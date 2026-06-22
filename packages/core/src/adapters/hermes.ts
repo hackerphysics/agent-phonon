@@ -103,6 +103,7 @@ class HermesSession implements AdapterSession {
     return new Promise((resolve) => {
       const child = spawn(this.env.binPath ?? "hermes", args, {
         cwd: this.cwd,
+        shell: process.platform === "win32",
         env: { ...process.env, ...(opts.environment ?? {}), HERMES_PROFILE: this.profile } as NodeJS.ProcessEnv,
       });
       this.current = child;
@@ -266,7 +267,7 @@ export class HermesAdapter implements AgentAdapter {
   /** 枚举 Hermes profile（去 ANSI 色解析 profile list）。 */
   private listProfiles(): Promise<Array<{ name: string; model?: string }>> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "hermes", ["profile", "list"]);
+      const child = spawn(this.env.binPath ?? "hermes", ["profile", "list"], { shell: process.platform === "win32" });
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve([{ name: this.defaultProfile }]));
@@ -287,7 +288,7 @@ export class HermesAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "hermes", ["--version"]);
+      const child = spawn(this.env.binPath ?? "hermes", ["--version"], { shell: process.platform === "win32" });
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { homedir, platform } from "node:os";
+import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
@@ -11,23 +11,45 @@ import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, 
  */
 
 function probe(bin: string, args: string[] = ["--version"]): { ok: boolean; out: string } {
-  const r = spawnSync(bin, args, { timeout: 8000 });
+  const r = spawnSync(bin, args, { timeout: 8000, shell: platform() === "win32" });
   return { ok: r.status === 0, out: (r.stdout?.toString() ?? "").trim().split("\n")[0] ?? "" };
 }
 
-function commandPath(bin: string): string | undefined {
-  const candidates = [
-    join(homedir(), ".npm-global", "bin", bin),
-    join(homedir(), ".local", "bin", bin),
-    join(homedir(), ".bun", "bin", bin),
-    join(homedir(), ".cargo", "bin", bin),
-    `/opt/homebrew/bin/${bin}`,
-    `/usr/local/bin/${bin}`,
-    `/usr/bin/${bin}`,
+function executableNames(bin: string): string[] {
+  if (platform() !== "win32") return [bin];
+  const exts = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((e) => e.toLowerCase());
+  return [bin, ...exts.map((e) => `${bin}${e}`), ...exts.map((e) => `${bin}${e.toUpperCase()}`)];
+}
+
+export function commandPath(bin: string): string | undefined {
+  const home = homedir();
+  const appData = process.env.APPDATA;
+  const localAppData = process.env.LOCALAPPDATA;
+  const dirs = [
+    join(home, ".npm-global", "bin"),
+    join(home, ".local", "bin"),
+    join(home, ".bun", "bin"),
+    join(home, ".cargo", "bin"),
+    ...(appData ? [join(appData, "npm")] : []),
+    ...(localAppData ? [join(localAppData, "Programs"), join(localAppData, "Microsoft", "WindowsApps")] : []),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    ...(process.env.PATH ?? "").split(delimiter).filter(Boolean),
   ];
-  for (const p of candidates) if (existsSync(p)) return p;
-  const r = spawnSync("bash", ["-lc", `command -v ${bin}`], { timeout: 3000 });
-  const out = (r.stdout?.toString() ?? "").trim().split("\n")[0];
+  for (const dir of dirs) {
+    for (const name of executableNames(bin)) {
+      const p = join(dir, name);
+      if (existsSync(p)) return p;
+    }
+  }
+
+  const r = platform() === "win32"
+    ? spawnSync("where.exe", [bin], { timeout: 3000 })
+    : spawnSync("sh", ["-lc", `command -v ${bin}`], { timeout: 3000 });
+  const out = (r.stdout?.toString() ?? "").trim().split(/\r?\n/)[0];
   return r.status === 0 && out ? out : undefined;
 }
 
@@ -43,8 +65,12 @@ function gatewayReachable(url: string): boolean {
 }
 
 function openCodeBin(): string {
-  const bundled = join(homedir(), ".opencode", "bin", "opencode");
-  return existsSync(bundled) ? bundled : "opencode";
+  const bundledDir = join(homedir(), ".opencode", "bin");
+  for (const name of executableNames("opencode")) {
+    const p = join(bundledDir, name);
+    if (existsSync(p)) return p;
+  }
+  return commandPath("opencode") ?? "opencode";
 }
 
 export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {

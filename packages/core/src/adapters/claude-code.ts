@@ -147,7 +147,7 @@ class ClaudeCodeSession implements AdapterSession {
         if (v !== undefined) childEnv[k] = v;
       }
 
-      const child = spawn(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: { ...childEnv, ...(opts.environment ?? {}) } });
+      const child = spawn(this.env.binPath ?? "claude", args, { cwd: this.cwd, shell: process.platform === "win32", env: { ...childEnv, ...(opts.environment ?? {}) } });
       this.current = child;
       let buf = "";
       let acc = "";
@@ -280,7 +280,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "claude", ["--version"]);
+      const child = spawn(this.env.binPath ?? "claude", ["--version"], { shell: process.platform === "win32" });
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

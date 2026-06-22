@@ -134,6 +134,7 @@ class CodexSession implements AdapterSession {
     return new Promise((resolve) => {
       const child = spawn(this.env.binPath ?? "codex", args, {
         cwd: this.cwd,
+        shell: process.platform === "win32",
         env: { ...process.env, ...(opts.environment ?? {}), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) } as NodeJS.ProcessEnv,
       });
       this.current = child;
@@ -253,7 +254,7 @@ export class CodexAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "codex", ["--version"]);
+      const child = spawn(this.env.binPath ?? "codex", ["--version"], { shell: process.platform === "win32" });
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

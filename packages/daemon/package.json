@@ -1,6 +1,6 @@
 {
   "name": "agent-phonon",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "agent-phonon device daemon — connects to servers, schedules local AI agents.",
   "license": "MIT",
   "type": "module",
