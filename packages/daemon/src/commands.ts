@@ -15,6 +15,22 @@ function probe(bin: string, args: string[] = ["--version"]): { ok: boolean; out:
   return { ok: r.status === 0, out: (r.stdout?.toString() ?? "").trim().split("\n")[0] ?? "" };
 }
 
+function commandPath(bin: string): string | undefined {
+  const candidates = [
+    join(homedir(), ".npm-global", "bin", bin),
+    join(homedir(), ".local", "bin", bin),
+    join(homedir(), ".bun", "bin", bin),
+    join(homedir(), ".cargo", "bin", bin),
+    `/opt/homebrew/bin/${bin}`,
+    `/usr/local/bin/${bin}`,
+    `/usr/bin/${bin}`,
+  ];
+  for (const p of candidates) if (existsSync(p)) return p;
+  const r = spawnSync("bash", ["-lc", `command -v ${bin}`], { timeout: 3000 });
+  const out = (r.stdout?.toString() ?? "").trim().split("\n")[0];
+  return r.status === 0 && out ? out : undefined;
+}
+
 function gatewayReachable(url: string): boolean {
   // 简单 TCP 探测：用 node 连一下 ws 端口
   try {
@@ -35,13 +51,28 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
   const out = [...adapters];
   const has = (type: AdapterConfig["type"]): boolean => out.some((a) => a.type === type);
 
-  if (!has("hermes") && probe("hermes").ok) out.push({ type: "hermes" });
+  if (!has("hermes")) {
+    const hermesPath = commandPath("hermes");
+    if (hermesPath && probe(hermesPath).ok) out.push({ type: "hermes", hermesBinPath: hermesPath });
+  }
 
   const ocBin = openCodeBin();
   if (!has("opencode") && probe(ocBin).ok) out.push({ type: "opencode", opencodeBinPath: ocBin === "opencode" ? undefined : ocBin });
 
-  if (!has("claude-code") && probe("claude").ok) out.push({ type: "claude-code", claudeDefaultModel: "default" });
-  if (!has("codex") && probe("codex").ok) out.push({ type: "codex", codexDefaultModel: "default" });
+  for (const a of out) {
+    if (a.type === "hermes" && !a.hermesBinPath) a.hermesBinPath = commandPath("hermes");
+    if (a.type === "claude-code" && !a.claudeBinPath) a.claudeBinPath = commandPath("claude");
+    if (a.type === "codex" && !a.codexBinPath) a.codexBinPath = commandPath("codex");
+  }
+
+  if (!has("claude-code")) {
+    const claudePath = commandPath("claude");
+    if (claudePath && probe(claudePath).ok) out.push({ type: "claude-code", claudeBinPath: claudePath, claudeDefaultModel: "default" });
+  }
+  if (!has("codex")) {
+    const codexPath = commandPath("codex");
+    if (codexPath && probe(codexPath).ok) out.push({ type: "codex", codexBinPath: codexPath, codexDefaultModel: "default" });
+  }
 
   return out;
 }
@@ -100,11 +131,11 @@ export function buildRegistry(adapters: AdapterConfig[]): AdapterRegistry {
       const token = a.gatewayToken ?? readOpenClawGatewayToken();
       if (token) reg.register(new OpenClawGatewayAdapter({ gateway: { baseUrl: a.gatewayUrl ?? "ws://127.0.0.1:18789", token }, defaultAgent: a.defaultAgent ?? "main" }));
     } else if (a.type === "claude-code") {
-      reg.register(new ClaudeCodeAdapter({ env: { baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
+      reg.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
     } else if (a.type === "codex") {
-      reg.register(new CodexAdapter({ env: { baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
+      reg.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
     } else if (a.type === "hermes") {
-      reg.register(new HermesAdapter({ env: { defaultModel: a.hermesModel, provider: a.hermesProvider } }));
+      reg.register(new HermesAdapter({ env: { binPath: a.hermesBinPath, defaultModel: a.hermesModel, provider: a.hermesProvider } }));
     } else if (a.type === "opencode") {
       reg.register(new OpenCodeAdapter({ env: { binPath: a.opencodeBinPath, defaultModel: a.opencodeModel } }));
     }
@@ -122,13 +153,13 @@ export function cmdAdapterAdd(type: string, opts: Record<string, string | undefi
       a = { type: "openclaw-gateway", gatewayUrl: opts.gatewayUrl ?? "ws://127.0.0.1:18789", gatewayToken: opts.token, defaultAgent: opts.defaultAgent ?? "main" };
       break;
     case "claude-code":
-      a = { type: "claude-code", claudeBaseUrl: opts.baseUrl, claudeAuthToken: opts.token, claudeDefaultModel: opts.model ?? "default" };
+      a = { type: "claude-code", claudeBinPath: opts.bin, claudeBaseUrl: opts.baseUrl, claudeAuthToken: opts.token, claudeDefaultModel: opts.model ?? "default" };
       break;
     case "codex":
-      a = { type: "codex", codexBaseUrl: opts.baseUrl, codexApiKey: opts.apiKey, codexDefaultModel: opts.model ?? "default", codexWireApi: (opts.wireApi as "responses" | "chat") ?? "responses" };
+      a = { type: "codex", codexBinPath: opts.bin, codexBaseUrl: opts.baseUrl, codexApiKey: opts.apiKey, codexDefaultModel: opts.model ?? "default", codexWireApi: (opts.wireApi as "responses" | "chat") ?? "responses" };
       break;
     case "hermes":
-      a = { type: "hermes", hermesModel: opts.model, hermesProvider: opts.provider };
+      a = { type: "hermes", hermesBinPath: opts.bin, hermesModel: opts.model, hermesProvider: opts.provider };
       break;
     case "opencode":
       a = { type: "opencode", opencodeBinPath: opts.bin, opencodeModel: opts.model };

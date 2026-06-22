@@ -28,17 +28,20 @@ export interface AdapterConfig {
   /** 默认 OpenClaw sub-agent。 */
   defaultAgent?: string;
   /** claude-code：网关 baseUrl/token/默认模型。 */
+  claudeBinPath?: string;
   claudeBaseUrl?: string;
   claudeAuthToken?: string;
   claudeDefaultModel?: string;
   claudeModels?: ModelInfo[];
   /** codex：网关 baseUrl(/v1)/key/默认模型/wireApi。 */
+  codexBinPath?: string;
   codexBaseUrl?: string;
   codexApiKey?: string;
   codexDefaultModel?: string;
   codexModels?: ModelInfo[];
   codexWireApi?: "responses" | "chat";
   /** hermes：默认模型/provider（用现有 hermes config）。 */
+  hermesBinPath?: string;
   hermesModel?: string;
   hermesProvider?: string;
   /** opencode：binary 路径/默认模型。 */

@@ -42,6 +42,8 @@ const CAPABILITIES: AgentCapabilities = {
 };
 
 export interface HermesEnv {
+  /** Hermes executable path. Prefer an absolute path when running under systemd/launchd. */
+  binPath?: string;
   /** 默认模型（如 anthropic/claude-opus-4.6 或 provider 自带格式）。 */
   defaultModel?: string;
   /** provider 覆盖（如 anthropic / openrouter；不传用 Hermes config 默认）。 */
@@ -99,7 +101,7 @@ class HermesSession implements AdapterSession {
 
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
-      const child = spawn("hermes", args, {
+      const child = spawn(this.env.binPath ?? "hermes", args, {
         cwd: this.cwd,
         env: { ...process.env, ...(opts.environment ?? {}), HERMES_PROFILE: this.profile } as NodeJS.ProcessEnv,
       });
@@ -264,7 +266,7 @@ export class HermesAdapter implements AgentAdapter {
   /** 枚举 Hermes profile（去 ANSI 色解析 profile list）。 */
   private listProfiles(): Promise<Array<{ name: string; model?: string }>> {
     return new Promise((resolve) => {
-      const child = spawn("hermes", ["profile", "list"]);
+      const child = spawn(this.env.binPath ?? "hermes", ["profile", "list"]);
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve([{ name: this.defaultProfile }]));
@@ -285,7 +287,7 @@ export class HermesAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn("hermes", ["--version"]);
+      const child = spawn(this.env.binPath ?? "hermes", ["--version"]);
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

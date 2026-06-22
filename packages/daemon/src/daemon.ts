@@ -64,11 +64,11 @@ export class PhononDaemon {
         this.gatewayAdapters.push(ad);
         this.registry.register(ad);
       } else if (a.type === "claude-code") {
-        this.registry.register(new ClaudeCodeAdapter({ env: { baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
+        this.registry.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
       } else if (a.type === "codex") {
-        this.registry.register(new CodexAdapter({ env: { baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
+        this.registry.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
       } else if (a.type === "hermes") {
-        this.registry.register(new HermesAdapter({ env: { defaultModel: a.hermesModel, provider: a.hermesProvider } }));
+        this.registry.register(new HermesAdapter({ env: { binPath: a.hermesBinPath, defaultModel: a.hermesModel, provider: a.hermesProvider } }));
       } else if (a.type === "opencode") {
         this.registry.register(new OpenCodeAdapter({ env: { binPath: a.opencodeBinPath, defaultModel: a.opencodeModel } }));
       } else if (a.type === "openclaw-cli") {

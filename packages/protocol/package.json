@@ -1,6 +1,6 @@
 {
   "name": "@agent-phonon/protocol",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Wire protocol (zod schemas + types) for agent-phonon — the single source of truth contract between phonon devices and servers.",
   "license": "MIT",
   "type": "module",

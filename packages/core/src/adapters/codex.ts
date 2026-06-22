@@ -65,6 +65,8 @@ export function resolveCodexSessionFile(threadId: string, codexHome = join(homed
 }
 
 export interface CodexEnv {
+  /** Codex executable path. Prefer an absolute path when running under systemd/launchd. */
+  binPath?: string;
   /** Optional OpenAI-compatible endpoint override. Omit to use the user's native Codex config. */
   baseUrl?: string;
   /** Optional API key for baseUrl. Omit to use the user's native Codex config. */
@@ -130,7 +132,7 @@ class CodexSession implements AdapterSession {
 
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
-      const child = spawn("codex", args, {
+      const child = spawn(this.env.binPath ?? "codex", args, {
         cwd: this.cwd,
         env: { ...process.env, ...(opts.environment ?? {}), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) } as NodeJS.ProcessEnv,
       });
@@ -251,7 +253,7 @@ export class CodexAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn("codex", ["--version"]);
+      const child = spawn(this.env.binPath ?? "codex", ["--version"]);
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

@@ -40,6 +40,8 @@ const CAPABILITIES: AgentCapabilities = {
 };
 
 export interface ClaudeCodeEnv {
+  /** Claude executable path. Prefer an absolute path when running under systemd/launchd. */
+  binPath?: string;
   /** Optional Anthropic-compatible endpoint override. Omit to use the user's native Claude Code login/config. */
   baseUrl?: string;
   /** Optional auth token for baseUrl. Omit to use the user's native Claude Code login/config. */
@@ -145,7 +147,7 @@ class ClaudeCodeSession implements AdapterSession {
         if (v !== undefined) childEnv[k] = v;
       }
 
-      const child = spawn("claude", args, { cwd: this.cwd, env: { ...childEnv, ...(opts.environment ?? {}) } });
+      const child = spawn(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: { ...childEnv, ...(opts.environment ?? {}) } });
       this.current = child;
       let buf = "";
       let acc = "";
@@ -278,7 +280,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn("claude", ["--version"]);
+      const child = spawn(this.env.binPath ?? "claude", ["--version"]);
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));
