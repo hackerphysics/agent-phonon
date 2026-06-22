@@ -1,0 +1,40 @@
+{
+  "name": "@agent-phonon/console",
+  "version": "0.1.0",
+  "description": "agent-phonon console — a server-SDK-based server with a web UI to orchestrate device agents.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "phonon-console": "./dist/cli.js"
+  },
+  "main": "./dist/server.js",
+  "files": [
+    "dist",
+    "public"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@agent-phonon/server-sdk": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.6.3"
+  },
+  "author": "agent-phonon contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hackerphysics/agent-phonon.git",
+    "directory": "packages/console"
+  },
+  "homepage": "https://github.com/hackerphysics/agent-phonon#readme",
+  "bugs": {
+    "url": "https://github.com/hackerphysics/agent-phonon/issues"
+  },
+  "private": true
+}

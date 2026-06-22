@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-ts:
+    name: TypeScript build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run consistency
+      - run: pnpm -r build
+      - run: pnpm -r test
+
+  test-python:
+    name: Python SDK e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run consistency
+      - run: pnpm --filter @agent-phonon/protocol build
+      - run: pnpm --filter @agent-phonon/core build
+      - run: pnpm --filter @agent-phonon/server-sdk build
+      - run: pnpm --filter @agent-phonon/test-server build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python SDK
+        working-directory: sdk-python
+        run: pip install -e .
+
+      - name: Run e2e
+        working-directory: sdk-python
+        run: python3 test_e2e.py

@@ -1,0 +1,23 @@
+{
+  "id": "agent-phonon-hitl",
+  "name": "agent-phonon HITL Bridge",
+  "description": "Intercepts tool calls and routes them to agent-phonon for human-in-the-loop approval.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "bridgeUrl": {
+        "type": "string",
+        "description": "phonon-core HITL bridge URL (default http://127.0.0.1:4318)"
+      },
+      "interceptTools": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Tool names to intercept (empty = intercept all)"
+      }
+    }
+  }
+}

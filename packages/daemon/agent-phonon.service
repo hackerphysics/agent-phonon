@@ -1,0 +1,28 @@
+# agent-phonon systemd user unit（bug-bash B4）
+#
+# 安装（用户级，无需 root）：
+#   mkdir -p ~/.config/systemd/user
+#   cp packages/daemon/agent-phonon.service ~/.config/systemd/user/
+#   # 编辑 ExecStart 指向你的 node + cli.js 绝对路径
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agent-phonon
+#   systemctl --user status agent-phonon
+#
+# 前置：agent-phonon init && agent-phonon server add ws://your-server:port --trust-local
+
+[Unit]
+Description=agent-phonon device daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成你的绝对路径（which node；dist/cli.js 路径）
+ExecStart=/usr/bin/node %h/agent-phonon/packages/daemon/dist/cli.js start
+Restart=always
+RestartSec=5
+# 资源约束（单设备友好）
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

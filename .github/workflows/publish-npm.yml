@@ -1,0 +1,75 @@
+name: Publish npm packages
+
+# Publishes all public @agent-phonon/* packages + the unscoped `agent-phonon`
+# daemon to npm using **Trusted Publishing (OIDC)** — no NPM_TOKEN needed.
+# Note: do not pass --provenance while the repository is private; npm provenance
+# currently requires a public GitHub source repository.
+#
+# One-time setup (per package, on npmjs.com):
+#   npmjs.com → each package → Settings → Trusted Publisher → add:
+#     Provider:    GitHub Actions
+#     Owner:       hackerphysics
+#     Repository:  agent-phonon
+#     Workflow:    publish-npm.yml
+#   For the FIRST ever publish of a brand-new package name, npm has no package to
+#   attach a trusted publisher to yet. Two options:
+#     (a) configure a "pending" trusted publisher at the org level, or
+#     (b) do the very first `npm publish` once with a token, then switch to OIDC.
+#   Requires npm CLI >= 11.5 (Node 24 bundles it) for OIDC support.
+#
+# Trigger: tag `v*` (e.g. v0.1.0), or manual dry-run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack only, do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 bundles an npm CLI new enough for Trusted Publishing / OIDC.
+          node-version: 24.x
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run consistency
+      - run: pnpm -r build
+      - run: pnpm -r test
+
+      # Publish in dependency order. No NODE_AUTH_TOKEN: npm uses the workflow's
+      # OIDC identity (Trusted Publishing). pnpm rewrites workspace:* to concrete
+      # versions on publish.
+      - name: Publish (or pack on dry-run)
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          for dir in \
+            packages/protocol \
+            packages/sdk-server-ts \
+            packages/daemon; do
+            echo "::group::$dir"
+            if [ "${DRY_RUN}" = "true" ]; then
+              ( cd "$dir" && pnpm pack )
+            else
+              ( cd "$dir" && tgz=$(pnpm pack | tail -1) && npm publish "$tgz" --access public && rm -f "$tgz" )
+            fi
+            echo "::endgroup::"
+          done

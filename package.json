@@ -1,0 +1,19 @@
+{
+  "name": "agent-phonon-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Unified scheduler for local AI coding agents — monorepo root",
+  "license": "MIT",
+  "author": "agent-phonon contributors",
+  "repository": { "type": "git", "url": "git+https://github.com/hackerphysics/agent-phonon.git" },
+  "homepage": "https://github.com/hackerphysics/agent-phonon#readme",
+  "bugs": { "url": "https://github.com/hackerphysics/agent-phonon/issues" },
+  "engines": { "node": ">=22.5" },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "consistency": "node scripts/check-consistency.mjs",
+    "test": "pnpm run consistency && pnpm -r test"
+  }
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-phonon-sdk"
+version = "0.2.4"
+description = "Server SDK for agent-phonon — orchestrate AI agents across multiple devices."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["websockets>=12.0"]
+license = "MIT"
+authors = [{ name = "agent-phonon contributors" }]
+keywords = ["ai", "agents", "orchestration", "llm", "sdk"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/hackerphysics/agent-phonon"
+Repository = "https://github.com/hackerphysics/agent-phonon"
+Issues = "https://github.com/hackerphysics/agent-phonon/issues"
+
+[tool.setuptools.packages.find]
+include = ["agent_phonon*"]

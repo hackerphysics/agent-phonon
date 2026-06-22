@@ -1,0 +1,51 @@
+{
+  "name": "@agent-phonon/test-server",
+  "version": "0.1.0",
+  "description": "In-project reference server for agent-phonon — implements the server side of the protocol for testing. NOT for production.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "phonon-test-server": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && node --test dist/fn-*.test.js dist/p0-fixes.test.js dist/sdk-e2e.test.js",
+    "test:e2e": "pnpm build && node --test dist/e2e.test.js dist/e2e-full.test.js dist/e2e-gateway.test.js dist/e2e-hitl.test.js",
+    "test:all": "pnpm build && node --test dist/**/*.test.js"
+  },
+  "dependencies": {
+    "@agent-phonon/protocol": "workspace:*",
+    "@agent-phonon/core": "workspace:*",
+    "ws": "^8.18.0",
+    "@agent-phonon/server-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.6.3"
+  },
+  "author": "agent-phonon contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hackerphysics/agent-phonon.git",
+    "directory": "packages/test-server"
+  },
+  "homepage": "https://github.com/hackerphysics/agent-phonon#readme",
+  "bugs": {
+    "url": "https://github.com/hackerphysics/agent-phonon/issues"
+  }
+}

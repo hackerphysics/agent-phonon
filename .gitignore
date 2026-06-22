@@ -1,0 +1,23 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+*.log
+*.db
+.DS_Store
+coverage/
+.turbo/
+__pycache__/
+*.pyc
+sdk-python/*.egg-info/
+sdk-python/build/
+sdk-python/dist/
+.pytest_cache/
+*.whl
+*.tar.gz
+
+# device secret key (env at-rest encryption) — never commit
+device.key
+*.bak-*
+dist-test/

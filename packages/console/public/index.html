@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>agent-phonon console</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --green:#3fb950; --red:#f85149; --amber:#d29922; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 18px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:16px; margin:0; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--red); display:inline-block; }
+  .dot.on { background:var(--green); }
+  .wrap { display:grid; grid-template-columns:300px 1fr; height:calc(100vh - 49px); }
+  .side { border-right:1px solid var(--border); overflow:auto; padding:12px; }
+  .main { display:flex; flex-direction:column; overflow:hidden; }
+  .device { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px; margin-bottom:10px; }
+  .device h3 { margin:0 0 6px; font-size:13px; }
+  .agent { font-size:12px; color:var(--muted); padding:3px 0; cursor:pointer; border-radius:4px; }
+  .agent:hover { color:var(--accent); }
+  .agent.sel { color:var(--accent); font-weight:600; }
+  .form { padding:12px 18px; border-bottom:1px solid var(--border); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .form input { background:var(--panel); border:1px solid var(--border); color:var(--fg); border-radius:6px; padding:8px 10px; }
+  .form input.task { flex:1; min-width:240px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--fg); }
+  .stream { flex:1; overflow:auto; padding:14px 18px; font:13px/1.6 ui-monospace,Menlo,monospace; }
+  .ev { margin-bottom:4px; white-space:pre-wrap; }
+  .ev .tag { color:var(--muted); font-size:11px; }
+  .ev.tool { color:var(--amber); }
+  .ev.result { color:var(--green); border-top:1px dashed var(--border); padding-top:6px; margin-top:6px; }
+  .ev.err { color:var(--red); }
+  .ev.unsol { color:#a371f7; }
+  .sel-info { font-size:12px; color:var(--muted); padding:0 18px 8px; }
+  .modal-bg { position:fixed; inset:0; background:#000a; display:none; align-items:center; justify-content:center; }
+  .modal-bg.show { display:flex; }
+  .modal { background:var(--panel); border:1px solid var(--amber); border-radius:10px; padding:20px; max-width:520px; }
+  .modal h3 { margin:0 0 8px; color:var(--amber); }
+  .modal pre { background:var(--bg); padding:10px; border-radius:6px; overflow:auto; font-size:12px; }
+  .modal .row { display:flex; gap:8px; margin-top:12px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="conn"></span>
+  <h1>agent-phonon console</h1>
+  <span style="color:var(--muted);font-size:12px" id="status">connecting…</span>
+</header>
+<div class="wrap">
+  <div class="side">
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px;display:flex;justify-content:space-between">
+      <span>DEVICES</span><a href="#" id="refresh" style="color:var(--accent)">refresh</a>
+    </div>
+    <div id="devices"></div>
+  </div>
+  <div class="main">
+    <div class="sel-info" id="selInfo">select an agent on the left</div>
+    <div class="form">
+      <input class="task" id="task" placeholder="give a task to the selected agent…" />
+      <input id="project" placeholder="project (name or id)" value="demo" style="width:160px" />
+      <button id="send">Send</button>
+      <button class="ghost" id="clear">Clear</button>
+    </div>
+    <div class="stream" id="stream"></div>
+  </div>
+</div>
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <h3>⚠️ HITL — approve tool call?</h3>
+    <div id="modalBody"></div>
+    <pre id="modalHook"></pre>
+    <div class="row">
+      <button id="approve">Allow</button>
+      <button class="ghost" id="deny" style="border-color:var(--red);color:var(--red)">Block</button>
+    </div>
+  </div>
+</div>
+<script>
+const ws = new WebSocket(`ws://${location.host}/ws`);
+const $ = (id) => document.getElementById(id);
+let sel = null; // { deviceId, agent, model }
+let devices = [];
+
+ws.onopen = () => { $("conn").classList.add("on"); $("status").textContent = "connected"; send({cmd:"list-devices"}); };
+ws.onclose = () => { $("conn").classList.remove("on"); $("status").textContent = "disconnected"; };
+ws.onmessage = (e) => handle(JSON.parse(e.data));
+function send(m){ ws.send(JSON.stringify(m)); }
+
+function handle(m){
+  if (m.type === "devices") { devices = m.devices; renderDevices(); }
+  else if (m.type === "device.connected" || m.type === "device.disconnected") { send({cmd:"list-devices"}); }
+  else if (m.type === "session.created") { addEv(`tag`, `▶ session ${m.sessionId.slice(-6)} on ${m.agent}`); }
+  else if (m.type === "stream") { renderStream(m.event); }
+  else if (m.type === "session.end") { addEv("result", `■ turn ended (${m.event.status||"done"})`); }
+  else if (m.type === "unsolicited") { addEv("unsol", `🔔 [${m.deviceId}] ${m.event.text||""}`); }
+  else if (m.type === "hook.pending") { showHook(m); }
+}
+
+function renderDevices(){
+  const el = $("devices"); el.innerHTML = "";
+  if (!devices.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">no devices connected</div>'; return; }
+  for (const d of devices){
+    const div = document.createElement("div"); div.className = "device";
+    div.innerHTML = `<h3>🖥 ${d.deviceId}</h3>`;
+    for (const a of d.agents){
+      const ag = document.createElement("div"); ag.className = "agent";
+      ag.textContent = (a.available?"● ":"○ ") + a.agentId;
+      ag.onclick = () => { sel = { deviceId:d.deviceId, agent:a.agentId, model:a.models[0]||"" }; renderDevices(); $("selInfo").textContent = `${d.deviceId} · ${a.agentId} · ${sel.model}`; };
+      if (sel && sel.deviceId===d.deviceId && sel.agent===a.agentId) ag.classList.add("sel");
+      div.appendChild(ag);
+    }
+    el.appendChild(div);
+  }
+}
+
+function renderStream(ev){
+  if (ev.type === "message") { addEv("", ev.text, true); }
+  else if (ev.type === "tool_call") { addEv("tool", `🔧 ${ev.toolName||""}`); }
+  else if (ev.type === "result") { addEv("result", `✓ ${ev.text||""}`); }
+  else if (ev.type === "error") { addEv("err", `✗ ${ev.message||""}`); }
+}
+let lastMsgEl = null;
+function addEv(cls, text, append){
+  const s = $("stream");
+  if (append && lastMsgEl){ lastMsgEl.textContent += text; s.scrollTop = s.scrollHeight; return; }
+  const div = document.createElement("div"); div.className = "ev "+cls; div.textContent = text;
+  s.appendChild(div); s.scrollTop = s.scrollHeight;
+  lastMsgEl = (cls===""? div : null);
+}
+
+$("send").onclick = () => {
+  if (!sel) { alert("select an agent first"); return; }
+  const input = $("task").value.trim(); if (!input) return;
+  addEv("tag", `→ ${input}`); $("task").value = "";
+  send({ cmd:"send-task", deviceId:sel.deviceId, agent:sel.agent, model:sel.model, project:$("project").value.trim(), input });
+};
+$("task").addEventListener("keydown", e => { if (e.key==="Enter") $("send").click(); });
+$("clear").onclick = () => { $("stream").innerHTML=""; lastMsgEl=null; };
+$("refresh").onclick = (e) => { e.preventDefault(); send({cmd:"list-devices"}); };
+
+let curHook = null;
+function showHook(m){
+  curHook = m.id;
+  $("modalBody").textContent = `Device ${m.deviceId} wants to run a ${m.hook.hookType} operation:`;
+  $("modalHook").textContent = JSON.stringify(m.hook.payload||{}, null, 2);
+  $("modalBg").classList.add("show");
+}
+$("approve").onclick = () => { send({cmd:"hook-decide", id:curHook, action:"continue"}); $("modalBg").classList.remove("show"); };
+$("deny").onclick = () => { send({cmd:"hook-decide", id:curHook, action:"abort", reason:"blocked by operator"}); $("modalBg").classList.remove("show"); };
+</script>
+</body>
+</html>
