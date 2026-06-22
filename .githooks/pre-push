@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+need_gate=false
+release_tags=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref" in
+    refs/heads/main)
+      need_gate=true
+      ;;
+    refs/tags/v*|refs/tags/py-v*)
+      need_gate=true
+      release_tags+=("${local_ref#refs/tags/}")
+      ;;
+  esac
+done
+
+if [ "$need_gate" != "true" ]; then
+  exit 0
+fi
+
+echo "[agent-phonon pre-push] running consistency gate..."
+pnpm run consistency
+
+for tag in "${release_tags[@]}"; do
+  echo "[agent-phonon pre-push] checking release tag $tag..."
+  node scripts/release-guard.mjs "$tag"
+done
+
+if [ "${#release_tags[@]}" -gt 0 ]; then
+  echo "[agent-phonon pre-push] release tag push: running full build/test before GitHub Actions..."
+  pnpm -r build
+  pnpm -r test
+fi
+
+echo "[agent-phonon pre-push] ok"

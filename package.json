@@ -14,6 +14,8 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "consistency": "node scripts/check-consistency.mjs",
+    "release:guard": "node scripts/release-guard.mjs",
+    "install-hooks": "node scripts/install-git-hooks.mjs",
     "test": "pnpm run consistency && pnpm -r test"
   }
 }

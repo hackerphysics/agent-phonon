@@ -50,6 +50,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run consistency
+      - run: node scripts/release-guard.mjs "${GITHUB_REF_NAME:-}"
       - run: pnpm -r build
       - run: pnpm -r test
 

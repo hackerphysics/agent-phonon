@@ -32,10 +32,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24.x
 
       - name: Consistency gate
         run: node scripts/check-consistency.mjs
+
+      - name: Release tag guard
+        run: node scripts/release-guard.mjs "${GITHUB_REF_NAME:-}"
 
       - uses: actions/setup-python@v5
         with:
