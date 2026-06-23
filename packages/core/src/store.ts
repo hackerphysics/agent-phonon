@@ -121,6 +121,28 @@ export class PhononStore {
       );
       CREATE INDEX IF NOT EXISTS idx_env_scope ON env_vars(scope, project_id, agent_id, skill_name);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_env_unique ON env_vars(scope, IFNULL(project_id,''), IFNULL(agent_id,''), IFNULL(skill_name,''), name);
+      CREATE TABLE IF NOT EXISTS workflows (
+        workflow_id  TEXT PRIMARY KEY,
+        tenant_id    TEXT NOT NULL,
+        project_id   TEXT NOT NULL,
+        worktree_id  TEXT,
+        mode         TEXT NOT NULL,
+        plan_json    TEXT NOT NULL,
+        input        TEXT,
+        policy_json  TEXT,
+        shared_json  TEXT,
+        status       TEXT NOT NULL,
+        final_text   TEXT,
+        error        TEXT,
+        nodes_json   TEXT NOT NULL,
+        seq          INTEGER NOT NULL DEFAULT 0,
+        acked_seq    INTEGER NOT NULL DEFAULT -1,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id, created_at);
     `);
   }
 
@@ -300,5 +322,46 @@ export class PhononStore {
   }
   idempotencyPut(key: string, result: string): void {
     this.db.prepare("INSERT INTO idempotency(k,result,created_at) VALUES(?,?,?) ON CONFLICT(k) DO NOTHING").run(key, result, Date.now());
+  }
+
+  // ---- workflows (L3 checkpoint) ----
+  upsertWorkflow(w: {
+    workflowId: string; tenantId: string; projectId: string; worktreeId?: string;
+    mode: string; planJson: string; input?: string; policyJson?: string; sharedJson?: string;
+    status: string; finalText?: string; error?: string; nodesJson: string;
+    seq: number; ackedSeq: number; createdAt: string; updatedAt: string; completedAt?: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO workflows(workflow_id,tenant_id,project_id,worktree_id,mode,plan_json,input,policy_json,shared_json,status,final_text,error,nodes_json,seq,acked_seq,created_at,updated_at,completed_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(workflow_id) DO UPDATE SET
+           status=excluded.status,
+           final_text=excluded.final_text,
+           error=excluded.error,
+           nodes_json=excluded.nodes_json,
+           seq=excluded.seq,
+           acked_seq=excluded.acked_seq,
+           updated_at=excluded.updated_at,
+           completed_at=excluded.completed_at`,
+      )
+      .run(
+        w.workflowId, w.tenantId, w.projectId, w.worktreeId ?? null, w.mode, w.planJson,
+        w.input ?? null, w.policyJson ?? null, w.sharedJson ?? null,
+        w.status, w.finalText ?? null, w.error ?? null, w.nodesJson,
+        w.seq, w.ackedSeq, w.createdAt, w.updatedAt, w.completedAt ?? null,
+      );
+  }
+
+  getWorkflow(workflowId: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM workflows WHERE workflow_id=?").get(workflowId) as Record<string, unknown> | undefined;
+  }
+
+  listWorkflows(tenantId: string): Array<Record<string, unknown>> {
+    return this.db.prepare("SELECT * FROM workflows WHERE tenant_id=? ORDER BY created_at DESC").all(tenantId) as Array<Record<string, unknown>>;
+  }
+
+  ackWorkflow(workflowId: string, lastSeq: number): void {
+    this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=?").run(lastSeq, workflowId);
   }
 }

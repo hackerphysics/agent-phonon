@@ -125,6 +125,7 @@ export class PhononConnection {
       engine: this.engine,
       resolveCwd: (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId),
       env: this.env,
+      store: this.store,
       emit: (event) => this.peer.notifyRaw("workflow.event", event),
     });
   }
@@ -388,6 +389,8 @@ export class PhononConnection {
           plan: p.plan as WorkflowPlan,
           input: p.input as string | undefined,
           policy: p.policy as never,
+          sharedContext: p.sharedContext as never,
+          resumeFrom: p.resumeFrom as never,
           metadata: p.metadata as Record<string, unknown> | undefined,
         });
       case "workflow.status":

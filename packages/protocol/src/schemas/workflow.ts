@@ -4,13 +4,12 @@ import { AgentId, ProjectId, SessionId, Timestamp } from "./common.js";
 /**
  * L3 Orchestration Protocol (workflow.*)
  *
- * Design rules (locked in 2026-06-23 review):
+ * Locked design (2026-06-23 v0.4 + v0.5 review):
  * - L3 编排是 L1 session 的 wrapper，不重新发明 session 概念。
  * - Node 创建出来的 L1 session 的所有 stream.event 自动带 workflowId / nodeId / role
- *   字段（见 stream.ts 的 StreamEventBase 扩展），服务端按这些字段筛选/区分。
- *   workflow.event **不重复承载** session 流，只负责工作流级元事件（status / route / decision）。
- * - Executor 通过 `RoutingDirective`（agent emit → phonon 解析 → 升级成路由）告诉 phonon 把
- *   下一条消息送给哪个 worker，参考 D22 “skill 教格式”的设计原则。
+ *   字段（见 stream.ts），服务端按这些字段筛选/区分。
+ *   workflow.event **不重复承载** session 流，只负责工作流级元事件。
+ * - phonon 只提供通用底层能力。category / wisdom 这类业务由上层 server 自行实现。
  */
 
 const ModelId = z.string().min(1);
@@ -20,6 +19,14 @@ const ClientRequestId = z.string().min(1);
 export const WorkflowId = z.string().min(1);
 export const WorkflowNodeId = z.string().min(1);
 export const WorkflowEdgeId = z.string().min(1);
+
+/**
+ * Role 字段说明（review v0.5）：
+ *   role 是这个 agent 在当前 workflow 中扮演的角色，由调用方自由定义。
+ *   phonon 只做透传 + 在 stream.event / workflow.event 里回显，不解析其语义。
+ *   常见示例："executor" / "worker" / "reviewer" / "coder" / "planner" / "chairman" / "participant"
+ *   上层服务可以把 role 映射到 category / system prompt / 模型选择，phonon 不感知。
+ */
 export const WorkflowRoleId = z.string().min(1);
 
 // ---------------------------------------------------------------------------
@@ -30,6 +37,7 @@ export const WorkflowNode = z.object({
   nodeId: WorkflowNodeId,
   agent: AgentId,
   model: ModelId,
+  /** 该节点在 workflow 中扮演的角色（由调用方定义，phonon 仅回显）。 */
   role: WorkflowRoleId.optional(),
   input: z.string().optional(),
   systemPrompt: z.string().optional(),
@@ -65,10 +73,6 @@ export const WorkflowCommunicationGraph = z.object({
 });
 export type WorkflowCommunicationGraph = z.infer<typeof WorkflowCommunicationGraph>;
 
-/**
- * Graph 模式的 executor 节点 — 用 WorkflowNode.extend 复用字段
- * （review P1-4：避免和 WorkflowNode 漂移）。
- */
 export const WorkflowExecutorNode = WorkflowNode.extend({
   role: z.literal("executor").default("executor"),
 });
@@ -82,7 +86,39 @@ export const WorkflowGraphPlan = z.object({
 });
 export type WorkflowGraphPlan = z.infer<typeof WorkflowGraphPlan>;
 
-export const WorkflowPlan = z.discriminatedUnion("mode", [WorkflowDagPlan, WorkflowGraphPlan]);
+// ---------------------------------------------------------------------------
+// Discussion plan (review v0.5 借鉴 4，对应 Foreman _run_discuss_rounds)
+//
+// N 个 agent 平等参与多轮讨论，chairman 控场决定何时终止。
+// 与 graph 模式根本区别：没有路由 + 没有主从；所有 participant 每轮并行发言。
+// ---------------------------------------------------------------------------
+
+export const WorkflowDiscussionPlan = z.object({
+  mode: z.literal("discussion"),
+  /** 主题（initial input） — 所有 participant 第一轮收到这个。 */
+  topic: z.string(),
+  /** 参与者列表（无主从）。 */
+  participants: z.array(WorkflowNode).min(2),
+  /** Chairman 必须是 participants 之一的 nodeId，每轮所有 participant 发完它再 review + 决定续/停。 */
+  chairman: WorkflowNodeId,
+  termination: z
+    .object({
+      /** chairman 输出含该信号则终止。 */
+      chairmanSignal: z.string().default("[DISCUSS_END]"),
+      /** 硬上限。 */
+      maxRounds: z.number().int().positive().default(10),
+      /** 自然达成共识的检测字符串（任一 participant 输出含此则终止，可选）。 */
+      consensusSignal: z.string().optional(),
+    })
+    .default({}),
+});
+export type WorkflowDiscussionPlan = z.infer<typeof WorkflowDiscussionPlan>;
+
+export const WorkflowPlan = z.discriminatedUnion("mode", [
+  WorkflowDagPlan,
+  WorkflowGraphPlan,
+  WorkflowDiscussionPlan,
+]);
 export type WorkflowPlan = z.infer<typeof WorkflowPlan>;
 
 // ---------------------------------------------------------------------------
@@ -111,17 +147,9 @@ export const WorkflowNodeStatus = z.enum([
 export type WorkflowNodeStatus = z.infer<typeof WorkflowNodeStatus>;
 
 // ---------------------------------------------------------------------------
-// Execution policy (review P1-6)
+// Execution policy
 // ---------------------------------------------------------------------------
 
-/**
- * 工作流执行策略 — 全部可选，给服务端调度旋钮，不强制理解。
- * - timeoutSeconds        : 整个 workflow 超时；超时后 workflow 走 timeout 终态。
- * - perNodeTimeoutSeconds : 每个 node 单独超时；超时后该 node failed/timeout。
- * - onNodeFailure         : 单 node 失败的传播策略，默认 fail_workflow。
- *                           skip_dependents 跳过依赖该 node 的下游；continue 完全忽略并继续。
- * - maxParallel           : DAG 内同时 running 的 node 上限，未设默认无限。
- */
 export const WorkflowPolicy = z
   .object({
     timeoutSeconds: z.number().int().positive().optional(),
@@ -133,6 +161,47 @@ export const WorkflowPolicy = z
 export type WorkflowPolicy = z.infer<typeof WorkflowPolicy>;
 
 // ---------------------------------------------------------------------------
+// Shared context (review v0.5 借鉴 3：通用共享上下文，不是 SSOT)
+//
+// phonon 在每个 node create 时把 sharedContext 注入到 systemPrompt（追加形式）。
+// 文件路径会被 phonon 解析为 workspace 内绝对路径（受 policy 沙箱保护）。
+// 文件不存在则跳过该文件，不阻塞 workflow。
+// ---------------------------------------------------------------------------
+
+export const WorkflowSharedContext = z.object({
+  /** 直接文本：phonon 原样追加到每个 node 的 systemPrompt。 */
+  text: z.string().optional(),
+  /** workspace 相对路径列表（受 policy 沙箱）；phonon 读取后拼成 markdown 段追加到 systemPrompt。 */
+  files: z.array(z.string()).optional(),
+  /** 注入位置：prepend 在最前，append 在最后，默认 append。 */
+  placement: z.enum(["prepend", "append"]).default("append"),
+});
+export type WorkflowSharedContext = z.infer<typeof WorkflowSharedContext>;
+
+// ---------------------------------------------------------------------------
+// Resume (review v0.5 借鉴 2：checkpoint + 断点续跑)
+// ---------------------------------------------------------------------------
+
+export const WorkflowResumeFrom = z.object({
+  /** 要恢复的 workflowId（必须先前 run 过，并有 checkpoint）。 */
+  workflowId: WorkflowId,
+  /**
+   * 起点策略：
+   * - "last_success_dependents" : 从最后成功节点的下游开始（DAG 默认）
+   * - "failed_node"              : 重跑失败的那个 node（其他成功 node 不重做）
+   * - "node:<nodeId>"            : 显式指定从某 node 开始
+   */
+  strategy: z.union([
+    z.literal("last_success_dependents"),
+    z.literal("failed_node"),
+    z.string().regex(/^node:/),
+  ]).default("failed_node"),
+  /** 可选：重置某些 node 的状态（让它们重跑），覆盖默认策略。 */
+  rerunNodes: z.array(WorkflowNodeId).optional(),
+});
+export type WorkflowResumeFrom = z.infer<typeof WorkflowResumeFrom>;
+
+// ---------------------------------------------------------------------------
 // workflow.run
 // ---------------------------------------------------------------------------
 
@@ -141,8 +210,11 @@ export const WorkflowRunParams = z.object({
   worktreeId: z.string().optional(),
   plan: WorkflowPlan,
   input: z.string().optional(),
-  /** 执行策略；不传走全默认。 */
   policy: WorkflowPolicy.optional(),
+  /** 共享上下文（v0.5 新增）。 */
+  sharedContext: WorkflowSharedContext.optional(),
+  /** 断点续跑（v0.5 新增）。传入则跳过 plan 重新规划，从 checkpoint 恢复。 */
+  resumeFrom: WorkflowResumeFrom.optional(),
   clientRequestId: ClientRequestId.optional(),
   metadata: z.record(z.unknown()).optional(),
 });
@@ -152,17 +224,15 @@ export const WorkflowRunResult = z.object({
   workflowId: WorkflowId,
   status: WorkflowStatus,
   createdAt: Timestamp,
+  /** 是否走的 resume 路径。 */
+  resumed: z.boolean().default(false),
 });
 export type WorkflowRunResult = z.infer<typeof WorkflowRunResult>;
 
 // ---------------------------------------------------------------------------
-// Node runtime state (review P0-2: 加 result 字段，下游能拿到上游产物)
+// Node runtime state
 // ---------------------------------------------------------------------------
 
-/**
- * Node 终态产物 — 给 DAG 依赖节点 / executor 决策提供数据通道。
- * text 来自 L1 StreamResultEvent.text；status 与之对齐；usage 透传 token 统计。
- */
 export const WorkflowNodeResult = z.object({
   text: z.string().optional(),
   status: z.enum(["completed", "interrupted", "aborted", "failed", "timeout"]),
@@ -186,8 +256,9 @@ export const WorkflowNodeRuntime = z.object({
   startedAt: Timestamp.optional(),
   completedAt: Timestamp.optional(),
   error: z.string().optional(),
-  /** 终态产物（P0-2）。pending/running 节点为 undefined。 */
   result: WorkflowNodeResult.optional(),
+  /** 该节点完成的轮次计数（discussion 用；DAG/Graph 一次执行 = 1）。 */
+  iterations: z.number().int().nonnegative().optional(),
 });
 export type WorkflowNodeRuntime = z.infer<typeof WorkflowNodeRuntime>;
 
@@ -202,17 +273,15 @@ export const WorkflowStatusResult = z.object({
   workflowId: WorkflowId,
   status: WorkflowStatus,
   project: ProjectId,
-  mode: z.enum(["dag", "graph"]),
+  mode: z.enum(["dag", "graph", "discussion"]),
   nodes: z.array(WorkflowNodeRuntime),
   createdAt: Timestamp,
   updatedAt: Timestamp,
   completedAt: Timestamp.optional(),
   error: z.string().optional(),
-  /**
-   * 最终结果引用 — DAG 模式下若 plan.finalNodeId 命中，则为该 node 的 result.text；
-   * graph 模式下为 executor 的 result.text（如果 executor 已完成）。
-   */
   finalText: z.string().optional(),
+  /** 是否可 resume：phonon 持有该 workflow 的 checkpoint。 */
+  resumable: z.boolean().default(false),
 });
 export type WorkflowStatusResult = z.infer<typeof WorkflowStatusResult>;
 
@@ -224,7 +293,6 @@ export type WorkflowCancelResult = z.infer<typeof WorkflowCancelResult>;
 export const WorkflowListParams = z.object({
   status: WorkflowStatus.optional(),
   projectId: ProjectId.optional(),
-  /** ISO 时间窗：含 since、不含 until。 */
   since: Timestamp.optional(),
   until: Timestamp.optional(),
   limit: z.number().int().positive().max(100).default(50).optional(),
@@ -238,20 +306,22 @@ export const WorkflowListResult = z.object({
 export type WorkflowListResult = z.infer<typeof WorkflowListResult>;
 
 // ---------------------------------------------------------------------------
-// workflow.event (P0-1: 只承载工作流级元事件；session 流走 stream.event)
-// P0-3: 复用 stream.ack 机制 — 元事件挂 sessionId 时随 ack 自动清理；
-//       不挂 session 的纯 workflow 状态事件由 workflow.ack 单独 ack（见 methods.ts）。
+// workflow.event
+// v0.5 新增事件类型：round.started / round.completed / discussion.terminated
+// （为 Discussion 模式准备；DAG/Graph 不发这些）
 // ---------------------------------------------------------------------------
 
 export const WorkflowEvent = z.object({
   workflowId: WorkflowId,
   seq: z.number().int().nonnegative(),
   type: z.enum([
-    "workflow.status", // 工作流整体状态变化（queued/running/completed/failed/cancelled/timeout）
-    "node.status", // 单个 node 状态变化（含终态时的 result）
-    "edge.route", // executor 路由到某个 worker（实际触发）
-    "executor.decision", // executor 给出路由决策（解析自 RoutingDirective）
-    // 注：原 "node.stream" 已删除（P0-1）。session 输出走 stream.event 并自带 workflowId/nodeId。
+    "workflow.status",
+    "node.status",
+    "edge.route",
+    "executor.decision",
+    "round.started", // discussion / graph iteration 轮次开始
+    "round.completed", // 一轮所有参与者发完
+    "discussion.terminated", // discussion 终止（含理由）
   ]),
   nodeId: WorkflowNodeId.optional(),
   sessionId: SessionId.optional(),
@@ -260,17 +330,15 @@ export const WorkflowEvent = z.object({
   model: ModelId.optional(),
   role: WorkflowRoleId.optional(),
   status: z.union([WorkflowStatus, WorkflowNodeStatus]).optional(),
-  /** 终态时的产物（与 WorkflowNodeRuntime.result 同形）。 */
   result: WorkflowNodeResult.optional(),
+  /** 自由载荷。常见字段：iteration, from, to, reason, terminationReason 等。 */
   payload: z.record(z.unknown()).optional(),
   timestamp: Timestamp,
 });
 export type WorkflowEvent = z.infer<typeof WorkflowEvent>;
 
 // ---------------------------------------------------------------------------
-// workflow.ack — server → phonon 确认 workflow 元事件（P0-3）
-// 与 stream.ack 平行；元事件不一定有 sessionId（如 workflow.status），所以
-// 单独按 workflowId + seq 确认，phonon 据此清理 workflow 维度的 outbox。
+// workflow.ack
 // ---------------------------------------------------------------------------
 
 export const WorkflowAckParams = z.object({
@@ -280,23 +348,58 @@ export const WorkflowAckParams = z.object({
 export type WorkflowAckParams = z.infer<typeof WorkflowAckParams>;
 
 // ---------------------------------------------------------------------------
-// Routing directive (P1-5)
-// Executor agent 在输出里 emit 一段 fenced JSON / structured block，由 phonon 解析后
-// 升级成内部路由动作。adapter 配套的 executor skill 教 agent 这个格式。
-// 协议层只定义形态；具体解析器（fenced block prefix / json-only / etc.）由 phonon 实现选择。
+// Routing directive — v0.5 升级为判别联合（review 借鉴 1）
+//
+// Executor agent 在输出里 emit fenced JSON / structured block，phonon 解析后
+// 升级成内部动作。新增 feedback / reply / done 三种语义，比单一 route 表达力强。
+//
+// kind 缺省时回退为 workflow.route（向后兼容 0.4 行为）。
+// 兼容前缀：```phonon.workflow.* / ```workflow.*。
 // ---------------------------------------------------------------------------
 
-export const WorkflowRoutingDirective = z.object({
+/** route：派新任务给目标 worker（v0.4 既有语义）。 */
+export const WorkflowRouteDirective = z.object({
   kind: z.literal("workflow.route"),
-  /** 目标 worker nodeId；可单播或广播。 */
   to: z.union([WorkflowNodeId, z.array(WorkflowNodeId).min(1)]),
-  /** 发给目标 worker 的消息内容。 */
   message: z.string(),
-  /** 路由理由（可选，进 executor.decision 事件的 payload）。 */
   reason: z.string().optional(),
-  /** 宣告流程结束；置 true 时 phonon 停止迭代，本轮 executor 输出作为最终结果。 */
-  terminate: z.boolean().default(false),
-  /** 透传 metadata。 */
   metadata: z.record(z.unknown()).optional(),
 });
+export type WorkflowRouteDirective = z.infer<typeof WorkflowRouteDirective>;
+
+/** feedback：让目标 worker 基于上次输出返工修订（显式语义，区分于新任务）。 */
+export const WorkflowFeedbackDirective = z.object({
+  kind: z.literal("workflow.feedback"),
+  to: WorkflowNodeId,
+  message: z.string(),
+  reason: z.string().optional(),
+  metadata: z.record(z.unknown()).optional(),
+});
+export type WorkflowFeedbackDirective = z.infer<typeof WorkflowFeedbackDirective>;
+
+/** reply：模拟键盘输入（应答目标 agent 卡住的交互提示，如 [Y/n]）。 */
+export const WorkflowReplyDirective = z.object({
+  kind: z.literal("workflow.reply"),
+  to: WorkflowNodeId,
+  /** 应答内容（通常 1-2 字符："Y"/"n"/"y" 等）。 */
+  keystroke: z.string(),
+  reason: z.string().optional(),
+});
+export type WorkflowReplyDirective = z.infer<typeof WorkflowReplyDirective>;
+
+/** done：显式宣告 workflow 完成。 */
+export const WorkflowDoneDirective = z.object({
+  kind: z.literal("workflow.done"),
+  /** 最终总结文本，作为 workflow.finalText。 */
+  finalSummary: z.string().optional(),
+  reason: z.string().optional(),
+});
+export type WorkflowDoneDirective = z.infer<typeof WorkflowDoneDirective>;
+
+export const WorkflowRoutingDirective = z.discriminatedUnion("kind", [
+  WorkflowRouteDirective,
+  WorkflowFeedbackDirective,
+  WorkflowReplyDirective,
+  WorkflowDoneDirective,
+]);
 export type WorkflowRoutingDirective = z.infer<typeof WorkflowRoutingDirective>;
