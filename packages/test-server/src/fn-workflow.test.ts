@@ -94,7 +94,7 @@ test("workflow.run DAG: onNodeFailure=skip_dependents skips downstream when upst
 });
 
 test("workflow.run graph: executor RoutingDirective drives worker; executor.decision + edge.route emitted", async () => {
-  // executor 第一次发指令路由到 worker；第二次（带 worker 回复）声明 terminate
+  // executor 第一轮发路由指令；第二轮拿到 worker 输出后 emit workflow.done 终止
   let executorTurn = 0;
   const tc = makeConn((input) => {
     if (input.includes("EXECUTOR of a multi-agent workflow")) {
@@ -109,10 +109,9 @@ test("workflow.run graph: executor RoutingDirective drives worker; executor.deci
     if (input.includes("Worker results from previous iteration")) {
       return [
         "Final decision:",
-        "```phonon.workflow.route",
-        JSON.stringify({ to: "worker", message: "noop", terminate: true }),
+        "```phonon.workflow.done",
+        JSON.stringify({ finalSummary: "Final answer text.", reason: "review complete" }),
         "```",
-        "Final answer text.",
       ].join("\n");
     }
     // worker
@@ -210,8 +209,8 @@ test("workflow.run graph: workflow.feedback directive carries [FEEDBACK / REVISE
   assert.equal(status.status, "completed");
   // worker node 收到的输入应被打上 FEEDBACK 标记
   const allNodes = (status as unknown as { nodes: Array<{ nodeId: string; result?: { text?: string } }> }).nodes;
-  // worker 节点实际叫 worker#it1（每轮迭代后缀）
-  const workerNode = allNodes.find((n) => n.nodeId.startsWith("worker#"));
+  // 修复问题 B 后：worker 节点不再有 #it1 后缀，直接按名查找
+  const workerNode = allNodes.find((n) => n.nodeId === "worker");
   assert.match(workerNode?.result?.text ?? "", /\[FEEDBACK \/ REVISE\][\s\S]*tighten the prose/);
   // edge.route 事件携带 kind=workflow.feedback
   const events = tc.notifications.filter((e) => e.workflowId === run.workflowId);
@@ -221,8 +220,8 @@ test("workflow.run graph: workflow.feedback directive carries [FEEDBACK / REVISE
 test("workflow.run discussion: chairman signal terminates after N rounds, finalText = last chairman", async () => {
   let chairmanRound = 0;
   const tc = makeConn((input) => {
-    // chairman 提示词包含 "chairman. Round"
-    if (input.includes("You are the chairman")) {
+    // chairman 调用的独特提示词包含 "As the chairman, decide whether"
+    if (input.includes("As the chairman, decide whether")) {
       chairmanRound++;
       if (chairmanRound >= 2) return `Chairman summary R${chairmanRound}. [DISCUSS_END]`;
       return `Chairman summary R${chairmanRound}. Keep exploring.`;

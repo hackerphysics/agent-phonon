@@ -129,6 +129,18 @@ function buildDirective(kindFromTag: string, obj: Record<string, unknown>): Work
 export class WorkflowEngine {
   private runs = new Map<string, WorkflowRunState>();
   private sessionToNode = new Map<string, { workflowId: string; nodeId: string }>();
+  /**
+   * 持久 session 缓存（修复问题 A，2026-06-23）。
+   * key = `${workflowId}::${persistentNodeId}`，value = sessionId。
+   *
+   * Graph executor、Graph worker、Discussion participants 都走这个缓存：
+   * - 首轮 create session 后入缓存
+   * - 后续轮 send 进同一 session（agent 看到完整历史）
+   * - workflow 终态时由 cleanupPersistent() 统一 terminate
+   *
+   * DAG 节点仍是 burner 模式（纯一次性），不进这个缓存。
+   */
+  private persistentSessions = new Map<string, string>();
   private pendingResultText = new Map<string, string>();
   private turnResultCache = new Map<string, WorkflowNodeResult>();
   private turnWaiters = new Map<string, (r: WorkflowNodeResult) => void>();
@@ -254,6 +266,8 @@ export class WorkflowEngine {
         try { await this.opts.engine.terminate(this.opts.tenantId, n.sessionId); } catch {}
       }
     }
+    // 清理本 workflow 的所有 persistent session
+    await this.cleanupPersistent(run);
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "cancelled", payload: { reason } });
     return { workflowId, status: "cancelled" };
@@ -336,6 +350,7 @@ export class WorkflowEngine {
           try { await this.opts.engine.terminate(this.opts.tenantId, n.sessionId); } catch {}
         }
       }
+      await this.cleanupPersistent(run);
     }
   }
 
@@ -488,7 +503,7 @@ export class WorkflowEngine {
       "Use `workflow.done` when you decide the workflow is complete.",
     ].join("\n");
 
-    // 启动 executor
+    // 启动 executor（persistKey = executor nodeId，后续轮复用同一 session）
     const executorResult = await this.executeNode(
       run,
       plan.executor.nodeId,
@@ -498,6 +513,7 @@ export class WorkflowEngine {
       executorPrompt,
       plan.executor.agentConfig,
       plan.executor.systemPrompt,
+      plan.executor.nodeId, // ← persistKey
     );
 
     let currentDirectives = parseRoutingDirectives(executorResult.text ?? "");
@@ -508,6 +524,15 @@ export class WorkflowEngine {
       if (d.kind === "workflow.done") finalSummary = d.finalSummary;
     }
 
+    // 退出原因跟踪（修复问题 C）：executor 放弃/超 maxIterations 不是正常完成。
+    type GraphExit = "done" | "max_iterations" | "no_directive" | "no_valid_targets";
+    let exitReason: GraphExit | undefined;
+
+    // executor 首轮就没 emit 任何 directive：直接判定为 no_directive
+    if (currentDirectives.length === 0) {
+      exitReason = "no_directive";
+    }
+
     let iteration = 0;
     while (currentDirectives.length > 0 && !terminated && iteration < maxIterations) {
       if ((["cancelled", "failed", "timeout"] as string[]).includes(run.status)) return;
@@ -515,10 +540,12 @@ export class WorkflowEngine {
       this.emit(run, { type: "round.started", payload: { iteration, mode: "graph" } });
 
       const workerResults: { nodeId: string; text: string }[] = [];
+      let hadValidTarget = false;
       for (const directive of currentDirectives) {
         if (directive.kind === "workflow.done") {
           terminated = true;
           finalSummary = directive.finalSummary;
+          exitReason = "done";
           break;
         }
         // route / feedback / reply 都需要 target 在 allowedEdges 内
@@ -527,6 +554,7 @@ export class WorkflowEngine {
           : [];
         const validTargets = targets.filter((t) => allowedEdges.has(`${plan.executor.nodeId}->${t}`));
         if (validTargets.length === 0) continue;
+        hadValidTarget = true;
 
         for (const target of validTargets) {
           const worker = plan.workers.find((w) => w.nodeId === target);
@@ -556,20 +584,28 @@ export class WorkflowEngine {
 
           const workerRes = await this.executeNode(
             run,
-            `${worker.nodeId}#it${iteration}`,
+            worker.nodeId, // 修复问题 B：所有迭代复用同一 nodeId，iteration 走 payload，不再留空占位
             worker.agent,
             worker.model,
             worker.role ?? "worker",
             workerInput,
             worker.agentConfig,
             worker.systemPrompt,
+            worker.nodeId, // persistKey: 同一 worker 跨轮复用 session
           );
           workerResults.push({ nodeId: target, text: workerRes.text ?? "" });
         }
       }
       if (terminated) break;
+      if (!hadValidTarget) {
+        // 本轮中所有 directive 的 target 都被 graph 拒了 → executor 乱府或疑似问题
+        this.emit(run, { type: "round.completed", payload: { iteration, workerCount: 0 } });
+        exitReason = "no_valid_targets";
+        break;
+      }
       if (workerResults.length === 0) {
         this.emit(run, { type: "round.completed", payload: { iteration, workerCount: 0 } });
+        exitReason = "no_directive";
         break;
       }
       this.emit(run, { type: "round.completed", payload: { iteration, workerCount: workerResults.length } });
@@ -583,13 +619,14 @@ export class WorkflowEngine {
       ].join("\n\n");
       const nextRes = await this.executeNode(
         run,
-        `${plan.executor.nodeId}#it${iteration}`,
+        plan.executor.nodeId, // 修复问题 B：executor 跨轮复用同一 nodeId
         plan.executor.agent,
         plan.executor.model,
         "executor",
         followupPrompt,
         plan.executor.agentConfig,
         plan.executor.systemPrompt,
+        plan.executor.nodeId, // persistKey
       );
       lastExecutorText = nextRes.text ?? lastExecutorText;
       currentDirectives = parseRoutingDirectives(lastExecutorText);
@@ -597,10 +634,39 @@ export class WorkflowEngine {
         if (d.kind === "workflow.done") {
           terminated = true;
           finalSummary = d.finalSummary;
+          exitReason = "done";
         }
       }
+      // executor 本轮输出不含任何 directive → 放弃了
+      if (currentDirectives.length === 0 && !terminated) {
+        exitReason = "no_directive";
+      }
     }
+    if (!exitReason) {
+      // while 正常退出但未设 exitReason → 一定是超了 maxIterations
+      exitReason = terminated ? "done" : "max_iterations";
+    }
+
     run.finalText = finalSummary ?? lastExecutorText;
+    // Graph 终态：清理 persistent session
+    await this.cleanupPersistent(run);
+
+    // 修复问题 C：非 done 退出都该标 failed，不是 completed
+    if (exitReason !== "done") {
+      run.status = "failed";
+      run.completedAt = new Date().toISOString();
+      run.updatedAt = run.completedAt;
+      run.error = `graph executor terminated abnormally: ${exitReason}` +
+        (exitReason === "no_directive" ? " (executor emitted no parseable directive)" :
+         exitReason === "no_valid_targets" ? " (all routing targets were rejected by communicationGraph)" :
+         exitReason === "max_iterations" ? ` (reached maxIterations=${maxIterations})` : "");
+      this.persist(run);
+      this.emit(run, {
+        type: "workflow.status",
+        status: "failed",
+        payload: { error: run.error, terminationReason: exitReason, finalText: run.finalText },
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -628,14 +694,15 @@ export class WorkflowEngine {
       round++;
       this.emit(run, { type: "round.started", payload: { iteration: round, mode: "discussion", participants: nonChair.map((p) => p.nodeId) } });
 
-      // 阶段 A：非主席并行发言
+      // 阶段 A：非主席并行发言。复用各自持久 session（persistKey = p.nodeId）：agent
+      // 本身记得上轮说过什么、自己是谁，不需在 prompt 里复述全部历史（避免问题 E 复粘）。
       const prompt = round === 1
-        ? `Topic: ${plan.topic}\n\nThis is round ${round}. Share your view.`
-        : `Topic: ${plan.topic}\n\nThis is round ${round}. Below are previous turns:\n\n${transcript.slice(-20).map((t) => `[round ${t.round}, ${t.nodeId} as ${t.role ?? "participant"}]\n${t.text}`).join("\n\n")}\n\nContinue the discussion.`;
+        ? `This is a multi-agent discussion. Topic: ${plan.topic}\n\nThis is round ${round}. State your position briefly. Stay strictly in character.`
+        : `This is round ${round} of the discussion. Building on what has already been said in earlier rounds (you remember your own prior turns), advance the discussion with NEW points. Do not repeat or summarize previous turns. Stay strictly in character.`;
 
       const speakResults = await Promise.allSettled(
         nonChair.map((p) =>
-          this.executeNode(run, `${p.nodeId}#r${round}`, p.agent, p.model, p.role ?? "participant", prompt, p.agentConfig, p.systemPrompt)
+          this.executeNode(run, p.nodeId, p.agent, p.model, p.role ?? "participant", prompt, p.agentConfig, p.systemPrompt, p.nodeId)
             .then((r) => ({ nodeId: p.nodeId, role: p.role, text: r.text ?? "" })),
         ),
       );
@@ -654,10 +721,10 @@ export class WorkflowEngine {
         break;
       }
 
-      // 阶段 B：主席审视本轮
+      // 阶段 B：主席审视本轮。复用同一 chairman session（他也记得自己之前的总结）。
+      // prompt 只发本轮 contributions，避免复述全部历史。
       const chairmanPrompt = [
-        `Topic: ${plan.topic}`,
-        `You are the chairman. Round ${round} just finished.`,
+        `Round ${round} of the discussion just finished.`,
         "",
         "This round's contributions:",
         ...speakResults.map((sr, i) => {
@@ -665,13 +732,14 @@ export class WorkflowEngine {
           return `[${nonChair[i]!.nodeId}] (failed: ${String(sr.reason)})`;
         }),
         "",
-        `If discussion should end, include the literal token "${chairmanSignal}" in your reply.`,
-        "Otherwise, summarize this round and indicate what should be explored next.",
-      ].join("\n\n");
+        `As the chairman, decide whether the discussion has reached a useful conclusion.`,
+        `If yes, write your final summary AND include the literal token "${chairmanSignal}" somewhere in your reply (this signals the discussion to end).`,
+        "If no, summarize this round briefly and indicate what should be explored next.",
+      ].join("\n");
 
       const chairmanRes = await this.executeNode(
-        run, `${chairman.nodeId}#r${round}`, chairman.agent, chairman.model, chairman.role ?? "chairman",
-        chairmanPrompt, chairman.agentConfig, chairman.systemPrompt,
+        run, chairman.nodeId, chairman.agent, chairman.model, chairman.role ?? "chairman",
+        chairmanPrompt, chairman.agentConfig, chairman.systemPrompt, chairman.nodeId,
       );
       transcript.push({ round, nodeId: chairman.nodeId, role: chairman.role ?? "chairman", text: chairmanRes.text ?? "" });
 
@@ -684,6 +752,9 @@ export class WorkflowEngine {
 
     this.emit(run, { type: "discussion.terminated", payload: { rounds: round, reason: terminationReason ?? "unknown" } });
 
+    // Discussion 终态：清理 persistent session
+    await this.cleanupPersistent(run);
+
     // finalText = 最后一轮 chairman 输出，没有则最后一轮最后一个 participant
     const lastChairman = [...transcript].reverse().find((t) => t.nodeId === chairman.nodeId);
     run.finalText = lastChairman?.text ?? (transcript.length ? transcript[transcript.length - 1]!.text : undefined);
@@ -693,6 +764,16 @@ export class WorkflowEngine {
   // Single node execution
   // ---------------------------------------------------------------------------
 
+  /**
+   * 运行单个 node。
+   *
+   * persistKey（修复问题 A，2026-06-23）：
+   *   - undefined  : burner 模式（DAG）— create 一个临时 session、跑完立刻 terminate
+   *   - 非空    : persistent 模式（Graph executor / Graph workers / Discussion participants）—
+   *                 首轮 create + 入 persistentSessions cache，后续轮复用同一 session 走 send，
+   *                 agent 看到完整历史；workflow 终态时由 cleanupPersistent() 统一 terminate。
+   *                 传 persistKey 是调用方选定的逻辑 node id（不带 #it1 / #r1 迭代后缀）。
+   */
   private async executeNode(
     run: WorkflowRunState,
     nodeId: string,
@@ -702,40 +783,52 @@ export class WorkflowEngine {
     input: string,
     agentConfig?: Record<string, unknown>,
     nodeSystemPrompt?: string,
+    persistKey?: string,
   ): Promise<WorkflowNodeResult> {
     const node = run.nodes.find((n) => n.nodeId === nodeId) ?? this.addNode(run, { nodeId, agent, model, role });
     node.status = "running";
-    node.startedAt = new Date().toISOString();
-    run.updatedAt = node.startedAt;
-    this.emit(run, { type: "node.status", nodeId, agent, model, role, status: "running" });
+    node.startedAt = node.startedAt ?? new Date().toISOString();
+    node.iterations = (node.iterations ?? 0) + 1;
+    run.updatedAt = new Date().toISOString();
+    this.emit(run, { type: "node.status", nodeId, agent, model, role, status: "running", payload: { iteration: node.iterations } });
 
     try {
       const cwd = this.opts.resolveCwd(run.project, run.worktreeId);
-      const systemPrompt = this.buildSystemPrompt(run, nodeSystemPrompt, cwd);
-      // initialContext 走 ContextItem[]，把 systemPrompt 当作 system role 项注入
+      const systemPrompt = this.buildSystemPrompt(run, nodeSystemPrompt, cwd, role);
       const initialContext = systemPrompt ? [{ role: "system" as const, content: systemPrompt }] : undefined;
 
-      const created = await this.opts.engine.create({
-        tenantId: run.tenantId,
-        project: run.project,
-        worktreeId: run.worktreeId,
-        cwd,
-        agent,
-        model,
-        verbosity: "messages",
-        agentConfig,
-        initialContext,
-        workflowAttr: { workflowId: run.workflowId, nodeId, role },
-      });
-      node.sessionId = created.sessionId;
-      this.sessionToNode.set(created.sessionId, { workflowId: run.workflowId, nodeId });
+      // ---- session 获取：persistent 复用 cache；burner 每次新建 ----
+      const cacheKey = persistKey ? `${run.workflowId}::${persistKey}` : undefined;
+      let sessionId = cacheKey ? this.persistentSessions.get(cacheKey) : undefined;
+      const isNewSession = !sessionId;
+      if (!sessionId) {
+        const created = await this.opts.engine.create({
+          tenantId: run.tenantId,
+          project: run.project,
+          worktreeId: run.worktreeId,
+          cwd,
+          agent,
+          model,
+          verbosity: "messages",
+          agentConfig,
+          initialContext,
+          workflowAttr: { workflowId: run.workflowId, nodeId, role },
+        });
+        sessionId = created.sessionId;
+        this.sessionToNode.set(sessionId, { workflowId: run.workflowId, nodeId });
+        if (cacheKey) this.persistentSessions.set(cacheKey, sessionId);
+      } else {
+        // 复用中的 session：sessionToNode 映射要重新指向当前 nodeId（比如 exec#it1 这种调用）
+        this.sessionToNode.set(sessionId, { workflowId: run.workflowId, nodeId });
+      }
+      node.sessionId = sessionId;
 
-      const sent = await this.opts.engine.send(run.tenantId, created.sessionId, input, {
+      const sent = await this.opts.engine.send(run.tenantId, sessionId, input, {
         environment: this.opts.env.resolveForExecution({ projectId: run.project, agent }),
       });
       node.turnId = sent.turnId;
 
-      const result = await this.awaitTurnResult(run, created.sessionId, sent.turnId);
+      const result = await this.awaitTurnResult(run, sessionId, sent.turnId);
       node.result = result;
       node.status = result.status === "completed" ? "completed" : "failed";
       node.completedAt = new Date().toISOString();
@@ -748,7 +841,12 @@ export class WorkflowEngine {
         agent, model, role, status: node.status, result,
       });
 
-      try { await this.opts.engine.terminate(run.tenantId, created.sessionId); } catch {}
+      // burner 模式：跑完立刻纸连 session。
+      // persistent 模式：保留 session，下轮复用；由 cleanupPersistent() 统一清理。
+      if (!cacheKey) {
+        try { await this.opts.engine.terminate(run.tenantId, sessionId); } catch {}
+      }
+      void isNewSession;
       if (node.status === "failed") throw new Error(node.error ?? "node failed");
       return result;
     } catch (err) {
@@ -760,6 +858,18 @@ export class WorkflowEngine {
       this.emit(run, { type: "node.status", nodeId, agent, model, role, status: "failed", payload: { error: node.error } });
       throw err;
     }
+  }
+
+  /** 清理某 workflow 的所有 persistent session（底层 best-effort）。 */
+  private async cleanupPersistent(run: WorkflowRunState): Promise<void> {
+    const prefix = `${run.workflowId}::`;
+    const toRemove: string[] = [];
+    for (const [k, sid] of this.persistentSessions.entries()) {
+      if (!k.startsWith(prefix)) continue;
+      toRemove.push(k);
+      try { await this.opts.engine.terminate(run.tenantId, sid); } catch {}
+    }
+    for (const k of toRemove) this.persistentSessions.delete(k);
   }
 
   private async awaitTurnResult(run: WorkflowRunState, sessionId: string, turnId: string): Promise<WorkflowNodeResult> {
@@ -794,28 +904,44 @@ export class WorkflowEngine {
   // SharedContext: 把 sharedContext (text + files) 拼到每个 node 的 systemPrompt
   // ---------------------------------------------------------------------------
 
-  private buildSystemPrompt(run: WorkflowRunState, nodeSystemPrompt: string | undefined, cwd: string): string | undefined {
-    const sc = run.sharedContext;
-    if (!sc) return nodeSystemPrompt;
+  private buildSystemPrompt(run: WorkflowRunState, nodeSystemPrompt: string | undefined, cwd: string, role?: string): string | undefined {
     const segments: string[] = [];
-    if (sc.text) segments.push(`# Shared Workflow Context\n\n${sc.text}`);
-    for (const rel of sc.files ?? []) {
-      try {
-        const abs = path.resolve(cwd, rel);
-        const real = fs.realpathSync(abs);
-        // sandbox check：确保 real 路径在 cwd 下
-        const cwdReal = fs.realpathSync(cwd);
-        if (!real.startsWith(cwdReal + path.sep) && real !== cwdReal) continue;
-        const content = fs.readFileSync(real, "utf8");
-        segments.push(`# Shared File: ${rel}\n\n\`\`\`\n${content}\n\`\`\``);
-      } catch {
-        // 文件不存在/无法读 → 跳过
+
+    // 问题 D 修复（2026-06-23 真 Claude 跳出角色）：role 字段加进 system prompt，
+    // 让 agent 清楚知道自己演什么、处于什么 workflow。不依赖调用方手动拼接。
+    if (role) {
+      segments.push(
+        `# Workflow Role\n\nYou are participating in an agent-phonon workflow (workflowId=${run.workflowId}, mode=${run.mode}).\nYour role in this workflow: **${role}**.\nNode id: ${this.nodeContextForPrompt(run, role) ?? "current"}.\nStay in this role for the entire turn. Do not break character.`,
+      );
+    }
+
+    const sc = run.sharedContext;
+    if (sc) {
+      if (sc.text) segments.push(`# Shared Workflow Context\n\n${sc.text}`);
+      for (const rel of sc.files ?? []) {
+        try {
+          const abs = path.resolve(cwd, rel);
+          const real = fs.realpathSync(abs);
+          const cwdReal = fs.realpathSync(cwd);
+          if (!real.startsWith(cwdReal + path.sep) && real !== cwdReal) continue;
+          const content = fs.readFileSync(real, "utf8");
+          segments.push(`# Shared File: ${rel}\n\n\`\`\`\n${content}\n\`\`\``);
+        } catch {
+          // skip
+        }
       }
     }
+
     if (segments.length === 0) return nodeSystemPrompt;
-    const shared = segments.join("\n\n");
-    if (!nodeSystemPrompt) return shared;
-    return sc.placement === "prepend" ? `${shared}\n\n${nodeSystemPrompt}` : `${nodeSystemPrompt}\n\n${shared}`;
+    const built = segments.join("\n\n");
+    if (!nodeSystemPrompt) return built;
+    return sc?.placement === "prepend" ? `${built}\n\n${nodeSystemPrompt}` : `${nodeSystemPrompt}\n\n${built}`;
+  }
+
+  private nodeContextForPrompt(run: WorkflowRunState, _role: string): string | undefined {
+    // 预留接口：如果有需要可以按 nodeId 反查，目前不指明返回 undefined。
+    void run;
+    return undefined;
   }
 
   // ---------------------------------------------------------------------------
@@ -944,6 +1070,8 @@ export class WorkflowEngine {
     run.updatedAt = run.completedAt;
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "failed", payload: { error: run.error } });
+    // 清理本 workflow 的所有 persistent session（不阻塞 fail 路径）
+    void this.cleanupPersistent(run).catch(() => {});
   }
 
   private toStatus(run: WorkflowRunState): WorkflowStatusResult {

@@ -324,9 +324,9 @@ test("e2e GRAPH broadcast: route to=[w1,w2] fans out, both workers run, then don
     }) as { workflowId: string };
     const st = await waitWorkflow(fx.device, run.workflowId) as { status: string; nodes: Array<{ nodeId: string }>; finalText?: string };
     assert.equal(st.status, "completed");
-    // w1 / w2 都应该有 #it1 后缀的执行节点
-    assert.ok(st.nodes.some((n) => n.nodeId === "w1#it1"), `nodes: ${st.nodes.map((n) => n.nodeId).join(",")}`);
-    assert.ok(st.nodes.some((n) => n.nodeId === "w2#it1"));
+    // 修复问题 B 后：w1 / w2 跨轮复用同一 nodeId，不再有 #it1 后缀
+    assert.ok(st.nodes.some((n) => n.nodeId === "w1"), `nodes: ${st.nodes.map((n) => n.nodeId).join(",")}`);
+    assert.ok(st.nodes.some((n) => n.nodeId === "w2"));
     assert.match(st.finalText ?? "", /Both workers reported/);
   } finally { await fx.cleanup(); }
 });
@@ -338,7 +338,7 @@ test("e2e GRAPH broadcast: route to=[w1,w2] fans out, both workers run, then don
 test("e2e DISCUSSION: chairman signal terminates discussion", { timeout: 30000 }, async () => {
   let chairmanCalls = 0;
   const fx = await makeFixture((input) => {
-    if (input.includes("You are the chairman")) {
+    if (input.includes("As the chairman, decide whether")) {
       chairmanCalls++;
       if (chairmanCalls >= 2) return "Round 2 summary. We have enough. [DISCUSS_END]";
       return "Round 1 summary. Need another round.";
@@ -372,7 +372,7 @@ test("e2e DISCUSSION: chairman signal terminates discussion", { timeout: 30000 }
 test("e2e DISCUSSION: consensus signal from participant terminates immediately", { timeout: 30000 }, async () => {
   let participantCalls = 0;
   const fx = await makeFixture((input) => {
-    if (input.includes("You are the chairman")) {
+    if (input.includes("As the chairman, decide whether")) {
       return "round summary";
     }
     participantCalls++;
