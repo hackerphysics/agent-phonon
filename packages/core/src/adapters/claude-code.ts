@@ -36,6 +36,7 @@ const CAPABILITIES: AgentCapabilities = {
   skillManagement: true, // Claude Code 有 skills（/skill-name）
   hooks: ["pre_tool", "pre_command"],
   streaming: true, // stream-json 真流式
+  workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4 },
 };
 

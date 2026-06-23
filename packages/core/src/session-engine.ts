@@ -55,6 +55,12 @@ interface SessionRecord {
   seq: number;
   createdAt: string;
   lastActiveAt?: string;
+  /**
+   * L3 归属（review P0-1）：由 WorkflowEngine 在 create 时注入。
+   * 该 session 所有 stream.event 会被 decorate 为携带 workflowId/nodeId/role，
+   * 服务端能直接从 stream.event 区分哪个节点的输出。
+   */
+  workflowAttr?: { workflowId: string; nodeId: string; role?: string };
 }
 
 /** 流式事件订阅回调（core 用它转发给对应 tenant 连接）。 */
@@ -126,6 +132,22 @@ export class SessionEngine {
     });
   }
 
+  /**
+   * 给 stream event 加上 L3 归属字段（review P0-1）。
+   * 由 workflow node 创建的 session 会携 workflowAttr，该 session 所有事件都被搼上
+   * workflowId/nodeId/role，服务端能从 stream.event 直接区分 workflow / node 来源。
+   * 普通 session 原样返回，不引入额外字段。
+   */
+  private decorateEvent(rec: SessionRecord, event: Record<string, unknown>): Record<string, unknown> {
+    if (!rec.workflowAttr) return event;
+    return {
+      ...event,
+      workflowId: rec.workflowAttr.workflowId,
+      nodeId: rec.workflowAttr.nodeId,
+      role: rec.workflowAttr.role,
+    };
+  }
+
   /** 校验 sessionId 是否属于某 tenant（L2 dispatch 用，D13）。 */
   assertTenant(sessionId: string, tenantId: string): SessionRecord {
     const rec = this.sessions.get(sessionId);
@@ -145,6 +167,8 @@ export class SessionEngine {
     verbosity: "final" | "messages" | "tools" | "trace";
     agentConfig?: Record<string, unknown>;
     initialContext?: ContextItem[];
+    /** L3 归属（workflow node 创建 session 时传入）。 */
+    workflowAttr?: { workflowId: string; nodeId: string; role?: string };
   }): Promise<{ sessionId: string; status: string; createdAt: string }> {
     const adapter = this.registry.resolve(params.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${params.agent} not found`);
@@ -162,7 +186,7 @@ export class SessionEngine {
     // 自发输出水槽（D16）：adapter 在无 active turn 时的输出走这里，core 统一打 seq 后转发
     adapterSession.setUnsolicitedSink?.((event) => {
       const rec = this.sessions.get(sessionId);
-      if (rec) this.sink({ ...event, seq: rec.seq++ } as StreamEvent);
+      if (rec) this.sink(this.decorateEvent(rec, { ...event, seq: rec.seq++ }) as StreamEvent);
     });
 
     const createdAt = new Date().toISOString();
@@ -181,6 +205,7 @@ export class SessionEngine {
       queue: [],
       seq: 0,
       createdAt,
+      workflowAttr: params.workflowAttr,
     });
     const rec0 = this.sessions.get(sessionId)!;
     this.persist(rec0);
@@ -202,7 +227,7 @@ export class SessionEngine {
     });
     rec.adapterSession.setUnsolicitedSink?.((event) => {
       const r = this.sessions.get(rec.sessionId);
-      if (r) this.sink({ ...event, seq: r.seq++ } as StreamEvent);
+      if (r) this.sink(this.decorateEvent(r, { ...event, seq: r.seq++ }) as StreamEvent);
     });
     rec.detached = false;
     rec.status = "idle";
@@ -287,7 +312,7 @@ export class SessionEngine {
       } else if (t === "tool_result") {
         this.emit2("tool", "debug", "tool.result", rec, { turnId, data: { toolName: (event as { toolName?: string }).toolName } });
       }
-      this.sink({ ...event, seq: rec.seq++ } as StreamEvent);
+      this.sink(this.decorateEvent(rec, { ...event, seq: rec.seq++ }) as StreamEvent);
     };
     try {
       await rec.adapterSession.send(input, { turnId, verbosity, skills, environment, emit, signal: abort.signal });
@@ -329,7 +354,7 @@ export class SessionEngine {
     // 后续 adapter 被 kill 重发的 failed/close 会被 runTurn.emit 去重。
     if (turnId && !rec.terminalTurns.has(turnId)) {
       rec.terminalTurns.add(turnId);
-      this.sink({
+      this.sink(this.decorateEvent(rec, {
         type: "result",
         sessionId,
         turnId,
@@ -338,7 +363,7 @@ export class SessionEngine {
         text: "",
         status: "interrupted",
         final: true,
-      } as StreamEvent);
+      }) as StreamEvent);
     }
     // 再触发 abort + 停底层执行
     rec.abort?.abort();

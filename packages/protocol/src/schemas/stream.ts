@@ -51,6 +51,15 @@ const StreamEventBase = z.object({
   /** 单调递增序号（按 session），保证调用方可排序/去重。 */
   seq: z.number().int().nonnegative(),
   at: Timestamp,
+  /**
+   * L3 编排归属（review P0-1，2026-06-23）。
+   * session 由 workflow node 创建时，phonon 自动给该 session 所有事件打上这些字段，
+   * 服务端按 workflowId 筛流、按 nodeId/role 区分来源。
+   * 没有归属的普通 session 留空，向后兼容。
+   */
+  workflowId: z.string().optional(),
+  nodeId: z.string().optional(),
+  role: z.string().optional(),
 });
 
 export const StreamMessageEvent = StreamEventBase.extend({

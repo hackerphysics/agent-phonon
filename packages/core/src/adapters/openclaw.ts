@@ -33,6 +33,7 @@ const OPENCLAW_CAPABILITIES: AgentCapabilities = {
   skillManagement: true, // OpenClaw 有 skills 目录
   hooks: ["pre_tool", "pre_command"],
   streaming: false, // --json 是一次性返回，非增量流（v0 用 final 事件）
+  workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4, maxContextTokens: 1048576 },
 };
 

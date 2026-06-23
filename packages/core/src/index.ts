@@ -382,13 +382,24 @@ export class PhononConnection {
 
       // ---- L3 workflow orchestration ----
       case "workflow.run":
-        return this.workflows!.run({ project: p.project as string, worktreeId: p.worktreeId as string | undefined, plan: p.plan as WorkflowPlan, input: p.input as string | undefined, metadata: p.metadata as Record<string, unknown> | undefined });
+        return this.workflows!.run({
+          project: p.project as string,
+          worktreeId: p.worktreeId as string | undefined,
+          plan: p.plan as WorkflowPlan,
+          input: p.input as string | undefined,
+          policy: p.policy as never,
+          metadata: p.metadata as Record<string, unknown> | undefined,
+        });
       case "workflow.status":
         return this.workflows!.status(p.workflowId as string);
       case "workflow.cancel":
         return this.workflows!.cancel(p.workflowId as string, p.reason as string | undefined);
       case "workflow.list":
-        return this.workflows!.list(p as { status?: string; limit?: number });
+        return this.workflows!.list(p as { status?: string; projectId?: string; since?: string; until?: string; limit?: number });
+      case "workflow.ack": {
+        this.workflows?.ack(p.workflowId as string, p.lastSeq as number);
+        return null;
+      }
 
       // ---- 连接/可靠性（s2p） ----
       case "stream.ack": {

@@ -181,6 +181,10 @@ class PhononDevice:
     async def workflow_list(self, **filt: Any) -> Any:
         return await self._peer.request("workflow.list", filt)
 
+    async def workflow_ack(self, workflow_id: str, last_seq: int) -> None:
+        """Acknowledge workflow.event seq<=last_seq (parallel to stream.ack, P0-3)."""
+        await self._peer.notify("workflow.ack", {"workflowId": workflow_id, "lastSeq": last_seq})
+
     def set_hook_decider(self, fn: HookDecider) -> None:
         self._hook_decider = fn
 
@@ -225,8 +229,13 @@ class PhononDevice:
                 self._discovery_changed(params or {})
             return None
         if method == "workflow.event":
+            ev = params or {}
+            wid = ev.get("workflowId")
+            seq = ev.get("seq")
+            if wid and isinstance(seq, int):
+                await self._peer.notify("workflow.ack", {"workflowId": wid, "lastSeq": seq})
             if self._workflow_event_handler:
-                self._workflow_event_handler(params or {})
+                self._workflow_event_handler(ev)
             return None
         if method == "document.send":
             if self._document_handler:

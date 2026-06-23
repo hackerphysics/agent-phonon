@@ -49,6 +49,13 @@ export const AgentCapabilities = z.object({
   /** 是否支持流式输出。 */
   streaming: z.boolean(),
   /**
+   * L3 编排中可承担的角色（P2-9，2026-06-23 review）。
+   * executor 需要长话话/多轮决策能力（OpenClaw/Claude Code/Hermes 适合）；
+   * worker 一般单轮执行即可（Codex/OpenCode 也能干）。
+   * 不申明默认两者都不推荐。
+   */
+  workflowRoles: z.array(z.enum(["executor", "worker"])).default([]),
+  /**
    * 可选调度限制（P2-13）：server 据此做调度/背压。
    */
   limits: z

@@ -182,6 +182,8 @@ export class PhononDevice extends EventEmitter {
     status: (workflowId: string) => this.peer.request("workflow.status", { workflowId }),
     cancel: (workflowId: string, reason?: string) => this.peer.request("workflow.cancel", { workflowId, reason }),
     list: (filter?: Record<string, unknown>) => this.peer.request("workflow.list", filter ?? {}),
+    /** 确认已收到 workflow.event seq≤lastSeq（与 stream.ack 平行，P0-3）。 */
+    ack: (workflowId: string, lastSeq: number) => this.peer.notify("workflow.ack", { workflowId, lastSeq }),
   };
 
   /** 设置 HITL 裁决器（device 级，所有 session 共用）。 */
@@ -217,7 +219,15 @@ export class PhononDevice extends EventEmitter {
       return { action, reason };
     }
     if (method === "discovery.changed") { this.emit("discoveryChanged", params); return null; }
-    if (method === "workflow.event") { this.emit("workflowEvent", params); return null; }
+    if (method === "workflow.event") {
+      // auto-ack （与 stream.event 一致，避免 outbox 胀胀）
+      const ev = params as { workflowId?: string; seq?: number };
+      if (ev?.workflowId && typeof ev.seq === "number") {
+        this.peer.notify("workflow.ack", { workflowId: ev.workflowId, lastSeq: ev.seq });
+      }
+      this.emit("workflowEvent", params);
+      return null;
+    }
     if (method === "document.send") { this.emit("document", params); return { delivered: [] }; }
     if (method === "document.prepare_upload") { this.emit("prepareUpload", params); return { uploadRef: newId(), uploadUrl: "", method: "PUT" }; }
     if (method === "interaction.request") { this.emit("interaction", params); return { requestId: (params as { requestId: string }).requestId, action: "cancel" }; }

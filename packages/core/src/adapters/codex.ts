@@ -41,6 +41,7 @@ const CAPABILITIES: AgentCapabilities = {
   skillManagement: false,
   hooks: ["pre_command"],
   streaming: true, // --json 事件流
+  workflowRoles: ["worker"],
   limits: { maxConcurrentSessions: 4 },
 };
 

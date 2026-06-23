@@ -61,6 +61,7 @@ const CAPABILITIES: AgentCapabilities = {
   skillManagement: true, // hermes skills
   hooks: ["pre_command"],
   streaming: false, // -z 是纯文本一次性输出，非流式 → 用 final 事件
+  workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4 },
 };
 

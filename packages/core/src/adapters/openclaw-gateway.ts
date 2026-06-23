@@ -38,6 +38,7 @@ const CAPABILITIES: AgentCapabilities = {
   skillManagement: true,
   hooks: ["pre_tool", "pre_command"],
   streaming: true, // chat delta
+  workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4, maxContextTokens: 1048576 },
 };
 

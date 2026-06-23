@@ -95,6 +95,7 @@ import {
   WorkflowListParams,
   WorkflowListResult,
   WorkflowEvent,
+  WorkflowAckParams,
 } from "./workflow.js";
 
 /**
@@ -433,6 +434,13 @@ export const METHODS = {
     direction: "p2s",
     kind: "notification",
     params: WorkflowEvent,
+    result: z_void,
+  },
+  // workflow.ack: server 确认已收到某 workflow 元事件 seq≤N（P0-3、与 stream.ack 平行）
+  "workflow.ack": {
+    direction: "s2p",
+    kind: "notification",
+    params: WorkflowAckParams,
     result: z_void,
   },
 } as const;
