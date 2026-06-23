@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
 import type {
   AgentAdapter,
@@ -23,6 +23,12 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, Mode
  * 网关由调用方通过 CodexEnv 传入（baseUrl/apiKey/wireApi），adapter 不绑定任何特定网关；
  * 用 -c 临时覆盖 provider（不动用户的 ~/.codex/config.toml）。
  */
+
+const CODEX_FALLBACK_MODELS: ModelInfo[] = [
+  { id: "gpt-5.5", available: true },
+  { id: "gpt-5.4", available: true },
+  { id: "gpt-5.3-codex", available: true },
+];
 
 const CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // exec resume <thread_id>
@@ -62,6 +68,60 @@ export function resolveCodexSessionFile(threadId: string, codexHome = join(homed
   if (hits.length === 0) return undefined;
   hits.sort((a, b) => b.mtime - a.mtime);
   return hits[0]!.path;
+}
+
+function parseCodexConfig(configPath = join(homedir(), ".codex", "config.toml")): { model?: string; providerId?: string; baseUrl?: string } {
+  if (!existsSync(configPath)) return {};
+  const text = readFileSync(configPath, "utf8");
+  const model = text.match(/^model\s*=\s*"([^"]+)"/m)?.[1];
+  const providerId = text.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1];
+  let baseUrl: string | undefined;
+  if (providerId) {
+    const escaped = providerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const section = text.match(new RegExp(`\\[model_providers\\.${escaped}\\]([\\s\\S]*?)(?:\\n\\[|$)`))?.[1];
+    baseUrl = section?.match(/^base_url\s*=\s*"([^"]+)"/m)?.[1];
+  }
+  return { model, providerId, baseUrl };
+}
+
+function normalizeOpenAiModels(data: unknown): ModelInfo[] {
+  const rows = Array.isArray((data as { data?: unknown }).data)
+    ? (data as { data: unknown[] }).data
+    : (Array.isArray(data) ? data as unknown[] : []);
+  const out: ModelInfo[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const obj = row as Record<string, unknown>;
+    const id = typeof obj.id === "string" ? obj.id : undefined;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, ...(typeof obj.name === "string" ? { displayName: obj.name } : {}), available: true });
+  }
+  return out;
+}
+
+function fetchJson(url: string, headers?: Record<string, string>): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = (u.protocol === "http:" ? import("node:http") : import("node:https"))
+      .then((mod) => mod.request(url, { method: "GET", headers, timeout: 5000 }, (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (d) => (body += d));
+        res.on("end", () => {
+          if ((res.statusCode ?? 500) < 200 || (res.statusCode ?? 500) >= 300) {
+            reject(new Error(`GET ${url} failed: ${res.statusCode}`));
+            return;
+          }
+          try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+        });
+      }));
+    req.then((r) => {
+      r.on("timeout", () => r.destroy(new Error(`GET ${url} timeout`)));
+      r.on("error", reject);
+      r.end();
+    }, reject);
+  });
 }
 
 export interface CodexEnv {
@@ -233,6 +293,7 @@ export class CodexAdapter implements AgentAdapter {
   async discoverAgents(): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion();
     const available = version !== null;
+    const models = await this.discoverModels();
     return [{
       agentId: "codex" as AgentDescriptor["agentId"],
       displayName: "Codex",
@@ -240,9 +301,7 @@ export class CodexAdapter implements AgentAdapter {
       available,
       ...(available ? {} : { unavailableReason: "codex CLI not found" }),
       ...(version ? { version } : {}),
-      models: this.env.models?.length
-        ? this.env.models
-        : [{ id: this.env.defaultModel, available: true }],
+      models,
       capabilities: CAPABILITIES,
       scannedAt: new Date().toISOString(),
     }];
@@ -250,6 +309,24 @@ export class CodexAdapter implements AgentAdapter {
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     return new CodexSession(params.sessionId, params.model, params.cwd, this.env);
+  }
+
+  private async discoverModels(): Promise<ModelInfo[]> {
+    if (this.env.models?.length) return this.env.models;
+    const cfg = parseCodexConfig();
+    const baseUrl = this.env.baseUrl ?? cfg.baseUrl;
+    if (baseUrl) {
+      try {
+        const data = await fetchJson(`${baseUrl.replace(/\/$/, "")}/models`, this.env.apiKey ? { Authorization: `Bearer ${this.env.apiKey}` } : undefined);
+        const models = normalizeOpenAiModels(data);
+        if (models.length > 0) return models;
+      } catch { /* fall back below */ }
+    }
+    const configured = this.env.defaultModel !== "default" ? this.env.defaultModel : cfg.model;
+    const base = configured ? [{ id: configured, available: true }] : [];
+    const seen = new Set(base.map((m) => m.id));
+    for (const m of CODEX_FALLBACK_MODELS) if (!seen.has(m.id)) base.push(m);
+    return base.length > 0 ? base : CODEX_FALLBACK_MODELS;
   }
 
   private probeVersion(): Promise<string | null> {

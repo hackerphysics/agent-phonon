@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
 import type {
   AgentAdapter,
@@ -11,7 +11,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
-import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } from "@agent-phonon/protocol";
+import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 
 /**
  * Hermes adapter（design D10/D32，**多 agent runtime**，同 OpenClaw）。
@@ -27,6 +27,29 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } fro
  * 方案 A：用 Hermes 现有 provider 配置（不强制网关）。全自动：--yolo + --accept-hooks。
  */
 
+const HERMES_PROVIDER_FALLBACK_MODELS: Record<string, string[]> = {
+  // Hermes' built-in Copilot picker exposes these account/integrator-safe model ids.
+  copilot: [
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+    "claude-haiku-4.5",
+    "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+  ],
+  zai: ["glm-4.5", "glm-4.5-air", "glm-4.6", "glm-4.7", "glm-5", "glm-5-turbo", "glm-5.1", "glm-5.2"],
+};
+
 const CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // --resume / --pass-session-id
   nativeCompression: false,
@@ -40,6 +63,49 @@ const CAPABILITIES: AgentCapabilities = {
   streaming: false, // -z 是纯文本一次性输出，非流式 → 用 final 事件
   limits: { maxConcurrentSessions: 4 },
 };
+
+function parseHermesConfig(configPath = join(homedir(), ".hermes", "config.yaml")): { defaultModel?: string; provider?: string; catalogUrl?: string } {
+  if (!existsSync(configPath)) return {};
+  const text = readFileSync(configPath, "utf8");
+  const modelBlock = text.match(/(?:^|\n)model:\n([\s\S]*?)(?:\n[A-Za-z_][A-Za-z0-9_-]*:|$)/)?.[1] ?? "";
+  const defaultModel = modelBlock.match(/^\s+default:\s*['"]?([^'"\n]+)['"]?/m)?.[1]?.trim();
+  const provider = modelBlock.match(/^\s+provider:\s*['"]?([^'"\n]+)['"]?/m)?.[1]?.trim();
+  const catalogBlock = text.match(/(?:^|\n)model_catalog:\n([\s\S]*?)(?:\n[A-Za-z_][A-Za-z0-9_-]*:|$)/)?.[1] ?? "";
+  const catalogUrl = catalogBlock.match(/^\s+url:\s*['"]?([^'"\n]+)['"]?/m)?.[1]?.trim();
+  return { defaultModel, provider, catalogUrl };
+}
+
+function fetchHermesCatalogModels(url: string, provider?: string): Promise<ModelInfo[]> {
+  return new Promise((resolve) => {
+    const u = new URL(url);
+    const reqMod = u.protocol === "http:" ? import("node:http") : import("node:https");
+    reqMod.then((mod) => {
+      const req = mod.request(url, { method: "GET", timeout: 5000 }, (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (d) => (body += d));
+        res.on("end", () => {
+          try {
+            const data = JSON.parse(body) as { providers?: Record<string, { models?: Array<{ id?: string; description?: string }> }> };
+            const providers = data.providers ?? {};
+            const rows = provider
+              ? (providers[provider]?.models ?? [])
+              : Object.values(providers).flatMap((p) => p.models ?? []);
+            const seen = new Set<string>();
+            resolve(rows.flatMap((m) => {
+              if (!m.id || seen.has(m.id)) return [];
+              seen.add(m.id);
+              return [{ id: m.id, ...(m.description ? { displayName: m.description } : {}), available: true } satisfies ModelInfo];
+            }));
+          } catch { resolve([]); }
+        });
+      });
+      req.on("timeout", () => req.destroy());
+      req.on("error", () => resolve([]));
+      req.end();
+    }, () => resolve([]));
+  });
+}
 
 export interface HermesEnv {
   /** Hermes executable path. Prefer an absolute path when running under systemd/launchd. */
@@ -242,6 +308,10 @@ export class HermesAdapter implements AgentAdapter {
     }
     // 枚举所有 profile = 多个 agent（D32，同 OpenClaw）
     const profiles = await this.listProfiles();
+    const cfg = parseHermesConfig();
+    const provider = this.env.provider ?? cfg.provider;
+    const catalogModels = cfg.catalogUrl ? await fetchHermesCatalogModels(cfg.catalogUrl, provider) : [];
+    const providerFallbackModels = provider ? (HERMES_PROVIDER_FALLBACK_MODELS[provider] ?? []).map((id) => ({ id, available: true })) : [];
     const now = new Date().toISOString();
     return profiles.map((p) => ({
       agentId: `hermes:${p.name}` as AgentDescriptor["agentId"],
@@ -249,12 +319,20 @@ export class HermesAdapter implements AgentAdapter {
       adapter: "hermes",
       available: true,
       ...(version ? { version } : {}),
-      models: p.model
-        ? [{ id: p.model, available: true }]
-        : (this.env.defaultModel ? [{ id: this.env.defaultModel, available: true }] : [{ id: "default", displayName: "Hermes default", available: true }]),
+      models: this.modelsForProfile(p.model, [...catalogModels, ...providerFallbackModels], cfg.defaultModel),
       capabilities: CAPABILITIES,
       scannedAt: now,
     }));
+  }
+
+  private modelsForProfile(profileModel: string | undefined, catalogModels: ModelInfo[], configDefault: string | undefined): ModelInfo[] {
+    const preferred = profileModel ?? this.env.defaultModel ?? configDefault;
+    const models: ModelInfo[] = preferred ? [{ id: preferred, available: true }] : [];
+    const seen = new Set(models.map((m) => m.id));
+    for (const m of catalogModels) {
+      if (!seen.has(m.id)) { models.push(m); seen.add(m.id); }
+    }
+    return models.length > 0 ? models : [{ id: "default", displayName: "Hermes default", available: true }];
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
