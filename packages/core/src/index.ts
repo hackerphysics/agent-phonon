@@ -393,6 +393,7 @@ export class PhononConnection {
         return this.workflows!.run({
           project: p.project as string,
           worktreeId: p.worktreeId as string | undefined,
+          branch: p.branch as string | undefined,
           plan: p.plan as WorkflowPlan,
           input: p.input as string | undefined,
           policy: p.policy as never,

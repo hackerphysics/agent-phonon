@@ -1201,7 +1201,7 @@ export class WorkflowEngine {
     const run: WorkflowRunState = {
       workflowId: rf.workflowId,
       tenantId: row.tenant_id as string,
-      project: row.project_id as string,
+      project: (row.project_id as string | null) ?? undefined,
       worktreeId: (row.worktree_id as string | null) ?? undefined,
       mode: row.mode as "dag" | "graph" | "discussion",
       plan,
@@ -1289,7 +1289,7 @@ export class WorkflowEngine {
     return {
       workflowId: row.workflow_id as string,
       status: row.status as WorkflowStatusResult["status"],
-      project: row.project_id as string,
+      project: (row.project_id as string | null) ?? undefined,
       mode: row.mode as "dag" | "graph" | "discussion",
       nodes: JSON.parse(row.nodes_json as string),
       createdAt: row.created_at as string,

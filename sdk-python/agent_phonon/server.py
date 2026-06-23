@@ -172,9 +172,10 @@ class PhononDevice:
     async def workflow_run(
         self,
         *,
-        project: str,
         plan: dict,
+        project: str | None = None,
         worktree_id: str | None = None,
+        branch: str | None = None,
         input: str | None = None,
         policy: dict | None = None,
         shared_context: dict | None = None,
@@ -190,9 +191,13 @@ class PhononDevice:
         shared_context: { text?, files?, placement: "prepend"|"append" }
         resume_from: { workflowId, strategy, rerunNodes? }
         """
-        params: dict = {"project": project, "plan": plan}
+        params: dict = {"plan": plan}
+        if project is not None:
+            params["project"] = project
         if worktree_id is not None:
             params["worktreeId"] = worktree_id
+        if branch is not None:
+            params["branch"] = branch
         if input is not None:
             params["input"] = input
         if policy is not None:

@@ -635,6 +635,34 @@ test("e2e v0.6: per-node worktreeId — 真实 git 仓库按需创建 + 同 key 
   } finally { await fx.cleanup(); }
 });
 
+test("e2e v0.6: workflow-level branch — node 继承 branch 并 checkout 主目录", { timeout: 30000 }, async () => {
+  const fx = await makeFixture((input) => `echo:${input.slice(0,30)}`);
+  try {
+    const proj = await fx.device.project.create({ name: "v06-wf-branch", git: true }) as { project: { projectId: string; path: string } };
+    const fs = await import("node:fs");
+    fs.writeFileSync(`${proj.project.path}/README.md`, "init\n");
+    const { execSync } = await import("node:child_process");
+    execSync(`git -C ${proj.project.path} add . && git -C ${proj.project.path} -c user.email=x@y -c user.name=x commit -m init`, { stdio: "ignore" });
+    execSync(`git -C ${proj.project.path} branch feature-wf`);
+
+    const run = await fx.device.workflow.run({
+      project: proj.project.projectId,
+      branch: "feature-wf",
+      plan: {
+        mode: "dag",
+        nodes: [
+          { nodeId: "a", agent: "mock:a", model: "m1", input: "x" },
+        ],
+      },
+    }) as { workflowId: string };
+
+    const st = await waitWorkflow(fx.device, run.workflowId) as { status: string };
+    assert.equal(st.status, "completed");
+    const cur = execSync(`git -C ${proj.project.path} rev-parse --abbrev-ref HEAD`).toString().trim();
+    assert.equal(cur, "feature-wf");
+  } finally { await fx.cleanup(); }
+});
+
 test("e2e v0.6: per-node branch — 不传 worktreeId 时 git checkout 切主目录", { timeout: 30000 }, async () => {
   const fx = await makeFixture((input) => `echo:${input.slice(0,30)}`);
   try {
