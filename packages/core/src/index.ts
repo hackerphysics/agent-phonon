@@ -9,9 +9,10 @@ import { PhononStore } from "./store.js";
 import { FileManager } from "./file-manager.js";
 import { collectDeviceResources } from "./resources.js";
 import { collectDeviceInfo } from "./device-info.js";
+import { WorkflowEngine } from "./workflow-engine.js";
 import { EnvManager } from "./env-manager.js";
 import type { AgentAdapter } from "./adapter.js";
-import { PROTOCOL_VERSION, parseParams, METHODS, type StreamEvent, type TenantPolicy, type MethodName } from "@agent-phonon/protocol";
+import { PROTOCOL_VERSION, parseParams, METHODS, type StreamEvent, type TenantPolicy, type MethodName, type WorkflowPlan } from "@agent-phonon/protocol";
 
 /** 改状态的方法（幂等适用）。 */
 const MUTATING_METHODS = new Set<string>([
@@ -28,6 +29,8 @@ const MUTATING_METHODS = new Set<string>([
   "file.mkdir",
   "env.set",
   "env.delete",
+  "workflow.run",
+  "workflow.cancel",
 ]);
 
 /**
@@ -54,6 +57,7 @@ export class PhononConnection {
   private files: FileManager;
   private env: EnvManager;
   private obs?: import("./observability.js").ObsBus;
+  private workflows?: WorkflowEngine;
   /** 该 tenant 绑定的默认项目工作目录解析器（v0 简化：projectId 即绝对路径或映射）。 */
   private resolveProjectCwd: (project: string) => string;
 
@@ -82,6 +86,7 @@ export class PhononConnection {
     // 先建 engine（ProjectManager 要用它查 active session）
     this.outbox = new Outbox({ store: this.store, tenantId: opts.tenantId });
     this.engine = new SessionEngine(opts.registry, (event: StreamEvent) => {
+      this.workflows?.onStreamEvent(event);
       // 下行可靠投递（D29）：先入 outbox（含 sqlite）再发；server ack 后清理
       this.outbox.enqueue(event);
       this.peer.notifyRaw("stream.event", event);
@@ -115,6 +120,13 @@ export class PhononConnection {
     this.resolveProjectCwd = opts.resolveProjectCwd ?? ((p) => this.projects.resolveCwd(p));
 
     this.peer = new RpcPeer(opts.transport, (method, params) => this.dispatch(method, params));
+    this.workflows = new WorkflowEngine({
+      tenantId: this.tenantId,
+      engine: this.engine,
+      resolveCwd: (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId),
+      env: this.env,
+      emit: (event) => this.peer.notifyRaw("workflow.event", event),
+    });
   }
 
   /** 喂入收到的文本。 */
@@ -365,6 +377,18 @@ export class PhononConnection {
       }
       case "skill.list":
         return { skills: this.skills.list({ agent: p.agent as string | undefined, scope: p.scope as "global" | "project" | undefined, projectId: p.projectId as string | undefined }) };
+      case "skill.dirs":
+        return { directories: await this.skills.dirs({ agent: p.agent as string | undefined, scope: p.scope as "global" | "project" | undefined, projectId: p.projectId as string | undefined }) };
+
+      // ---- L3 workflow orchestration ----
+      case "workflow.run":
+        return this.workflows!.run({ project: p.project as string, worktreeId: p.worktreeId as string | undefined, plan: p.plan as WorkflowPlan, input: p.input as string | undefined, metadata: p.metadata as Record<string, unknown> | undefined });
+      case "workflow.status":
+        return this.workflows!.status(p.workflowId as string);
+      case "workflow.cancel":
+        return this.workflows!.cancel(p.workflowId as string, p.reason as string | undefined);
+      case "workflow.list":
+        return this.workflows!.list(p as { status?: string; limit?: number });
 
       // ---- 连接/可靠性（s2p） ----
       case "stream.ack": {
@@ -407,6 +431,7 @@ export { SkillManager } from "./skill-manager.js";
 export { PolicyEnforcer } from "./policy.js";
 export { IdempotencyStore } from "./idempotency.js";
 export { Outbox } from "./outbox.js";
+export { WorkflowEngine } from "./workflow-engine.js";
 export { PhononStore } from "./store.js";
 export { SecretBox } from "./secret-box.js";
 export { FileManager } from "./file-manager.js";

@@ -20,5 +20,6 @@ export * from "./schemas/connect.js";
 export * from "./schemas/device.js";
 export * from "./schemas/file.js";
 export * from "./schemas/env.js";
+export * from "./schemas/workflow.js";
 export * from "./schemas/jsonrpc.js";
 export * from "./schemas/methods.js";

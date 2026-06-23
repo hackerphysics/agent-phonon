@@ -269,6 +269,7 @@ Release guardrails live in:
 ## Documentation
 
 - [Wire protocol](./docs/PROTOCOL.md)
+- [L3 orchestration protocol](./docs/L3_ORCHESTRATION.md)
 - [Design decisions](./docs/design.md)
 - [Agent CLI integration](./docs/agent-cli-integration.md)
 - [Release checklist](./docs/COMMIT_RELEASE_CHECKLIST.md)

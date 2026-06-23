@@ -251,6 +251,7 @@ pnpm run install-hooks
 ## 文档
 
 - [协议](./docs/PROTOCOL.md)
+- [L3 多 Agent 编排协议](./docs/L3_ORCHESTRATION.md)
 - [设计决策](./docs/design.md)
 - [Agent CLI 集成](./docs/agent-cli-integration.md)
 - [发布 checklist](./docs/COMMIT_RELEASE_CHECKLIST.md)

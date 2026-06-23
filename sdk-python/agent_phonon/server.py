@@ -78,6 +78,7 @@ class PhononDevice:
         self._document_handler: Optional[Callable[[dict], None]] = None
         self._prepare_upload_handler: Optional[Callable[[dict], dict]] = None
         self._interaction_handler: Optional[Callable[[dict], dict]] = None
+        self._workflow_event_handler: Optional[Callable[[dict], None]] = None
 
     async def call(self, method: str, params: Any) -> Any:
         return await self._peer.request(method, params)
@@ -165,6 +166,21 @@ class PhononDevice:
     async def skill_list(self, **filt: Any) -> dict:
         return await self._peer.request("skill.list", filt)
 
+    async def skill_dirs(self, **filt: Any) -> dict:
+        return await self._peer.request("skill.dirs", filt)
+
+    async def workflow_run(self, **params: Any) -> Any:
+        return await self._peer.request("workflow.run", params)
+
+    async def workflow_status(self, workflow_id: str) -> Any:
+        return await self._peer.request("workflow.status", {"workflowId": workflow_id})
+
+    async def workflow_cancel(self, workflow_id: str, reason: str | None = None) -> Any:
+        return await self._peer.request("workflow.cancel", {"workflowId": workflow_id, "reason": reason})
+
+    async def workflow_list(self, **filt: Any) -> Any:
+        return await self._peer.request("workflow.list", filt)
+
     def set_hook_decider(self, fn: HookDecider) -> None:
         self._hook_decider = fn
 
@@ -182,6 +198,9 @@ class PhononDevice:
 
     def set_interaction_handler(self, fn: Callable[[dict], dict]) -> None:
         self._interaction_handler = fn
+
+    def set_workflow_event_handler(self, fn: Callable[[dict], None]) -> None:
+        self._workflow_event_handler = fn
 
     async def _handle_inbound(self, method: str, params: Any) -> Any:
         if method == "stream.event":
@@ -204,6 +223,10 @@ class PhononDevice:
         if method == "discovery.changed":
             if self._discovery_changed:
                 self._discovery_changed(params or {})
+            return None
+        if method == "workflow.event":
+            if self._workflow_event_handler:
+                self._workflow_event_handler(params or {})
             return None
         if method == "document.send":
             if self._document_handler:

@@ -119,3 +119,33 @@ export const SkillListResult = z.object({
   skills: z.array(SkillDescriptor),
 });
 export type SkillListResult = z.infer<typeof SkillListResult>;
+
+// --- skill.dirs ---
+export const SkillDirsParams = z.object({
+  /** 可选：global scope 的目标 agent。 */
+  agent: AgentId.optional(),
+  /** 可选：project scope 的目标项目。 */
+  projectId: ProjectId.optional(),
+  /** 可选：只查 global 或 project；不传时按 agent/projectId 返回可查范围。 */
+  scope: SkillScope.optional(),
+});
+export type SkillDirsParams = z.infer<typeof SkillDirsParams>;
+
+export const SkillDirectoryDescriptor = z.object({
+  /** skill 目录名。 */
+  name: z.string().min(1),
+  scope: SkillScope,
+  agent: AgentId.optional(),
+  projectId: ProjectId.optional(),
+  /** scope 根目录（global skill root 或 <project>/.agent/skills）。 */
+  rootPath: z.string().min(1),
+  /** skill 目录真实本机路径。 */
+  path: z.string().min(1),
+  exists: z.boolean(),
+});
+export type SkillDirectoryDescriptor = z.infer<typeof SkillDirectoryDescriptor>;
+
+export const SkillDirsResult = z.object({
+  directories: z.array(SkillDirectoryDescriptor),
+});
+export type SkillDirsResult = z.infer<typeof SkillDirsResult>;

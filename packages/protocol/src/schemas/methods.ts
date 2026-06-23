@@ -68,6 +68,8 @@ import {
   SkillUninstallResult,
   SkillListParams,
   SkillListResult,
+  SkillDirsParams,
+  SkillDirsResult,
 } from "./skill.js";
 import { DeviceInfoParams, DeviceInfoResult, DeviceResourcesParams, DeviceResourcesResult } from "./device.js";
 import {
@@ -83,6 +85,17 @@ import {
   FileMkdirResult,
 } from "./file.js";
 import { EnvSetParams, EnvSetResult, EnvListParams, EnvListResult, EnvDeleteParams, EnvDeleteResult } from "./env.js";
+import {
+  WorkflowRunParams,
+  WorkflowRunResult,
+  WorkflowStatusParams,
+  WorkflowStatusResult,
+  WorkflowCancelParams,
+  WorkflowCancelResult,
+  WorkflowListParams,
+  WorkflowListResult,
+  WorkflowEvent,
+} from "./workflow.js";
 
 /**
  * 方法注册表（design 全协议的单一事实来源）。
@@ -383,6 +396,44 @@ export const METHODS = {
     kind: "request",
     params: SkillListParams,
     result: SkillListResult,
+  },
+  "skill.dirs": {
+    direction: "s2p",
+    kind: "request",
+    params: SkillDirsParams,
+    result: SkillDirsResult,
+  },
+
+  // --- L3 workflow orchestration (DAG / executor graph) ---
+  "workflow.run": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowRunParams,
+    result: WorkflowRunResult,
+  },
+  "workflow.status": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowStatusParams,
+    result: WorkflowStatusResult,
+  },
+  "workflow.cancel": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowCancelParams,
+    result: WorkflowCancelResult,
+  },
+  "workflow.list": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowListParams,
+    result: WorkflowListResult,
+  },
+  "workflow.event": {
+    direction: "p2s",
+    kind: "notification",
+    params: WorkflowEvent,
+    result: z_void,
   },
 } as const;
 

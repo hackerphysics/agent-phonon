@@ -1,13 +1,13 @@
 # agent-phonon 协议总览（一页速读）
 
 > 自动对照 `packages/protocol` 源码的人话版总览。字段级看 `src/schemas/*.ts`，决策看 `docs/design.md`。
-> 当前 43 个方法，协议版本 `0.1.0`。
+> 当前 49 个方法，协议版本 `0.1.0`。
 
 ## 一句话
 
 phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 JSON-RPC 2.0。服务端下发 session 操作，phonon 上推流式结果 / 自发输出 / hook 请求。
 
-## 43 个方法
+## 49 个方法
 
 | 方法 | 方向 | 类型 | 干啥 |
 |------|------|------|------|
@@ -53,6 +53,12 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `skill.install` | server→phonon | request | 给 agent 装 skill（global\|project）；source 支持 inline files / archive tar.gz / localPath / url 预留 |
 | `skill.uninstall` | server→phonon | request | 卸 skill |
 | `skill.list` | server→phonon | request | 列 skill |
+| `skill.dirs` | server→phonon | request | 查询某 agent global skill 目录、某 project `.agent/skills` 下 skill 名称与真实本机路径 |
+| `workflow.run` | server→phonon | request | L3 编排：提交 DAG 或 executor graph 执行计划 |
+| `workflow.status` | server→phonon | request | 查询 workflow 与各 node/session 状态 |
+| `workflow.cancel` | server→phonon | request | 取消 workflow |
+| `workflow.list` | server→phonon | request | 列 workflow run |
+| `workflow.event` | phonon→server | notify | L3 可观测事件：workflow/node/session/executor 决策流 |
 
 ## session 状态（你问的重点，D19）
 

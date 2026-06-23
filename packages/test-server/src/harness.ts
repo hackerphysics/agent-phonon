@@ -176,6 +176,7 @@ export class TestConn {
     // phonon → server 通知
     if (msg.method === "stream.event") { this.streamEvents.push(msg.params as Record<string, unknown>); return; }
     if (msg.method === "discovery.changed") { this.notifications.push(msg.params as Record<string, unknown>); return; }
+    if (msg.method === "workflow.event") { this.notifications.push(msg.params as Record<string, unknown>); return; }
     // phonon → server 请求（hook.fired / document.* / interaction.* 等）：回响应
     if (typeof msg.method === "string" && "id" in msg) {
       let result: unknown = { applied: true };

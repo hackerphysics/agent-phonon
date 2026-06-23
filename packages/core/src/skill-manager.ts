@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile, readdir, stat, mkdtemp, lstat } from "node:fs/promises";
+import { mkdir, rm, writeFile, readdir, stat, mkdtemp, lstat, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
@@ -151,6 +151,34 @@ export class SkillManager {
       if (filter?.projectId && s.projectId !== filter.projectId) return false;
       return true;
     });
+  }
+
+  async dirs(filter?: { agent?: string; scope?: "global" | "project"; projectId?: string }): Promise<Array<{ name: string; scope: "global" | "project"; agent?: string; projectId?: string; rootPath: string; path: string; exists: boolean }>> {
+    const rows: Array<{ name: string; scope: "global" | "project"; agent?: string; projectId?: string; rootPath: string; path: string; exists: boolean }> = [];
+    if (filter?.scope !== "project" && filter?.agent) {
+      const adapter = this.registry.resolve(filter.agent);
+      const root = adapter?.globalSkillDir?.(filter.agent);
+      if (root) rows.push(...await this.listDirs(root, { scope: "global", agent: filter.agent }));
+    }
+    if (filter?.scope !== "global" && filter?.projectId) {
+      const projPath = this.resolveProjectPath(filter.projectId);
+      if (!projPath) throw new PhononError("errProjectNotFound", `project ${filter.projectId} not found`);
+      rows.push(...await this.listDirs(join(projPath, ".agent", "skills"), { scope: "project", projectId: filter.projectId }));
+    }
+    return rows;
+  }
+
+  private async listDirs(root: string, base: { scope: "global" | "project"; agent?: string; projectId?: string }): Promise<Array<{ name: string; scope: "global" | "project"; agent?: string; projectId?: string; rootPath: string; path: string; exists: boolean }>> {
+    const rootPath = existsSync(root) ? await realpath(root) : resolve(root);
+    if (!existsSync(root)) return [];
+    const entries = await readdir(root, { withFileTypes: true });
+    const rows = [] as Array<{ name: string; scope: "global" | "project"; agent?: string; projectId?: string; rootPath: string; path: string; exists: boolean }>;
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = join(root, e.name);
+      rows.push({ name: e.name, ...base, rootPath, path: await realpath(full), exists: true });
+    }
+    return rows.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   private async installArchive(source: Extract<SkillSource, { kind: "archive" }>, dest: string): Promise<string> {

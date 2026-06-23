@@ -105,6 +105,9 @@ test("skill: install project scope → list → uninstall", async () => {
   assert.ok(existsSync(join(inst.skill.installedPath, "SKILL.md")));
   const list = (await tc.call("skill.list", { projectId: c.project.projectId })) as { skills: unknown[] };
   assert.equal(list.skills.length, 1);
+  const dirs = (await tc.call("skill.dirs", { projectId: c.project.projectId, scope: "project" })) as { directories: Array<{ name: string; path: string; rootPath: string; scope: string; exists: boolean }> };
+  assert.deepEqual(dirs.directories.map((d) => [d.name, d.scope, d.exists]), [["my-skill", "project", true]]);
+  assert.equal(dirs.directories[0]!.path, inst.skill.installedPath);
   await tc.call("skill.uninstall", { agent: "mock:default", name: "my-skill", scope: "project", projectId: c.project.projectId });
   const list2 = (await tc.call("skill.list", {})) as { skills: unknown[] };
   assert.equal(list2.skills.length, 0);
@@ -148,6 +151,9 @@ test("skill: global scope → adapter runtime dir", async () => {
     source: { kind: "inline", files: { "SKILL.md": "# G" } },
   })) as { skill: { installedPath: string } };
   assert.ok(inst.skill.installedPath.includes("mock-default"));
+  const dirs = (await tc.call("skill.dirs", { agent: "mock:default", scope: "global" })) as { directories: Array<{ name: string; path: string; rootPath: string; scope: string; exists: boolean }> };
+  assert.deepEqual(dirs.directories.map((d) => [d.name, d.scope, d.exists]), [["g-skill", "global", true]]);
+  assert.equal(dirs.directories[0]!.path, inst.skill.installedPath);
 });
 
 test("skill: url install denied by policy", async () => {

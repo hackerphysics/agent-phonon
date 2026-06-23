@@ -1,6 +1,6 @@
 {
   "name": "@agent-phonon/server-sdk",
-  "version": "0.2.11",
+  "version": "0.3.0",
   "description": "Server SDK for agent-phonon — build a server that orchestrates agents across multiple devices.",
   "license": "MIT",
   "type": "module",

@@ -174,6 +174,14 @@ export class PhononDevice extends EventEmitter {
     install: (p: { agent: string; name: string; scope: "global" | "project"; projectId?: string; source: unknown; clientRequestId?: string }) => this.peer.request("skill.install", p),
     uninstall: (p: { agent: string; name: string; scope: "global" | "project"; projectId?: string }) => this.peer.request("skill.uninstall", p),
     list: (filter?: { agent?: string; scope?: "global" | "project"; projectId?: string }) => this.peer.request("skill.list", filter ?? {}),
+    dirs: (filter?: { agent?: string; scope?: "global" | "project"; projectId?: string }) => this.peer.request("skill.dirs", filter ?? {}),
+  };
+
+  workflow = {
+    run: (p: Record<string, unknown>) => this.peer.request("workflow.run", p),
+    status: (workflowId: string) => this.peer.request("workflow.status", { workflowId }),
+    cancel: (workflowId: string, reason?: string) => this.peer.request("workflow.cancel", { workflowId, reason }),
+    list: (filter?: Record<string, unknown>) => this.peer.request("workflow.list", filter ?? {}),
   };
 
   /** 设置 HITL 裁决器（device 级，所有 session 共用）。 */
@@ -209,6 +217,7 @@ export class PhononDevice extends EventEmitter {
       return { action, reason };
     }
     if (method === "discovery.changed") { this.emit("discoveryChanged", params); return null; }
+    if (method === "workflow.event") { this.emit("workflowEvent", params); return null; }
     if (method === "document.send") { this.emit("document", params); return { delivered: [] }; }
     if (method === "document.prepare_upload") { this.emit("prepareUpload", params); return { uploadRef: newId(), uploadUrl: "", method: "PUT" }; }
     if (method === "interaction.request") { this.emit("interaction", params); return { requestId: (params as { requestId: string }).requestId, action: "cancel" }; }
