@@ -34,6 +34,10 @@ export interface WorkflowNodeInput {
   dependsOn?: string[];
   agentConfig?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  // v0.6: per-node 执行环境覆写
+  project?: string;
+  worktreeId?: string;
+  branch?: string;
 }
 export interface WorkflowEdgeInput {
   edgeId?: string;
@@ -248,8 +252,9 @@ export class PhononDevice extends EventEmitter {
    */
   workflow = {
     run: (params: {
-      project: string;
+      project?: string;
       worktreeId?: string;
+      branch?: string;
       plan: WorkflowPlanInput;
       input?: string;
       policy?: WorkflowPolicy;

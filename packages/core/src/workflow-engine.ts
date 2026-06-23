@@ -39,8 +39,12 @@ interface WorkflowNodeState {
 interface WorkflowRunState {
   workflowId: string;
   tenantId: string;
-  project: string;
+  /** workflow 级默认 project；v0.6 起可选（node 可覆盖） */
+  project?: string;
+  /** workflow 级默认 worktree key；v0.6 起 node 可覆盖 */
   worktreeId?: string;
+  /** workflow 级默认 branch；v0.6 起 node 可覆盖 */
+  branch?: string;
   mode: "dag" | "graph" | "discussion";
   plan: WorkflowPlan;
   input?: string;
@@ -146,11 +150,35 @@ export class WorkflowEngine {
   private turnWaiters = new Map<string, (r: WorkflowNodeResult) => void>();
   private idSeq = 1;
 
+  /**
+   * 隔离 key → 实际 worktreeId（v0.6）。
+   * key = `${workflowId}::${projectId}::${userWorktreeKey}`，value = phonon 创出的 内部 worktreeId。
+   * 那些 worktree 是 phonon 自己创的 → workflow 终态时负责清理。
+   */
+  private autoWorktrees = new Map<string, { projectId: string; worktreeId: string; userKey: string }>();
+
+  /**
+   * 主目录 checkout 的 branch 跨节点缓存（v0.6）。
+   * key = `${workflowId}::${projectId}` → 该 workflow 上一次在它里 checkout 的 branch。
+   * 用于避免同一个 branch 重复 checkout。
+   */
+  private mainBranchCheckedOut = new Map<string, string>();
+
   constructor(private opts: {
     tenantId: string;
     engine: SessionEngine;
     resolveCwd: (projectId: string, worktreeId?: string) => string;
     env: EnvManager;
+    /**
+     * 可选：project manager 访问接口，用于 per-node 按需创建 worktree + 主目录 branch checkout。
+     * 不指明则 worktreeId/branch 覆写失效、phonon 徽后退到 v0.5 行为。
+     */
+    projects?: {
+      worktreeCreate: (params: { projectId: string; baseBranch: string; newBranch?: string }) => Promise<{ worktreeId: string; path: string; branch: string }>;
+      worktreeRemove: (params: { projectId: string; worktreeId: string; force?: boolean }) => Promise<unknown>;
+      runGit?: (projectId: string, args: string[]) => Promise<string>;
+      getProjectPath: (projectId: string) => string;
+    };
     /** 可选：sqlite store。提供则 checkpoint 落盘 + 支持 resumeFrom。 */
     store?: PhononStore;
     emit: (event: WorkflowEvent) => void;
@@ -161,8 +189,9 @@ export class WorkflowEngine {
   // ---------------------------------------------------------------------------
 
   async run(params: {
-    project: string;
+    project?: string;
     worktreeId?: string;
+    branch?: string;
     plan: WorkflowPlan;
     input?: string;
     policy?: WorkflowPolicy;
@@ -196,6 +225,7 @@ export class WorkflowEngine {
       tenantId: this.opts.tenantId,
       project: params.project,
       worktreeId: params.worktreeId,
+      branch: params.branch,
       mode: params.plan.mode,
       plan: params.plan,
       input: params.input,
@@ -266,10 +296,11 @@ export class WorkflowEngine {
         try { await this.opts.engine.terminate(this.opts.tenantId, n.sessionId); } catch {}
       }
     }
-    // 清理本 workflow 的所有 persistent session
+    // 清理本 workflow 的所有 persistent session + worktree
     await this.cleanupPersistent(run);
+    const wtKept1 = await this.cleanupAutoWorktrees(run);
     this.persist(run);
-    this.emit(run, { type: "workflow.status", status: "cancelled", payload: { reason } });
+    this.emit(run, { type: "workflow.status", status: "cancelled", payload: { reason, worktreesKept: wtKept1.kept } });
     return { workflowId, status: "cancelled" };
   }
 
@@ -351,6 +382,10 @@ export class WorkflowEngine {
         }
       }
       await this.cleanupPersistent(run);
+      const wtKept2 = await this.cleanupAutoWorktrees(run);
+      if (wtKept2.kept.length > 0) {
+        this.emit(run, { type: "workflow.status", status: "timeout", payload: { worktreesKept: wtKept2.kept } });
+      }
     }
   }
 
@@ -367,8 +402,10 @@ export class WorkflowEngine {
       run.completedAt = new Date().toISOString();
       run.updatedAt = run.completedAt;
       this.fillFinalText(run);
+      // DAG completed 路径：也要清理 auto worktree（持久 session 在 graph/discussion 内部已清）
+      const wtKeptEx = await this.cleanupAutoWorktrees(run);
       this.persist(run);
-      this.emit(run, { type: "workflow.status", status: "completed", payload: { finalText: run.finalText } });
+      this.emit(run, { type: "workflow.status", status: "completed", payload: { finalText: run.finalText, worktreesKept: wtKeptEx.kept } });
     }
   }
 
@@ -426,7 +463,8 @@ export class WorkflowEngine {
       for (let i = 0; i < runnable.length; i += batchSize) {
         const batch = runnable.slice(i, i + batchSize);
         const results = await Promise.allSettled(batch.map((n) =>
-          this.executeNode(run, n.nodeId, n.agent, n.model, n.role, this.composeDagNodeInput(run, n, succeeded), n.agentConfig, n.systemPrompt)
+          this.executeNode(run, n.nodeId, n.agent, n.model, n.role, this.composeDagNodeInput(run, n, succeeded), n.agentConfig, n.systemPrompt, undefined,
+            { project: n.project, worktreeId: n.worktreeId, branch: n.branch })
         ));
         for (let j = 0; j < batch.length; j++) {
           const n = batch[j]!;
@@ -504,6 +542,7 @@ export class WorkflowEngine {
     ].join("\n");
 
     // 启动 executor（persistKey = executor nodeId，后续轮复用同一 session）
+    const execEnv = { project: plan.executor.project, worktreeId: plan.executor.worktreeId, branch: plan.executor.branch };
     const executorResult = await this.executeNode(
       run,
       plan.executor.nodeId,
@@ -513,7 +552,8 @@ export class WorkflowEngine {
       executorPrompt,
       plan.executor.agentConfig,
       plan.executor.systemPrompt,
-      plan.executor.nodeId, // ← persistKey
+      plan.executor.nodeId,
+      execEnv,
     );
 
     let currentDirectives = parseRoutingDirectives(executorResult.text ?? "");
@@ -592,6 +632,7 @@ export class WorkflowEngine {
             worker.agentConfig,
             worker.systemPrompt,
             worker.nodeId, // persistKey: 同一 worker 跨轮复用 session
+            { project: worker.project, worktreeId: worker.worktreeId, branch: worker.branch },
           );
           workerResults.push({ nodeId: target, text: workerRes.text ?? "" });
         }
@@ -627,6 +668,7 @@ export class WorkflowEngine {
         plan.executor.agentConfig,
         plan.executor.systemPrompt,
         plan.executor.nodeId, // persistKey
+        execEnv,
       );
       lastExecutorText = nextRes.text ?? lastExecutorText;
       currentDirectives = parseRoutingDirectives(lastExecutorText);
@@ -648,8 +690,12 @@ export class WorkflowEngine {
     }
 
     run.finalText = finalSummary ?? lastExecutorText;
-    // Graph 终态：清理 persistent session
+    // Graph 终态：清理 persistent session + worktree
     await this.cleanupPersistent(run);
+    const wtKept3 = await this.cleanupAutoWorktrees(run);
+    if (wtKept3.kept.length > 0) {
+      this.emit(run, { type: "workflow.status", status: run.status, payload: { worktreesKept: wtKept3.kept } });
+    }
 
     // 修复问题 C：非 done 退出都该标 failed，不是 completed
     if (exitReason !== "done") {
@@ -702,7 +748,8 @@ export class WorkflowEngine {
 
       const speakResults = await Promise.allSettled(
         nonChair.map((p) =>
-          this.executeNode(run, p.nodeId, p.agent, p.model, p.role ?? "participant", prompt, p.agentConfig, p.systemPrompt, p.nodeId)
+          this.executeNode(run, p.nodeId, p.agent, p.model, p.role ?? "participant", prompt, p.agentConfig, p.systemPrompt, p.nodeId,
+            { project: p.project, worktreeId: p.worktreeId, branch: p.branch })
             .then((r) => ({ nodeId: p.nodeId, role: p.role, text: r.text ?? "" })),
         ),
       );
@@ -740,6 +787,7 @@ export class WorkflowEngine {
       const chairmanRes = await this.executeNode(
         run, chairman.nodeId, chairman.agent, chairman.model, chairman.role ?? "chairman",
         chairmanPrompt, chairman.agentConfig, chairman.systemPrompt, chairman.nodeId,
+        { project: chairman.project, worktreeId: chairman.worktreeId, branch: chairman.branch },
       );
       transcript.push({ round, nodeId: chairman.nodeId, role: chairman.role ?? "chairman", text: chairmanRes.text ?? "" });
 
@@ -752,8 +800,12 @@ export class WorkflowEngine {
 
     this.emit(run, { type: "discussion.terminated", payload: { rounds: round, reason: terminationReason ?? "unknown" } });
 
-    // Discussion 终态：清理 persistent session
+    // Discussion 终态：清理 persistent session + worktree
     await this.cleanupPersistent(run);
+    const wtKept4 = await this.cleanupAutoWorktrees(run);
+    if (wtKept4.kept.length > 0) {
+      this.emit(run, { type: "workflow.status", status: run.status, payload: { worktreesKept: wtKept4.kept } });
+    }
 
     // finalText = 最后一轮 chairman 输出，没有则最后一轮最后一个 participant
     const lastChairman = [...transcript].reverse().find((t) => t.nodeId === chairman.nodeId);
@@ -784,6 +836,8 @@ export class WorkflowEngine {
     agentConfig?: Record<string, unknown>,
     nodeSystemPrompt?: string,
     persistKey?: string,
+    /** v0.6: 该节点的执行环境覆写（project/worktreeId/branch）。不传默认继承 workflow 级。 */
+    nodeEnv?: { project?: string; worktreeId?: string; branch?: string },
   ): Promise<WorkflowNodeResult> {
     const node = run.nodes.find((n) => n.nodeId === nodeId) ?? this.addNode(run, { nodeId, agent, model, role });
     node.status = "running";
@@ -793,7 +847,11 @@ export class WorkflowEngine {
     this.emit(run, { type: "node.status", nodeId, agent, model, role, status: "running", payload: { iteration: node.iterations } });
 
     try {
-      const cwd = this.opts.resolveCwd(run.project, run.worktreeId);
+      // v0.6: resolveExecution 处理 per-node 覆写 + worktree 按需创建/复用 + branch checkout
+      const exec = await this.resolveExecution(run, nodeEnv);
+      const cwd = exec.cwd;
+      const effectiveProject = exec.projectId;
+      const effectiveWorktreeId = exec.worktreeId;
       const systemPrompt = this.buildSystemPrompt(run, nodeSystemPrompt, cwd, role);
       const initialContext = systemPrompt ? [{ role: "system" as const, content: systemPrompt }] : undefined;
 
@@ -804,8 +862,8 @@ export class WorkflowEngine {
       if (!sessionId) {
         const created = await this.opts.engine.create({
           tenantId: run.tenantId,
-          project: run.project,
-          worktreeId: run.worktreeId,
+          project: effectiveProject,
+          worktreeId: effectiveWorktreeId,
           cwd,
           agent,
           model,
@@ -824,7 +882,7 @@ export class WorkflowEngine {
       node.sessionId = sessionId;
 
       const sent = await this.opts.engine.send(run.tenantId, sessionId, input, {
-        environment: this.opts.env.resolveForExecution({ projectId: run.project, agent }),
+        environment: this.opts.env.resolveForExecution({ projectId: effectiveProject, agent }),
       });
       node.turnId = sent.turnId;
 
@@ -870,6 +928,142 @@ export class WorkflowEngine {
       try { await this.opts.engine.terminate(run.tenantId, sid); } catch {}
     }
     for (const k of toRemove) this.persistentSessions.delete(k);
+  }
+
+  // =============================================================================
+  // v0.6: per-node 执行环境解析（project / worktreeId / branch）+ 按需 worktree
+  // =============================================================================
+
+  /**
+   * 解析 node 的执行环境。处理 4 种情况（详见 protocol WorkflowNode.branch/worktreeId 文档）：
+   *   1) 不传 worktreeId + 不传 branch  → project 主目录当前 branch
+   *   2) 不传 worktreeId + 传 branch    → project 主目录先 git checkout <branch>
+   *   3) 传 worktreeId（首次）         → 按需创建 worktree（branch 决定 base）
+   *   4) 传 worktreeId（复用）         → 直接拿之前创的 worktree，branch 字段被忽略
+   *
+   * 返回 { projectId, worktreeId, cwd }；项目级 + node 级覆写都已合并。
+   */
+  private async resolveExecution(
+    run: WorkflowRunState,
+    nodeEnv?: { project?: string; worktreeId?: string; branch?: string },
+  ): Promise<{ projectId: string; worktreeId?: string; cwd: string }> {
+    const projectId = nodeEnv?.project ?? run.project;
+    if (!projectId) {
+      throw new PhononError(
+        "errInvalidParams",
+        "workflow node has no project: neither node.project nor workflow.project is set",
+      );
+    }
+    const userWorktreeKey = nodeEnv?.worktreeId ?? run.worktreeId;
+    const branch = nodeEnv?.branch ?? run.branch;
+
+    // ---- 情况 3/4: 用户给了 worktreeId ----
+    if (userWorktreeKey) {
+      const autoKey = `${run.workflowId}::${projectId}::${userWorktreeKey}`;
+      const existing = this.autoWorktrees.get(autoKey);
+      if (existing) {
+        // 复用：branch 字段被忽略；不再 checkout/创建
+        const cwd = this.opts.resolveCwd(projectId, existing.worktreeId);
+        return { projectId, worktreeId: existing.worktreeId, cwd };
+      }
+      // 首次：按需创建。branch 决定 base，缺省用项目当前 branch（git 默认行为）
+      if (!this.opts.projects) {
+        throw new PhononError(
+          "errCapabilityUnsupported",
+          "workflow node uses worktreeId but ProjectManager API is not wired into WorkflowEngine",
+        );
+      }
+      const baseBranch = branch ?? await this.detectCurrentBranch(projectId);
+      const autoBranch = `phonon-wf-${run.workflowId}-${userWorktreeKey}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
+      const wt = await this.opts.projects.worktreeCreate({
+        projectId, baseBranch, newBranch: autoBranch,
+      });
+      this.autoWorktrees.set(autoKey, { projectId, worktreeId: wt.worktreeId, userKey: userWorktreeKey });
+      const cwd = this.opts.resolveCwd(projectId, wt.worktreeId);
+      return { projectId, worktreeId: wt.worktreeId, cwd };
+    }
+
+    // ---- 情况 2: 不要 worktree 但要切 branch ----
+    if (branch) {
+      const cacheKey = `${run.workflowId}::${projectId}`;
+      const already = this.mainBranchCheckedOut.get(cacheKey);
+      if (already !== branch) {
+        if (!this.opts.projects?.runGit) {
+          throw new PhononError(
+            "errCapabilityUnsupported",
+            "workflow node uses branch but git runner is not wired into WorkflowEngine",
+          );
+        }
+        try {
+          await this.opts.projects.runGit(projectId, ["checkout", branch]);
+          this.mainBranchCheckedOut.set(cacheKey, branch);
+        } catch (e) {
+          throw new PhononError("errInvalidParams", `git checkout ${branch} failed: ${(e as Error).message}`);
+        }
+      }
+    }
+
+    // ---- 情况 1/2 终态: 项目主目录 cwd ----
+    const cwd = this.opts.resolveCwd(projectId);
+    return { projectId, cwd };
+  }
+
+  private async detectCurrentBranch(projectId: string): Promise<string> {
+    if (!this.opts.projects?.runGit) return "HEAD"; // 极端兜底
+    try {
+      const out = await this.opts.projects.runGit(projectId, ["rev-parse", "--abbrev-ref", "HEAD"]);
+      const branch = out.trim();
+      return branch || "HEAD";
+    } catch {
+      return "HEAD";
+    }
+  }
+
+  /**
+   * 清理某 workflow 自动创建的所有 worktree。
+   * 安全规则（按 Stephen 要求）：
+   *  - git status --porcelain 干净 → 调 worktreeRemove（不 force）
+   *  - dirty → 保留 worktree 不删；emit warn 到 workflow.status payload
+   *  - branch 一律不删（用户下次可传 branch 名继续开发）
+   */
+  private async cleanupAutoWorktrees(run: WorkflowRunState): Promise<{ kept: Array<{ worktreeId: string; userKey: string; reason: string }> }> {
+    const kept: Array<{ worktreeId: string; userKey: string; reason: string }> = [];
+    const prefix = `${run.workflowId}::`;
+    const toClear: string[] = [];
+    for (const [k, entry] of this.autoWorktrees.entries()) {
+      if (!k.startsWith(prefix)) continue;
+      toClear.push(k);
+      if (!this.opts.projects) continue;
+      try {
+        // 检查 worktree dirty 状态
+        let dirty = false;
+        if (this.opts.projects.runGit) {
+          // 通过 worktree path 跑 git status；先拿 path
+          const wtPath = this.opts.resolveCwd(entry.projectId, entry.worktreeId);
+          try {
+            // 走 git -C <wtPath> status --porcelain
+            const out = await this.opts.projects.runGit(entry.projectId, ["-C", wtPath, "status", "--porcelain"]);
+            dirty = out.trim().length > 0;
+          } catch (e) {
+            // 检查失败保守起见标 dirty（不删除）
+            dirty = true;
+          }
+        }
+        if (dirty) {
+          kept.push({ worktreeId: entry.worktreeId, userKey: entry.userKey, reason: "worktree has uncommitted changes" });
+          continue;
+        }
+        await this.opts.projects.worktreeRemove({ projectId: entry.projectId, worktreeId: entry.worktreeId });
+      } catch (err) {
+        kept.push({ worktreeId: entry.worktreeId, userKey: entry.userKey, reason: `cleanup failed: ${(err as Error).message}` });
+      }
+    }
+    for (const k of toClear) this.autoWorktrees.delete(k);
+    // 同时清掉主目录 branch checkout 缓存
+    for (const k of [...this.mainBranchCheckedOut.keys()]) {
+      if (k.startsWith(prefix)) this.mainBranchCheckedOut.delete(k);
+    }
+    return { kept };
   }
 
   private async awaitTurnResult(run: WorkflowRunState, sessionId: string, turnId: string): Promise<WorkflowNodeResult> {
@@ -1070,8 +1264,9 @@ export class WorkflowEngine {
     run.updatedAt = run.completedAt;
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "failed", payload: { error: run.error } });
-    // 清理本 workflow 的所有 persistent session（不阻塞 fail 路径）
+    // 清理本 workflow 的所有 persistent session + worktree（不阻塞 fail 路径）
     void this.cleanupPersistent(run).catch(() => {});
+    void this.cleanupAutoWorktrees(run).catch(() => {});
   }
 
   private toStatus(run: WorkflowRunState): WorkflowStatusResult {

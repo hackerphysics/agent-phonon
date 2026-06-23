@@ -549,3 +549,118 @@ test("e2e stream events carry workflowId+nodeId+role through real SDK", { timeou
     assert.equal(n1.result?.text, "echo: scribble");
   } finally { await fx.cleanup(); }
 });
+
+// =============================================================================
+// v0.6: per-node project/worktreeId/branch 覆写
+// =============================================================================
+
+test("e2e v0.6: per-node project 覆写 — 同一 workflow 不同 node 跑在不同 project", { timeout: 30000 }, async () => {
+  const fx = await makeFixture((input) => `echo:${input.slice(0,30)}`);
+  try {
+    const projA = await fx.device.project.create({ name: "proj-a", git: false }) as { project: { projectId: string; path: string } };
+    const projB = await fx.device.project.create({ name: "proj-b", git: false }) as { project: { projectId: string; path: string } };
+
+    // 不传 workflow 级 project；每个 node 自己指定
+    const run = await fx.device.workflow.run({
+      // project 不传
+      plan: {
+        mode: "dag",
+        nodes: [
+          { nodeId: "a", agent: "mock:a", model: "m1", input: "Atask", project: projA.project.projectId },
+          { nodeId: "b", agent: "mock:b", model: "m1", input: "Btask", project: projB.project.projectId },
+        ],
+      },
+    }) as { workflowId: string };
+
+    const st = await waitWorkflow(fx.device, run.workflowId) as { status: string; nodes: Array<{ nodeId: string; status: string; result?: { text?: string } }> };
+    assert.equal(st.status, "completed");
+    assert.equal(st.nodes.find(n => n.nodeId === "a")?.status, "completed");
+    assert.equal(st.nodes.find(n => n.nodeId === "b")?.status, "completed");
+  } finally { await fx.cleanup(); }
+});
+
+test("e2e v0.6: workflow 无 project + node 也无 project → 报错", { timeout: 15000 }, async () => {
+  const fx = await makeFixture();
+  try {
+    const run = await fx.device.workflow.run({
+      plan: {
+        mode: "dag",
+        nodes: [{ nodeId: "a", agent: "mock:a", model: "m1", input: "x" }],
+      },
+    }) as { workflowId: string };
+
+    const st = await waitWorkflow(fx.device, run.workflowId) as { status: string; error?: string };
+    assert.equal(st.status, "failed");
+    assert.match(st.error ?? "", /no project/);
+  } finally { await fx.cleanup(); }
+});
+
+test("e2e v0.6: per-node worktreeId — 真实 git 仓库按需创建 + 同 key 复用", { timeout: 45000 }, async () => {
+  const fx = await makeFixture((input) => `echo:${input.slice(0,30)}`);
+  try {
+    // 创一个真 git project：phonon 自动 git init
+    const proj = await fx.device.project.create({ name: "v06-git", git: true }) as { project: { projectId: string; path: string } };
+    // git init 之后还要有第一个 commit，不然 git worktree add 会失败
+    const fs = await import("node:fs");
+    fs.writeFileSync(`${proj.project.path}/README.md`, "init\n");
+    const { execSync } = await import("node:child_process");
+    execSync(`git -C ${proj.project.path} add . && git -C ${proj.project.path} -c user.email=x@y -c user.name=x commit -m init`, { stdio: "ignore" });
+
+    // 两个 node 用同一个 worktreeId "exp1" → 第一次创建、第二次复用
+    const run = await fx.device.workflow.run({
+      project: proj.project.projectId,
+      plan: {
+        mode: "dag",
+        nodes: [
+          { nodeId: "a", agent: "mock:a", model: "m1", input: "Atask", worktreeId: "exp1" },
+          { nodeId: "b", agent: "mock:b", model: "m1", dependsOn: ["a"], input: "Btask", worktreeId: "exp1" },
+        ],
+      },
+    }) as { workflowId: string };
+
+    const st = await waitWorkflow(fx.device, run.workflowId, 30000) as { status: string; nodes: Array<{ nodeId: string; status: string }> };
+    assert.equal(st.status, "completed");
+    assert.ok(st.nodes.every(n => n.status === "completed"));
+
+    // 验证 worktree 被自动创建：检查 git worktree list
+    const wtList = execSync(`git -C ${proj.project.path} worktree list`).toString();
+    // workflow 结束时应已自动清理（干净 worktree → remove）
+    // 只看 branch 名字包含 phonon-wf- 的 worktree（主目录 branch 是 master，不会匹中）
+    const phononWts = wtList.split("\n").filter(l => l.match(/\[phonon-wf-/));
+    assert.equal(phononWts.length, 0, `自动 worktree 应已被清理；现存: ${phononWts.join("\\n")}`);
+
+    // 验证 branch 没被删（用户下次可继续）
+    const branches = execSync(`git -C ${proj.project.path} branch`).toString();
+    assert.match(branches, /phonon-wf-/, "phonon 创建的 branch 不应被删除");
+  } finally { await fx.cleanup(); }
+});
+
+test("e2e v0.6: per-node branch — 不传 worktreeId 时 git checkout 切主目录", { timeout: 30000 }, async () => {
+  const fx = await makeFixture((input) => `echo:${input.slice(0,30)}`);
+  try {
+    const proj = await fx.device.project.create({ name: "v06-branch", git: true }) as { project: { projectId: string; path: string } };
+    const fs = await import("node:fs");
+    fs.writeFileSync(`${proj.project.path}/README.md`, "init\n");
+    const { execSync } = await import("node:child_process");
+    execSync(`git -C ${proj.project.path} add . && git -C ${proj.project.path} -c user.email=x@y -c user.name=x commit -m init`, { stdio: "ignore" });
+    // 创一个 feature branch
+    execSync(`git -C ${proj.project.path} branch feature-x`);
+
+    const run = await fx.device.workflow.run({
+      project: proj.project.projectId,
+      plan: {
+        mode: "dag",
+        nodes: [
+          { nodeId: "a", agent: "mock:a", model: "m1", input: "x", branch: "feature-x" },
+        ],
+      },
+    }) as { workflowId: string };
+
+    const st = await waitWorkflow(fx.device, run.workflowId) as { status: string };
+    assert.equal(st.status, "completed");
+
+    // 验证主目录现在在 feature-x 上
+    const cur = execSync(`git -C ${proj.project.path} rev-parse --abbrev-ref HEAD`).toString().trim();
+    assert.equal(cur, "feature-x");
+  } finally { await fx.cleanup(); }
+});

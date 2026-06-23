@@ -124,7 +124,7 @@ export class PhononStore {
       CREATE TABLE IF NOT EXISTS workflows (
         workflow_id  TEXT PRIMARY KEY,
         tenant_id    TEXT NOT NULL,
-        project_id   TEXT NOT NULL,
+        project_id   TEXT,
         worktree_id  TEXT,
         mode         TEXT NOT NULL,
         plan_json    TEXT NOT NULL,
@@ -326,7 +326,7 @@ export class PhononStore {
 
   // ---- workflows (L3 checkpoint) ----
   upsertWorkflow(w: {
-    workflowId: string; tenantId: string; projectId: string; worktreeId?: string;
+    workflowId: string; tenantId: string; projectId?: string; worktreeId?: string;
     mode: string; planJson: string; input?: string; policyJson?: string; sharedJson?: string;
     status: string; finalText?: string; error?: string; nodesJson: string;
     seq: number; ackedSeq: number; createdAt: string; updatedAt: string; completedAt?: string;
@@ -346,7 +346,7 @@ export class PhononStore {
            completed_at=excluded.completed_at`,
       )
       .run(
-        w.workflowId, w.tenantId, w.projectId, w.worktreeId ?? null, w.mode, w.planJson,
+        w.workflowId, w.tenantId, w.projectId ?? null, w.worktreeId ?? null, w.mode, w.planJson,
         w.input ?? null, w.policyJson ?? null, w.sharedJson ?? null,
         w.status, w.finalText ?? null, w.error ?? null, w.nodesJson,
         w.seq, w.ackedSeq, w.createdAt, w.updatedAt, w.completedAt ?? null,

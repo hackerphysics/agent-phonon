@@ -45,6 +45,32 @@ export const WorkflowNode = z.object({
   sessionId: SessionId.optional(),
   agentConfig: z.record(z.unknown()).optional(),
   metadata: z.record(z.unknown()).optional(),
+
+  // ===== 执行环境（v0.6 改造。62026-06-23。不兼容旧 worktreeId 句柄语义）=====
+  /**
+   * 此节点跑在哪个 project。不传默认继承 workflow 级 project。
+   * project + workflow 级都没传，phonon 拒接。
+   */
+  project: ProjectId.optional(),
+  /**
+   * 隔离 key。调用方自定义的任意字符串。
+   * - 不传  → 该节点跑在 project 主目录
+   * - 传了 → phonon 按 (projectId, worktreeId) 复合键维护隔离 worktree：
+   *           • 同一 workflow 内首次看到 → 创建 worktree（branch 名 phonon 自动生成）
+   *           • 同一 workflow 内后续节点用同一 key → 复用同一 worktree
+   *           • 不跨 workflow 复用（下次 workflow.run 同名 key 是新 worktree）
+   * - workflow 终态时 phonon 尝试自动清理：git status 干净则 worktree remove；dirty 则保留
+   *   且发 workflow.status payload warn。创出的 branch 一律不删。
+   */
+  worktreeId: z.string().optional(),
+  /**
+   * Git branch。意义联动 worktreeId：
+   * - 不传 worktreeId 传 branch → 在 project 主目录先 `git checkout <branch>` 再跑（对主目录有副作用，法定调用方负责）
+   * - 传 worktreeId 首次传 branch → 作为新 worktree 的 base branch（从它检出）
+   * - 传 worktreeId 未传 branch 首次 → 从 project 当前 branch 检出
+   * - worktreeId 复用时 branch 被忽略（worktree 已存在）
+   */
+  branch: z.string().optional(),
 });
 export type WorkflowNode = z.infer<typeof WorkflowNode>;
 
@@ -206,8 +232,15 @@ export type WorkflowResumeFrom = z.infer<typeof WorkflowResumeFrom>;
 // ---------------------------------------------------------------------------
 
 export const WorkflowRunParams = z.object({
-  project: ProjectId,
+  /**
+   * 默认 project。可以省略，但如果某个 node 也没传 project，phonon 会拒接。
+   * v0.6 起改为可选，支持每个 node 跳不同 project 的跨项目编排场景。
+   */
+  project: ProjectId.optional(),
+  /** 默认隔离 key；node 未传 worktreeId 时继承该值。含义及复用规则同 WorkflowNode.worktreeId。 */
   worktreeId: z.string().optional(),
+  /** 默认 branch；node 未传 branch 时继承。含义同 WorkflowNode.branch。 */
+  branch: z.string().optional(),
   plan: WorkflowPlan,
   input: z.string().optional(),
   policy: WorkflowPolicy.optional(),
@@ -272,7 +305,8 @@ export type WorkflowStatusParams = z.infer<typeof WorkflowStatusParams>;
 export const WorkflowStatusResult = z.object({
   workflowId: WorkflowId,
   status: WorkflowStatus,
-  project: ProjectId,
+  /** workflow 默认 project；v0.6 起可选。 */
+  project: ProjectId.optional(),
   mode: z.enum(["dag", "graph", "discussion"]),
   nodes: z.array(WorkflowNodeRuntime),
   createdAt: Timestamp,

@@ -1,6 +1,6 @@
 import { SessionEngine, AdapterRegistry } from "./session-engine.js";
 import { RpcPeer, PhononError, type RpcTransport } from "./rpc.js";
-import { ProjectManager } from "./project-manager.js";
+import { ProjectManager, runGit } from "./project-manager.js";
 import { SkillManager } from "./skill-manager.js";
 import { PolicyEnforcer } from "./policy.js";
 import { IdempotencyStore } from "./idempotency.js";
@@ -125,6 +125,13 @@ export class PhononConnection {
       engine: this.engine,
       resolveCwd: (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId),
       env: this.env,
+      // v0.6: 接入 ProjectManager 给 workflow node 提供 per-node worktree 按需创建/checkout 能力
+      projects: {
+        worktreeCreate: (params) => this.projects.worktreeCreate(params).then((wt) => ({ worktreeId: wt.worktreeId, path: wt.path, branch: wt.branch })),
+        worktreeRemove: (params) => this.projects.worktreeRemove(params),
+        runGit: async (projectId, args) => runGit(this.projects.get(projectId).path, args),
+        getProjectPath: (projectId) => this.projects.get(projectId).path,
+      },
       store: this.store,
       emit: (event) => this.peer.notifyRaw("workflow.event", event),
     });
