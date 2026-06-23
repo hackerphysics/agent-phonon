@@ -7,7 +7,62 @@ import type {
   StreamEvent,
   HookFiredParams,
   HookAction,
+  WorkflowPolicy,
+  WorkflowSharedContext,
+  WorkflowResumeFrom,
+  WorkflowEvent,
+  WorkflowStatusResult,
+  WorkflowListResult,
+  WorkflowListParams,
+  WorkflowRunResult,
 } from "@agent-phonon/protocol";
+
+/**
+ * Workflow plan 宝松型（SDK 使用面）。
+ *
+ * 不用 protocol 内部的 branded AgentId、SessionId 等 zod 品牌类型，以免调用方
+ * 要手动 cast "mock:a" 为品牌类型。字段语义与协议一致，phonon 端进入后会
+ * 走 zod 校验。
+ */
+export interface WorkflowNodeInput {
+  nodeId: string;
+  agent: string;
+  model: string;
+  role?: string;
+  input?: string;
+  systemPrompt?: string;
+  dependsOn?: string[];
+  agentConfig?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+export interface WorkflowEdgeInput {
+  edgeId?: string;
+  from: string;
+  to: string;
+  label?: string;
+  condition?: string;
+  metadata?: Record<string, unknown>;
+}
+export interface WorkflowCommunicationGraphInput {
+  edges?: WorkflowEdgeInput[];
+  allowSelfLoop?: boolean;
+  maxIterations?: number;
+}
+export interface WorkflowDiscussionTerminationInput {
+  chairmanSignal?: string;
+  maxRounds?: number;
+  consensusSignal?: string;
+}
+export type WorkflowPlanInput =
+  | { mode: "dag"; nodes: WorkflowNodeInput[]; edges?: WorkflowEdgeInput[]; finalNodeId?: string }
+  | { mode: "graph"; executor: WorkflowNodeInput; workers: WorkflowNodeInput[]; communicationGraph: WorkflowCommunicationGraphInput }
+  | {
+      mode: "discussion";
+      topic: string;
+      participants: WorkflowNodeInput[];
+      chairman: string;
+      termination?: WorkflowDiscussionTerminationInput;
+    };
 
 /**
  * agent-phonon Server SDK。
@@ -177,14 +232,49 @@ export class PhononDevice extends EventEmitter {
     dirs: (filter?: { agent?: string; scope?: "global" | "project"; projectId?: string }) => this.peer.request("skill.dirs", filter ?? {}),
   };
 
+  /**
+   * L3 workflow orchestration。
+   * 传入 typed plan/policy/sharedContext/resumeFrom；SDK 原样透传 phonon，
+   * `device.on("workflowEvent", ...)` 订阅元事件（SDK 自动 ack）。
+   *
+   * 示例：
+   *   const run = await device.workflow.run({
+   *     project,
+   *     plan: { mode: "dag", nodes: [...] },
+   *     policy: { onNodeFailure: "skip_dependents", maxParallel: 3 },
+   *     sharedContext: { text: "..." },
+   *   });
+   *   const status = await device.workflow.status(run.workflowId);
+   */
   workflow = {
-    run: (p: Record<string, unknown>) => this.peer.request("workflow.run", p),
-    status: (workflowId: string) => this.peer.request("workflow.status", { workflowId }),
-    cancel: (workflowId: string, reason?: string) => this.peer.request("workflow.cancel", { workflowId, reason }),
-    list: (filter?: Record<string, unknown>) => this.peer.request("workflow.list", filter ?? {}),
-    /** 确认已收到 workflow.event seq≤lastSeq（与 stream.ack 平行，P0-3）。 */
-    ack: (workflowId: string, lastSeq: number) => this.peer.notify("workflow.ack", { workflowId, lastSeq }),
+    run: (params: {
+      project: string;
+      worktreeId?: string;
+      plan: WorkflowPlanInput;
+      input?: string;
+      policy?: WorkflowPolicy;
+      sharedContext?: WorkflowSharedContext;
+      resumeFrom?: WorkflowResumeFrom;
+      clientRequestId?: string;
+      metadata?: Record<string, unknown>;
+    }) => this.peer.request("workflow.run", params) as Promise<WorkflowRunResult>,
+    status: (workflowId: string) =>
+      this.peer.request("workflow.status", { workflowId }) as Promise<WorkflowStatusResult>,
+    cancel: (workflowId: string, reason?: string) =>
+      this.peer.request("workflow.cancel", { workflowId, reason }) as Promise<{ workflowId: string; status: "cancelled" }>,
+    list: (filter?: WorkflowListParams) =>
+      this.peer.request("workflow.list", filter ?? {}) as Promise<WorkflowListResult>,
+    /** 手动 ack workflow.event seq≤lastSeq（平时不需调用，SDK 自动 ack）。 */
+    ack: (workflowId: string, lastSeq: number) =>
+      this.peer.notify("workflow.ack", { workflowId, lastSeq }),
   };
+
+  /** 流式订阅 workflow.event（不使用 EventEmitter 字符串名的 typed 参数版本）。 */
+  onWorkflowEvent(handler: (ev: WorkflowEvent) => void): () => void {
+    const wrapper = (params: unknown) => handler(params as WorkflowEvent);
+    this.on("workflowEvent", wrapper);
+    return () => this.off("workflowEvent", wrapper);
+  }
 
   /** 设置 HITL 裁决器（device 级，所有 session 共用）。 */
   setHookDecider(fn: HookDecider): void {

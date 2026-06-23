@@ -169,20 +169,73 @@ class PhononDevice:
     async def skill_dirs(self, **filt: Any) -> dict:
         return await self._peer.request("skill.dirs", filt)
 
-    async def workflow_run(self, **params: Any) -> Any:
+    async def workflow_run(
+        self,
+        *,
+        project: str,
+        plan: dict,
+        worktree_id: str | None = None,
+        input: str | None = None,
+        policy: dict | None = None,
+        shared_context: dict | None = None,
+        resume_from: dict | None = None,
+        client_request_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Start (or resume) an L3 workflow.
+
+        plan: { mode: "dag" | "graph" | "discussion", ... }
+        policy: { onNodeFailure?: "fail_workflow"|"skip_dependents"|"continue",
+                  timeoutSeconds?, perNodeTimeoutSeconds?, maxParallel? }
+        shared_context: { text?, files?, placement: "prepend"|"append" }
+        resume_from: { workflowId, strategy, rerunNodes? }
+        """
+        params: dict = {"project": project, "plan": plan}
+        if worktree_id is not None:
+            params["worktreeId"] = worktree_id
+        if input is not None:
+            params["input"] = input
+        if policy is not None:
+            params["policy"] = policy
+        if shared_context is not None:
+            params["sharedContext"] = shared_context
+        if resume_from is not None:
+            params["resumeFrom"] = resume_from
+        if client_request_id is not None:
+            params["clientRequestId"] = client_request_id
+        if metadata is not None:
+            params["metadata"] = metadata
         return await self._peer.request("workflow.run", params)
 
-    async def workflow_status(self, workflow_id: str) -> Any:
+    async def workflow_status(self, workflow_id: str) -> dict:
         return await self._peer.request("workflow.status", {"workflowId": workflow_id})
 
-    async def workflow_cancel(self, workflow_id: str, reason: str | None = None) -> Any:
+    async def workflow_cancel(self, workflow_id: str, reason: str | None = None) -> dict:
         return await self._peer.request("workflow.cancel", {"workflowId": workflow_id, "reason": reason})
 
-    async def workflow_list(self, **filt: Any) -> Any:
-        return await self._peer.request("workflow.list", filt)
+    async def workflow_list(
+        self,
+        *,
+        status: str | None = None,
+        project_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict:
+        params: dict = {}
+        if status is not None: params["status"] = status
+        if project_id is not None: params["projectId"] = project_id
+        if since is not None: params["since"] = since
+        if until is not None: params["until"] = until
+        if limit is not None: params["limit"] = limit
+        if cursor is not None: params["cursor"] = cursor
+        return await self._peer.request("workflow.list", params)
 
     async def workflow_ack(self, workflow_id: str, last_seq: int) -> None:
-        """Acknowledge workflow.event seq<=last_seq (parallel to stream.ack, P0-3)."""
+        """Acknowledge workflow.event seq<=last_seq (parallel to stream.ack, P0-3).
+        一般不需调用：SDK 在 workflow.event 入口已自动 ack。
+        """
         await self._peer.notify("workflow.ack", {"workflowId": workflow_id, "lastSeq": last_seq})
 
     def set_hook_decider(self, fn: HookDecider) -> None:
