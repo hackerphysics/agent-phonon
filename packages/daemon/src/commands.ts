@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join, dirname, delimiter } from "node:path";
+import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
@@ -207,6 +207,65 @@ export function cmdAdapterList(): void {
   for (const a of effective) {
     const auto = cfg.adapters.some((x) => x.type === a.type) ? "" : " [auto]";
     console.log(`- ${a.type}${a.defaultAgent ? ` (agent: ${a.defaultAgent})` : ""}${auto}`);
+  }
+}
+
+function systemctlUser(args: string[]): void {
+  const r = spawnSync("systemctl", ["--user", ...args], { stdio: "inherit" });
+  if (r.status !== 0) fail(`systemctl --user ${args.join(" ")} failed`);
+}
+
+function serviceUnitPath(): string {
+  return join(homedir(), ".config", "systemd", "user", "agent-phonon.service");
+}
+
+function serviceUnitContent(): string {
+  const node = process.execPath;
+  const cli = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
+  return `[Unit]\nDescription=agent-phonon device daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${node} ${cli} start\nRestart=always\nRestartSec=5\nMemoryMax=256M\n\n[Install]\nWantedBy=default.target\n`;
+}
+
+export function cmdService(sub: string | undefined, opts: { force?: boolean } = {}): void {
+  if (platform() !== "linux") {
+    fail(`service ${sub ?? ""} is currently implemented for Linux systemd --user only (platform=${platform()})`);
+  }
+  const unit = serviceUnitPath();
+  switch (sub) {
+    case "install": {
+      if (existsSync(unit) && !opts.force) fail(`${unit} already exists (use --force to overwrite)`);
+      mkdirSync(dirname(unit), { recursive: true });
+      writeFileSync(unit, serviceUnitContent(), { mode: 0o644 });
+      chmodSync(unit, 0o644);
+      systemctlUser(["daemon-reload"]);
+      systemctlUser(["enable", "agent-phonon.service"]);
+      console.log(`installed systemd user service → ${unit}`);
+      console.log("start it with: agent-phonon service start");
+      if (!existsSync(join(homedir(), ".agent-phonon", "config.json"))) console.log("config not found yet; run: agent-phonon init");
+      break;
+    }
+    case "start":
+      systemctlUser(["start", "agent-phonon.service"]);
+      console.log("started agent-phonon.service");
+      break;
+    case "stop":
+      systemctlUser(["stop", "agent-phonon.service"]);
+      console.log("stopped agent-phonon.service");
+      break;
+    case "restart":
+      systemctlUser(["restart", "agent-phonon.service"]);
+      console.log("restarted agent-phonon.service");
+      break;
+    case "status":
+      systemctlUser(["status", "agent-phonon.service", "--no-pager"]);
+      break;
+    case "uninstall":
+      systemctlUser(["disable", "--now", "agent-phonon.service"]);
+      rmSync(unit, { force: true });
+      systemctlUser(["daemon-reload"]);
+      console.log(`removed ${unit}`);
+      break;
+    default:
+      fail("usage: agent-phonon service install|start|stop|restart|status|uninstall [--force]");
   }
 }
 

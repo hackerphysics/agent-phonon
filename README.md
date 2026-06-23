@@ -55,7 +55,7 @@ packages**. Three packages are published:
 | `packages/daemon` | `agent-phonon` (npm) | Installing/running the phonon daemon on a device |
 | `packages/protocol` | `@agent-phonon/protocol` (npm) | Reusing protocol types & zod schemas in TS |
 | `packages/sdk-server-ts` | `@agent-phonon/server-sdk` (npm) | A TS/Node server orchestrating phonon devices |
-| `sdk-python` | `agent-phonon` (PyPI) | A Python/AI server orchestrating phonon devices |
+| `sdk-python` | `agent-phonon-sdk` (PyPI) | A Python/AI server orchestrating phonon devices |
 
 `@agent-phonon/core` is the device-side implementation library; it is **bundled
 into the `agent-phonon` daemon** rather than published separately. The
@@ -72,13 +72,13 @@ production**.
 - Cross-language e2e is straightforward — verify the TS and Python SDKs both
   drive a real phonon core from the same repo.
 - Install experience is unaffected — users still
-  `npm install @agent-phonon/server-sdk` or `pip install agent-phonon`.
+  `npm install @agent-phonon/server-sdk` or `pip install agent-phonon-sdk`.
 - Splittable later — once the protocol/API stabilize and release cadences
   diverge, individual packages can move to their own repos.
 
 ## Quick start
 
-> Requires Node.js >= 20 and pnpm >= 9. (Python SDK needs Python >= 3.10.)
+> Requires Node.js >= 22.5 and pnpm >= 9. (Python SDK needs Python >= 3.10.)
 
 ```bash
 pnpm install
@@ -95,7 +95,16 @@ npm install @agent-phonon/server-sdk
 Orchestrate from a server (Python):
 
 ```bash
-pip install agent-phonon
+pip install agent-phonon-sdk
+```
+
+Install/run the device daemon from npm:
+
+```bash
+npm install -g agent-phonon
+agent-phonon init
+agent-phonon service install   # Linux systemd --user
+agent-phonon service start
 ```
 
 See [`docs/PROTOCOL.md`](./docs/PROTOCOL.md) for the wire protocol,

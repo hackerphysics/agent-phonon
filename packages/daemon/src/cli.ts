@@ -9,7 +9,7 @@ import {
   type DaemonConfig,
 } from "./config.js";
 import { existsSync } from "node:fs";
-import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall } from "./commands.js";
+import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall, cmdService } from "./commands.js";
 
 /**
  * agent-phonon CLI（bug-bash B4）。
@@ -100,6 +100,10 @@ async function main(): Promise<void> {
       else { console.error("usage: agent-phonon adapter add <type> | list"); process.exit(1); }
       break;
     }
+    case "service": {
+      cmdService(args[0], { force: flag("force") });
+      break;
+    }
     case "plugin": {
       const sub = args[0];
       if (sub === "install") cmdPluginInstall(args[1] ?? "");
@@ -114,6 +118,7 @@ async function main(): Promise<void> {
       console.log("  adapter add <type> [opts]     configure an adapter override (auto-detect covers common local agents)");
       console.log("  adapter list                  list configured + auto-detected adapters");
       console.log("  plugin install openclaw       install OpenClaw HITL plugin");
+      console.log("  service install|start|status  manage Linux systemd --user service");
       console.log("  server add <url> [--trust-local] [--device-key <k>]");
       console.log("  server list");
       console.log("  config [--show-secrets]       show config (redacted by default)");
