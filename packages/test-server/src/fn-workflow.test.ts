@@ -48,9 +48,9 @@ test("workflow.run DAG: stream.event carries workflowId/nodeId; node.result popu
   assert.equal(a.status, "completed");
   assert.equal(b.status, "completed");
   assert.equal(a.result?.status, "completed");
-  assert.equal(a.result?.text, "echo:Ainput");
+  assert.match(a.result?.text ?? "", /echo:[\s\S]*# Target Workspace[\s\S]*Ainput/);
   // 下游 B 的 input 应该被注入了上游 A 的 result.text
-  assert.match(b.result?.text ?? "", /echo:Binput[\s\S]*upstream node "a"[\s\S]*echo:Ainput/);
+  assert.match(b.result?.text ?? "", /echo:[\s\S]*Binput[\s\S]*upstream node "a"[\s\S]*echo:[\s\S]*Ainput/);
   // finalText = finalNodeId 节点的 result.text
   assert.equal(status.finalText, b.result?.text);
 
@@ -257,15 +257,11 @@ test("workflow.run discussion: chairman signal terminates after N rounds, finalT
 });
 
 test("workflow.run dag: sharedContext.text appended to every node's systemPrompt (via initialContext)", async () => {
-  // MockSession 在 inject 时不一定回显 system content；但 systemPrompt 通过 initialContext 注入
-  // 我们改用 reply 回显输入，并检查 systemPrompt 通过 createSession 传入（adapter 收到 initialContext）
-  // 这里取巧：用 MockAdapter 的 reply 拼接 — 我们让 reply 把 environment 显示出来不直接，但
-  // 可以验证：sharedContext.text 在 cwd 的某个 file 里被读到并出现在 worker 输出
-  // 改用 files：写一个文件到 workspace，让 sharedContext.files 读它
-  const reply = (input: string) => `seen: ${input.slice(0, 50)}`;
+  // MockSession 现在与真实 adapter 一致：把 initialContext（含 sharedContext.text + node systemPrompt）
+  // 拼进首轮 input。reply 原样回显完整 input，可直接断言 sharedContext.text 被注入。
+  const reply = (input: string) => `SEEN::${input}`;
   const tc = makeConn(reply);
   const project = await tc.call("project.create", { name: "wf-shared" }) as { project: { projectId: string; path: string } };
-  // 直接传 text 验证（file 系统验证留给真实场景）
   const run = await tc.call("workflow.run", {
     project: project.project.projectId,
     plan: {
@@ -277,11 +273,12 @@ test("workflow.run dag: sharedContext.text appended to every node's systemPrompt
 
   const status = await waitWorkflow(tc, run.workflowId) as { status: string };
   assert.equal(status.status, "completed");
-  // 既然 MockSession.send 收到 input 但 systemPrompt 通过 initialContext 走的，
-  // 我们最少验证 workflow 跑成功（不报错）；细节验证留给手动调试
-  // 也可以通过断言 reply 内容跟 input 相关：
   const node = (status as unknown as { nodes: Array<{ result?: { text?: string } }> }).nodes[0];
-  assert.match(node?.result?.text ?? "", /seen: hello/);
+  const text = node?.result?.text ?? "";
+  // sharedContext.text 必须到达 adapter input（这正是 initialContext 传递修复验证的核心）
+  assert.match(text, /Common rules: be terse\./);
+  // node 原始 input 也要在
+  assert.match(text, /hello/);
 });
 
 test("workflow.run resumeFrom: resume failed workflow re-runs failed node only", async () => {
@@ -522,4 +519,37 @@ test("workflow.run graph: human_review interaction never responds → engine loc
   assert.ok(events.length >= 1, `expected ≥1 human_review.resolved events, got ${events.length}`);
   const hasTimeout = events.some((e) => /timed out locally/.test(((e.payload as { feedback?: string })?.feedback) ?? ""));
   assert.ok(hasTimeout, "at least one human_review.resolved should be marked as local timeout");
+});
+
+// 防回归（真实测试暴露的 bug）: workflow node 的 systemPrompt 必须经 initialContext 传到 adapter
+// 背景: 6 个 spawn adapter 原本都在 createSession 丢弃了 initialContext，导致 workflow 给
+// executor/worker 设的 systemPrompt 根本没传给模型。这里用 MockSession（现已与真实 adapter 一致
+// 地消费 initialContext）验证 systemPrompt 真的到达了 node 的 input。
+test("workflow: node systemPrompt is delivered to adapter via initialContext (dag)", async () => {
+  // reply 原样回显 input，便于断言 systemPrompt 被拼进首轮
+  const tc = makeConn((i) => `SEEN_INPUT::${i}`);
+  const project = await tc.call("project.create", { name: "wf-sysprompt" }) as { project: { projectId: string } };
+  const SENTINEL = "SYSPROMPT_SENTINEL_42 you must obey this role";
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "do the task",
+    plan: {
+      mode: "dag",
+      nodes: [
+        { nodeId: "a", agent: "mock:a", model: "m1", input: "node A input", systemPrompt: SENTINEL },
+      ],
+      finalNodeId: "a",
+    },
+  }) as { workflowId: string };
+  const status = await waitWorkflow(tc, run.workflowId) as { status: string; nodes: Array<{ nodeId: string; result?: { text?: string } }> };
+  assert.equal(status.status, "completed");
+  const nodeA = status.nodes.find((n) => n.nodeId === "a");
+  // node 的 result.text 是 reply(effectiveInput)，而 effectiveInput 应该包含被拼进的 systemPrompt sentinel
+  const resultText = nodeA?.result?.text ?? "";
+  assert.ok(
+    resultText.includes(SENTINEL),
+    `node systemPrompt should reach adapter input; got: ${resultText.slice(0, 200)}`,
+  );
+  assert.match(resultText, /# Target Workspace/, "target workspace block should reach adapter input");
+  assert.match(resultText, new RegExp(project.project.projectId), "target workspace should include project id");
 });

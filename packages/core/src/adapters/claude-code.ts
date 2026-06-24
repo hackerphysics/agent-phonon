@@ -10,6 +10,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
+import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 
 /**
@@ -95,12 +96,16 @@ class ClaudeCodeSession implements AdapterSession {
     return this.settingsPath;
   }
 
-  constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv) {
+  constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.env = env;
     this.uuid = randomUUID();
+    // contextInjection: 把 createSession 的 initialContext（含 workflow systemPrompt/角色定义）
+    // 暂存进 pendingInject，首轮 send 拼进 prompt（修：之前 initialContext 被丢弃，
+    // 导致 workflow node 的 systemPrompt 没传给模型）。
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
@@ -276,7 +281,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
-    return new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env);
+    return new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
   }
 
   private probeVersion(): Promise<string | null> {

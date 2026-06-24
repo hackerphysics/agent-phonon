@@ -433,7 +433,7 @@ test("e2e DISCUSSION: maxRounds hard cap when no termination signal ever sent", 
 test("e2e sharedContext: text + files are injected into every node's systemPrompt", { timeout: 30000 }, async () => {
   // workspace 充当 phonon 的 allowed root + project 默认目录
   const ws = mkdtempSync(join(tmpdir(), "phonon-shared-"));
-  const fx = await makeFixture((input) => `seen: ${input.slice(0, 30)}`, ws);
+  const fx = await makeFixture((input) => `seen: ${input}`, ws);
   try {
     // project.create 不传 path → phonon 在 workspace 下自动建
     const proj = await fx.device.project.create({ name: "shared", git: false }) as { project: { projectId: string; path: string } };
@@ -455,8 +455,11 @@ test("e2e sharedContext: text + files are injected into every node's systemPromp
     }) as { workflowId: string };
     const st = await waitWorkflow(fx.device, run.workflowId) as { status: string; nodes: Array<{ result?: { text?: string } }> };
     assert.equal(st.status, "completed");
-    // 至少能跑通；systemPrompt 拼接逻辑由 unit test 覆盖
-    assert.equal(st.nodes[0]?.result?.text, "seen: hello");
+    // initialContext 修复后：sharedContext.text + files 真的注入到 node 的 input（经 systemPrompt）
+    const text = st.nodes[0]?.result?.text ?? "";
+    assert.match(text, /PROJECT RULES: respond in JSON/, "sharedContext.text should reach adapter input");
+    assert.match(text, /Use 4-space indent/, "sharedContext.files content should reach adapter input");
+    assert.match(text, /hello/, "node input should still be present");
   } finally { await fx.cleanup(); }
 });
 
@@ -546,7 +549,9 @@ test("e2e stream events carry workflowId+nodeId+role through real SDK", { timeou
     const n1 = st.nodes.find((n) => n.nodeId === "n1")!;
     assert.equal(n1.role, "scribe");
     assert.ok(n1.sessionId, "node should have a sessionId");
-    assert.equal(n1.result?.text, "echo: scribble");
+    // initialContext 修复后：role 会注入 "# Workflow Role" systemPrompt 到 input，
+    // 所以 echo 回显里能看到 role/workflow 信息 + 原始 input。
+    assert.match(n1.result?.text ?? "", /Workflow Role|scribe|scribble/, "role systemPrompt should reach adapter input");
   } finally { await fx.cleanup(); }
 });
 

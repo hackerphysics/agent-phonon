@@ -21,3 +21,4 @@ sdk-python/dist/
 device.key
 *.bak-*
 dist-test/
+tmp-realtest/

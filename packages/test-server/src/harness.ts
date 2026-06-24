@@ -1,4 +1,4 @@
-import { PhononConnection, type RpcTransport, type AgentAdapter, type AdapterSession } from "@agent-phonon/core";
+import { PhononConnection, type RpcTransport, type AgentAdapter, type AdapterSession, formatInitialContextLines } from "@agent-phonon/core";
 import type { StreamEvent, ContextItem } from "@agent-phonon/protocol";
 
 /**
@@ -61,8 +61,8 @@ export class MockAdapter implements AgentAdapter {
     }));
   }
 
-  async createSession(params: { sessionId: string; agentId: string; model: string; cwd: string }): Promise<AdapterSession> {
-    const s = new MockSession(params.sessionId, params.model, this.opts);
+  async createSession(params: { sessionId: string; agentId: string; model: string; cwd: string; initialContext?: ContextItem[] }): Promise<AdapterSession> {
+    const s = new MockSession(params.sessionId, params.model, this.opts, params.initialContext);
     this.lastSession = s;
     return s;
   }
@@ -81,11 +81,17 @@ export class MockSession implements AdapterSession {
   compressed = 0;
   lastEnvironment?: Record<string, string>;
 
-  constructor(sessionId: string, model: string, opts: MockAdapterOpts) {
+  constructor(sessionId: string, model: string, opts: MockAdapterOpts, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
     this.opts = opts;
+    // 与真实 adapter 一致：把 initialContext（含 workflow systemPrompt）暂存，首轮 send 拼进 input。
+    // （之前 MockSession 也丢弃 initialContext，所以 systemPrompt 未传递的 bug 一直没被测出）
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
+
+  /** 暂存的注入上下文（首轮 send 拼进 input，与真实 adapter 一致）。 */
+  private pendingInject: string[] = [];
 
   async send(input: string, o: { turnId: string; verbosity: string; skills?: string[]; environment?: Record<string, string>; emit: (e: StreamEvent) => void; signal?: AbortSignal }): Promise<void> {
     if (this.opts.sendDelayMs) {
@@ -100,7 +106,13 @@ export class MockSession implements AdapterSession {
       }
     }
     this.lastEnvironment = o.environment;
-    const text = (this.opts.reply ?? ((i: string) => i))(input);
+    // 首轮拼进暂存的注入（含 systemPrompt），与真实 adapter 一致
+    let effectiveInput = input;
+    if (this.pendingInject.length > 0) {
+      effectiveInput = this.pendingInject.join("\n") + "\n\n" + effectiveInput;
+      this.pendingInject = [];
+    }
+    const text = (this.opts.reply ?? ((i: string) => i))(effectiveInput);
     o.emit({ type: "message", sessionId: this.sessionId, turnId: o.turnId, seq: 0, at: new Date().toISOString(), role: "assistant", text, delta: true } as StreamEvent);
     o.emit({ type: "result", sessionId: this.sessionId, turnId: o.turnId, seq: 0, at: new Date().toISOString(), text, status: "completed", final: true } as StreamEvent);
   }

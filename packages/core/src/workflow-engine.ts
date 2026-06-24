@@ -922,7 +922,7 @@ export class WorkflowEngine {
       const cwd = exec.cwd;
       const effectiveProject = exec.projectId;
       const effectiveWorktreeId = exec.worktreeId;
-      const systemPrompt = this.buildSystemPrompt(run, nodeSystemPrompt, cwd, role);
+      const systemPrompt = this.buildSystemPrompt(run, nodeSystemPrompt, cwd, role, effectiveProject, effectiveWorktreeId);
       const initialContext = systemPrompt ? [{ role: "system" as const, content: systemPrompt }] : undefined;
 
       // ---- session 获取：persistent 复用 cache；burner 每次新建 ----
@@ -1246,7 +1246,7 @@ export class WorkflowEngine {
   // SharedContext: 把 sharedContext (text + files) 拼到每个 node 的 systemPrompt
   // ---------------------------------------------------------------------------
 
-  private buildSystemPrompt(run: WorkflowRunState, nodeSystemPrompt: string | undefined, cwd: string, role?: string): string | undefined {
+  private buildSystemPrompt(run: WorkflowRunState, nodeSystemPrompt: string | undefined, cwd: string, role?: string, projectId?: string, worktreeId?: string): string | undefined {
     const segments: string[] = [];
 
     // 问题 D 修复（2026-06-23 真 Claude 跳出角色）：role 字段加进 system prompt，
@@ -1256,6 +1256,10 @@ export class WorkflowEngine {
         `# Workflow Role\n\nYou are participating in an agent-phonon workflow (workflowId=${run.workflowId}, mode=${run.mode}).\nYour role in this workflow: **${role}**.\nNode id: ${this.nodeContextForPrompt(run, role) ?? "current"}.\nStay in this role for the entire turn. Do not break character.`,
       );
     }
+
+    segments.push(
+      `# Target Workspace\n\nProject ID: ${projectId ?? "(none)"}\nWorktree ID: ${worktreeId ?? "(main project directory)"}\nTarget path: ${cwd}\n\nDo all project file operations under the target path above. If your runtime starts elsewhere, first switch to this target path before reading or writing project files.`,
+    );
 
     const sc = run.sharedContext;
     if (sc) {

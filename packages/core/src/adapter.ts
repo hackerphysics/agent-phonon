@@ -87,6 +87,23 @@ export interface CreateSessionParams {
 }
 
 /**
+ * 把 createSession 的 initialContext（含 workflow systemPrompt / 角色定义 / 预置上下文）
+ * 转成可拼进首轮 message 的文本行。
+ *
+ * 背景：spawn 类 adapter（OpenClaw / Claude Code / Codex / Hermes / OpenCode）没有独立的
+ * system-prompt 通道，之前 createSession 直接丢弃了 initialContext，导致 workflow 给 executor/
+ * worker 设的 systemPrompt 根本没传给模型。统一通过这个 helper 把它们拼进 pendingInject，
+ * 首轮 send 自动带上（复用各 adapter 已有的 pendingInject 机制，不额外起 turn）。
+ */
+export function formatInitialContextLines(initialContext?: ContextItem[]): string[] {
+  if (!initialContext || initialContext.length === 0) return [];
+  return initialContext.map((c) => {
+    const tag = c.role === "system" ? "[SYSTEM]" : c.role === "assistant" ? "[ASSISTANT]" : "[CONTEXT]";
+    return `${tag}\n${c.content}`;
+  });
+}
+
+/**
  * Adapter 顶层接口。
  *
  * runtime vs agent（design D32）：

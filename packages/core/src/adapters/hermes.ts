@@ -11,6 +11,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
+import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 
 /**
@@ -131,7 +132,7 @@ class HermesSession implements AdapterSession {
   private current?: ReturnType<typeof spawn>;
   private pendingInject: string[] = [];
 
-  constructor(sessionId: string, model: string, cwd: string, env: HermesEnv, profile: string) {
+  constructor(sessionId: string, model: string, cwd: string, env: HermesEnv, profile: string, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
@@ -139,6 +140,8 @@ class HermesSession implements AdapterSession {
     this.profile = profile;
     this.hermesSessionId = randomUUID();
     this.convName = `phonon-${sessionId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    // contextInjection: 注入 initialContext（含 workflow systemPrompt）进首轮 message
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
@@ -340,7 +343,7 @@ export class HermesAdapter implements AgentAdapter {
     // 从复合 agentId 解出 profile：hermes:default → default
     const profile = params.agentId.includes(":") ? params.agentId.split(":")[1]! : this.defaultProfile;
     const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "");
-    return new HermesSession(params.sessionId, model, params.cwd, this.env, profile);
+    return new HermesSession(params.sessionId, model, params.cwd, this.env, profile, params.initialContext);
   }
 
   /** 枚举 Hermes profile（去 ANSI 色解析 profile list）。 */

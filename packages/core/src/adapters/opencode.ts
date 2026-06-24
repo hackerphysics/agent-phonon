@@ -10,6 +10,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
+import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } from "@agent-phonon/protocol";
 
 /**
@@ -68,11 +69,13 @@ class OpenCodeSession implements AdapterSession {
   private current?: ReturnType<typeof spawn>;
   private pendingInject: string[] = [];
 
-  constructor(sessionId: string, model: string, cwd: string, bin: string) {
+  constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.bin = bin;
+    // contextInjection: 注入 initialContext（含 workflow systemPrompt）进首轮 message
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
@@ -228,7 +231,7 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     const model = params.model && params.model !== "default" ? params.model : (this.defaultModel ?? "");
-    return new OpenCodeSession(params.sessionId, model, params.cwd, this.bin);
+    return new OpenCodeSession(params.sessionId, model, params.cwd, this.bin, params.initialContext);
   }
 
   private probeVersion(): Promise<string | null> {

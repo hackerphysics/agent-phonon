@@ -9,6 +9,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
+import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 
 /**
@@ -153,11 +154,13 @@ class CodexSession implements AdapterSession {
   private current?: ReturnType<typeof spawn>;
   private pendingInject: string[] = [];
 
-  constructor(sessionId: string, model: string, cwd: string, env: CodexEnv) {
+  constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.env = env;
+    // contextInjection: 注入 initialContext（含 workflow systemPrompt）进首轮 message
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
   private providerArgs(): string[] {
@@ -309,7 +312,7 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
-    return new CodexSession(params.sessionId, params.model, params.cwd, this.env);
+    return new CodexSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
   }
 
   private async discoverModels(): Promise<ModelInfo[]> {

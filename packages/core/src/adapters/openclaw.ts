@@ -9,6 +9,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
+import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } from "@agent-phonon/protocol";
 
 /**
@@ -56,13 +57,18 @@ class OpenClawSession implements AdapterSession {
   /** 暂存的注入上下文（下次 send 拼进 input，不单独跑一轮，修 P0#13）。 */
   private pendingInject: string[] = [];
 
-  constructor(sessionId: string, model: string, cwd: string, openclawAgent = "main") {
+  constructor(sessionId: string, model: string, cwd: string, openclawAgent = "main", initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.openclawAgent = openclawAgent;
     // 用 phonon sessionId 派生稳定的 OpenClaw session-key
     this.sessionKey = `agent:${openclawAgent}:phonon-${sessionId}`;
+    // contextInjection: 把 createSession 的 initialContext（含 workflow systemPrompt/角色定义）
+    // 暂存进 pendingInject，首轮 send 时拼进首条 message。OpenClaw spawn 版没有独立
+    // system-prompt 通道，这是注入 system 上下文的唯一可靠方式（修：之前 initialContext 被丢弃，
+    // 导致 workflow executor 的 systemPrompt 根本没传给模型）。
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
@@ -265,7 +271,7 @@ export class OpenClawAdapter implements AgentAdapter {
     const openclawAgent =
       (params.agentConfig?.openclawAgent as string) ??
       (params.agentId?.includes(":") ? params.agentId.split(":")[1]! : this.defaultAgent);
-    return new OpenClawSession(params.sessionId, params.model, params.cwd, openclawAgent);
+    return new OpenClawSession(params.sessionId, params.model, params.cwd, openclawAgent, params.initialContext);
   }
 
   private probeVersion(): Promise<string | null> {

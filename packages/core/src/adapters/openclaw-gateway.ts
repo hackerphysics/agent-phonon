@@ -4,6 +4,7 @@ import type {
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
+import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 import { GatewayClient, type GatewayConfig } from "../gateway-client.js";
 import { randomUUID } from "node:crypto";
@@ -58,13 +59,18 @@ class GatewaySession implements AdapterSession {
     this.unsolicitedSink = sink;
   }
 
-  constructor(gw: GatewayClient, sessionId: string, model: string, openclawAgent: string) {
+  constructor(gw: GatewayClient, sessionId: string, model: string, openclawAgent: string, initialContext?: ContextItem[]) {
     this.gw = gw;
     this.sessionId = sessionId;
     this.model = model;
     this.openclawAgent = openclawAgent;
     this.sessionKey = `agent:${openclawAgent}:phonon-${sessionId}`;
+    // contextInjection: 暂存 initialContext（含 workflow systemPrompt），首轮 send 拼进 message。
+    this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
+
+  /** 暂存的注入上下文（首轮 send 拼进 message，与其他 adapter 一致）。 */
+  private pendingInject: string[] = [];
 
   get key(): string {
     return this.sessionKey;
@@ -130,8 +136,13 @@ class GatewaySession implements AdapterSession {
   async send(input: string, opts: SendOptions): Promise<void> {
     const { turnId, emit } = opts;
     let message = input;
+    // 暂存的注入（含首轮 systemPrompt）先拼进本轮
+    if (this.pendingInject.length > 0) {
+      message = this.pendingInject.join("\n") + "\n\n" + message;
+      this.pendingInject = [];
+    }
     if (opts.skills && opts.skills.length > 0) {
-      message = `[必须本轮加载并使用这些 skill: ${opts.skills.join(", ")}]\n\n${input}`;
+      message = `[必须本轮加载并使用这些 skill: ${opts.skills.join(", ")}]\n\n${message}`;
     }
 
     await new Promise<void>((resolve) => {
@@ -346,7 +357,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     const subAgent =
       (params.agentConfig?.openclawAgent as string) ??
       (params.agentId.includes(":") ? params.agentId.split(":")[1]! : this.defaultAgent);
-    const session = new GatewaySession(this.gw, params.sessionId, params.model, subAgent);
+    const session = new GatewaySession(this.gw, params.sessionId, params.model, subAgent, params.initialContext);
     // sessions.create 失败要外显（修 P0#6），不能静默吞
     try {
       await this.gw.rpc("sessions.create", { key: session.key, model: params.model }, 15000);
