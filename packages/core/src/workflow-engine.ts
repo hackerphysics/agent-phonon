@@ -644,7 +644,8 @@ export class WorkflowEngine {
           const reviewResult = await this.requestHumanReview(run, directive);
           if (reviewResult.approved) {
             terminated = true;
-            finalSummary = reviewResult.feedback ?? directive.summary;
+            // v0.7 review fix: reviewer 不填 feedback 时，优先保留 executor 原始产出（不丢 LLM 输出），其次才是 directive.summary。
+            finalSummary = reviewResult.feedback ?? lastExecutorText ?? directive.summary;
             exitReason = "done";
             break;
           }
@@ -1042,12 +1043,33 @@ export class WorkflowEngine {
       },
     };
     let response: { approved?: boolean; feedback?: string; reviewer?: string; values?: Record<string, unknown> };
+    // v0.7 补补丁：engine 本地 timeout race，防止 server 不 honor timeoutSeconds 或永远不回导致 workflow 永久挂死。
+    // 策略：取 directive.timeoutSeconds + 5 秒宽限（留 server 优先回的机会），在 phonon 这边超时 → reject + emit resolved。
+    const localTimeoutMs = Math.max(1000, directive.timeoutSeconds * 1000 + 5000);
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
-      response = await this.opts.requestInteraction(interactionParams) as never;
+      const timeoutP = new Promise<"__local_timeout__">((resolve) => {
+        timeoutHandle = setTimeout(() => resolve("__local_timeout__"), localTimeoutMs);
+      });
+      const raceResult = await Promise.race([
+        this.opts.requestInteraction(interactionParams),
+        timeoutP,
+      ]);
+      if (raceResult === "__local_timeout__") {
+        const toResult = {
+          approved: false,
+          feedback: `human review timed out locally after ${localTimeoutMs}ms (directive timeoutSeconds=${directive.timeoutSeconds})`,
+        };
+        this.emit(run, { type: "human_review.resolved", payload: toResult });
+        return toResult;
+      }
+      response = raceResult as never;
     } catch (e) {
       const errResult = { approved: false, feedback: `interaction failed: ${(e as Error).message}` };
       this.emit(run, { type: "human_review.resolved", payload: errResult });
       return errResult;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
     // server 可能返回 { values: {...} } 或直接平铺
     const values = (response?.values ?? response) as { approved?: boolean; feedback?: string; reviewer?: string };

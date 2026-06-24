@@ -179,10 +179,18 @@ export class TestConn {
     if (msg.method === "workflow.event") { this.notifications.push(msg.params as Record<string, unknown>); return; }
     // phonon → server 请求（hook.fired / document.* / interaction.* 等）：回响应
     if (typeof msg.method === "string" && "id" in msg) {
-      let result: unknown = { applied: true };
-      if (msg.method === "hook.fired" && this.hookDecider) result = this.hookDecider(msg.params as Record<string, unknown>);
-      else if (this.requestResponders.has(msg.method)) result = this.requestResponders.get(msg.method)!(msg.params);
-      void this.conn.handle(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+      const method = msg.method;
+      const id = msg.id;
+      const params = msg.params;
+      void (async () => {
+        let result: unknown = { applied: true };
+        if (method === "hook.fired" && this.hookDecider) result = this.hookDecider(params as Record<string, unknown>);
+        else if (this.requestResponders.has(method)) {
+          // responder 可能返回 Promise（模拟慢响应 / 永不响应）——需 await
+          result = await Promise.resolve(this.requestResponders.get(method)!(params));
+        }
+        void this.conn.handle(JSON.stringify({ jsonrpc: "2.0", id, result }));
+      })();
     }
   }
 

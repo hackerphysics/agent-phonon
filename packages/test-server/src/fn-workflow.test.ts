@@ -407,3 +407,119 @@ test("workflow.run graph: workflow.human_review rejected → feedback goes back 
   // executor 应该被调过至少 2 次（首轮 emit review + reject 后第二轮 emit done）
   assert.equal(sawRejectedFeedback, true, "executor should have received [HUMAN REVIEW REJECTED] feedback in followup turn");
 });
+
+// v0.7 review fix #3: 连续 rejected 撞 maxIterations → workflow failed with terminationReason=max_iterations
+test("workflow.run graph: continuous human_review rejected reaches maxIterations → failed", async () => {
+  let rejectCount = 0;
+  const tc = makeConn((_input) => {
+    // executor 每一轮都 emit human_review（永远不 done，模拟卡死场景）
+    return [
+      "Need human review again:",
+      "```phonon.workflow.human_review",
+      JSON.stringify({ title: "Plan review", summary: "Plan A" }),
+      "```",
+    ].join("\n");
+  });
+  tc.setRequestResponder("interaction.request", () => {
+    rejectCount++;
+    return { values: { approved: false, feedback: `reject #${rejectCount}: try again`, reviewer: "bob" } };
+  });
+
+  const project = await tc.call("project.create", { name: "wf-hr-reject-loop" }) as { project: { projectId: string } };
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "do",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:executor", model: "m1" },
+      workers: [{ nodeId: "w", agent: "mock:a", model: "m1", role: "worker" }],
+      communicationGraph: { edges: [{ from: "exec", to: "w" }], maxIterations: 3 },
+    },
+  }) as { workflowId: string };
+
+  const status = await waitWorkflow(tc, run.workflowId) as { status: string; error?: string };
+  assert.equal(status.status, "failed");
+  assert.match(status.error ?? "", /max_iterations|reached maxIterations=3/);
+  // 每轮都 reject 一次，应该至少 ≥3 次（maxIterations=3）
+  assert.ok(rejectCount >= 3, `expected at least 3 rejects, got ${rejectCount}`);
+  const events = tc.notifications.filter((e) => e.workflowId === run.workflowId);
+  const failedEv = events.find((e) => e.type === "workflow.status" && (e.payload as { error?: string })?.error?.includes?.("max_iterations"));
+  assert.ok(failedEv, "should emit failed status with max_iterations terminationReason");
+});
+
+// v0.7 review fix #2: approved=true 但 reviewer 无 feedback → finalText 回退到 executor 最后一轮原文
+test("workflow.run graph: human_review approved without feedback → finalText falls back to last executor output", async () => {
+  const EXECUTOR_RAW_TEXT = "Plan A: build a foo, then a bar, then a baz. END.";
+  const tc = makeConn((input) => {
+    if (input.includes("EXECUTOR of a multi-agent workflow")) {
+      // executor 输出大段实质内容 + 一个 human_review directive
+      return [
+        EXECUTOR_RAW_TEXT,
+        "",
+        "```phonon.workflow.human_review",
+        JSON.stringify({ title: "Approve my plan", summary: "Should we ship?" }),
+        "```",
+      ].join("\n");
+    }
+    return "worker output";
+  });
+  // reviewer 点同意，但 feedback 字段缺省
+  tc.setRequestResponder("interaction.request", () => ({ values: { approved: true, reviewer: "alice" } }));
+
+  const project = await tc.call("project.create", { name: "wf-hr-approve-no-feedback" }) as { project: { projectId: string } };
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "do",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:executor", model: "m1" },
+      workers: [{ nodeId: "w", agent: "mock:a", model: "m1", role: "worker" }],
+      communicationGraph: { edges: [{ from: "exec", to: "w" }], maxIterations: 3 },
+    },
+  }) as { workflowId: string };
+
+  const status = await waitWorkflow(tc, run.workflowId) as { status: string; finalText?: string };
+  assert.equal(status.status, "completed");
+  // 关键：finalText 应该包含 executor 的实际产出，而不是 directive.summary（"Should we ship?"）
+  assert.match(status.finalText ?? "", /Plan A: build a foo/);
+  assert.doesNotMatch(status.finalText ?? "", /^Should we ship\?$/);
+});
+
+// v0.7 review fix #1: server 不回 interaction.request → engine 本地 timeout race 兜底
+test("workflow.run graph: human_review interaction never responds → engine local timeout treats as rejected (then maxIterations)", async () => {
+  const tc = makeConn((_input) => {
+    // executor 每轮都 emit human_review，且 directive 把 timeoutSeconds 设得极小（1 秒）
+    return [
+      "Need quick review:",
+      "```phonon.workflow.human_review",
+      JSON.stringify({ title: "x", summary: "y", timeoutSeconds: 1 }),
+      "```",
+    ].join("\n");
+  });
+  // 故意不设 setRequestResponder → harness 默认走 { applied: true } 立即回
+  // 但我们要模拟 "永不回" → 用一个永远 pending 的 responder
+  tc.setRequestResponder("interaction.request", () => new Promise(() => { /* never resolves */ }));
+
+  const project = await tc.call("project.create", { name: "wf-hr-timeout" }) as { project: { projectId: string } };
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "do",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:executor", model: "m1" },
+      workers: [{ nodeId: "w", agent: "mock:a", model: "m1", role: "worker" }],
+      communicationGraph: { edges: [{ from: "exec", to: "w" }], maxIterations: 2 },
+    },
+  }) as { workflowId: string };
+
+  // 每轮 timeout=1s+5s 兜底=6s；maxIterations=2 → 整体应 ~12s 内结束
+  const status = await waitWorkflow(tc, run.workflowId, 30000) as { status: string; error?: string };
+  // 超时后被当 rejected，executor 又 emit 同一 directive，最终撞 maxIterations
+  assert.equal(status.status, "failed");
+  assert.match(status.error ?? "", /max_iterations|reached maxIterations/);
+  // 应该出现至少 2 次 human_review.resolved（每轮一次）且都带 "timed out locally" feedback
+  const events = tc.notifications.filter((e) => e.workflowId === run.workflowId && e.type === "human_review.resolved");
+  assert.ok(events.length >= 1, `expected ≥1 human_review.resolved events, got ${events.length}`);
+  const hasTimeout = events.some((e) => /timed out locally/.test(((e.payload as { feedback?: string })?.feedback) ?? ""));
+  assert.ok(hasTimeout, "at least one human_review.resolved should be marked as local timeout");
+});
