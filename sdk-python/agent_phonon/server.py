@@ -237,6 +237,23 @@ class PhononDevice:
     async def workflow_status(self, workflow_id: str) -> dict:
         return await self._peer.request("workflow.status", {"workflowId": workflow_id})
 
+    async def workflow_resume(
+        self,
+        workflow_id: str,
+        strategy: str = "failed_node",
+        rerun_nodes: list[str] | None = None,
+        feedback: str | None = None,
+        shared_context_patch: dict | None = None,
+    ) -> dict:
+        params: dict = {"workflowId": workflow_id, "strategy": strategy}
+        if rerun_nodes is not None:
+            params["rerunNodes"] = rerun_nodes
+        if feedback is not None:
+            params["feedback"] = feedback
+        if shared_context_patch is not None:
+            params["sharedContextPatch"] = shared_context_patch
+        return await self._peer.request("workflow.resume", params)
+
     async def workflow_cancel(self, workflow_id: str, reason: str | None = None) -> dict:
         return await self._peer.request("workflow.cancel", {"workflowId": workflow_id, "reason": reason})
 
