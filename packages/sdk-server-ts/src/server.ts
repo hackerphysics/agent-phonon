@@ -152,6 +152,9 @@ export class PhononDevice extends EventEmitter {
   private peer: RpcPeer;
   private sessions = new Map<string, PhononSession>();
   private hookDecider?: HookDecider;
+  private interactionHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private documentHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private prepareUploadHandler?: (params: unknown) => Promise<unknown> | unknown;
   /** 自发输出（无对应 session 时）回调。 */
   private onUnsolicited?: (ev: StreamEvent) => void;
 
@@ -303,6 +306,23 @@ export class PhononDevice extends EventEmitter {
   setHookDecider(fn: HookDecider): void {
     this.hookDecider = fn;
   }
+  /**
+   * v0.7: 设置 interaction.request 回调（HITL / workflow.human_review 走这里）。
+   * 回调返回值会同步作为 phonon 侧 RPC 响应。可以是 async。
+   * 不设置时，SDK 默认回 { action: "cancel" }，phonon 端会按 rejected 处理。
+   * 推荐返回 `{ values: { approved: boolean, feedback?: string, reviewer?: string } }`。
+   */
+  setInteractionHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
+    this.interactionHandler = fn;
+  }
+  /** v0.7: 设置 document.send 处理器（不设则默认 delivered=[]）。 */
+  setDocumentHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
+    this.documentHandler = fn;
+  }
+  /** v0.7: 设置 document.prepare_upload 处理器（不设则默认空 stub）。 */
+  setPrepareUploadHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
+    this.prepareUploadHandler = fn;
+  }
   /** 设置自发输出回调。 */
   setUnsolicitedHandler(fn: (ev: StreamEvent) => void): void {
     this.onUnsolicited = fn;
@@ -341,9 +361,22 @@ export class PhononDevice extends EventEmitter {
       this.emit("workflowEvent", params);
       return null;
     }
-    if (method === "document.send") { this.emit("document", params); return { delivered: [] }; }
-    if (method === "document.prepare_upload") { this.emit("prepareUpload", params); return { uploadRef: newId(), uploadUrl: "", method: "PUT" }; }
-    if (method === "interaction.request") { this.emit("interaction", params); return { requestId: (params as { requestId: string }).requestId, action: "cancel" }; }
+    if (method === "document.send") {
+      this.emit("document", params);
+      if (this.documentHandler) return await this.documentHandler(params);
+      return { delivered: [] };
+    }
+    if (method === "document.prepare_upload") {
+      this.emit("prepareUpload", params);
+      if (this.prepareUploadHandler) return await this.prepareUploadHandler(params);
+      return { uploadRef: newId(), uploadUrl: "", method: "PUT" };
+    }
+    if (method === "interaction.request") {
+      this.emit("interaction", params);
+      if (this.interactionHandler) return await this.interactionHandler(params);
+      // v0.7: 默认没注册 handler 时，engine 会按 rejected 处理（进 进 欢迎改进。返回 cancel 动作）。
+      return { requestId: (params as { requestId?: string })?.requestId, action: "cancel" };
+    }
     return null;
   }
 

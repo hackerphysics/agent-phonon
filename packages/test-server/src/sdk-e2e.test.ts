@@ -19,6 +19,29 @@ function dialPhonon(serverUrl: string, deviceId: string, deviceKey?: string) {
   return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, resolveProjectCwd: () => cwd, deviceKey });
 }
 
+function dialPhononHR(serverUrl: string, deviceId: string, deviceKey?: string) {
+  // 专给 v0.7 HITL 测试用的 phonon：executor 会 emit workflow.human_review directive
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({
+    name: "mock",
+    agentIds: ["mock:exec", "mock:w"],
+    models: ["m1"],
+    reply: (input: string) => {
+      if (input.includes("EXECUTOR of a multi-agent workflow")) {
+        return [
+          "need review",
+          "```phonon.workflow.human_review",
+          JSON.stringify({ title: "Approve?", summary: "plan A", timeoutSeconds: 30 }),
+          "```",
+        ].join("\n");
+      }
+      return "worker out";
+    },
+  }));
+  const cwd = mkdtempSync(join(tmpdir(), "phonon-sdk-hr-"));
+  return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, resolveProjectCwd: () => cwd, deviceKey });
+}
+
 test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, async () => {
   const server = new PhononServer({ authenticate: (id) => ({ tenantId: `t-${id}` }) });
   const port = await server.listen();
@@ -120,5 +143,61 @@ test("server-sdk: MULTI-DEVICE — one server manages multiple phonons", { timeo
   }
 
   c1.close(); c2.close(); c3.close();
+  await server.close();
+});
+
+// v0.7: 用 TS SDK setInteractionHandler 走通 workflow.human_review 全链路
+test("server-sdk: v0.7 HITL via device.setInteractionHandler + workflow.human_review", { timeout: 30000 }, async () => {
+  const server = new PhononServer();
+  const port = await server.listen();
+  const deviceReady = new Promise<import("@agent-phonon/server-sdk").PhononDevice>((resolve) => server.on("device", resolve));
+  const client = dialPhononHR(`ws://127.0.0.1:${port}`, "dev-hr");
+  await client.connect();
+  const device = await deviceReady;
+
+  // 注册 interaction handler（同步 reply）
+  const reviewSeen: unknown[] = [];
+  device.setInteractionHandler((params: unknown) => {
+    reviewSeen.push(params);
+    return { values: { approved: true, feedback: "shipped by TS SDK handler", reviewer: "alice" } };
+  });
+
+  const proj = await device.project.create({ name: "p-hr", git: false });
+  const wf = await device.workflow.run({
+    project: proj.project.projectId,
+    input: "do",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:exec", model: "m1" },
+      workers: [{ nodeId: "w", agent: "mock:w", model: "m1", role: "worker" }],
+      communicationGraph: { edges: [{ from: "exec", to: "w" }], maxIterations: 3 },
+    },
+  });
+
+  // 轮询 status 直到终态
+  let st: { status: string; finalText?: string } | undefined;
+  for (let i = 0; i < 200; i++) {
+    st = await device.workflow.status(wf.workflowId) as { status: string; finalText?: string };
+    if (["completed", "failed", "cancelled", "timeout"].includes(st.status)) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(st?.status, "completed");
+  assert.match(st?.finalText ?? "", /shipped by TS SDK handler/);
+  assert.ok(reviewSeen.length >= 1, "interaction handler should have been called at least once");
+
+  // v0.7: workflow.resume RPC 可达性验证（不存在的 wf 应报 errInvalidParams）
+  let resumeErrMsg = "";
+  try {
+    await device.workflow.resume({ workflowId: "wf-does-not-exist", strategy: "failed_node" });
+    throw new Error("workflow.resume on missing wf should have raised");
+  } catch (e) {
+    resumeErrMsg = (e as Error).message;
+  }
+  assert.ok(
+    /no resumable checkpoint|errInvalidParams|invalid/i.test(resumeErrMsg),
+    `unexpected error from workflow.resume: ${resumeErrMsg}`,
+  );
+
+  client.close();
   await server.close();
 });

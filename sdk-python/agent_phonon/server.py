@@ -336,15 +336,25 @@ class PhononDevice:
             return None
         if method == "document.send":
             if self._document_handler:
-                self._document_handler(params or {})
+                res = self._document_handler(params or {})
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, dict):
+                    return res
             return {"delivered": []}
         if method == "document.prepare_upload":
             if self._prepare_upload_handler:
-                return self._prepare_upload_handler(params or {})
+                res = self._prepare_upload_handler(params or {})
+                if asyncio.iscoroutine(res):
+                    res = await res
+                return res
             return {"uploadRef": new_id(), "uploadUrl": "", "method": "PUT"}
         if method == "interaction.request":
             if self._interaction_handler:
-                return self._interaction_handler(params or {})
+                res = self._interaction_handler(params or {})
+                if asyncio.iscoroutine(res):
+                    res = await res
+                return res
             return {"requestId": (params or {}).get("requestId"), "action": "cancel"}
         return None
 
