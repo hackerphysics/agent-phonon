@@ -227,6 +227,26 @@ export const WorkflowResumeFrom = z.object({
 });
 export type WorkflowResumeFrom = z.infer<typeof WorkflowResumeFrom>;
 
+/**
+ * workflow.resume：独立 method（v0.7），取代之前用 workflow.run.resumeFrom 偷渡的方式。
+ * resumeFrom 字段保留向后兼容，但 SDK 优先使用 workflow.resume。
+ */
+export const WorkflowResumeParams = z.object({
+  workflowId: WorkflowId,
+  strategy: z.union([
+    z.literal("last_success_dependents"),
+    z.literal("failed_node"),
+    z.string().regex(/^node:/),
+  ]).default("failed_node"),
+  rerunNodes: z.array(WorkflowNodeId).optional(),
+  /** 可选：附加给 executor 的反馈文本（HITL 后特别有用） */
+  feedback: z.string().optional(),
+  /** 可选：恢复时调整 sharedContext */
+  sharedContextPatch: WorkflowSharedContext.optional(),
+});
+export type WorkflowResumeParams = z.infer<typeof WorkflowResumeParams>;
+
+
 // ---------------------------------------------------------------------------
 // workflow.run
 // ---------------------------------------------------------------------------
@@ -356,6 +376,8 @@ export const WorkflowEvent = z.object({
     "round.started", // discussion / graph iteration 轮次开始
     "round.completed", // 一轮所有参与者发完
     "discussion.terminated", // discussion 终止（含理由）
+    "human_review.requested", // executor emit workflow.human_review 触发
+    "human_review.resolved",  // server 通过 interaction.respond 回复
   ]),
   nodeId: WorkflowNodeId.optional(),
   sessionId: SessionId.optional(),
@@ -430,10 +452,48 @@ export const WorkflowDoneDirective = z.object({
 });
 export type WorkflowDoneDirective = z.infer<typeof WorkflowDoneDirective>;
 
+/**
+ * human_review: 请求 server 进行人工审查（v0.7 新增）。
+ *
+ * Executor emit 这个 directive 后，phonon 暂停 workflow，通过 `interaction.request`
+ * 反向问 server；server 返回 { approved, feedback? } 后：
+ *   - approved=true   → 当作 workflow.done 处理（finalSummary = feedback ?? executor 文本）
+ *   - approved=false  → 把 feedback 文本作为 executor 下一轮的输入（"revise based on review"）
+ * phonon 同时 emit workflow.event { type: "human_review.requested" / "human_review.resolved" }。
+ *
+ * 这是设备侧底层 HITL 机制；UI 渲染、表单字段、文档关联、Feishu 集成等业务由 server 实现。
+ */
+export const WorkflowHumanReviewDirective = z.object({
+  kind: z.literal("workflow.human_review"),
+  /** 审查标题（短，给 UI 显示用） */
+  title: z.string(),
+  /** 审查内容/摘要（长，给 reviewer 看） */
+  summary: z.string(),
+  /** 关联的产物文件路径（workspace 相对） */
+  artifacts: z.array(z.object({
+    path: z.string(),
+    role: z.enum(["report", "diff", "spec", "log", "other"]).default("other"),
+  })).optional(),
+  reason: z.string().optional(),
+  /** 等待 server 响应的超时秒数，默认 1800 (30min) */
+  timeoutSeconds: z.number().int().positive().default(1800),
+});
+export type WorkflowHumanReviewDirective = z.infer<typeof WorkflowHumanReviewDirective>;
+
+/** server 对 human_review 的响应 schema（通过 interaction.respond 走 form value） */
+export const WorkflowHumanReviewResponse = z.object({
+  approved: z.boolean(),
+  /** 反馈文字。approved=true 时可作 finalSummary；approved=false 时作 executor 下一轮输入 */
+  feedback: z.string().optional(),
+  reviewer: z.string().optional(),
+});
+export type WorkflowHumanReviewResponse = z.infer<typeof WorkflowHumanReviewResponse>;
+
 export const WorkflowRoutingDirective = z.discriminatedUnion("kind", [
   WorkflowRouteDirective,
   WorkflowFeedbackDirective,
   WorkflowReplyDirective,
   WorkflowDoneDirective,
+  WorkflowHumanReviewDirective,
 ]);
 export type WorkflowRoutingDirective = z.infer<typeof WorkflowRoutingDirective>;

@@ -66,7 +66,7 @@ interface WorkflowRunState {
 // =============================================================================
 
 // 兼容前缀：phonon.workflow.<kind> 或 workflow.<kind>
-const ROUTE_BLOCK_RE = /```(?:phonon\.)?workflow\.(route|feedback|reply|done)\s*\n([\s\S]+?)\n```/gi;
+const ROUTE_BLOCK_RE = /```(?:phonon\.)?workflow\.(route|feedback|reply|done|human_review)\s*\n([\s\S]+?)\n```/gi;
 
 function parseRoutingDirectives(text: string): WorkflowRoutingDirective[] {
   const out: WorkflowRoutingDirective[] = [];
@@ -120,6 +120,16 @@ function buildDirective(kindFromTag: string, obj: Record<string, unknown>): Work
         kind: "workflow.done",
         finalSummary: obj.finalSummary as string | undefined,
         reason: obj.reason as string | undefined,
+      };
+    case "workflow.human_review":
+      if (typeof obj.title !== "string" || typeof obj.summary !== "string") return null;
+      return {
+        kind: "workflow.human_review",
+        title: obj.title,
+        summary: obj.summary,
+        artifacts: Array.isArray(obj.artifacts) ? obj.artifacts as { path: string; role: "report"|"diff"|"spec"|"log"|"other" }[] : undefined,
+        reason: obj.reason as string | undefined,
+        timeoutSeconds: (typeof obj.timeoutSeconds === "number" ? obj.timeoutSeconds : 1800),
       };
     default:
       return null;
@@ -182,6 +192,8 @@ export class WorkflowEngine {
     /** 可选：sqlite store。提供则 checkpoint 落盘 + 支持 resumeFrom。 */
     store?: PhononStore;
     emit: (event: WorkflowEvent) => void;
+    /** v0.7: 反向请求 server 做 HITL（用于 workflow.human_review directive） */
+    requestInteraction?: (params: unknown) => Promise<unknown>;
   }) {}
 
   // ---------------------------------------------------------------------------
@@ -243,6 +255,45 @@ export class WorkflowEngine {
     this.emit(run, { type: "workflow.status", status: "queued" });
     void this.executeWithTimeout(run).catch((err) => this.fail(run, err));
     return { workflowId, status: run.status, createdAt: run.createdAt, resumed: false };
+  }
+
+  /**
+   * v0.7: workflow.resume —— 独立入口，比 run({resumeFrom}) 更明确。
+   * 支持 sharedContextPatch（浅 merge）和 feedback（写进 sharedContext.notes 末尾）。
+   */
+  async resume(params: {
+    workflowId: string;
+    strategy: "last_success_dependents" | "failed_node" | `node:${string}`;
+    rerunNodes?: string[];
+    feedback?: string;
+    sharedContextPatch?: WorkflowSharedContext;
+  }): Promise<WorkflowRunResult> {
+    const restored = this.restoreFromCheckpoint({
+      workflowId: params.workflowId,
+      strategy: params.strategy,
+      rerunNodes: params.rerunNodes,
+    });
+    if (!restored) {
+      throw new PhononError("errInvalidParams", `workflow ${params.workflowId} has no resumable checkpoint`);
+    }
+    // 合并 sharedContext patch + feedback
+    if (params.sharedContextPatch || params.feedback) {
+      const base = restored.sharedContext ?? {};
+      const merged: WorkflowSharedContext = {
+        placement: "append",
+        ...base,
+        ...(params.sharedContextPatch ?? {}),
+      };
+      if (params.feedback) {
+        const prevText = typeof merged.text === "string" ? merged.text : "";
+        const fbBlock = `\n\n[resume feedback @${new Date().toISOString()}]\n${params.feedback}`;
+        merged.text = prevText ? prevText + fbBlock : fbBlock.trimStart();
+      }
+      restored.sharedContext = merged;
+      this.persist(restored);
+    }
+    void this.executeWithTimeout(restored).catch((err) => this.fail(restored, err));
+    return { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
   }
 
   status(workflowId: string): WorkflowStatusResult {
@@ -587,6 +638,24 @@ export class WorkflowEngine {
           finalSummary = directive.finalSummary;
           exitReason = "done";
           break;
+        }
+        if (directive.kind === "workflow.human_review") {
+          // v0.7: 暂停 workflow，反向问 server，等回复后决定 done 或继续
+          const reviewResult = await this.requestHumanReview(run, directive);
+          if (reviewResult.approved) {
+            terminated = true;
+            finalSummary = reviewResult.feedback ?? directive.summary;
+            exitReason = "done";
+            break;
+          }
+          // 拒绝 → 把 feedback 作为下一轮 executor 输入
+          hadValidTarget = true;
+          // 把 feedback 当成一个伪 worker 结果喂回 executor
+          workerResults.push({
+            nodeId: "__human_review__",
+            text: `[HUMAN REVIEW REJECTED]\nReviewer feedback: ${reviewResult.feedback ?? "(no feedback)"}\nReviewer: ${reviewResult.reviewer ?? "(unknown)"}`,
+          });
+          continue;
         }
         // route / feedback / reply 都需要 target 在 allowedEdges 内
         const targets = "to" in directive
@@ -933,6 +1002,63 @@ export class WorkflowEngine {
   // =============================================================================
   // v0.6: per-node 执行环境解析（project / worktreeId / branch）+ 按需 worktree
   // =============================================================================
+
+  /**
+   * v0.7: 把 workflow.human_review directive 转成对 server 的 interaction.request 调用。
+   * server 用 interaction.respond 返回 { approved, feedback?, reviewer? }，phonon 解析回来。
+   */
+  private async requestHumanReview(
+    run: WorkflowRunState,
+    directive: { kind: "workflow.human_review"; title: string; summary: string; artifacts?: Array<{ path: string; role: string }>; reason?: string; timeoutSeconds: number },
+  ): Promise<{ approved: boolean; feedback?: string; reviewer?: string }> {
+    // emit requested 事件，server 端 UI 可以预先准备
+    this.emit(run, {
+      type: "human_review.requested",
+      payload: { title: directive.title, summary: directive.summary, artifacts: directive.artifacts, reason: directive.reason },
+    });
+    if (!this.opts.requestInteraction) {
+      // 没接 interaction → 视为拒绝（让 executor 知道这条路走不通）
+      const result = { approved: false, feedback: "phonon was not configured with requestInteraction; reject by default" };
+      this.emit(run, { type: "human_review.resolved", payload: result });
+      return result;
+    }
+    // 构造 interaction.request 表单
+    const interactionParams = {
+      reason: directive.reason ?? "Human review requested by workflow executor",
+      sessionId: run.workflowId, // 让 server 能按 workflowId 路由
+      timeoutSeconds: directive.timeoutSeconds,
+      form: {
+        title: directive.title,
+        description: directive.summary,
+        metadata: {
+          workflowId: run.workflowId,
+          artifacts: directive.artifacts,
+        },
+        fields: [
+          { name: "approved", label: "Approve?", type: "boolean", required: true },
+          { name: "feedback", label: "Feedback", type: "text", required: false },
+          { name: "reviewer", label: "Reviewer", type: "text", required: false },
+        ],
+      },
+    };
+    let response: { approved?: boolean; feedback?: string; reviewer?: string; values?: Record<string, unknown> };
+    try {
+      response = await this.opts.requestInteraction(interactionParams) as never;
+    } catch (e) {
+      const errResult = { approved: false, feedback: `interaction failed: ${(e as Error).message}` };
+      this.emit(run, { type: "human_review.resolved", payload: errResult });
+      return errResult;
+    }
+    // server 可能返回 { values: {...} } 或直接平铺
+    const values = (response?.values ?? response) as { approved?: boolean; feedback?: string; reviewer?: string };
+    const result = {
+      approved: !!values?.approved,
+      feedback: typeof values?.feedback === "string" ? values.feedback : undefined,
+      reviewer: typeof values?.reviewer === "string" ? values.reviewer : undefined,
+    };
+    this.emit(run, { type: "human_review.resolved", payload: result });
+    return result;
+  }
 
   /**
    * 解析 node 的执行环境。处理 4 种情况（详见 protocol WorkflowNode.branch/worktreeId 文档）：

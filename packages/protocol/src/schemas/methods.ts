@@ -102,6 +102,7 @@ import {
   WorkflowListResult,
   WorkflowEvent,
   WorkflowAckParams,
+  WorkflowResumeParams,
 } from "./workflow.js";
 
 /**
@@ -465,6 +466,13 @@ export const METHODS = {
     kind: "notification",
     params: WorkflowEvent,
     result: z_void,
+  },
+  // workflow.resume: 独立的 resume 方法（v0.7）；run.resumeFrom 仍支持但 SDK 推荐这个。
+  "workflow.resume": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowResumeParams,
+    result: WorkflowRunResult,
   },
   // workflow.ack: server 确认已收到某 workflow 元事件 seq≤N（P0-3、与 stream.ack 平行）
   "workflow.ack": {

@@ -137,6 +137,7 @@ export class PhononConnection {
       },
       store: this.store,
       emit: (event) => this.peer.notifyRaw("workflow.event", event),
+      requestInteraction: (params: unknown) => this.peer.requestRaw("interaction.request", params),
     });
   }
 
@@ -422,6 +423,14 @@ export class PhononConnection {
         return this.workflows!.cancel(p.workflowId as string, p.reason as string | undefined);
       case "workflow.list":
         return this.workflows!.list(p as { status?: string; projectId?: string; since?: string; until?: string; limit?: number });
+      case "workflow.resume":
+        return this.workflows!.resume({
+          workflowId: p.workflowId as string,
+          strategy: (p.strategy as "last_success_dependents" | "failed_node" | `node:${string}` | undefined) ?? "failed_node",
+          rerunNodes: p.rerunNodes as string[] | undefined,
+          feedback: p.feedback as string | undefined,
+          sharedContextPatch: p.sharedContextPatch as never,
+        });
       case "workflow.ack": {
         this.workflows?.ack(p.workflowId as string, p.lastSeq as number);
         return null;

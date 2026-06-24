@@ -279,6 +279,14 @@ export class PhononDevice extends EventEmitter {
       this.peer.request("workflow.cancel", { workflowId, reason }) as Promise<{ workflowId: string; status: "cancelled" }>,
     list: (filter?: WorkflowListParams) =>
       this.peer.request("workflow.list", filter ?? {}) as Promise<WorkflowListResult>,
+    /** v0.7: 独立 resume 入口。推荐使用，比 run({resumeFrom}) 语义更明确。 */
+    resume: (params: {
+      workflowId: string;
+      strategy?: "last_success_dependents" | "failed_node" | `node:${string}`;
+      rerunNodes?: string[];
+      feedback?: string;
+      sharedContextPatch?: WorkflowSharedContext;
+    }) => this.peer.request("workflow.resume", params) as Promise<WorkflowRunResult>,
     /** 手动 ack workflow.event seq≤lastSeq（平时不需调用，SDK 自动 ack）。 */
     ack: (workflowId: string, lastSeq: number) =>
       this.peer.notify("workflow.ack", { workflowId, lastSeq }),

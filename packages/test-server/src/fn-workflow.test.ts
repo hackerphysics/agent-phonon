@@ -322,3 +322,88 @@ test("workflow.run resumeFrom: resume failed workflow re-runs failed node only",
   assert.equal(status2.nodes.find((n) => n.nodeId === "a")?.status, "completed");
   assert.equal(status2.nodes.find((n) => n.nodeId === "b")?.status, "completed");
 });
+
+// v0.7: workflow.human_review directive ========================================
+
+test("workflow.run graph: workflow.human_review approved → done with feedback as finalText", async () => {
+  const tc = makeConn((input) => {
+    if (input.includes("EXECUTOR of a multi-agent workflow")) {
+      return [
+        "Need human review:",
+        "```phonon.workflow.human_review",
+        JSON.stringify({ title: "Review my plan", summary: "Should we proceed?", artifacts: [{ path: "report.md", role: "report" }] }),
+        "```",
+      ].join("\n");
+    }
+    return "worker output";
+  });
+  // server 回 approved=true + feedback
+  tc.setRequestResponder("interaction.request", () => ({ values: { approved: true, feedback: "Looks great, ship it.", reviewer: "alice" } }));
+
+  const project = await tc.call("project.create", { name: "wf-hr-approve" }) as { project: { projectId: string } };
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "do",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:executor", model: "m1" },
+      workers: [{ nodeId: "w", agent: "mock:a", model: "m1", role: "worker" }],
+      communicationGraph: { edges: [{ from: "exec", to: "w" }], maxIterations: 3 },
+    },
+  }) as { workflowId: string };
+
+  const status = await waitWorkflow(tc, run.workflowId) as { status: string; finalText?: string };
+  assert.equal(status.status, "completed");
+  assert.equal(status.finalText, "Looks great, ship it.");
+  const events = tc.notifications.filter((e) => e.workflowId === run.workflowId);
+  assert.ok(events.some((e) => e.type === "human_review.requested"));
+  const resolved = events.find((e) => e.type === "human_review.resolved");
+  assert.ok(resolved);
+  assert.equal((resolved!.payload as { approved?: boolean }).approved, true);
+});
+
+test("workflow.run graph: workflow.human_review rejected → feedback goes back to executor as next-iteration input", async () => {
+  let sawRejectedFeedback = false;
+  const tc = makeConn((input) => {
+    if (input.includes("EXECUTOR of a multi-agent workflow")) {
+      return [
+        "Need human review:",
+        "```phonon.workflow.human_review",
+        JSON.stringify({ title: "Plan review", summary: "Plan A" }),
+        "```",
+      ].join("\n");
+    }
+    if (input.includes("Worker results from previous iteration")) {
+      const wasRejected = input.includes("[HUMAN REVIEW REJECTED]");
+      if (wasRejected) {
+        sawRejectedFeedback = true;
+        return [
+          "OK revised:",
+          "```phonon.workflow.done",
+          JSON.stringify({ finalSummary: "Revised based on reviewer feedback." }),
+          "```",
+        ].join("\n");
+      }
+    }
+    return "worker output";
+  });
+  tc.setRequestResponder("interaction.request", () => ({ values: { approved: false, feedback: "Try plan B instead", reviewer: "bob" } }));
+
+  const project = await tc.call("project.create", { name: "wf-hr-reject" }) as { project: { projectId: string } };
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "do",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:executor", model: "m1" },
+      workers: [{ nodeId: "w", agent: "mock:a", model: "m1", role: "worker" }],
+      communicationGraph: { edges: [{ from: "exec", to: "w" }], maxIterations: 5 },
+    },
+  }) as { workflowId: string };
+
+  const status = await waitWorkflow(tc, run.workflowId) as { status: string; finalText?: string };
+  assert.equal(status.status, "completed");
+  assert.match(status.finalText ?? "", /Revised based on reviewer feedback/);
+  // executor 应该被调过至少 2 次（首轮 emit review + reject 后第二轮 emit done）
+  assert.equal(sawRejectedFeedback, true, "executor should have received [HUMAN REVIEW REJECTED] feedback in followup turn");
+});
