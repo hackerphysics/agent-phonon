@@ -133,6 +133,28 @@ class PhononDevice:
     async def git_delete_branch(self, project_id: str, branch: str, **opts: Any) -> Any:
         return await self._peer.request("project.git.deleteBranch", {"projectId": project_id, "branch": branch, **opts})
 
+    # v0.7: 6 个底层 git 操作
+    async def git_commit(self, project_id: str, message: str, **opts: Any) -> dict:
+        return await self._peer.request("project.git.commit", {"projectId": project_id, "message": message, **opts})
+
+    async def git_merge(self, project_id: str, source_branch: str, **opts: Any) -> dict:
+        params: dict = {"projectId": project_id, "sourceBranch": source_branch}
+        for k in ("targetBranch", "strategy", "message", "abortOnConflict"):
+            if k in opts: params[k] = opts[k]
+        return await self._peer.request("project.git.merge", params)
+
+    async def git_diff(self, project_id: str, **opts: Any) -> dict:
+        return await self._peer.request("project.git.diff", {"projectId": project_id, **opts})
+
+    async def git_log(self, project_id: str, **opts: Any) -> dict:
+        return await self._peer.request("project.git.log", {"projectId": project_id, **opts})
+
+    async def git_push(self, project_id: str, branch: str, **opts: Any) -> dict:
+        return await self._peer.request("project.git.push", {"projectId": project_id, "branch": branch, **opts})
+
+    async def git_status(self, project_id: str, **opts: Any) -> dict:
+        return await self._peer.request("project.git.status", {"projectId": project_id, **opts})
+
     async def env_set(self, scope: str, name: str, value: str, **opts: Any) -> dict:
         return await self._peer.request("env.set", {"scope": scope, "name": name, "value": value, **opts})
 

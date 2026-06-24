@@ -60,6 +60,12 @@ import {
   WorktreeRemoveResult,
   GitDeleteBranchParams,
   GitDeleteBranchResult,
+  GitCommitParams, GitCommitResult,
+  GitMergeParams, GitMergeResult,
+  GitDiffParams, GitDiffResult,
+  GitLogParams, GitLogResult,
+  GitPushParams, GitPushResult,
+  GitStatusParams, GitStatusResult,
 } from "./project.js";
 import {
   SkillInstallParams,
@@ -325,6 +331,30 @@ export const METHODS = {
     kind: "request",
     params: GitDeleteBranchParams,
     result: GitDeleteBranchResult,
+  },
+  "project.git.commit": {
+    direction: "s2p", kind: "request",
+    params: GitCommitParams, result: GitCommitResult,
+  },
+  "project.git.merge": {
+    direction: "s2p", kind: "request",
+    params: GitMergeParams, result: GitMergeResult,
+  },
+  "project.git.diff": {
+    direction: "s2p", kind: "request",
+    params: GitDiffParams, result: GitDiffResult,
+  },
+  "project.git.log": {
+    direction: "s2p", kind: "request",
+    params: GitLogParams, result: GitLogResult,
+  },
+  "project.git.push": {
+    direction: "s2p", kind: "request",
+    params: GitPushParams, result: GitPushResult,
+  },
+  "project.git.status": {
+    direction: "s2p", kind: "request",
+    params: GitStatusParams, result: GitStatusResult,
   },
 
   // --- 受控工作区文件读写（server 下发，project/worktree scoped）---

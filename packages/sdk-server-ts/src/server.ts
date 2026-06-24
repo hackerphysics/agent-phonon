@@ -213,6 +213,16 @@ export class PhononDevice extends EventEmitter {
       remove: (p: { projectId: string; worktreeId: string; force?: boolean }) => this.peer.request("project.worktree.remove", p),
     },
     deleteBranch: (p: { projectId: string; branch: string; force?: boolean }) => this.peer.request("project.git.deleteBranch", p),
+    // v0.7: 6 个底层 git 操作（嵌套在 project.git 命名空间下）
+    git: {
+      commit: (p: { projectId: string; worktreeId?: string; message: string; files?: string[]; allowEmpty?: boolean; author?: { name: string; email: string } }) => this.peer.request("project.git.commit", p),
+      merge: (p: { projectId: string; sourceBranch: string; targetBranch?: string; strategy?: "merge"|"squash"|"rebase"|"ff-only"; message?: string; abortOnConflict?: boolean }) => this.peer.request("project.git.merge", p),
+      diff: (p: { projectId: string; worktreeId?: string; ref1?: string; ref2?: string; paths?: string[]; contextLines?: number; statOnly?: boolean; maxBytes?: number }) => this.peer.request("project.git.diff", p),
+      log: (p: { projectId: string; worktreeId?: string; branch?: string; limit?: number; since?: string; until?: string; paths?: string[] }) => this.peer.request("project.git.log", p),
+      push: (p: { projectId: string; worktreeId?: string; branch: string; remote?: string; force?: boolean; setUpstream?: boolean }) => this.peer.request("project.git.push", p),
+      status: (p: { projectId: string; worktreeId?: string }) => this.peer.request("project.git.status", p),
+      deleteBranch: (p: { projectId: string; branch: string; force?: boolean }) => this.peer.request("project.git.deleteBranch", p),
+    },
   };
 
   env = {

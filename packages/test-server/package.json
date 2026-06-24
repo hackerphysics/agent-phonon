@@ -24,7 +24,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build && node --test dist/fn-*.test.js dist/p0-fixes.test.js dist/sdk-e2e.test.js",
-    "test:e2e": "pnpm build && node --test dist/e2e.test.js dist/e2e-full.test.js dist/e2e-gateway.test.js dist/e2e-hitl.test.js dist/e2e-workflow.test.js",
+    "test:e2e": "pnpm build && node --test dist/e2e.test.js dist/e2e-full.test.js dist/e2e-gateway.test.js dist/e2e-hitl.test.js dist/e2e-workflow.test.js dist/e2e-git.test.js",
     "test:all": "pnpm build && node --test dist/**/*.test.js"
   },
   "dependencies": {

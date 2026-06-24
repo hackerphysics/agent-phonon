@@ -23,6 +23,9 @@ const MUTATING_METHODS = new Set<string>([
   "project.worktree.create",
   "project.worktree.remove",
   "project.git.deleteBranch",
+  "project.git.commit",
+  "project.git.merge",
+  "project.git.push",
   "skill.install",
   "skill.uninstall",
   "file.write",
@@ -345,6 +348,18 @@ export class PhononConnection {
         const r = await this.projects.deleteBranch({ projectId: p.projectId as string, branch: p.branch as string, force: p.force as boolean });
         return { branch: p.branch, deleted: true, wasMerged: r.wasMerged, affectedWorktrees: r.affectedWorktrees };
       }
+      case "project.git.commit":
+        return this.projects.gitCommit(p as { projectId: string; worktreeId?: string; message: string; files?: string[]; allowEmpty?: boolean; author?: { name: string; email: string } });
+      case "project.git.merge":
+        return this.projects.gitMerge(p as { projectId: string; sourceBranch: string; targetBranch?: string; strategy?: "merge"|"squash"|"rebase"|"ff-only"; message?: string; abortOnConflict?: boolean });
+      case "project.git.diff":
+        return this.projects.gitDiff(p as { projectId: string; worktreeId?: string; ref1?: string; ref2?: string; paths?: string[]; contextLines?: number; statOnly?: boolean; maxBytes?: number });
+      case "project.git.log":
+        return this.projects.gitLog(p as { projectId: string; worktreeId?: string; branch?: string; limit?: number; since?: string; until?: string; paths?: string[] });
+      case "project.git.push":
+        return this.projects.gitPush(p as { projectId: string; worktreeId?: string; branch: string; remote?: string; force?: boolean; setUpstream?: boolean });
+      case "project.git.status":
+        return this.projects.gitStatus(p as { projectId: string; worktreeId?: string });
 
       // ---- file workspace IO (project/worktree scoped) ----
       case "file.read":

@@ -183,3 +183,176 @@ export const GitDeleteBranchResult = z.object({
   affectedWorktrees: z.array(z.string()).optional(),
 });
 export type GitDeleteBranchResult = z.infer<typeof GitDeleteBranchResult>;
+
+// ===========================================================================
+// project.git.*  v0.7：底层 Git 操作（commit/merge/diff/log/push/status）
+// 设计原则：phonon 只暴露通用 git 能力；PR 创建等平台特定逻辑由上层 server 实现。
+// ===========================================================================
+
+// --- project.git.commit ---
+export const GitCommitParams = z.object({
+  projectId: ProjectId,
+  /** 在哪个 worktree 提交；不传 = 项目主目录 */
+  worktreeId: z.string().optional(),
+  message: z.string().min(1),
+  /** 显式列出要 add 的路径（相对 cwd）；不传 = git add -A */
+  files: z.array(z.string()).optional(),
+  /** 允许空 commit（git commit --allow-empty）；默认 false */
+  allowEmpty: z.boolean().default(false),
+  /** 提交者信息（可选；不传走 git 全局配置） */
+  author: z.object({ name: z.string(), email: z.string() }).optional(),
+});
+export type GitCommitParams = z.infer<typeof GitCommitParams>;
+
+export const GitCommitResult = z.object({
+  commitSha: z.string(),
+  /** 该 commit 改了几个文件 */
+  filesChanged: z.number().int().nonnegative(),
+  insertions: z.number().int().nonnegative().optional(),
+  deletions: z.number().int().nonnegative().optional(),
+});
+export type GitCommitResult = z.infer<typeof GitCommitResult>;
+
+// --- project.git.merge ---
+export const GitMergeParams = z.object({
+  projectId: ProjectId,
+  /** 把这个分支合并进 targetBranch；可以是 commit sha */
+  sourceBranch: z.string().min(1),
+  /** 合并到哪个分支；不传 = 当前 branch */
+  targetBranch: z.string().optional(),
+  /** 合并策略 */
+  strategy: z.enum(["merge", "squash", "rebase", "ff-only"]).default("merge"),
+  /** merge commit 消息（squash/merge 时用） */
+  message: z.string().optional(),
+  /** 冲突时是否 abort（默认 true，避免 worktree 留在冲突状态） */
+  abortOnConflict: z.boolean().default(true),
+});
+export type GitMergeParams = z.infer<typeof GitMergeParams>;
+
+export const GitMergeResult = z.object({
+  /** 合并后的最新 commit sha */
+  commitSha: z.string().optional(),
+  /** 是否产生 merge commit（squash/ff 可能没有） */
+  mergeCommitCreated: z.boolean(),
+  /** 是否有冲突 */
+  hasConflict: z.boolean(),
+  /** 冲突文件列表（hasConflict=true 时） */
+  conflictFiles: z.array(z.string()).optional(),
+  /** 当 abortOnConflict=true 且发生冲突时为 true */
+  aborted: z.boolean().optional(),
+});
+export type GitMergeResult = z.infer<typeof GitMergeResult>;
+
+// --- project.git.diff ---
+export const GitDiffParams = z.object({
+  projectId: ProjectId,
+  worktreeId: z.string().optional(),
+  /** diff 起点；不传 = HEAD（与工作区比较） */
+  ref1: z.string().optional(),
+  /** diff 终点；不传 = 工作区当前状态 */
+  ref2: z.string().optional(),
+  /** 只 diff 这些路径 */
+  paths: z.array(z.string()).optional(),
+  /** 上下文行数，默认 3 */
+  contextLines: z.number().int().nonnegative().default(3),
+  /** stat 而不是 patch */
+  statOnly: z.boolean().default(false),
+  /** 最大返回字节数，超出截断 */
+  maxBytes: z.number().int().positive().default(1048576),
+});
+export type GitDiffParams = z.infer<typeof GitDiffParams>;
+
+export const GitDiffResult = z.object({
+  /** unified diff 文本（statOnly=false 时） */
+  patch: z.string().optional(),
+  /** stat 摘要（filesChanged/insertions/deletions） */
+  filesChanged: z.number().int().nonnegative(),
+  insertions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+  /** patch 是否被截断 */
+  truncated: z.boolean(),
+});
+export type GitDiffResult = z.infer<typeof GitDiffResult>;
+
+// --- project.git.log ---
+export const GitLogParams = z.object({
+  projectId: ProjectId,
+  worktreeId: z.string().optional(),
+  branch: z.string().optional(),
+  limit: z.number().int().positive().max(500).default(50),
+  /** 起始时间 ISO */
+  since: z.string().optional(),
+  /** 结束时间 ISO */
+  until: z.string().optional(),
+  /** 只看这些路径相关的提交 */
+  paths: z.array(z.string()).optional(),
+});
+export type GitLogParams = z.infer<typeof GitLogParams>;
+
+export const GitCommitInfo = z.object({
+  sha: z.string(),
+  shortSha: z.string(),
+  author: z.string(),
+  email: z.string(),
+  timestamp: z.string(),
+  subject: z.string(),
+  body: z.string().optional(),
+});
+export type GitCommitInfo = z.infer<typeof GitCommitInfo>;
+
+export const GitLogResult = z.object({
+  commits: z.array(GitCommitInfo),
+});
+export type GitLogResult = z.infer<typeof GitLogResult>;
+
+// --- project.git.push ---
+export const GitPushParams = z.object({
+  projectId: ProjectId,
+  worktreeId: z.string().optional(),
+  branch: z.string().min(1),
+  remote: z.string().default("origin"),
+  force: z.boolean().default(false),
+  /** 如果远端不存在该 branch 是否 set-upstream */
+  setUpstream: z.boolean().default(true),
+});
+export type GitPushParams = z.infer<typeof GitPushParams>;
+
+export const GitPushResult = z.object({
+  pushed: z.boolean(),
+  remote: z.string(),
+  branch: z.string(),
+  /** 推送了多少个 commit */
+  commitsPushed: z.number().int().nonnegative().optional(),
+  /** push 后远端 HEAD sha */
+  remoteHead: z.string().optional(),
+});
+export type GitPushResult = z.infer<typeof GitPushResult>;
+
+// --- project.git.status ---
+export const GitStatusParams = z.object({
+  projectId: ProjectId,
+  worktreeId: z.string().optional(),
+});
+export type GitStatusParams = z.infer<typeof GitStatusParams>;
+
+export const GitFileStatus = z.object({
+  /** 文件路径（相对 cwd） */
+  path: z.string(),
+  /** 索引区状态（git status --porcelain 第 1 位） */
+  index: z.enum(["unmodified", "modified", "added", "deleted", "renamed", "copied", "untracked"]),
+  /** 工作区状态（第 2 位） */
+  worktree: z.enum(["unmodified", "modified", "added", "deleted", "renamed", "copied", "untracked"]),
+});
+export type GitFileStatus = z.infer<typeof GitFileStatus>;
+
+export const GitStatusResult = z.object({
+  branch: z.string(),
+  /** 是否 dirty（有任何未提交改动） */
+  isClean: z.boolean(),
+  /** ahead/behind 上游 */
+  ahead: z.number().int().nonnegative().optional(),
+  behind: z.number().int().nonnegative().optional(),
+  upstream: z.string().optional(),
+  files: z.array(GitFileStatus),
+});
+export type GitStatusResult = z.infer<typeof GitStatusResult>;
