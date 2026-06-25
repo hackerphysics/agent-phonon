@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, rm, readdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, resolve, basename } from "node:path";
+import { join, resolve, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { PhononError } from "./rpc.js";
 
@@ -411,7 +411,7 @@ export class ProjectManager {
     const root = this.cwdFor(params.projectId, params.worktreeId);
     const cwd = params.cwd ? resolve(root, params.cwd) : root;
     const normRoot = resolve(root);
-    if (!(cwd === normRoot || cwd.startsWith(normRoot + "/"))) throw new PhononError("errPolicyDenied", "project.exec cwd escapes project/worktree root");
+    if (!(cwd === normRoot || cwd.startsWith(normRoot + sep))) throw new PhononError("errPolicyDenied", "project.exec cwd escapes project/worktree root");
     if (params.command.includes("\n") || params.command.includes("\r") || params.command.includes("\0")) throw new PhononError("errInvalidParams", "invalid command");
     const started = Date.now();
     const max = params.maxOutputBytes ?? 1024 * 1024;

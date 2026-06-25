@@ -197,7 +197,8 @@ class OpenClawSession implements AdapterSession {
 
   private run(args: string[], signal?: AbortSignal, environment?: Record<string, string>): Promise<string | null> {
     return new Promise((resolve, reject) => {
-      const child = spawn("openclaw", args, { cwd: this.cwd, env: { ...process.env, ...(environment ?? {}) } as NodeJS.ProcessEnv });
+      // shell:win32 — npm 全局 `openclaw` 在 Windows 是 .cmd shim，Node 22 不带 shell 直接 spawn .cmd 会抛 EINVAL（与 claude/codex/hermes adapter 保持一致）。
+      const child = spawn("openclaw", args, { cwd: this.cwd, shell: process.platform === "win32", env: { ...process.env, ...(environment ?? {}) } as NodeJS.ProcessEnv });
       this.current = child;
       let out = "";
       let err = "";
@@ -276,7 +277,7 @@ export class OpenClawAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn("openclaw", ["--version"]);
+      const child = spawn("openclaw", ["--version"], { shell: process.platform === "win32" });
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

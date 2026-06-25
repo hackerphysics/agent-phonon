@@ -1,4 +1,5 @@
 import { cpus, freemem, loadavg, totalmem } from "node:os";
+import { statfs } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -23,13 +24,11 @@ export async function collectDeviceResources(path = process.cwd()) {
 }
 
 async function diskUsage(path: string) {
-  const { stdout } = await execFileAsync("df", ["-Pk", path], { timeout: 3000 });
-  const lines = stdout.trim().split(/\n/);
-  const row = lines[lines.length - 1]?.trim().split(/\s+/);
-  if (!row || row.length < 6) return { path };
-  const totalBytes = Number(row[1]) * 1024;
-  const usedBytes = Number(row[2]) * 1024;
-  const freeBytes = Number(row[3]) * 1024;
+  // fs.statfs 是 Node 原生跨平台 API（Windows/macOS/Linux 均可），不再 shell out `df`（POSIX only）。
+  const s = await statfs(path);
+  const totalBytes = s.blocks * s.bsize;
+  const freeBytes = s.bavail * s.bsize; // bavail = 非特权用户可用，贴近实际可写
+  const usedBytes = Math.max(0, totalBytes - s.bfree * s.bsize);
   return { path, totalBytes, freeBytes, usedBytes, usagePercent: totalBytes ? (usedBytes / totalBytes) * 100 : undefined };
 }
 

@@ -86,7 +86,7 @@ async function main(): Promise<void> {
       break;
     }
     case "doctor":
-      cmdDoctor();
+      await cmdDoctor();
       break;
     case "discover":
       await cmdDiscover();

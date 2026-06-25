@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { Socket } from "node:net";
 import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
@@ -53,15 +54,21 @@ export function commandPath(bin: string): string | undefined {
   return r.status === 0 && out ? out : undefined;
 }
 
-function gatewayReachable(url: string): boolean {
-  // 简单 TCP 探测：用 node 连一下 ws 端口
-  try {
-    const u = new URL(url.replace(/^ws/, "http"));
-    const r = spawnSync("bash", ["-c", `exec 3<>/dev/tcp/${u.hostname}/${u.port || 80} && echo ok`], { timeout: 3000 });
-    return r.status === 0;
-  } catch {
-    return false;
-  }
+function gatewayReachable(url: string): Promise<boolean> {
+  // 跨平台 TCP 探测（纯 Node net，不依赖 bash//dev/tcp，修 Windows 恒为 unreachable）。
+  return new Promise((resolve) => {
+    let u: URL;
+    try { u = new URL(url.replace(/^ws/, "http")); } catch { resolve(false); return; }
+    const port = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+    const sock = new Socket();
+    let done = false;
+    const finish = (ok: boolean): void => { if (done) return; done = true; sock.destroy(); resolve(ok); };
+    sock.setTimeout(3000);
+    sock.once("connect", () => finish(true));
+    sock.once("timeout", () => finish(false));
+    sock.once("error", () => finish(false));
+    sock.connect(port, u.hostname);
+  });
 }
 
 function openCodeBin(): string {
@@ -104,12 +111,12 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
 }
 
 /** doctor：体检本机 agent 可用性 + Gateway + 插件。 */
-export function cmdDoctor(): void {
+export async function cmdDoctor(): Promise<void> {
   console.log("agent-phonon doctor\n");
   // OpenClaw Gateway
   const gwToken = readOpenClawGatewayToken();
   const gwUrl = "ws://127.0.0.1:18789";
-  const gwOk = gatewayReachable(gwUrl);
+  const gwOk = await gatewayReachable(gwUrl);
   console.log(`OpenClaw Gateway (${gwUrl}): ${gwOk ? "✓ reachable" : "✗ unreachable"}${gwToken ? " (token found)" : " (no token in ~/.openclaw/openclaw.json)"}`);
   // OpenClaw plugin
   const pluginDir = join(homedir(), ".openclaw", "extensions", "agent-phonon-hitl");

@@ -100,7 +100,8 @@ class OpenCodeSession implements AdapterSession {
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
       // 关键：stdin 设 ignore(=DEVNULL)，否则 OpenCode 检测到 stdin pipe 会等交互输入卡死
-      const child = spawn(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...(opts.environment ?? {}) } as NodeJS.ProcessEnv });
+      // shell:win32 — bin 回退为 PATH 上的 `opencode`（.cmd shim），Node 22 不带 shell spawn .cmd 会抛 EINVAL（与其它 adapter 一致）。
+      const child = spawn(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", env: { ...process.env, ...(opts.environment ?? {}) } as NodeJS.ProcessEnv });
       this.current = child;
       let buf = "";
       let acc = "";
@@ -236,7 +237,7 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.bin, ["--version"]);
+      const child = spawn(this.bin, ["--version"], { shell: process.platform === "win32" });
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));
