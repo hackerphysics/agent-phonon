@@ -112,7 +112,7 @@ test("git.merge: 合并 feature branch 到 master (ff)", { timeout: 15000 }, asy
     execSync(`git -C ${ctx.project.path} checkout -b feat`);
     writeFileSync(join(ctx.project.path, "feat.txt"), "feat\n");
     execSync(`git -C ${ctx.project.path} -c user.email=t@x -c user.name=t add . && git -C ${ctx.project.path} -c user.email=t@x -c user.name=t commit -q -m feat`);
-    execSync(`git -C ${ctx.project.path} checkout master 2>/dev/null || git -C ${ctx.project.path} checkout main`);
+    execSync(`git -C ${ctx.project.path} checkout -`); // 切回默认分支（跨平台：避免 POSIX `2>/dev/null` + 硬编码 master/main）
     const r = await ctx.device.project.git.merge({
       projectId: ctx.project.projectId,
       sourceBranch: "feat",
@@ -122,8 +122,8 @@ test("git.merge: 合并 feature branch 到 master (ff)", { timeout: 15000 }, asy
     assert.equal(r.hasConflict, false);
     assert.equal(r.mergeCommitCreated, true);
     assert.match(r.commitSha ?? "", /^[0-9a-f]{40}$/);
-    // 合并后 feat.txt 在主分支可见
-    assert.equal(readFileSync(join(ctx.project.path, "feat.txt"), "utf8"), "feat\n");
+    // 合并后 feat.txt 在主分支可见（归一化行尾：Windows git autocrlf 会把 \n 转 \r\n）
+    assert.equal(readFileSync(join(ctx.project.path, "feat.txt"), "utf8").replace(/\r\n/g, "\n"), "feat\n");
   } finally { await ctx.cleanup(); }
 });
 
@@ -137,7 +137,7 @@ test("git.merge: 冲突时 abortOnConflict=true 自动回滚", { timeout: 15000 
     execSync(`git -C ${ctx.project.path} checkout -b feat HEAD~1`);
     writeFileSync(join(ctx.project.path, "README.md"), "feat\n");
     execSync(`git -C ${ctx.project.path} -c user.email=t@x -c user.name=t add . && git -C ${ctx.project.path} -c user.email=t@x -c user.name=t commit -q -m feat`);
-    execSync(`git -C ${ctx.project.path} checkout master 2>/dev/null || git -C ${ctx.project.path} checkout main`);
+    execSync(`git -C ${ctx.project.path} checkout -`); // 切回默认分支（跨平台）
     const r = await ctx.device.project.git.merge({
       projectId: ctx.project.projectId, sourceBranch: "feat", strategy: "merge",
     }) as { hasConflict: boolean; aborted?: boolean; conflictFiles?: string[] };
@@ -145,7 +145,7 @@ test("git.merge: 冲突时 abortOnConflict=true 自动回滚", { timeout: 15000 
     assert.equal(r.aborted, true);
     assert.ok(r.conflictFiles?.includes("README.md"));
     // 回滚后主分支内容仍是 main
-    assert.equal(readFileSync(join(ctx.project.path, "README.md"), "utf8"), "main\n");
+    assert.equal(readFileSync(join(ctx.project.path, "README.md"), "utf8").replace(/\r\n/g, "\n"), "main\n");
   } finally { await ctx.cleanup(); }
 });
 
