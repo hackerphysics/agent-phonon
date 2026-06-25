@@ -101,7 +101,10 @@ async function waitWorkflow(device: PhononDevice, workflowId: string, timeoutMs 
 // =============================================================================
 
 test("e2e DAG linear: a → b → c, upstream result.text flows down the chain", { timeout: 30000 }, async () => {
-  const fx = await makeFixture((input) => `echo:${input.slice(0, 80)}`);
+  // reply 不截断：workflow 会把 workspace systemPrompt 注入到 node input 前面
+  // （commit 35a8e19），旧的 slice(0,80) 会把真正的 input 信号（A/B/C + upstream）
+  // 截掉，导致三个节点输出雷同、丢失验证能力。不截断后用 includes 验证数据流。
+  const fx = await makeFixture((input) => `echo:${input}`);
   try {
     const proj = await fx.device.project.create({ name: "linear", git: false });
     const wfEvents: Record<string, unknown>[] = [];
@@ -126,10 +129,13 @@ test("e2e DAG linear: a → b → c, upstream result.text flows down the chain",
     const aText = st.nodes.find((n) => n.nodeId === "a")?.result?.text ?? "";
     const bText = st.nodes.find((n) => n.nodeId === "b")?.result?.text ?? "";
     const cText = st.nodes.find((n) => n.nodeId === "c")?.result?.text ?? "";
-    assert.equal(aText, "echo:A");
-    // b 的 input 应包含 echo:A
-    assert.ok(bText.includes("echo:A"), `b should contain upstream a: ${bText}`);
-    assert.ok(cText.includes("echo:B"), `c should contain upstream b's prefix: ${cText}`);
+    // a 收到原始 input "A" 并 echo
+    assert.ok(aText.startsWith("echo:"), `a should be an echo: ${aText}`);
+    assert.ok(aText.includes("A"), `a should contain its own input A: ${aText}`);
+    // b 的 input 应包含上游 a 的完整 result（验证 result.text 沿链向下流）
+    assert.ok(bText.includes(aText), `b should contain upstream a's full result: ${bText}`);
+    // c 的 input 应包含上游 b 的完整 result
+    assert.ok(cText.includes(bText), `c should contain upstream b's full result: ${cText}`);
     assert.equal(st.finalText, cText);
     // workflow.event 含 status events
     assert.ok(wfEvents.some((e) => e.type === "workflow.status" && e.status === "completed"));
