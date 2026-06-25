@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+export const DeviceFsRoot = z.enum(["home", "workspaceRoot"]);
+export type DeviceFsRoot = z.infer<typeof DeviceFsRoot>;
+
 /**
  * 设备级信息与可观测协议。
  *
@@ -65,3 +68,32 @@ export const DeviceResourcesResult = z.object({
   }).optional(),
 });
 export type DeviceResourcesResult = z.infer<typeof DeviceResourcesResult>;
+
+export const DeviceFsListParams = z.object({
+  root: DeviceFsRoot.default("workspaceRoot").optional(),
+  /** path relative to root; absolute paths are rejected. */
+  path: z.string().default(".").optional(),
+  includeHidden: z.boolean().default(false).optional(),
+  limit: z.number().int().positive().max(1000).default(200).optional(),
+});
+export type DeviceFsListParams = z.infer<typeof DeviceFsListParams>;
+
+export const DeviceFsEntry = z.object({
+  name: z.string(),
+  path: z.string(),
+  realPath: z.string(),
+  kind: z.enum(["file", "directory", "symlink", "other"]),
+  size: z.number().int().nonnegative().optional(),
+  mtimeMs: z.number().nonnegative().optional(),
+});
+export type DeviceFsEntry = z.infer<typeof DeviceFsEntry>;
+
+export const DeviceFsListResult = z.object({
+  root: DeviceFsRoot,
+  rootPath: z.string(),
+  path: z.string(),
+  realPath: z.string(),
+  entries: z.array(DeviceFsEntry),
+  truncated: z.boolean().default(false),
+});
+export type DeviceFsListResult = z.infer<typeof DeviceFsListResult>;

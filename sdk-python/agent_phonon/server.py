@@ -108,6 +108,10 @@ class PhononDevice:
         """设备资源快照：CPU/内存/磁盘/进程/GPU best-effort。"""
         return await self._peer.request("device.resources", {})
 
+    async def fs_list(self, **opts: Any) -> dict:
+        """Device-level directory listing under safe roots (home/workspaceRoot)."""
+        return await self._peer.request("device.fs.list", opts)
+
     # ---- project / file / skill 便捷封装 ----
     async def project_create(self, name: str, git: bool = True, **opts: Any) -> dict:
         return await self._peer.request("project.create", {"name": name, "git": git, **opts})

@@ -1,19 +1,20 @@
 # agent-phonon 协议总览（一页速读）
 
 > 自动对照 `packages/protocol` 源码的人话版总览。字段级看 `src/schemas/*.ts`，决策看 `docs/design.md`。
-> 当前 61 个方法，协议版本 `0.1.0`。
+> 当前 62 个方法，协议版本 `0.1.0`。
 
 ## 一句话
 
 phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 JSON-RPC 2.0。服务端下发 session 操作，phonon 上推流式结果 / 自发输出 / hook 请求。
 
-## 61 个方法
+## 62 个方法
 
 | 方法 | 方向 | 类型 | 干啥 |
 |------|------|------|------|
 | `connect.hello` | phonon→server | request | 握手：协议版本 + 设备身份 → 回 tenant 绑定 |
 | `device.info` | server→phonon | request | 查 OS/机器信息与调度标签：平台、架构、hostname、capabilities（如 ios-development/windows-desktop-development） |
 | `device.resources` | server→phonon | request | 查设备资源快照：CPU/内存/磁盘/进程/GPU best-effort（仅监控，不调度） |
+| `device.fs.list` | server→phonon | request | 设备级目录浏览：列出 home/workspaceRoot 下目录项元数据，不读取文件内容 |
 | `discovery.list` | server→phonon | request | 列本机可用 agent + 各自模型 |
 | `discovery.get` | server→phonon | request | 单个 agent 详情 |
 | `discovery.changed` | phonon→server | notify | 可用性变化主动推 |

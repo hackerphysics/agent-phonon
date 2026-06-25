@@ -1,3 +1,6 @@
+import { readdir, lstat, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { SessionEngine, AdapterRegistry } from "./session-engine.js";
 import { RpcPeer, PhononError, type RpcTransport } from "./rpc.js";
 import { ProjectManager, runGit } from "./project-manager.js";
@@ -239,12 +242,37 @@ export class PhononConnection {
     return this.dispatchInner(method, p);
   }
 
+  private async deviceFsList(params: { root?: "home" | "workspaceRoot"; path?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
+    const root = params.root ?? "workspaceRoot";
+    const rootPath = root === "home" ? homedir() : this.policy.workspaceRoot;
+    const relPath = params.path ?? ".";
+    if (isAbsolute(relPath)) throw new PhononError("errPolicyDenied", "device.fs.list path must be relative to selected root");
+    const target = resolve(rootPath, relPath);
+    const rootReal = await realpath(rootPath);
+    const targetReal = await realpath(target);
+    const rel = relative(rootReal, targetReal);
+    if (rel.startsWith("..") || isAbsolute(rel)) throw new PhononError("errPolicyDenied", "device.fs.list path escapes selected root");
+    const entriesRaw = await readdir(targetReal, { withFileTypes: true });
+    const limit = params.limit ?? 200;
+    const filtered = entriesRaw.filter((e) => params.includeHidden || !e.name.startsWith("."));
+    const entries = [] as Array<{ name: string; path: string; realPath: string; kind: "file" | "directory" | "symlink" | "other"; size?: number; mtimeMs?: number }>;
+    for (const e of filtered.slice(0, limit)) {
+      const full = join(targetReal, e.name);
+      const st = await lstat(full);
+      const kind = e.isDirectory() ? "directory" : e.isFile() ? "file" : e.isSymbolicLink() ? "symlink" : "other";
+      entries.push({ name: e.name, path: join(relPath, e.name), realPath: await realpath(full).catch(() => full), kind, size: st.isFile() ? st.size : undefined, mtimeMs: st.mtimeMs });
+    }
+    return { root, rootPath: rootReal, path: relPath, realPath: targetReal, entries, truncated: filtered.length > limit };
+  }
+
   private async dispatchInner(method: string, p: Record<string, unknown>): Promise<unknown> {
     switch (method) {
       case "device.info":
         return collectDeviceInfo();
       case "device.resources":
         return collectDeviceResources(this.policy.workspaceRoot);
+      case "device.fs.list":
+        return this.deviceFsList(p as { root?: "home" | "workspaceRoot"; path?: string; includeHidden?: boolean; limit?: number });
       case "discovery.list": {
         // 聚合所有 runtime 的 sub-agents（OpenClaw 多 agent / Codex 单 agent）
         const nested = await Promise.all(this.registry.all().map((a) => a.discoverAgents()));

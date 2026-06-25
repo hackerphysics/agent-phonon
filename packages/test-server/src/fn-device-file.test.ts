@@ -34,6 +34,22 @@ test("device.resources: returns basic CPU/memory/disk/process snapshot", async (
   assert.ok(res.cpu.cores > 0);
 });
 
+test("device.fs.list: browses workspaceRoot and rejects escaping root", async () => {
+  const { tc, root } = setup();
+  await mkdir(join(root, "visible"));
+  await writeFile(join(root, "visible", "a.txt"), "hello");
+  await writeFile(join(root, ".hidden"), "secret");
+
+  const listed = await tc.call("device.fs.list", { root: "workspaceRoot", path: ".", includeHidden: false }) as { entries: Array<{ name: string; kind: string; path: string }> };
+  assert.ok(listed.entries.some((e) => e.name === "visible" && e.kind === "directory"));
+  assert.ok(!listed.entries.some((e) => e.name === ".hidden"));
+
+  const nested = await tc.call("device.fs.list", { root: "workspaceRoot", path: "visible" }) as { entries: Array<{ name: string; kind: string; path: string }> };
+  assert.deepEqual(nested.entries.map((e) => [e.name, e.kind]), [["a.txt", "file"]]);
+
+  await assert.rejects(() => tc.call("device.fs.list", { root: "workspaceRoot", path: ".." }), (e: any) => e?.data?.appCode === "errPolicyDenied");
+});
+
 test("file.*: mkdir/write/read/stat/list within project", async () => {
   const { tc } = setup();
   const p = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string; path: string } };

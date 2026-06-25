@@ -205,6 +205,11 @@ export class PhononDevice extends EventEmitter {
     return this.peer.request("device.resources", {});
   }
 
+  /** Device-level directory listing under safe roots (home/workspaceRoot). */
+  fsList(params?: { root?: "home" | "workspaceRoot"; path?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
+    return this.peer.request("device.fs.list", params ?? {});
+  }
+
   // ---- project / file / skill 便捷封装 ----
   project = {
     create: (p: { name: string; path?: string; git?: boolean; remote?: string; clientRequestId?: string }) => this.peer.request("project.create", p) as Promise<{ project: { projectId: string; path: string } }>,
