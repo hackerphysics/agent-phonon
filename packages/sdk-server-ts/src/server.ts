@@ -155,6 +155,7 @@ export class PhononDevice extends EventEmitter {
   private interactionHandler?: (params: unknown) => Promise<unknown> | unknown;
   private documentHandler?: (params: unknown) => Promise<unknown> | unknown;
   private prepareUploadHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private workflowEventHandler?: (ev: WorkflowEvent) => Promise<unknown> | unknown;
   /** 自发输出（无对应 session 时）回调。 */
   private onUnsolicited?: (ev: StreamEvent) => void;
 
@@ -305,6 +306,14 @@ export class PhononDevice extends EventEmitter {
     },
   };
 
+  /**
+   * Reliable workflow.event consumer. If set, SDK awaits this handler before
+   * sending workflow.ack, so callers can persist/forward the event first.
+   */
+  setWorkflowEventHandler(fn: (ev: WorkflowEvent) => Promise<unknown> | unknown): void {
+    this.workflowEventHandler = fn;
+  }
+
   /** 流式订阅 workflow.event（不使用 EventEmitter 字符串名的 typed 参数版本）。 */
   onWorkflowEvent(handler: (ev: WorkflowEvent) => void): () => void {
     const wrapper = (params: unknown) => handler(params as WorkflowEvent);
@@ -363,12 +372,13 @@ export class PhononDevice extends EventEmitter {
     }
     if (method === "discovery.changed") { this.emit("discoveryChanged", params); return null; }
     if (method === "workflow.event") {
-      // auto-ack （与 stream.event 一致，避免 outbox 胀胀）
-      const ev = params as { workflowId?: string; seq?: number };
+      const ev = params as WorkflowEvent;
+      if (this.workflowEventHandler) await this.workflowEventHandler(ev);
+      this.emit("workflowEvent", params);
+      // auto-ack after reliable handler succeeds（与 stream.event 一致，避免 outbox 胀大）
       if (ev?.workflowId && typeof ev.seq === "number") {
         this.peer.notify("workflow.ack", { workflowId: ev.workflowId, lastSeq: ev.seq });
       }
-      this.emit("workflowEvent", params);
       return null;
     }
     if (method === "document.send") {

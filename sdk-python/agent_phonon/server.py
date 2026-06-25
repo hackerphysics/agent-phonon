@@ -78,7 +78,7 @@ class PhononDevice:
         self._document_handler: Optional[Callable[[dict], None]] = None
         self._prepare_upload_handler: Optional[Callable[[dict], dict]] = None
         self._interaction_handler: Optional[Callable[[dict], dict]] = None
-        self._workflow_event_handler: Optional[Callable[[dict], None]] = None
+        self._workflow_event_handler: Optional[Callable[[dict], Awaitable[None] | None]] = None
 
     async def call(self, method: str, params: Any) -> Any:
         return await self._peer.request(method, params)
@@ -315,7 +315,7 @@ class PhononDevice:
     def set_interaction_handler(self, fn: Callable[[dict], dict]) -> None:
         self._interaction_handler = fn
 
-    def set_workflow_event_handler(self, fn: Callable[[dict], None]) -> None:
+    def set_workflow_event_handler(self, fn: Callable[[dict], Awaitable[None] | None]) -> None:
         self._workflow_event_handler = fn
 
     async def _handle_inbound(self, method: str, params: Any) -> Any:
@@ -342,12 +342,14 @@ class PhononDevice:
             return None
         if method == "workflow.event":
             ev = params or {}
+            if self._workflow_event_handler:
+                res = self._workflow_event_handler(ev)
+                if asyncio.iscoroutine(res):
+                    await res
             wid = ev.get("workflowId")
             seq = ev.get("seq")
             if wid and isinstance(seq, int):
                 await self._peer.notify("workflow.ack", {"workflowId": wid, "lastSeq": seq})
-            if self._workflow_event_handler:
-                self._workflow_event_handler(ev)
             return None
         if method == "document.send":
             if self._document_handler:
