@@ -40,12 +40,17 @@ test("device.fs.list: browses workspaceRoot and rejects escaping root", async ()
   await writeFile(join(root, "visible", "a.txt"), "hello");
   await writeFile(join(root, ".hidden"), "secret");
 
+  const roots = await tc.call("device.fs.roots", {}) as { roots: Array<{ root: string; path: string }> };
+  assert.ok(roots.roots.some((r) => r.root === "workspaceRoot"));
   const listed = await tc.call("device.fs.list", { root: "workspaceRoot", path: ".", includeHidden: false }) as { entries: Array<{ name: string; kind: string; path: string }> };
   assert.ok(listed.entries.some((e) => e.name === "visible" && e.kind === "directory"));
   assert.ok(!listed.entries.some((e) => e.name === ".hidden"));
 
   const nested = await tc.call("device.fs.list", { root: "workspaceRoot", path: "visible" }) as { entries: Array<{ name: string; kind: string; path: string }> };
   assert.deepEqual(nested.entries.map((e) => [e.name, e.kind]), [["a.txt", "file"]]);
+
+  const abs = await tc.call("device.fs.list", { absolutePath: join(root, "visible") }) as { entries: Array<{ name: string; kind: string; path: string }> };
+  assert.deepEqual(abs.entries.map((e) => [e.name, e.kind]), [["a.txt", "file"]]);
 
   await assert.rejects(() => tc.call("device.fs.list", { root: "workspaceRoot", path: ".." }), (e: any) => e?.data?.appCode === "errPolicyDenied");
 });

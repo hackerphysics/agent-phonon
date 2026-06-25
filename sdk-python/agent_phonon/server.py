@@ -108,8 +108,12 @@ class PhononDevice:
         """设备资源快照：CPU/内存/磁盘/进程/GPU best-effort。"""
         return await self._peer.request("device.resources", {})
 
+    async def fs_roots(self) -> dict:
+        """Device-level browsable filesystem roots."""
+        return await self._peer.request("device.fs.roots", {})
+
     async def fs_list(self, **opts: Any) -> dict:
-        """Device-level directory listing under safe roots (home/workspaceRoot)."""
+        """Device-level directory listing under safe roots or absolute root paths."""
         return await self._peer.request("device.fs.list", opts)
 
     # ---- project / file / skill 便捷封装 ----

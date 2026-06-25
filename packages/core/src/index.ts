@@ -1,6 +1,7 @@
 import { readdir, lstat, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { homedir, platform } from "node:os";
+import { isAbsolute, join, relative, resolve, parse } from "node:path";
 import { SessionEngine, AdapterRegistry } from "./session-engine.js";
 import { RpcPeer, PhononError, type RpcTransport } from "./rpc.js";
 import { ProjectManager, runGit } from "./project-manager.js";
@@ -242,11 +243,28 @@ export class PhononConnection {
     return this.dispatchInner(method, p);
   }
 
-  private async deviceFsList(params: { root?: "home" | "workspaceRoot"; path?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
-    const root = params.root ?? "workspaceRoot";
-    const rootPath = root === "home" ? homedir() : this.policy.workspaceRoot;
-    const relPath = params.path ?? ".";
-    if (isAbsolute(relPath)) throw new PhononError("errPolicyDenied", "device.fs.list path must be relative to selected root");
+  private deviceFsRoots(): { roots: Array<{ root: string; path: string; label?: string }> } {
+    const roots: Array<{ root: string; path: string; label?: string }> = [
+      { root: "workspaceRoot", path: this.policy.workspaceRoot, label: "agent-phonon workspace root" },
+      { root: "home", path: homedir(), label: "user home" },
+    ];
+    if (platform() === "win32") {
+      for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+        const p = `${c}:\\\\`;
+        if (existsSync(p)) roots.push({ root: p, path: p, label: `${c}: drive` });
+      }
+    } else {
+      roots.push({ root: "/", path: "/", label: "filesystem root" });
+    }
+    return { roots };
+  }
+
+  private async deviceFsList(params: { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
+    const roots = this.deviceFsRoots().roots;
+    const root = params.absolutePath ? parse(params.absolutePath).root : (params.root ?? "workspaceRoot");
+    const rootPath = params.absolutePath ? parse(params.absolutePath).root : (roots.find((r) => r.root === root)?.path ?? root);
+    const relPath = params.absolutePath ? relative(rootPath, params.absolutePath) || "." : (params.path ?? ".");
+    if (isAbsolute(relPath)) throw new PhononError("errPolicyDenied", "device.fs.list relative path must not be absolute when using root");
     const target = resolve(rootPath, relPath);
     const rootReal = await realpath(rootPath);
     const targetReal = await realpath(target);
@@ -271,8 +289,10 @@ export class PhononConnection {
         return collectDeviceInfo();
       case "device.resources":
         return collectDeviceResources(this.policy.workspaceRoot);
+      case "device.fs.roots":
+        return this.deviceFsRoots();
       case "device.fs.list":
-        return this.deviceFsList(p as { root?: "home" | "workspaceRoot"; path?: string; includeHidden?: boolean; limit?: number });
+        return this.deviceFsList(p as { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number });
       case "discovery.list": {
         // 聚合所有 runtime 的 sub-agents（OpenClaw 多 agent / Codex 单 agent）
         const nested = await Promise.all(this.registry.all().map((a) => a.discoverAgents()));

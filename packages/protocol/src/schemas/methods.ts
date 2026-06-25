@@ -78,7 +78,7 @@ import {
   SkillDirsParams,
   SkillDirsResult,
 } from "./skill.js";
-import { DeviceInfoParams, DeviceInfoResult, DeviceResourcesParams, DeviceResourcesResult, DeviceFsListParams, DeviceFsListResult } from "./device.js";
+import { DeviceInfoParams, DeviceInfoResult, DeviceResourcesParams, DeviceResourcesResult, DeviceFsRootsParams, DeviceFsRootsResult, DeviceFsListParams, DeviceFsListResult } from "./device.js";
 import {
   FileReadParams,
   FileReadResult,
@@ -148,6 +148,12 @@ export const METHODS = {
     kind: "request",
     params: DeviceResourcesParams,
     result: DeviceResourcesResult,
+  },
+  "device.fs.roots": {
+    direction: "s2p",
+    kind: "request",
+    params: DeviceFsRootsParams,
+    result: DeviceFsRootsResult,
   },
   "device.fs.list": {
     direction: "s2p",

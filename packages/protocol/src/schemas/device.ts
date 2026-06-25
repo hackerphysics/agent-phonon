@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const DeviceFsRoot = z.enum(["home", "workspaceRoot"]);
+export const DeviceFsRoot = z.string().min(1);
 export type DeviceFsRoot = z.infer<typeof DeviceFsRoot>;
 
 /**
@@ -69,10 +69,26 @@ export const DeviceResourcesResult = z.object({
 });
 export type DeviceResourcesResult = z.infer<typeof DeviceResourcesResult>;
 
+export const DeviceFsRootsParams = z.object({}).default({});
+export type DeviceFsRootsParams = z.infer<typeof DeviceFsRootsParams>;
+
+export const DeviceFsRootDescriptor = z.object({
+  root: DeviceFsRoot,
+  path: z.string(),
+  label: z.string().optional(),
+});
+export type DeviceFsRootDescriptor = z.infer<typeof DeviceFsRootDescriptor>;
+
+export const DeviceFsRootsResult = z.object({ roots: z.array(DeviceFsRootDescriptor) });
+export type DeviceFsRootsResult = z.infer<typeof DeviceFsRootsResult>;
+
 export const DeviceFsListParams = z.object({
+  /** Named root returned by device.fs.roots. Ignored when absolutePath is provided. */
   root: DeviceFsRoot.default("workspaceRoot").optional(),
-  /** path relative to root; absolute paths are rejected. */
+  /** path relative to root. */
   path: z.string().default(".").optional(),
+  /** Absolute path for root-level browsing, e.g. `/` on POSIX or `C:\\` on Windows. */
+  absolutePath: z.string().optional(),
   includeHidden: z.boolean().default(false).optional(),
   limit: z.number().int().positive().max(1000).default(200).optional(),
 });

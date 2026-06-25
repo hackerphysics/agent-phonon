@@ -205,8 +205,13 @@ export class PhononDevice extends EventEmitter {
     return this.peer.request("device.resources", {});
   }
 
-  /** Device-level directory listing under safe roots (home/workspaceRoot). */
-  fsList(params?: { root?: "home" | "workspaceRoot"; path?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
+  /** Device-level browsable filesystem roots. */
+  fsRoots(): Promise<unknown> {
+    return this.peer.request("device.fs.roots", {});
+  }
+
+  /** Device-level directory listing under safe roots or absolute root paths. */
+  fsList(params?: { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
     return this.peer.request("device.fs.list", params ?? {});
   }
 
