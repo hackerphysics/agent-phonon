@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { spawnAgent } from "../proc.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
@@ -151,7 +152,7 @@ class CodexSession implements AdapterSession {
   private cwd: string;
   private env: CodexEnv;
   private threadId?: string; // Codex thread_id（= 会话），从 thread.started 抓
-  private current?: ReturnType<typeof spawn>;
+  private current?: ChildProcess;
   private pendingInject: string[] = [];
 
   constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[]) {
@@ -196,9 +197,8 @@ class CodexSession implements AdapterSession {
 
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "codex", args, {
+      const child = spawnAgent(this.env.binPath ?? "codex", args, {
         cwd: this.cwd,
-        shell: process.platform === "win32",
         env: { ...process.env, ...(opts.environment ?? {}), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) } as NodeJS.ProcessEnv,
       });
       this.current = child;
@@ -335,7 +335,7 @@ export class CodexAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "codex", ["--version"], { shell: process.platform === "win32" });
+      const child = spawnAgent(this.env.binPath ?? "codex", ["--version"], {});
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

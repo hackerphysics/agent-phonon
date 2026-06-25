@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { spawnAgent } from "../proc.js";
 import { randomUUID } from "node:crypto";
 import { writeFileSync, rmSync, mkdtempSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -86,7 +87,7 @@ class ClaudeCodeSession implements AdapterSession {
   private cwd: string;
   private env: ClaudeCodeEnv;
   private started = false; // 是否已建过（决定 --session-id vs --resume）
-  private current?: ReturnType<typeof spawn>;
+  private current?: ChildProcess;
   private pendingInject: string[] = [];
   private settingsPath?: string;
 
@@ -153,7 +154,7 @@ class ClaudeCodeSession implements AdapterSession {
         if (v !== undefined) childEnv[k] = v;
       }
 
-      const child = spawn(this.env.binPath ?? "claude", args, { cwd: this.cwd, shell: process.platform === "win32", env: { ...childEnv, ...(opts.environment ?? {}) } });
+      const child = spawnAgent(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: { ...childEnv, ...(opts.environment ?? {}) } });
       this.current = child;
       let buf = "";
       let acc = "";
@@ -299,7 +300,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.env.binPath ?? "claude", ["--version"], { shell: process.platform === "win32" });
+      const child = spawnAgent(this.env.binPath ?? "claude", ["--version"], {});
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

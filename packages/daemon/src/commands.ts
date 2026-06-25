@@ -4,7 +4,7 @@ import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chm
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter } from "@agent-phonon/core";
+import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, spawnSyncAgent } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
 
 /**
@@ -12,7 +12,9 @@ import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, 
  */
 
 function probe(bin: string, args: string[] = ["--version"]): { ok: boolean; out: string } {
-  const r = spawnSync(bin, args, { timeout: 8000, shell: platform() === "win32" });
+  // spawnSyncAgent：win32 下给含空格的全路径（如 C:\Program Files\nodejs\claude.cmd）加引号，
+  // 否则 cmd.exe 在空格处截断 → probe 误判为不可用 → autoDetect 不加 adapter → discover=0。
+  const r = spawnSyncAgent(bin, args, { timeout: 8000 });
   return { ok: r.status === 0, out: (r.stdout?.toString() ?? "").trim().split("\n")[0] ?? "" };
 }
 
@@ -20,8 +22,18 @@ function executableNames(bin: string): string[] {
   if (platform() !== "win32") return [bin];
   const exts = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
     .split(";")
-    .map((e) => e.toLowerCase());
-  return [bin, ...exts.map((e) => `${bin}${e}`), ...exts.map((e) => `${bin}${e.toUpperCase()}`)];
+    .map((e) => e.toLowerCase())
+    .filter(Boolean);
+  // Windows：带 PATHEXT 扩展名的版本优先（.cmd/.exe 才是真正可执行的）。
+  // 裸名放最后——npm 全局会同时生成一个无扩展名的 Unix shell shim（如
+  // `C:\Program Files\nodejs\claude`），它 existsSync 为 true 但 Windows 根本
+  // 不能执行；旧实现把裸名放第一位导致 commandPath 命中这个 shim → adapter
+  // spawn 时 ENOENT/EINVAL，最终 discover=0（doctor 却 ✓，因为 probe 用裸名+shell）。
+  return [
+    ...exts.map((e) => `${bin}${e}`),
+    ...exts.map((e) => `${bin}${e.toUpperCase()}`),
+    bin,
+  ];
 }
 
 export function commandPath(bin: string): string | undefined {

@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { spawnAgent } from "../proc.js";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -53,7 +54,7 @@ class OpenClawSession implements AdapterSession {
   private sessionKey: string;
   private cwd: string;
   private openclawAgent: string;
-  private current?: ReturnType<typeof spawn>;
+  private current?: ChildProcess;
   /** 暂存的注入上下文（下次 send 拼进 input，不单独跑一轮，修 P0#13）。 */
   private pendingInject: string[] = [];
 
@@ -198,7 +199,7 @@ class OpenClawSession implements AdapterSession {
   private run(args: string[], signal?: AbortSignal, environment?: Record<string, string>): Promise<string | null> {
     return new Promise((resolve, reject) => {
       // shell:win32 — npm 全局 `openclaw` 在 Windows 是 .cmd shim，Node 22 不带 shell 直接 spawn .cmd 会抛 EINVAL（与 claude/codex/hermes adapter 保持一致）。
-      const child = spawn("openclaw", args, { cwd: this.cwd, shell: process.platform === "win32", env: { ...process.env, ...(environment ?? {}) } as NodeJS.ProcessEnv });
+      const child = spawnAgent("openclaw", args, { cwd: this.cwd, env: { ...process.env, ...(environment ?? {}) } as NodeJS.ProcessEnv });
       this.current = child;
       let out = "";
       let err = "";
@@ -277,7 +278,7 @@ export class OpenClawAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn("openclaw", ["--version"], { shell: process.platform === "win32" });
+      const child = spawnAgent("openclaw", ["--version"], {});
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));

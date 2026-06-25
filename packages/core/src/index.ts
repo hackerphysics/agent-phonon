@@ -555,3 +555,4 @@ export { HermesAdapter } from "./adapters/hermes.js";
 export type { HermesEnv } from "./adapters/hermes.js";
 export { OpenCodeAdapter } from "./adapters/opencode.js";
 export type { OpenCodeEnv } from "./adapters/opencode.js";
+export { spawnAgent, spawnSyncAgent, quoteWinArg } from "./proc.js";

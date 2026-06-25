@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { spawnAgent } from "../proc.js";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -66,7 +67,7 @@ class OpenCodeSession implements AdapterSession {
   private cwd: string;
   private bin: string;
   private ocSessionId?: string; // OpenCode ses_ id（从事件抓，供 -s resume）
-  private current?: ReturnType<typeof spawn>;
+  private current?: ChildProcess;
   private pendingInject: string[] = [];
 
   constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[]) {
@@ -101,7 +102,7 @@ class OpenCodeSession implements AdapterSession {
     return new Promise((resolve) => {
       // 关键：stdin 设 ignore(=DEVNULL)，否则 OpenCode 检测到 stdin pipe 会等交互输入卡死
       // shell:win32 — bin 回退为 PATH 上的 `opencode`（.cmd shim），Node 22 不带 shell spawn .cmd 会抛 EINVAL（与其它 adapter 一致）。
-      const child = spawn(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", env: { ...process.env, ...(opts.environment ?? {}) } as NodeJS.ProcessEnv });
+      const child = spawnAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...(opts.environment ?? {}) } as NodeJS.ProcessEnv });
       this.current = child;
       let buf = "";
       let acc = "";
@@ -237,7 +238,7 @@ export class OpenCodeAdapter implements AgentAdapter {
 
   private probeVersion(): Promise<string | null> {
     return new Promise((resolve) => {
-      const child = spawn(this.bin, ["--version"], { shell: process.platform === "win32" });
+      const child = spawnAgent(this.bin, ["--version"], {});
       let out = "";
       child.stdout.on("data", (d) => (out += d.toString()));
       child.on("error", () => resolve(null));
