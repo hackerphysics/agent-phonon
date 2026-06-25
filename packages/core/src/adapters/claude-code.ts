@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
+import { writeFileSync, rmSync, mkdtempSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
@@ -238,9 +238,22 @@ class ClaudeCodeSession implements AdapterSession {
   }
 
   private resolveSessionFile(): string | undefined {
-    const projectDir = this.cwd.replace(/\\/g, "-").replace(/\//g, "-");
-    const file = join(homedir(), ".claude", "projects", projectDir, `${this.uuid}.jsonl`);
-    return existsSync(file) ? file : undefined;
+    // Claude Code 把 cwd 编码成 projects 子目录名：把 / \ : . 全部替换成 -。
+    // 例：POSIX /home/x/.cc → -home-x--cc；Windows C:\proj → C--proj。
+    // （旧实现只替换 / 和 \，Windows 的盘符冒号 : 没处理 → 目录名对不上 → 丢原生会话续接。）
+    const projectsRoot = join(homedir(), ".claude", "projects");
+    const projectDir = this.cwd.replace(/[/\\:.]/g, "-");
+    const primary = join(projectsRoot, projectDir, `${this.uuid}.jsonl`);
+    if (existsSync(primary)) return primary;
+    // 兜底：uuid 全局唯一，扫描 projects/*/ 找 <uuid>.jsonl，
+    // 防止编码规则在某平台有细微差异（盘符大小写、特殊字符等）导致主路径算错。
+    try {
+      for (const dir of readdirSync(projectsRoot)) {
+        const p = join(projectsRoot, dir, `${this.uuid}.jsonl`);
+        if (existsSync(p)) return p;
+      }
+    } catch { /* projects 目录不存在等，忽略 */ }
+    return undefined;
   }
 
   async interrupt(): Promise<void> {

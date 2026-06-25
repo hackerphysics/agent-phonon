@@ -232,9 +232,108 @@ function serviceUnitContent(): string {
   return `[Unit]\nDescription=agent-phonon device daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${node} ${cli} start\nRestart=always\nRestartSec=5\nMemoryMax=256M\n\n[Install]\nWantedBy=default.target\n`;
 }
 
+// ── macOS launchd ──────────────────────────────────────────────
+const LAUNCHD_LABEL = "ai.phonon.agent";
+
+function launchAgentPath(): string {
+  return join(homedir(), "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`);
+}
+
+function launchAgentContent(): string {
+  const node = process.execPath;
+  const cli = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
+  const logDir = join(homedir(), ".agent-phonon");
+  const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${esc(node)}</string>
+    <string>${esc(cli)}</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${esc(join(logDir, "daemon.out.log"))}</string>
+  <key>StandardErrorPath</key><string>${esc(join(logDir, "daemon.err.log"))}</string>
+</dict>
+</plist>
+`;
+}
+
+function launchctl(args: string[], opts: { check?: boolean } = {}): void {
+  const r = spawnSync("launchctl", args, { stdio: "inherit" });
+  if (opts.check && r.status !== 0) fail(`launchctl ${args.join(" ")} failed`);
+}
+
+function cmdServiceLaunchd(sub: string | undefined, opts: { force?: boolean }): void {
+  const plist = launchAgentPath();
+  switch (sub) {
+    case "install": {
+      if (existsSync(plist) && !opts.force) fail(`${plist} already exists (use --force to overwrite)`);
+      mkdirSync(dirname(plist), { recursive: true });
+      mkdirSync(join(homedir(), ".agent-phonon"), { recursive: true });
+      writeFileSync(plist, launchAgentContent(), { mode: 0o644 });
+      chmodSync(plist, 0o644);
+      launchctl(["unload", plist]); // best-effort（覆盖安装时先卸）
+      launchctl(["load", "-w", plist], { check: true });
+      console.log(`installed + loaded launchd user agent → ${plist}`);
+      console.log("it will start at login and is running now (RunAtLoad).");
+      if (!existsSync(join(homedir(), ".agent-phonon", "config.json"))) console.log("config not found yet; run: agent-phonon init");
+      break;
+    }
+    case "start":
+      launchctl(["start", LAUNCHD_LABEL], { check: true });
+      console.log(`started ${LAUNCHD_LABEL}`);
+      break;
+    case "stop":
+      launchctl(["stop", LAUNCHD_LABEL], { check: true });
+      console.log(`stopped ${LAUNCHD_LABEL}`);
+      break;
+    case "restart":
+      launchctl(["stop", LAUNCHD_LABEL]);
+      launchctl(["start", LAUNCHD_LABEL], { check: true });
+      console.log(`restarted ${LAUNCHD_LABEL}`);
+      break;
+    case "status":
+      // launchctl list <label> 返回该 job 的 dict（含 PID/LastExitStatus）；未加载则非零退出
+      launchctl(["list", LAUNCHD_LABEL]);
+      break;
+    case "uninstall":
+      launchctl(["unload", "-w", plist]);
+      rmSync(plist, { force: true });
+      console.log(`removed ${plist}`);
+      break;
+    default:
+      fail("usage: agent-phonon service install|start|stop|restart|status|uninstall [--force]");
+  }
+}
+
+function cmdServiceWindowsGuidance(): void {
+  // Windows 没有 systemd//launchd 等价的「用户级常驻服务」一键方案：
+  // Task Scheduler 不适合长驻守护，正经做法是 nssm/winsw（需外部二进制）。
+  // 不做半成品 schtasks hack，给出可照做的手动指引（诚实优先）。
+  const node = process.execPath;
+  const cli = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
+  console.log("Windows 暂无内置自启服务安装（systemd/launchd 在 Windows 无对应）。\n");
+  console.log("推荐用 nssm（https://nssm.cc）把它注册成 Windows 服务：");
+  console.log(`  nssm install agent-phonon "${node}" "${cli}" start`);
+  console.log("  nssm start agent-phonon\n");
+  console.log("或登录自启（开机后台运行，非真正服务）—— 在 PowerShell 执行：");
+  console.log(`  $a = New-ScheduledTaskAction -Execute '${node}' -Argument '"${cli}" start'`);
+  console.log("  $t = New-ScheduledTaskTrigger -AtLogOn");
+  console.log("  Register-ScheduledTask -TaskName agent-phonon -Action $a -Trigger $t -RunLevel Limited");
+}
+
 export function cmdService(sub: string | undefined, opts: { force?: boolean } = {}): void {
-  if (platform() !== "linux") {
-    fail(`service ${sub ?? ""} is currently implemented for Linux systemd --user only (platform=${platform()})`);
+  const plat = platform();
+  if (plat === "darwin") return cmdServiceLaunchd(sub, opts);
+  if (plat === "win32") return cmdServiceWindowsGuidance();
+  if (plat !== "linux") {
+    fail(`service ${sub ?? ""} not supported on platform=${plat} (linux systemd / macOS launchd / Windows nssm only)`);
   }
   const unit = serviceUnitPath();
   switch (sub) {

@@ -118,7 +118,7 @@ async function main(): Promise<void> {
       console.log("  adapter add <type> [opts]     configure an adapter override (auto-detect covers common local agents)");
       console.log("  adapter list                  list configured + auto-detected adapters");
       console.log("  plugin install openclaw       install OpenClaw HITL plugin");
-      console.log("  service install|start|status  manage Linux systemd --user service");
+      console.log("  service install|start|status  manage autostart service (Linux systemd / macOS launchd / Windows nssm)");
       console.log("  server add <url> [--trust-local] [--device-key <k>]");
       console.log("  server list");
       console.log("  config [--show-secrets]       show config (redacted by default)");
