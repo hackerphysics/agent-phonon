@@ -86,8 +86,11 @@ export class SkillManager {
     source: SkillSource;
     allowUrl?: boolean;
   }): Promise<SkillRecord> {
-    const dest = this.targetDir(params);
-    await mkdir(dest, { recursive: true });
+    const target = this.targetDir(params);
+    await mkdir(target, { recursive: true });
+    // realpath 归一化：与 skill.dirs 的 listDirs 保持一致（后者也 realpath）。
+    // 不归一则 macOS 上 installedPath=/var/...、dirs.path=/private/var/...不一致。
+    const dest = await realpath(target);
 
     let hash: string | undefined;
     const hasher = createHash("sha256");

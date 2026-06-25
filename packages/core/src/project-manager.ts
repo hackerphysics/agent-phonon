@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, rm, readdir, stat } from "node:fs/promises";
+import { mkdir, rm, readdir, stat, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve, basename, sep } from "node:path";
 import { homedir } from "node:os";
@@ -105,7 +105,7 @@ export class ProjectManager {
   async create(params: { name: string; path?: string; git?: boolean; remote?: string }): Promise<ProjectRecord> {
     const projectId = `proj-${Date.now()}-${this.idSeq++}`;
     const root = this.workspaceRoot ?? defaultWorkspaceRoot();
-    const path = params.path ? resolve(params.path) : join(root, params.name);
+    let path = params.path ? resolve(params.path) : join(root, params.name);
     // 路径校验（P0-1）：policy 执行越界拒绝（不再「记风险但放行」）
     if (this.assertProjectPath) this.assertProjectPath(path);
     if (existsSync(path) && (await readdir(path)).length > 0) {
@@ -113,6 +113,10 @@ export class ProjectManager {
     } else {
       await mkdir(path, { recursive: true });
     }
+    // realpath 归一化：让对外 path 与文件系统真实路径一致（macOS /var → /private/var
+    // 是 symlink；不归一会导致 project.exec 子进程 cwd、skill 安装路径报 /private/var
+    // 而 project.path 是 /var，上层做前缀匹配/围栏判断时跨平台错配）。
+    path = await realpath(path);
     const git = params.git !== false;
     if (git && !existsSync(join(path, ".git"))) {
       await runGit(path, ["init"]);
