@@ -226,6 +226,7 @@ export class PhononDevice extends EventEmitter {
       status: (p: { projectId: string; worktreeId?: string }) => this.peer.request("project.git.status", p),
       deleteBranch: (p: { projectId: string; branch: string; force?: boolean }) => this.peer.request("project.git.deleteBranch", p),
     },
+    exec: (p: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number }) => this.peer.request("project.exec", p),
   };
 
   env = {
@@ -293,6 +294,15 @@ export class PhononDevice extends EventEmitter {
     /** 手动 ack workflow.event seq≤lastSeq（平时不需调用，SDK 自动 ack）。 */
     ack: (workflowId: string, lastSeq: number) =>
       this.peer.notify("workflow.ack", { workflowId, lastSeq }),
+    events: {
+      list: (p: { workflowId: string; afterSeq?: number; limit?: number }) => this.peer.request("workflow.events.list", p) as Promise<{ events: WorkflowEvent[]; nextSeq?: number }>,
+    },
+    artifact: {
+      register: (p: { workflowId: string; nodeId?: string; kind: "report" | "diff" | "spec" | "log" | "patch" | "image" | "binary" | "other"; path: string; title?: string; mimeType?: string; metadata?: Record<string, unknown> }) => this.peer.request("workflow.artifact.register", p),
+    },
+    artifacts: {
+      list: (workflowId: string) => this.peer.request("workflow.artifacts.list", { workflowId }),
+    },
   };
 
   /** 流式订阅 workflow.event（不使用 EventEmitter 字符串名的 typed 参数版本）。 */

@@ -361,6 +361,8 @@ export class PhononConnection {
         return this.projects.gitPush(p as { projectId: string; worktreeId?: string; branch: string; remote?: string; force?: boolean; setUpstream?: boolean });
       case "project.git.status":
         return this.projects.gitStatus(p as { projectId: string; worktreeId?: string });
+      case "project.exec":
+        return this.projects.exec(p as { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number });
 
       // ---- file workspace IO (project/worktree scoped) ----
       case "file.read":
@@ -435,6 +437,12 @@ export class PhononConnection {
         this.workflows?.ack(p.workflowId as string, p.lastSeq as number);
         return null;
       }
+      case "workflow.events.list":
+        return this.workflows!.eventsList(p as { workflowId: string; afterSeq?: number; limit?: number });
+      case "workflow.artifact.register":
+        return this.workflows!.artifactRegister(p as { workflowId: string; nodeId?: string; kind: "report" | "diff" | "spec" | "log" | "patch" | "image" | "binary" | "other"; path: string; title?: string; mimeType?: string; metadata?: Record<string, unknown> });
+      case "workflow.artifacts.list":
+        return this.workflows!.artifactsList(p.workflowId as string);
 
       // ---- 连接/可靠性（s2p） ----
       case "stream.ack": {

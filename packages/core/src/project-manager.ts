@@ -406,6 +406,35 @@ export class ProjectManager {
     });
     return { branch, isClean: files.length === 0, ahead, behind, upstream, files };
   }
+
+  async exec(params: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number }): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; truncated: boolean }> {
+    const root = this.cwdFor(params.projectId, params.worktreeId);
+    const cwd = params.cwd ? resolve(root, params.cwd) : root;
+    const normRoot = resolve(root);
+    if (!(cwd === normRoot || cwd.startsWith(normRoot + "/"))) throw new PhononError("errPolicyDenied", "project.exec cwd escapes project/worktree root");
+    if (params.command.includes("\n") || params.command.includes("\r") || params.command.includes("\0")) throw new PhononError("errInvalidParams", "invalid command");
+    const started = Date.now();
+    const max = params.maxOutputBytes ?? 1024 * 1024;
+    const timeoutMs = params.timeoutMs ?? 120_000;
+    return new Promise((resolveP, reject) => {
+      const child = spawn(params.command, params.args ?? [], { cwd, shell: false, env: { ...process.env, ...(params.env ?? {}) } });
+      let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0); let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0); let truncated = false;
+      const append = (cur: Buffer<ArrayBufferLike>, d: Buffer): Buffer<ArrayBufferLike> => {
+        const next = Buffer.concat([cur, d]);
+        if (next.length > max) { truncated = true; return next.subarray(0, max); }
+        return next;
+      };
+      const timer = setTimeout(() => { child.kill("SIGTERM"); }, timeoutMs);
+      child.stdout.on("data", (d: Buffer) => { stdout = append(stdout, d); });
+      child.stderr.on("data", (d: Buffer) => { stderr = append(stderr, d); });
+      child.on("error", (e) => { clearTimeout(timer); reject(new PhononError("errInternal", `exec spawn failed: ${e.message}`)); });
+      child.on("close", (code, signal) => {
+        clearTimeout(timer);
+        const exitCode = code ?? (signal ? 128 : 1);
+        resolveP({ exitCode, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), durationMs: Date.now() - started, truncated });
+      });
+    });
+  }
 }
 
 export { runGit };

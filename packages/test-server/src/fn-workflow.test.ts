@@ -65,6 +65,18 @@ test("workflow.run DAG: stream.event carries workflowId/nodeId; node.result popu
   // workflow.event 仍含 workflow.status + node.status 元事件
   assert.ok(wfEvents.some((e) => e.type === "workflow.status" && e.status === "completed"));
   assert.ok(wfEvents.some((e) => e.type === "node.status" && e.nodeId === "a" && e.status === "completed"));
+  assert.ok((a.result as { usage?: { durationMs?: number } })?.usage?.durationMs !== undefined, "node result should include runtime duration telemetry");
+
+  const replay = await tc.call("workflow.events.list", { workflowId: run.workflowId, afterSeq: 0, limit: 20 }) as { events: Array<{ seq: number; type: string }> };
+  assert.ok(replay.events.length > 0, "workflow.events.list should replay stored workflow events");
+  assert.ok(replay.events.every((e) => e.seq > 0));
+
+  const art = await tc.call("workflow.artifact.register", { workflowId: run.workflowId, nodeId: "b", kind: "report", path: "reports/final.md", title: "Final report" }) as { artifact: { artifactId: string; kind: string; path: string } };
+  assert.equal(art.artifact.kind, "report");
+  const artifacts = await tc.call("workflow.artifacts.list", { workflowId: run.workflowId }) as { artifacts: Array<{ artifactId: string; path: string }> };
+  assert.equal(artifacts.artifacts.length, 1);
+  assert.equal(artifacts.artifacts[0]!.path, "reports/final.md");
+  assert.ok(tc.notifications.some((e) => e.workflowId === run.workflowId && e.type === "artifact.written"));
 });
 
 test("workflow.run DAG: onNodeFailure=skip_dependents skips downstream when upstream fails", async () => {

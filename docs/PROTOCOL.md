@@ -1,13 +1,13 @@
 # agent-phonon 协议总览（一页速读）
 
 > 自动对照 `packages/protocol` 源码的人话版总览。字段级看 `src/schemas/*.ts`，决策看 `docs/design.md`。
-> 当前 50 个方法，协议版本 `0.1.0`。
+> 当前 61 个方法，协议版本 `0.1.0`。
 
 ## 一句话
 
 phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 JSON-RPC 2.0。服务端下发 session 操作，phonon 上推流式结果 / 自发输出 / hook 请求。
 
-## 50 个方法
+## 61 个方法
 
 | 方法 | 方向 | 类型 | 干啥 |
 |------|------|------|------|
@@ -42,6 +42,8 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `project.worktree.list` | server→phonon | request | 列 worktree |
 | `project.worktree.remove` | server→phonon | request | 清理 worktree |
 | `project.git.deleteBranch` | server→phonon | request | 删合并分支 |
+| `project.git.commit/merge/diff/log/push/status` | server→phonon | request | 底层 Git 操作：提交、合并、diff、日志、推送、状态 |
+| `project.exec` | server→phonon | request | 在 project/worktree sandbox 内受控执行非 shell 命令，返回 exitCode/stdout/stderr/duration |
 | `file.read` | server→phonon | request | 读取 project/worktree 内文件（utf8/base64，可 maxBytes 截断） |
 | `file.write` | server→phonon | request | 写 project/worktree 内文件（可建父目录、可幂等） |
 | `file.list` | server→phonon | request | 列 project/worktree 内目录（可递归、limit） |
@@ -58,8 +60,11 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `workflow.status` | server→phonon | request | 查询 workflow 与各 node/session 状态；节点 result 带 text/status/usage；finalText 可选 |
 | `workflow.cancel` | server→phonon | request | 取消 workflow（幂等） |
 | `workflow.list` | server→phonon | request | 列 workflow run（可按 status/projectId/since/until 筛） |
-| `workflow.event` | phonon→server | notify | L3 工作流级元事件：workflow.status / node.status / edge.route / executor.decision（session 输出走 stream.event） |
+| `workflow.event` | phonon→server | notify | L3 工作流级元事件：workflow.status / node.status / edge.route / executor.decision / artifact.written / node.diagnostic（session 输出走 stream.event） |
 | `workflow.ack` | server→phonon | notify | 确认 workflow.event seq≤lastSeq（与 stream.ack 平行） |
+| `workflow.events.list` | server→phonon | request | 回放 workflow.event（afterSeq + limit），用于 Hub 重连/补历史 |
+| `workflow.artifact.register` | server→phonon | request | 登记 workflow 产物并发 artifact.written 事件 |
+| `workflow.artifacts.list` | server→phonon | request | 列出某 workflow 已登记产物 |
 
 ## session 状态（你问的重点，D19）
 

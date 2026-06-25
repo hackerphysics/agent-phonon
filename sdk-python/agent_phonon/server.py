@@ -155,6 +155,9 @@ class PhononDevice:
     async def git_status(self, project_id: str, **opts: Any) -> dict:
         return await self._peer.request("project.git.status", {"projectId": project_id, **opts})
 
+    async def project_exec(self, project_id: str, command: str, args: list[str] | None = None, **opts: Any) -> dict:
+        return await self._peer.request("project.exec", {"projectId": project_id, "command": command, "args": args or [], **opts})
+
     async def env_set(self, scope: str, name: str, value: str, **opts: Any) -> dict:
         return await self._peer.request("env.set", {"scope": scope, "name": name, "value": value, **opts})
 
@@ -281,6 +284,18 @@ class PhononDevice:
         一般不需调用：SDK 在 workflow.event 入口已自动 ack。
         """
         await self._peer.notify("workflow.ack", {"workflowId": workflow_id, "lastSeq": last_seq})
+
+    async def workflow_events_list(self, workflow_id: str, after_seq: int | None = None, limit: int | None = None) -> dict:
+        params: dict = {"workflowId": workflow_id}
+        if after_seq is not None: params["afterSeq"] = after_seq
+        if limit is not None: params["limit"] = limit
+        return await self._peer.request("workflow.events.list", params)
+
+    async def workflow_artifact_register(self, workflow_id: str, kind: str, path: str, **opts: Any) -> dict:
+        return await self._peer.request("workflow.artifact.register", {"workflowId": workflow_id, "kind": kind, "path": path, **opts})
+
+    async def workflow_artifacts_list(self, workflow_id: str) -> dict:
+        return await self._peer.request("workflow.artifacts.list", {"workflowId": workflow_id})
 
     def set_hook_decider(self, fn: HookDecider) -> None:
         self._hook_decider = fn

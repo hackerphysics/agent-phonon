@@ -356,3 +356,28 @@ export const GitStatusResult = z.object({
   files: z.array(GitFileStatus),
 });
 export type GitStatusResult = z.infer<typeof GitStatusResult>;
+
+// --- project.exec ---
+// 受控命令执行：在 project/worktree sandbox 内运行一个非 shell 命令。
+export const ProjectExecParams = z.object({
+  projectId: ProjectId,
+  worktreeId: z.string().optional(),
+  /** Executable name/path. Shell strings are not accepted; pass args separately. */
+  command: z.string().min(1),
+  args: z.array(z.string()).default([]),
+  /** Optional cwd relative to project/worktree root. Must stay inside that root. */
+  cwd: z.string().optional(),
+  env: z.record(z.string()).optional(),
+  timeoutMs: z.number().int().positive().max(30 * 60_000).default(120_000),
+  maxOutputBytes: z.number().int().positive().max(10 * 1024 * 1024).default(1024 * 1024),
+});
+export type ProjectExecParams = z.infer<typeof ProjectExecParams>;
+
+export const ProjectExecResult = z.object({
+  exitCode: z.number().int(),
+  stdout: z.string(),
+  stderr: z.string(),
+  durationMs: z.number().int().nonnegative(),
+  truncated: z.boolean().default(false),
+});
+export type ProjectExecResult = z.infer<typeof ProjectExecResult>;

@@ -66,6 +66,7 @@ import {
   GitLogParams, GitLogResult,
   GitPushParams, GitPushResult,
   GitStatusParams, GitStatusResult,
+  ProjectExecParams, ProjectExecResult,
 } from "./project.js";
 import {
   SkillInstallParams,
@@ -102,6 +103,12 @@ import {
   WorkflowListResult,
   WorkflowEvent,
   WorkflowAckParams,
+  WorkflowEventsListParams,
+  WorkflowEventsListResult,
+  WorkflowArtifactRegisterParams,
+  WorkflowArtifactRegisterResult,
+  WorkflowArtifactsListParams,
+  WorkflowArtifactsListResult,
   WorkflowResumeParams,
 } from "./workflow.js";
 
@@ -357,6 +364,10 @@ export const METHODS = {
     direction: "s2p", kind: "request",
     params: GitStatusParams, result: GitStatusResult,
   },
+  "project.exec": {
+    direction: "s2p", kind: "request",
+    params: ProjectExecParams, result: ProjectExecResult,
+  },
 
   // --- 受控工作区文件读写（server 下发，project/worktree scoped）---
   "file.read": {
@@ -480,6 +491,24 @@ export const METHODS = {
     kind: "notification",
     params: WorkflowAckParams,
     result: z_void,
+  },
+  "workflow.events.list": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowEventsListParams,
+    result: WorkflowEventsListResult,
+  },
+  "workflow.artifact.register": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowArtifactRegisterParams,
+    result: WorkflowArtifactRegisterResult,
+  },
+  "workflow.artifacts.list": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowArtifactsListParams,
+    result: WorkflowArtifactsListResult,
   },
 } as const;
 

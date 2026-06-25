@@ -48,6 +48,23 @@ test("project.remove deleteFiles denied without policy", async () => {
   await assert.rejects(() => tc.call("project.remove", { projectId: c.project.projectId, deleteFiles: true }), (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errPolicyDenied");
 });
 
+test("project.exec runs command in project sandbox and returns structured output", async () => {
+  const { tc } = setup();
+  const c = (await tc.call("project.create", { name: "exec-demo", git: false })) as { project: { projectId: string; path: string } };
+  const r = (await tc.call("project.exec", { projectId: c.project.projectId, command: process.execPath, args: ["-e", "console.log(process.cwd()); console.error('ERRLINE')"], maxOutputBytes: 10000 })) as { exitCode: number; stdout: string; stderr: string; durationMs: number; truncated: boolean };
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.stdout.trim(), c.project.path);
+  assert.match(r.stderr, /ERRLINE/);
+  assert.equal(r.truncated, false);
+  assert.ok(r.durationMs >= 0);
+});
+
+test("project.exec rejects cwd escaping project root", async () => {
+  const { tc } = setup();
+  const c = (await tc.call("project.create", { name: "exec-escape", git: false })) as { project: { projectId: string } };
+  await assert.rejects(() => tc.call("project.exec", { projectId: c.project.projectId, command: process.execPath, cwd: "..", args: ["-e", "console.log('no')"] }), (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errPolicyDenied");
+});
+
 test("project.remove with active session → errProjectHasActiveSessions", async () => {
   const { tc } = setup();
   const c = (await tc.call("project.create", { name: "p", git: false })) as { project: { projectId: string } };

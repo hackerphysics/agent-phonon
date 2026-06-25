@@ -13,6 +13,7 @@ import type {
   WorkflowSharedContext,
   WorkflowResumeFrom,
   WorkflowNodeResult,
+  WorkflowArtifact,
   WorkflowRoutingDirective,
   StreamEvent,
 } from "@agent-phonon/protocol";
@@ -158,6 +159,8 @@ export class WorkflowEngine {
   private pendingResultText = new Map<string, string>();
   private turnResultCache = new Map<string, WorkflowNodeResult>();
   private turnWaiters = new Map<string, (r: WorkflowNodeResult) => void>();
+  private workflowEvents = new Map<string, WorkflowEvent[]>();
+  private artifacts = new Map<string, WorkflowArtifact[]>();
   private idSeq = 1;
 
   /**
@@ -367,6 +370,44 @@ export class WorkflowEngine {
     }
   }
 
+  eventsList(params: { workflowId: string; afterSeq?: number; limit?: number }): { events: WorkflowEvent[]; nextSeq?: number } {
+    const all = this.workflowEvents.get(params.workflowId) ?? [];
+    const afterSeq = params.afterSeq ?? -1;
+    const limit = params.limit ?? 200;
+    const events = all.filter((e) => e.seq > afterSeq).slice(0, limit);
+    const last = events.at(-1)?.seq;
+    const hasMore = last !== undefined && all.some((e) => e.seq > last);
+    return { events, ...(hasMore && last !== undefined ? { nextSeq: last } : {}) };
+  }
+
+  artifactRegister(params: { workflowId: string; nodeId?: string; kind: WorkflowArtifact["kind"]; path: string; title?: string; mimeType?: string; metadata?: Record<string, unknown> }): { artifact: WorkflowArtifact } {
+    const run = this.runs.get(params.workflowId);
+    if (!run) throw new PhononError("errInvalidParams", `workflow ${params.workflowId} not found or is not active`);
+    let size: number | undefined;
+    try { size = fs.statSync(params.path).size; } catch { /* path may be virtual or created later */ }
+    const artifact: WorkflowArtifact = {
+      artifactId: `art-${Date.now()}-${this.idSeq++}`,
+      workflowId: params.workflowId,
+      nodeId: params.nodeId,
+      kind: params.kind,
+      path: params.path,
+      title: params.title,
+      mimeType: params.mimeType,
+      size,
+      createdAt: new Date().toISOString(),
+      metadata: params.metadata,
+    };
+    const list = this.artifacts.get(params.workflowId) ?? [];
+    list.push(artifact);
+    this.artifacts.set(params.workflowId, list);
+    this.emit(run, { type: "artifact.written", nodeId: params.nodeId, payload: artifact });
+    return { artifact };
+  }
+
+  artifactsList(workflowId: string): { artifacts: WorkflowArtifact[] } {
+    return { artifacts: this.artifacts.get(workflowId) ?? [] };
+  }
+
   /** SessionEngine sink → 提取 result 文本到 turnWaiters；不再产生 node.stream 事件。 */
   onStreamEvent(ev: StreamEvent): void {
     const sessionId = (ev as { sessionId?: string }).sessionId;
@@ -384,7 +425,11 @@ export class WorkflowEngine {
     } else if (evAny.type === "result") {
       const text = (evAny.text as string | undefined) || this.pendingResultText.get(key) || "";
       this.pendingResultText.delete(key);
-      const usage = evAny.usage as WorkflowNodeResult["usage"];
+      const rawUsage = evAny.usage as WorkflowNodeResult["usage"] | undefined;
+      const run = this.runs.get(mapping.workflowId);
+      const node = run?.nodes.find((n) => n.nodeId === mapping.nodeId);
+      const durationMs = node?.startedAt ? Math.max(0, Date.now() - Date.parse(node.startedAt)) : undefined;
+      const usage = rawUsage || durationMs !== undefined ? { ...(rawUsage ?? {}), ...(durationMs !== undefined && rawUsage?.durationMs === undefined ? { durationMs } : {}) } : undefined;
       const status = (evAny.status as WorkflowNodeResult["status"]) ?? "completed";
       const result: WorkflowNodeResult = { text, status, usage };
       const resolver = this.turnWaiters.get(key);
@@ -1454,8 +1499,11 @@ export class WorkflowEngine {
   }
 
   private emit(run: WorkflowRunState, partial: Record<string, unknown>): void {
-    const ev = { workflowId: run.workflowId, seq: run.seq++, timestamp: new Date().toISOString(), ...partial };
+    const ev = { workflowId: run.workflowId, seq: run.seq++, timestamp: new Date().toISOString(), ...partial } as unknown as WorkflowEvent;
+    const list = this.workflowEvents.get(run.workflowId) ?? [];
+    list.push(ev);
+    this.workflowEvents.set(run.workflowId, list);
     this.persist(run);
-    this.opts.emit(ev as unknown as WorkflowEvent);
+    this.opts.emit(ev);
   }
 }

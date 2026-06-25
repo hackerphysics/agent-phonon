@@ -293,6 +293,11 @@ export const WorkflowNodeResult = z.object({
     .object({
       inputTokens: z.number().int().nonnegative().optional(),
       outputTokens: z.number().int().nonnegative().optional(),
+      cachedTokens: z.number().int().nonnegative().optional(),
+      reasoningTokens: z.number().int().nonnegative().optional(),
+      toolCalls: z.number().int().nonnegative().optional(),
+      durationMs: z.number().int().nonnegative().optional(),
+      costEstimate: z.object({ amount: z.number().nonnegative(), currency: z.enum(["USD", "CNY"]) }).optional(),
     })
     .optional(),
 });
@@ -378,6 +383,8 @@ export const WorkflowEvent = z.object({
     "discussion.terminated", // discussion 终止（含理由）
     "human_review.requested", // executor emit workflow.human_review 触发
     "human_review.resolved",  // server 通过 interaction.respond 回复
+    "artifact.written",
+    "node.diagnostic",
   ]),
   nodeId: WorkflowNodeId.optional(),
   sessionId: SessionId.optional(),
@@ -402,6 +409,50 @@ export const WorkflowAckParams = z.object({
   lastSeq: z.number().int().nonnegative(),
 });
 export type WorkflowAckParams = z.infer<typeof WorkflowAckParams>;
+
+export const WorkflowEventsListParams = z.object({
+  workflowId: WorkflowId,
+  afterSeq: z.number().int().nonnegative().optional(),
+  limit: z.number().int().positive().max(1000).default(200).optional(),
+});
+export type WorkflowEventsListParams = z.infer<typeof WorkflowEventsListParams>;
+export const WorkflowEventsListResult = z.object({
+  events: z.array(WorkflowEvent),
+  nextSeq: z.number().int().nonnegative().optional(),
+});
+export type WorkflowEventsListResult = z.infer<typeof WorkflowEventsListResult>;
+
+export const WorkflowArtifact = z.object({
+  artifactId: z.string().min(1),
+  workflowId: WorkflowId,
+  nodeId: WorkflowNodeId.optional(),
+  kind: z.enum(["report", "diff", "spec", "log", "patch", "image", "binary", "other"]),
+  path: z.string().min(1),
+  title: z.string().optional(),
+  mimeType: z.string().optional(),
+  size: z.number().int().nonnegative().optional(),
+  createdAt: Timestamp,
+  metadata: z.record(z.unknown()).optional(),
+});
+export type WorkflowArtifact = z.infer<typeof WorkflowArtifact>;
+
+export const WorkflowArtifactRegisterParams = z.object({
+  workflowId: WorkflowId,
+  nodeId: WorkflowNodeId.optional(),
+  kind: WorkflowArtifact.shape.kind,
+  path: z.string().min(1),
+  title: z.string().optional(),
+  mimeType: z.string().optional(),
+  metadata: z.record(z.unknown()).optional(),
+});
+export type WorkflowArtifactRegisterParams = z.infer<typeof WorkflowArtifactRegisterParams>;
+export const WorkflowArtifactRegisterResult = z.object({ artifact: WorkflowArtifact });
+export type WorkflowArtifactRegisterResult = z.infer<typeof WorkflowArtifactRegisterResult>;
+
+export const WorkflowArtifactsListParams = z.object({ workflowId: WorkflowId });
+export type WorkflowArtifactsListParams = z.infer<typeof WorkflowArtifactsListParams>;
+export const WorkflowArtifactsListResult = z.object({ artifacts: z.array(WorkflowArtifact) });
+export type WorkflowArtifactsListResult = z.infer<typeof WorkflowArtifactsListResult>;
 
 // ---------------------------------------------------------------------------
 // Routing directive — v0.5 升级为判别联合（review 借鉴 1）
