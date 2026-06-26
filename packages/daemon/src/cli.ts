@@ -50,14 +50,39 @@ async function main(): Promise<void> {
           console.error("usage: agent-phonon server add <url> [--trust-local] [--device-key <key>]");
           process.exit(1);
         }
-        cfg.servers.push({ url, trustLocal: flag("trust-local"), deviceKey: opt("device-key") });
-        writeConfig(cfg);
-        console.log(`added server ${url} (${cfg.servers.length} total)`);
+        const existing = cfg.servers.findIndex((s) => s.url === url);
+        const entry = { url, trustLocal: flag("trust-local"), deviceKey: opt("device-key") };
+        if (existing >= 0) {
+          cfg.servers[existing] = entry; // 去重：同 url 覆盖，不重复堆叠
+          writeConfig(cfg);
+          console.log(`updated server ${url} (${cfg.servers.length} total)`);
+        } else {
+          cfg.servers.push(entry);
+          writeConfig(cfg);
+          console.log(`added server ${url} (${cfg.servers.length} total)`);
+        }
       } else if (sub === "list") {
         if (cfg.servers.length === 0) console.log("(no servers configured)");
-        for (const s of cfg.servers) console.log(`- ${s.url}${s.trustLocal ? " [trustLocal]" : ""}`);
+        cfg.servers.forEach((s, i) => console.log(`${i}: ${s.url}${s.trustLocal ? " [trustLocal]" : ""}${s.deviceKey ? " [deviceKey]" : ""}`));
+      } else if (sub === "remove" || sub === "rm") {
+        const target = args[1];
+        if (!target) {
+          console.error("usage: agent-phonon server remove <url|index>");
+          process.exit(1);
+        }
+        const before = cfg.servers.length;
+        // 支持按 url 或按 list 显示的序号删除
+        const idx = /^\d+$/.test(target) ? Number(target) : cfg.servers.findIndex((s) => s.url === target);
+        if (idx < 0 || idx >= cfg.servers.length) {
+          console.error(`server not found: ${target} (use 'agent-phonon server list' to see configured servers)`);
+          process.exit(1);
+        }
+        const [removed] = cfg.servers.splice(idx, 1);
+        writeConfig(cfg);
+        console.log(`removed server ${removed?.url} (${cfg.servers.length} remaining)`);
+        if (before > 0 && cfg.servers.length < before) console.log("restart the daemon for it to take effect: agent-phonon service restart");
       } else {
-        console.error("usage: agent-phonon server add|list");
+        console.error("usage: agent-phonon server add|list|remove");
         process.exit(1);
       }
       break;
@@ -121,6 +146,7 @@ async function main(): Promise<void> {
       console.log("  service install|start|status  manage autostart service (Linux systemd / macOS launchd / Windows nssm)");
       console.log("  server add <url> [--trust-local] [--device-key <k>]");
       console.log("  server list");
+      console.log("  server remove <url|index>");
       console.log("  config [--show-secrets]       show config (redacted by default)");
       console.log("\nrun:");
       console.log("  discover                      list available agents (without starting daemon)");
