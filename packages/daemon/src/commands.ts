@@ -281,6 +281,24 @@ function launchctl(args: string[], opts: { check?: boolean } = {}): void {
   if (opts.check && r.status !== 0) fail(`launchctl ${args.join(" ")} failed`);
 }
 
+/** 人话化的 launchd 服务状态（解析 launchctl list <label> 的 PID/LastExitStatus）。 */
+function launchctlStatus(label: string): void {
+  const r = spawnSync("launchctl", ["list", label], { encoding: "utf8" });
+  if (r.status !== 0) {
+    console.log(`✗ ${label}: not loaded (run: agent-phonon service install)`);
+    return;
+  }
+  const out = r.stdout ?? "";
+  const pidM = out.match(/"PID"\s*=\s*(\d+)/);
+  const exitM = out.match(/"LastExitStatus"\s*=\s*(-?\d+)/);
+  if (pidM) {
+    console.log(`✓ ${label}: running (PID ${pidM[1]})`);
+  } else {
+    const exit = exitM ? exitM[1] : "?";
+    console.log(`✗ ${label}: loaded but not running (last exit status ${exit})`);
+  }
+}
+
 function cmdServiceLaunchd(sub: string | undefined, opts: { force?: boolean }): void {
   const plist = launchAgentPath();
   switch (sub) {
@@ -311,8 +329,8 @@ function cmdServiceLaunchd(sub: string | undefined, opts: { force?: boolean }): 
       console.log(`restarted ${LAUNCHD_LABEL}`);
       break;
     case "status":
-      // launchctl list <label> 返回该 job 的 dict（含 PID/LastExitStatus）；未加载则非零退出
-      launchctl(["list", LAUNCHD_LABEL]);
+      // 人话化输出：✓ running (PID) / ✗ not loaded / ✗ loaded but not running
+      launchctlStatus(LAUNCHD_LABEL);
       break;
     case "uninstall":
       launchctl(["unload", "-w", plist]);
