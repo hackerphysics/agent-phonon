@@ -4,6 +4,7 @@ import type {
 } from "./adapter.js";
 import type { ContextItem, StreamEvent } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
+import { TranscriptWriter } from "./transcript.js";
 
 /** adapter 注册表：runtime name → adapter 实例。复合 agentId 按 runtime 前缀路由。 */
 export class AdapterRegistry {
@@ -55,6 +56,8 @@ interface SessionRecord {
   seq: number;
   createdAt: string;
   lastActiveAt?: string;
+  /** phonon 自存的会话快照 JSONL 路径（可观测/审计）。 */
+  transcriptPath?: string;
   /**
    * L3 归属（review P0-1）：由 WorkflowEngine 在 create 时注入。
    * 该 session 所有 stream.event 会被 decorate 为携带 workflowId/nodeId/role，
@@ -77,12 +80,16 @@ export class SessionEngine {
   private idSeq = 1;
   /** 可观测事件总线（可选）。 */
   private obs?: import("./observability.js").ObsBus;
+  /** 会话快照写入器（store 落盘时启用）。 */
+  private transcripts?: TranscriptWriter;
 
   constructor(registry: AdapterRegistry, sink: StreamSink, obs?: import("./observability.js").ObsBus, store?: import("./store.js").PhononStore) {
     this.registry = registry;
     this.sink = sink;
     this.obs = obs;
     this.store = store;
+    const tdir = store?.transcriptDir();
+    if (tdir) this.transcripts = new TranscriptWriter(tdir);
     if (store) this.restoreSessions(store);
   }
 
@@ -109,6 +116,7 @@ export class SessionEngine {
         seq: 0,
         createdAt: row.created_at as string,
         lastActiveAt: (row.last_active as string) ?? undefined,
+        transcriptPath: (row.transcript_path as string) ?? undefined,
       });
     }
   }
@@ -121,6 +129,7 @@ export class SessionEngine {
       sessionId: rec.sessionId, tenantId: rec.tenantId, projectId: rec.project,
       worktreeId: rec.worktreeId, agent: rec.agent, model: rec.model,
       status: rec.status, verbosity: rec.verbosity, createdAt: rec.createdAt, lastActive: rec.lastActiveAt,
+      transcriptPath: rec.transcriptPath,
     });
   }
 
@@ -208,6 +217,15 @@ export class SessionEngine {
       workflowAttr: params.workflowAttr,
     });
     const rec0 = this.sessions.get(sessionId)!;
+    // 会话快照：记路径入库 + 写一条 meta 头（best-effort）。
+    if (this.transcripts) {
+      rec0.transcriptPath = this.transcripts.pathFor(sessionId);
+      this.transcripts.append(sessionId, "meta", {
+        sessionId, tenantId: params.tenantId, project: params.project, worktreeId: params.worktreeId,
+        agent: params.agent, model: params.model, createdAt,
+        workflowAttr: params.workflowAttr,
+      });
+    }
     this.persist(rec0);
     this.emit2("session", "info", "session.create", rec0, { msg: `session ${sessionId} on ${params.agent} (${params.model})`, data: { model: params.model } });
     return { sessionId, status: "idle", createdAt };
@@ -293,6 +311,8 @@ export class SessionEngine {
   ): Promise<void> {
     const abort = new AbortController();
     rec.abort = abort;
+    // 会话快照：本轮 input 写一行（完整，不截断；审计要原始）。
+    this.transcripts?.append(rec.sessionId, "input", { turnId, input, verbosity, skills });
     const emit = (event: StreamEvent) => {
       const t = (event as { type?: string }).type;
       // 终态事件去重（避免双终态）：engine 统一发，adapter 重复发的丢弃
@@ -313,6 +333,8 @@ export class SessionEngine {
         this.emit2("tool", "debug", "tool.result", rec, { turnId, data: { toolName: (event as { toolName?: string }).toolName } });
       }
       this.sink(this.decorateEvent(rec, { ...event, seq: rec.seq++ }) as StreamEvent);
+      // 会话快照：tee 完整事件流（message/tool/result 等，含工具细节）。
+      this.transcripts?.append(rec.sessionId, "event", { turnId, event });
     };
     try {
       await rec.adapterSession.send(input, { turnId, verbosity, skills, environment, emit, signal: abort.signal });
@@ -541,6 +563,7 @@ export class SessionEngine {
       verbosity: rec.verbosity,
       createdAt: rec.createdAt,
       lastActiveAt: rec.lastActiveAt,
+      ...(rec.transcriptPath ? { transcriptPath: rec.transcriptPath } : {}),
     };
   }
 }

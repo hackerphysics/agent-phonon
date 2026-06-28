@@ -14,10 +14,12 @@ import { SecretBox } from "./secret-box.js";
  */
 export class PhononStore {
   private db: DatabaseSync;
+  private dbPath: string;
   /** env 变量值 at-rest 加密(AES-256-GCM)。密钥文件与库同目录、0600。 */
   private secrets: SecretBox;
 
   constructor(dbPath: string) {
+    this.dbPath = dbPath;
     if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
@@ -25,6 +27,14 @@ export class PhononStore {
     // 设备密钥：内存库用进程内随机密钥；落盘库用同目录 device.key(0600)。
     this.secrets = SecretBox.fromKeyFile(dbPath === ":memory:" ? undefined : join(dirname(dbPath), "device.key"));
     this.migrate();
+  }
+
+  /**
+   * 会话快照目录：db 同目录下的 sessions/（内存库返回 undefined，不落盘）。
+   */
+  transcriptDir(): string | undefined {
+    if (this.dbPath === ":memory:") return undefined;
+    return join(dirname(this.dbPath), "sessions");
   }
 
   private migrate(): void {
@@ -144,6 +154,18 @@ export class PhononStore {
       CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id, created_at);
     `);
+    // 增量列迁移（幂等）：旧库已存在时 CREATE TABLE IF NOT EXISTS 不会加新列，
+    // 用 PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN。
+    // sessions.transcript_path：phonon 自存的会话快照 JSONL 路径（可观测/审计）。
+    this.ensureColumn("sessions", "transcript_path", "TEXT");
+  }
+
+  /** 幂等加列：列不存在才 ALTER TABLE ADD COLUMN。 */
+  private ensureColumn(table: string, column: string, type: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   // ---- projects ----
@@ -223,17 +245,26 @@ export class PhononStore {
   }
 
   // ---- sessions（元数据，OpenClaw 原生可 resume）----
-  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string }): void {
+  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string }): void {
     this.db
       .prepare(
-        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active)
-         VALUES(?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, status=excluded.status, last_active=excluded.last_active`,
+        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, status=excluded.status, last_active=excluded.last_active,
+           transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path)`,
       )
-      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null);
+      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null);
   }
   loadSessions(): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM sessions WHERE status != 'terminated'").all() as Record<string, unknown>[];
+  }
+  /** 列出全部 session（含 terminated）—— prune/审计用。 */
+  listAllSessions(): Array<Record<string, unknown>> {
+    return this.db.prepare("SELECT * FROM sessions ORDER BY COALESCE(last_active, created_at) DESC").all() as Record<string, unknown>[];
+  }
+  /** 删一条 session 元数据（不动快照文件，由调用方决定）。 */
+  deleteSession(sessionId: string): void {
+    this.db.prepare("DELETE FROM sessions WHERE session_id=?").run(sessionId);
   }
 
   // ---- outbox ----

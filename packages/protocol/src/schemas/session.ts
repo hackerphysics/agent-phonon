@@ -303,6 +303,8 @@ export const SessionMeta = z.object({
   clientTag: z.string().optional(),
   createdAt: Timestamp,
   lastActiveAt: Timestamp.optional(),
+  /** phonon 自存的会话快照 JSONL 路径（可观测/审计；device 本地路径）。 */
+  transcriptPath: z.string().optional(),
 });
 export type SessionMeta = z.infer<typeof SessionMeta>;
 

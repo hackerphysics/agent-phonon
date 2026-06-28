@@ -4,7 +4,7 @@ import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chm
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, spawnSyncAgent } from "@agent-phonon/core";
+import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
 
 /**
@@ -432,4 +432,58 @@ export function cmdPluginInstall(which: string): void {
 function fail(msg: string): void {
   console.error("error:", msg);
   process.exit(1);
+}
+
+// ── sessions: 查看/清理会话快照 ──────────────────────────────
+export function cmdSessions(sub: string | undefined, opts: { olderThanDays?: number; keep?: number; yes?: boolean }): void {
+  let cfg: DaemonConfig;
+  try { cfg = loadConfig(); } catch { fail("config not initialized — run 'agent-phonon init' first"); return; }
+  const store = new PhononStore(cfg.dbPath);
+  const rows = store.listAllSessions();
+
+  if (sub === "list" || sub === undefined) {
+    if (rows.length === 0) { console.log("(no sessions)"); return; }
+    for (const r of rows) {
+      const id = r.session_id as string;
+      const tp = (r.transcript_path as string) ?? "";
+      const exists = tp && existsSync(tp) ? "" : (tp ? " [missing]" : " [no-transcript]");
+      console.log(`${id}  ${r.agent_id}  ${r.status}  ${(r.last_active as string) ?? (r.created_at as string)}  ${tp}${exists}`);
+    }
+    return;
+  }
+
+  if (sub === "prune") {
+    // 选出要删的：older-than（按 last_active/created_at 早于 N 天）与/或 keep（只保留最近 N 条）。
+    // 二者都给时取并集（满足任一即删）；都不给时报错（避免误删全部）。
+    if (opts.olderThanDays === undefined && opts.keep === undefined) {
+      fail("usage: agent-phonon sessions prune --older-than <days> | --keep <n> [--yes]");
+      return;
+    }
+    const now = Date.now();
+    const toDelete: Array<Record<string, unknown>> = [];
+    rows.forEach((r, idx) => {
+      const ts = Date.parse((r.last_active as string) ?? (r.created_at as string) ?? "");
+      const tooOld = opts.olderThanDays !== undefined && Number.isFinite(ts) && (now - ts) > opts.olderThanDays * 86400_000;
+      const beyondKeep = opts.keep !== undefined && idx >= opts.keep; // rows 已按 last_active DESC 排序
+      if (tooOld || beyondKeep) toDelete.push(r);
+    });
+    if (toDelete.length === 0) { console.log("nothing to prune"); return; }
+    if (!opts.yes) {
+      console.log(`would prune ${toDelete.length} session(s) + their transcript files:`);
+      for (const r of toDelete.slice(0, 20)) console.log(`  ${r.session_id}  ${r.agent_id}  ${(r.last_active as string) ?? (r.created_at as string)}`);
+      if (toDelete.length > 20) console.log(`  … and ${toDelete.length - 20} more`);
+      console.log("re-run with --yes to actually delete.");
+      return;
+    }
+    let filesRemoved = 0;
+    for (const r of toDelete) {
+      const tp = r.transcript_path as string | undefined;
+      if (tp && existsSync(tp)) { try { rmSync(tp, { force: true }); filesRemoved++; } catch { /* best-effort */ } }
+      store.deleteSession(r.session_id as string);
+    }
+    console.log(`pruned ${toDelete.length} session(s), removed ${filesRemoved} transcript file(s).`);
+    return;
+  }
+
+  fail("usage: agent-phonon sessions list|prune");
 }

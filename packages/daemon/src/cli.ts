@@ -9,7 +9,7 @@ import {
   type DaemonConfig,
 } from "./config.js";
 import { existsSync } from "node:fs";
-import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall, cmdService } from "./commands.js";
+import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall, cmdService, cmdSessions } from "./commands.js";
 
 /**
  * agent-phonon CLI（bug-bash B4）。
@@ -135,6 +135,16 @@ async function main(): Promise<void> {
       else { console.error("usage: agent-phonon plugin install openclaw"); process.exit(1); }
       break;
     }
+    case "sessions": {
+      const od = opt("older-than");
+      const kp = opt("keep");
+      cmdSessions(args[0], {
+        olderThanDays: od !== undefined ? Number(od) : undefined,
+        keep: kp !== undefined ? Number(kp) : undefined,
+        yes: flag("yes"),
+      });
+      break;
+    }
     default:
       console.log("agent-phonon — device daemon for scheduling local AI agents\n");
       console.log("setup:");
@@ -147,6 +157,8 @@ async function main(): Promise<void> {
       console.log("  server add <url> [--trust-local] [--device-key <k>]");
       console.log("  server list");
       console.log("  server remove <url|index>");
+      console.log("  sessions list                 list sessions + transcript snapshot paths");
+      console.log("  sessions prune --older-than <days>|--keep <n> [--yes]  delete old session snapshots");
       console.log("  config [--show-secrets]       show config (redacted by default)");
       console.log("\nrun:");
       console.log("  discover                      list available agents (without starting daemon)");
