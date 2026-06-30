@@ -14,6 +14,7 @@ import { FileManager } from "./file-manager.js";
 import { collectDeviceResources } from "./resources.js";
 import { collectDeviceInfo } from "./device-info.js";
 import { WorkflowEngine } from "./workflow-engine.js";
+import { SchedulerEngine } from "./scheduler-engine.js";
 import { EnvManager } from "./env-manager.js";
 import type { AgentAdapter } from "./adapter.js";
 import { PROTOCOL_VERSION, parseParams, METHODS, type StreamEvent, type TenantPolicy, type MethodName, type WorkflowPlan } from "@agent-phonon/protocol";
@@ -38,6 +39,13 @@ const MUTATING_METHODS = new Set<string>([
   "env.delete",
   "workflow.run",
   "workflow.cancel",
+  "schedule.create",
+  "schedule.update",
+  "schedule.delete",
+  "schedule.enable",
+  "schedule.disable",
+  "schedule.trigger",
+  "run.cancel",
 ]);
 
 /**
@@ -65,6 +73,7 @@ export class PhononConnection {
   private env: EnvManager;
   private obs?: import("./observability.js").ObsBus;
   private workflows?: WorkflowEngine;
+  private scheduler?: SchedulerEngine;
   /** 该 tenant 绑定的默认项目工作目录解析器（v0 简化：projectId 即绝对路径或映射）。 */
   private resolveProjectCwd: (project: string) => string;
 
@@ -94,6 +103,7 @@ export class PhononConnection {
     this.outbox = new Outbox({ store: this.store, tenantId: opts.tenantId });
     this.engine = new SessionEngine(opts.registry, (event: StreamEvent) => {
       this.workflows?.onStreamEvent(event);
+      this.scheduler?.onStreamEvent(event);
       // 下行可靠投递（D29）：先入 outbox（含 sqlite）再发；server ack 后清理
       this.outbox.enqueue(event);
       this.peer.notifyRaw("stream.event", event);
@@ -143,6 +153,18 @@ export class PhononConnection {
       emit: (event) => this.peer.notifyRaw("workflow.event", event),
       requestInteraction: (params: unknown) => this.peer.requestRaw("interaction.request", params),
     });
+
+    // L4 调度器（device-authoritative）。生命周期独立于 WS：start() 在 daemon 装载，
+    // 这里建好实例并接线 emit；断连时 owner 可换 emit 为 no-op，靠 store push_state 补推。
+    this.scheduler = new SchedulerEngine({
+      tenantId: this.tenantId,
+      engine: this.engine,
+      store: this.store,
+      resolveProjectCwd: (project) => this.resolveProjectCwd(project),
+      emit: (method, params) => this.peer.notifyRaw(method, params),
+      assertRunAllowed: () => this.policy.assertMethodAllowed("session.create"),
+    });
+    this.scheduler.start();
   }
 
   /** 喂入收到的文本。 */
@@ -492,6 +514,57 @@ export class PhononConnection {
       case "workflow.artifacts.list":
         return this.workflows!.artifactsList(p.workflowId as string);
 
+      // ---- L4 scheduling (cron / webhook / manual; device-authoritative) ----
+      case "schedule.create":
+        return this.scheduler!.create({
+          name: p.name as string,
+          trigger: p.trigger as never,
+          target: p.target as never,
+          consent: p.consent as never,
+          policy: p.policy as never,
+          enabled: p.enabled as boolean | undefined,
+        });
+      case "schedule.update":
+        return this.scheduler!.update({
+          scheduleId: p.scheduleId as string,
+          name: p.name as string | undefined,
+          enabled: p.enabled as boolean | undefined,
+          trigger: p.trigger as never,
+          target: p.target as never,
+          consent: p.consent as never,
+          policy: p.policy as never,
+        });
+      case "schedule.delete":
+        return this.scheduler!.delete(p.scheduleId as string);
+      case "schedule.list":
+        return this.scheduler!.list(p as { enabled?: boolean; triggerKind?: "cron" | "webhook" | "manual"; reveal?: boolean; limit?: number });
+      case "schedule.get":
+        return this.scheduler!.get(p.scheduleId as string, p.reveal as boolean | undefined);
+      case "schedule.enable":
+        return this.scheduler!.setEnabled(p.scheduleId as string, true);
+      case "schedule.disable":
+        return this.scheduler!.setEnabled(p.scheduleId as string, false);
+      case "schedule.trigger":
+        return this.scheduler!.trigger({
+          scheduleId: p.scheduleId as string,
+          source: p.source as never,
+          input: p.input as Record<string, unknown> | undefined,
+        });
+      case "schedule.runs.list":
+        return this.scheduler!.runsList(p.scheduleId as string, { status: p.status as string | undefined, limit: p.limit as number | undefined });
+      case "run.get":
+        return this.scheduler!.runGet(p.runId as string);
+      case "run.events.subscribe":
+        return this.scheduler!.subscribe(p.runId as string);
+      case "run.events.unsubscribe":
+        return this.scheduler!.unsubscribe(p.runId as string);
+      case "run.cancel":
+        return this.scheduler!.cancel(p.runId as string, p.reason as string | undefined);
+      case "schedule.ack": {
+        this.scheduler?.ack(p.runId as string, { lastSeq: p.lastSeq as number | undefined, finished: p.finished as boolean | undefined });
+        return null;
+      }
+
       // ---- 连接/可靠性（s2p） ----
       case "stream.ack": {
         // server 确认已收 seq≤lastSeq → phonon 清 outbox（D29 / P0-4）。
@@ -534,6 +607,8 @@ export { PolicyEnforcer } from "./policy.js";
 export { IdempotencyStore } from "./idempotency.js";
 export { Outbox } from "./outbox.js";
 export { WorkflowEngine } from "./workflow-engine.js";
+export { SchedulerEngine } from "./scheduler-engine.js";
+export { parseCron, nextCronAfter } from "./cron.js";
 export { PhononStore } from "./store.js";
 export { SecretBox } from "./secret-box.js";
 export { FileManager } from "./file-manager.js";

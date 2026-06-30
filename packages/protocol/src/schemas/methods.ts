@@ -111,6 +111,37 @@ import {
   WorkflowArtifactsListResult,
   WorkflowResumeParams,
 } from "./workflow.js";
+import {
+  ScheduleCreateParams,
+  ScheduleCreateResult,
+  ScheduleUpdateParams,
+  ScheduleUpdateResult,
+  ScheduleDeleteParams,
+  ScheduleDeleteResult,
+  ScheduleListParams,
+  ScheduleListResult,
+  ScheduleGetParams,
+  ScheduleGetResult,
+  ScheduleEnableParams,
+  ScheduleEnableResult,
+  ScheduleTriggerParams,
+  ScheduleTriggerResult,
+  ScheduleRunsListParams,
+  ScheduleRunsListResult,
+  RunGetParams,
+  RunGetResult,
+  RunEventsSubscribeParams,
+  RunEventsSubscribeResult,
+  RunEventsUnsubscribeParams,
+  RunEventsUnsubscribeResult,
+  RunCancelParams,
+  RunCancelResult,
+  ScheduleChangedParams,
+  RunStartedParams,
+  RunEventParams,
+  RunFinishedParams,
+  ScheduleAckParams,
+} from "./schedule.js";
 
 /**
  * 方法注册表（design 全协议的单一事实来源）。
@@ -521,6 +552,117 @@ export const METHODS = {
     kind: "request",
     params: WorkflowArtifactsListParams,
     result: WorkflowArtifactsListResult,
+  },
+
+  // --- L4 scheduling (cron / webhook / manual triggers; device-authoritative) ---
+  "schedule.create": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleCreateParams,
+    result: ScheduleCreateResult,
+  },
+  "schedule.update": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleUpdateParams,
+    result: ScheduleUpdateResult,
+  },
+  "schedule.delete": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleDeleteParams,
+    result: ScheduleDeleteResult,
+  },
+  "schedule.list": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleListParams,
+    result: ScheduleListResult,
+  },
+  "schedule.get": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleGetParams,
+    result: ScheduleGetResult,
+  },
+  "schedule.enable": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleEnableParams,
+    result: ScheduleEnableResult,
+  },
+  "schedule.disable": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleEnableParams,
+    result: ScheduleEnableResult,
+  },
+  "schedule.trigger": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleTriggerParams,
+    result: ScheduleTriggerResult,
+  },
+  "schedule.runs.list": {
+    direction: "s2p",
+    kind: "request",
+    params: ScheduleRunsListParams,
+    result: ScheduleRunsListResult,
+  },
+  "run.get": {
+    direction: "s2p",
+    kind: "request",
+    params: RunGetParams,
+    result: RunGetResult,
+  },
+  "run.events.subscribe": {
+    direction: "s2p",
+    kind: "request",
+    params: RunEventsSubscribeParams,
+    result: RunEventsSubscribeResult,
+  },
+  "run.events.unsubscribe": {
+    direction: "s2p",
+    kind: "request",
+    params: RunEventsUnsubscribeParams,
+    result: RunEventsUnsubscribeResult,
+  },
+  "run.cancel": {
+    direction: "s2p",
+    kind: "request",
+    params: RunCancelParams,
+    result: RunCancelResult,
+  },
+  // L4 phonon→server：镜像同步 + 按同意协议推送结果
+  "schedule.changed": {
+    direction: "p2s",
+    kind: "notification",
+    params: ScheduleChangedParams,
+    result: z_void,
+  },
+  "run.started": {
+    direction: "p2s",
+    kind: "notification",
+    params: RunStartedParams,
+    result: z_void,
+  },
+  "run.event": {
+    direction: "p2s",
+    kind: "notification",
+    params: RunEventParams,
+    result: z_void,
+  },
+  "run.finished": {
+    direction: "p2s",
+    kind: "notification",
+    params: RunFinishedParams,
+    result: z_void,
+  },
+  "schedule.ack": {
+    direction: "s2p",
+    kind: "notification",
+    params: ScheduleAckParams,
+    result: z_void,
   },
 } as const;
 

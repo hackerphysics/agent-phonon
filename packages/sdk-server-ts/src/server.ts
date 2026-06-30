@@ -15,7 +15,30 @@ import type {
   WorkflowListResult,
   WorkflowListParams,
   WorkflowRunResult,
+  Schedule,
+  ScheduleTrigger,
+  ScheduleConsent,
+  SchedulePolicy,
+  SchedulePushConsent,
+  ScheduleListParams,
+  ScheduleListResult,
+  ScheduleCreateResult,
+  Run,
+  RunStatus,
+  RunTriggerSource,
 } from "@agent-phonon/protocol";
+
+/** Schedule target 宽松型（SDK 使用面，避免调用方手动 cast 品牌类型）。 */
+export interface ScheduleTargetInput {
+  runKind?: "session" | "workflow";
+  project: string;
+  agent?: string;
+  model?: string;
+  prompt?: string;
+  plan?: WorkflowPlanInput;
+  agentConfig?: Record<string, unknown>;
+  skills?: string[];
+}
 
 /**
  * Workflow plan 宝松型（SDK 使用面）。
@@ -156,6 +179,7 @@ export class PhononDevice extends EventEmitter {
   private documentHandler?: (params: unknown) => Promise<unknown> | unknown;
   private prepareUploadHandler?: (params: unknown) => Promise<unknown> | unknown;
   private workflowEventHandler?: (ev: WorkflowEvent) => Promise<unknown> | unknown;
+  private runFinishedHandler?: (params: { run: Run; push: SchedulePushConsent }) => Promise<unknown> | unknown;
   /** 自发输出（无对应 session 时）回调。 */
   private onUnsolicited?: (ev: StreamEvent) => void;
 
@@ -317,6 +341,85 @@ export class PhononDevice extends EventEmitter {
   };
 
   /**
+   * L4 scheduling（定时任务 / Automation）。
+   *
+   * 调度真相源在 device；server 只是控制+观测面。
+   * - schedule.create/update/delete/list/get/enable/disable/trigger：管理
+   * - schedule.runs.list / run.get / run.events.subscribe / run.cancel：观测
+   * - `device.on("scheduleChanged" | "runStarted" | "runEvent" | "runFinished", ...)`：订阅推送
+   *
+   * 示例：
+   *   const { schedule, webhookToken } = await device.schedule.create({
+   *     name: "nightly",
+   *     trigger: { kind: "cron", expr: "0 3 * * *", tz: "Asia/Shanghai" },
+   *     target: { runKind: "session", project, agent, model, prompt: "..." },
+   *     consent: { push: "summary" },
+   *   });
+   */
+  schedule = {
+    create: (params: {
+      name: string;
+      trigger: ScheduleTrigger;
+      target: ScheduleTargetInput;
+      consent?: ScheduleConsent;
+      policy?: SchedulePolicy;
+      enabled?: boolean;
+      clientRequestId?: string;
+    }) => this.peer.request("schedule.create", params) as Promise<ScheduleCreateResult>,
+    update: (params: {
+      scheduleId: string;
+      name?: string;
+      enabled?: boolean;
+      trigger?: ScheduleTrigger;
+      target?: ScheduleTargetInput;
+      consent?: ScheduleConsent;
+      policy?: SchedulePolicy;
+      clientRequestId?: string;
+    }) => this.peer.request("schedule.update", params) as Promise<{ schedule: Schedule }>,
+    delete: (scheduleId: string, clientRequestId?: string) =>
+      this.peer.request("schedule.delete", { scheduleId, clientRequestId }) as Promise<{ scheduleId: string; deleted: boolean }>,
+    list: (filter?: ScheduleListParams) =>
+      this.peer.request("schedule.list", filter ?? {}) as Promise<ScheduleListResult>,
+    get: (scheduleId: string, reveal?: boolean) =>
+      this.peer.request("schedule.get", { scheduleId, reveal }) as Promise<{ schedule: Schedule }>,
+    enable: (scheduleId: string, clientRequestId?: string) =>
+      this.peer.request("schedule.enable", { scheduleId, clientRequestId }) as Promise<{ schedule: Schedule }>,
+    disable: (scheduleId: string, clientRequestId?: string) =>
+      this.peer.request("schedule.disable", { scheduleId, clientRequestId }) as Promise<{ schedule: Schedule }>,
+    /** 手动触发一次 run（manual / 测试 cron / 重放 webhook 都走它）。 */
+    trigger: (params: { scheduleId: string; source?: RunTriggerSource; input?: Record<string, unknown>; clientRequestId?: string }) =>
+      this.peer.request("schedule.trigger", params) as Promise<{ scheduleId: string; runId: string; status: RunStatus }>,
+    runs: {
+      list: (params: { scheduleId: string; status?: RunStatus; limit?: number }) =>
+        this.peer.request("schedule.runs.list", params) as Promise<{ runs: Run[] }>,
+    },
+    /** 手动 ack 终态 run（平时不需调用，SDK 在 run.finished 入口自动 ack）。 */
+    ack: (runId: string, opts?: { lastSeq?: number; finished?: boolean }) =>
+      this.peer.notify("schedule.ack", { runId, ...opts }),
+  };
+
+  /** L4 run 观测。 */
+  run = {
+    get: (runId: string) => this.peer.request("run.get", { runId }) as Promise<{ run: Run }>,
+    events: {
+      subscribe: (runId: string) =>
+        this.peer.request("run.events.subscribe", { runId }) as Promise<{ runId: string; subscribed: boolean; sessionId?: string }>,
+      unsubscribe: (runId: string) =>
+        this.peer.request("run.events.unsubscribe", { runId }) as Promise<{ runId: string; subscribed: boolean }>,
+    },
+    cancel: (runId: string, reason?: string, clientRequestId?: string) =>
+      this.peer.request("run.cancel", { runId, reason, clientRequestId }) as Promise<{ runId: string; status: RunStatus }>,
+  };
+
+  /**
+   * Reliable run.finished consumer. 若设置，SDK 在 ack 前 await 该 handler，
+   * 便于调用方先落库/转发再 ack。
+   */
+  setRunFinishedHandler(fn: (params: { run: Run; push: SchedulePushConsent }) => Promise<unknown> | unknown): void {
+    this.runFinishedHandler = fn;
+  }
+
+  /**
    * Reliable workflow.event consumer. If set, SDK awaits this handler before
    * sending workflow.ack, so callers can persist/forward the event first.
    */
@@ -406,6 +509,26 @@ export class PhononDevice extends EventEmitter {
       if (this.interactionHandler) return await this.interactionHandler(params);
       // v0.7: 默认没注册 handler 时，engine 会按 rejected 处理（进 进 欢迎改进。返回 cancel 动作）。
       return { requestId: (params as { requestId?: string })?.requestId, action: "cancel" };
+    }
+    // ---- L4 scheduling p2s（镜像同步 + 推送）----
+    if (method === "schedule.changed") { this.emit("scheduleChanged", params); return null; }
+    if (method === "run.started") { this.emit("runStarted", params); return null; }
+    if (method === "run.event") {
+      this.emit("runEvent", params);
+      // 订阅流自动 ack（与 stream.event 一致）
+      const ev = params as { runId?: string; seq?: number };
+      if (ev?.runId && typeof ev.seq === "number") {
+        this.peer.notify("schedule.ack", { runId: ev.runId, lastSeq: ev.seq });
+      }
+      return null;
+    }
+    if (method === "run.finished") {
+      const ev = params as { run: Run; push: SchedulePushConsent };
+      if (this.runFinishedHandler) await this.runFinishedHandler(ev);
+      this.emit("runFinished", params);
+      // 可靠消费后自动 ack run.finished，停止补推
+      if (ev?.run?.id) this.peer.notify("schedule.ack", { runId: ev.run.id, finished: true });
+      return null;
     }
     return null;
   }

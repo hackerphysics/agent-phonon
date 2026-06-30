@@ -189,6 +189,11 @@ export class TestConn {
     if (msg.method === "stream.event") { this.streamEvents.push(msg.params as Record<string, unknown>); return; }
     if (msg.method === "discovery.changed") { this.notifications.push(msg.params as Record<string, unknown>); return; }
     if (msg.method === "workflow.event") { this.notifications.push(msg.params as Record<string, unknown>); return; }
+    // L4 scheduling p2s notifications（镜像 + 推送）
+    if (msg.method === "schedule.changed" || msg.method === "run.started" || msg.method === "run.event" || msg.method === "run.finished") {
+      this.notifications.push({ __method: msg.method, ...(msg.params as Record<string, unknown>) });
+      return;
+    }
     // phonon → server 请求（hook.fired / document.* / interaction.* 等）：回响应
     if (typeof msg.method === "string" && "id" in msg) {
       const method = msg.method;

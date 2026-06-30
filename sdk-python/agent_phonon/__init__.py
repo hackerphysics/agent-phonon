@@ -3,4 +3,4 @@ from .server import PhononServer, PhononDevice, PhononSession
 from .rpc import RpcPeer, RpcError
 
 __all__ = ["PhononServer", "PhononDevice", "PhononSession", "RpcPeer", "RpcError"]
-__version__ = "0.8.4"
+__version__ = "0.9.0"

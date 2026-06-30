@@ -79,6 +79,10 @@ class PhononDevice:
         self._prepare_upload_handler: Optional[Callable[[dict], dict]] = None
         self._interaction_handler: Optional[Callable[[dict], dict]] = None
         self._workflow_event_handler: Optional[Callable[[dict], Awaitable[None] | None]] = None
+        self._schedule_changed_handler: Optional[Callable[[dict], None]] = None
+        self._run_started_handler: Optional[Callable[[dict], None]] = None
+        self._run_event_handler: Optional[Callable[[dict], None]] = None
+        self._run_finished_handler: Optional[Callable[[dict], Awaitable[None] | None]] = None
 
     async def call(self, method: str, params: Any) -> Any:
         return await self._peer.request(method, params)
@@ -305,6 +309,86 @@ class PhononDevice:
     async def workflow_artifacts_list(self, workflow_id: str) -> dict:
         return await self._peer.request("workflow.artifacts.list", {"workflowId": workflow_id})
 
+    # ---- L4 scheduling (cron / webhook / manual; device-authoritative) ----
+    async def schedule_create(
+        self,
+        name: str,
+        trigger: dict,
+        target: dict,
+        consent: dict | None = None,
+        policy: dict | None = None,
+        enabled: bool | None = None,
+        client_request_id: str | None = None,
+    ) -> dict:
+        """Create a schedule.
+
+        trigger: {kind: "cron", expr, tz?} | {kind: "webhook"} | {kind: "manual"}
+        target:  {runKind: "session", project, agent?, model?, prompt?, skills?}
+        consent: {push: "full"|"summary"|"status-only"}
+        """
+        params: dict = {"name": name, "trigger": trigger, "target": target}
+        if consent is not None: params["consent"] = consent
+        if policy is not None: params["policy"] = policy
+        if enabled is not None: params["enabled"] = enabled
+        if client_request_id is not None: params["clientRequestId"] = client_request_id
+        return await self._peer.request("schedule.create", params)
+
+    async def schedule_update(self, schedule_id: str, **patch: Any) -> dict:
+        return await self._peer.request("schedule.update", {"scheduleId": schedule_id, **patch})
+
+    async def schedule_delete(self, schedule_id: str, client_request_id: str | None = None) -> dict:
+        params: dict = {"scheduleId": schedule_id}
+        if client_request_id is not None: params["clientRequestId"] = client_request_id
+        return await self._peer.request("schedule.delete", params)
+
+    async def schedule_list(self, **filt: Any) -> dict:
+        return await self._peer.request("schedule.list", filt)
+
+    async def schedule_get(self, schedule_id: str, reveal: bool | None = None) -> dict:
+        params: dict = {"scheduleId": schedule_id}
+        if reveal is not None: params["reveal"] = reveal
+        return await self._peer.request("schedule.get", params)
+
+    async def schedule_enable(self, schedule_id: str) -> dict:
+        return await self._peer.request("schedule.enable", {"scheduleId": schedule_id})
+
+    async def schedule_disable(self, schedule_id: str) -> dict:
+        return await self._peer.request("schedule.disable", {"scheduleId": schedule_id})
+
+    async def schedule_trigger(self, schedule_id: str, source: str | None = None, input: dict | None = None) -> dict:
+        """Manually trigger one run (manual / test cron / replay webhook)."""
+        params: dict = {"scheduleId": schedule_id}
+        if source is not None: params["source"] = source
+        if input is not None: params["input"] = input
+        return await self._peer.request("schedule.trigger", params)
+
+    async def schedule_runs_list(self, schedule_id: str, status: str | None = None, limit: int | None = None) -> dict:
+        params: dict = {"scheduleId": schedule_id}
+        if status is not None: params["status"] = status
+        if limit is not None: params["limit"] = limit
+        return await self._peer.request("schedule.runs.list", params)
+
+    async def schedule_ack(self, run_id: str, last_seq: int | None = None, finished: bool | None = None) -> None:
+        """Acknowledge a finished/streaming run (parallel to stream.ack).
+        一般不需调用：SDK 在 run.event / run.finished 入口已自动 ack。
+        """
+        params: dict = {"runId": run_id}
+        if last_seq is not None: params["lastSeq"] = last_seq
+        if finished is not None: params["finished"] = finished
+        await self._peer.notify("schedule.ack", params)
+
+    async def run_get(self, run_id: str) -> dict:
+        return await self._peer.request("run.get", {"runId": run_id})
+
+    async def run_events_subscribe(self, run_id: str) -> dict:
+        return await self._peer.request("run.events.subscribe", {"runId": run_id})
+
+    async def run_events_unsubscribe(self, run_id: str) -> dict:
+        return await self._peer.request("run.events.unsubscribe", {"runId": run_id})
+
+    async def run_cancel(self, run_id: str, reason: str | None = None) -> dict:
+        return await self._peer.request("run.cancel", {"runId": run_id, "reason": reason})
+
     def set_hook_decider(self, fn: HookDecider) -> None:
         self._hook_decider = fn
 
@@ -325,6 +409,18 @@ class PhononDevice:
 
     def set_workflow_event_handler(self, fn: Callable[[dict], Awaitable[None] | None]) -> None:
         self._workflow_event_handler = fn
+
+    def set_schedule_changed_handler(self, fn: Callable[[dict], None]) -> None:
+        self._schedule_changed_handler = fn
+
+    def set_run_started_handler(self, fn: Callable[[dict], None]) -> None:
+        self._run_started_handler = fn
+
+    def set_run_event_handler(self, fn: Callable[[dict], None]) -> None:
+        self._run_event_handler = fn
+
+    def set_run_finished_handler(self, fn: Callable[[dict], Awaitable[None] | None]) -> None:
+        self._run_finished_handler = fn
 
     async def _handle_inbound(self, method: str, params: Any) -> Any:
         if method == "stream.event":
@@ -358,6 +454,34 @@ class PhononDevice:
             seq = ev.get("seq")
             if wid and isinstance(seq, int):
                 await self._peer.notify("workflow.ack", {"workflowId": wid, "lastSeq": seq})
+            return None
+        # ---- L4 scheduling p2s ----
+        if method == "schedule.changed":
+            if self._schedule_changed_handler:
+                self._schedule_changed_handler(params or {})
+            return None
+        if method == "run.started":
+            if self._run_started_handler:
+                self._run_started_handler(params or {})
+            return None
+        if method == "run.event":
+            ev = params or {}
+            if self._run_event_handler:
+                self._run_event_handler(ev)
+            rid = ev.get("runId")
+            seq = ev.get("seq")
+            if rid and isinstance(seq, int):
+                await self._peer.notify("schedule.ack", {"runId": rid, "lastSeq": seq})
+            return None
+        if method == "run.finished":
+            ev = params or {}
+            if self._run_finished_handler:
+                res = self._run_finished_handler(ev)
+                if asyncio.iscoroutine(res):
+                    await res
+            rid = (ev.get("run") or {}).get("id")
+            if rid:
+                await self._peer.notify("schedule.ack", {"runId": rid, "finished": True})
             return None
         if method == "document.send":
             if self._document_handler:

@@ -153,6 +153,44 @@ export class PhononStore {
       );
       CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id, created_at);
+      CREATE TABLE IF NOT EXISTS schedules (
+        id          TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        enabled     INTEGER NOT NULL DEFAULT 1,
+        trigger_json TEXT NOT NULL,
+        target_json TEXT NOT NULL,
+        consent_json TEXT NOT NULL,
+        policy_json TEXT,
+        webhook_token TEXT,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        last_run_at TEXT,
+        next_run_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_schedules_tenant ON schedules(tenant_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_schedules_webhook ON schedules(webhook_token);
+      CREATE TABLE IF NOT EXISTS runs (
+        id            TEXT PRIMARY KEY,
+        schedule_id   TEXT NOT NULL,
+        tenant_id     TEXT NOT NULL,
+        trigger_source TEXT NOT NULL,
+        status        TEXT NOT NULL,
+        session_id    TEXT,
+        workflow_id   TEXT,
+        started_at    TEXT,
+        finished_at   TEXT,
+        exit_reason   TEXT,
+        error         TEXT,
+        transcript_path TEXT,
+        result_text   TEXT,
+        usage_json    TEXT,
+        push_state    TEXT NOT NULL DEFAULT 'pending',
+        acked_seq     INTEGER NOT NULL DEFAULT -1,
+        created_at    TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_runs_schedule ON runs(schedule_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_runs_tenant ON runs(tenant_id, created_at);
     `);
     // 增量列迁移（幂等）：旧库已存在时 CREATE TABLE IF NOT EXISTS 不会加新列，
     // 用 PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN。
@@ -394,5 +432,85 @@ export class PhononStore {
 
   ackWorkflow(workflowId: string, lastSeq: number): void {
     this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=?").run(lastSeq, workflowId);
+  }
+
+  // ---- schedules (L4 定时任务定义；device 为真相源) ----
+  upsertSchedule(s: {
+    id: string; tenantId: string; name: string; enabled: boolean;
+    triggerJson: string; targetJson: string; consentJson: string; policyJson?: string;
+    webhookToken?: string; createdAt: string; updatedAt: string; lastRunAt?: string; nextRunAt?: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO schedules(id,tenant_id,name,enabled,trigger_json,target_json,consent_json,policy_json,webhook_token,created_at,updated_at,last_run_at,next_run_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           name=excluded.name, enabled=excluded.enabled,
+           trigger_json=excluded.trigger_json, target_json=excluded.target_json,
+           consent_json=excluded.consent_json, policy_json=excluded.policy_json,
+           webhook_token=excluded.webhook_token,
+           updated_at=excluded.updated_at, last_run_at=excluded.last_run_at, next_run_at=excluded.next_run_at`,
+      )
+      .run(
+        s.id, s.tenantId, s.name, s.enabled ? 1 : 0,
+        s.triggerJson, s.targetJson, s.consentJson, s.policyJson ?? null,
+        s.webhookToken ?? null, s.createdAt, s.updatedAt, s.lastRunAt ?? null, s.nextRunAt ?? null,
+      );
+  }
+  getSchedule(id: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM schedules WHERE id=?").get(id) as Record<string, unknown> | undefined;
+  }
+  getScheduleByWebhookToken(token: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM schedules WHERE webhook_token=?").get(token) as Record<string, unknown> | undefined;
+  }
+  listSchedules(tenantId: string): Array<Record<string, unknown>> {
+    return this.db.prepare("SELECT * FROM schedules WHERE tenant_id=? ORDER BY created_at DESC").all(tenantId) as Array<Record<string, unknown>>;
+  }
+  deleteSchedule(id: string): void {
+    this.db.prepare("DELETE FROM schedules WHERE id=?").run(id);
+    this.db.prepare("DELETE FROM runs WHERE schedule_id=?").run(id);
+  }
+
+  // ---- runs (L4 每次执行记录) ----
+  upsertRun(r: {
+    id: string; scheduleId: string; tenantId: string; triggerSource: string; status: string;
+    sessionId?: string; workflowId?: string; startedAt?: string; finishedAt?: string;
+    exitReason?: string; error?: string; transcriptPath?: string; resultText?: string;
+    usageJson?: string; pushState?: string; ackedSeq?: number; createdAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           status=excluded.status, session_id=excluded.session_id, workflow_id=excluded.workflow_id,
+           started_at=excluded.started_at, finished_at=excluded.finished_at,
+           exit_reason=excluded.exit_reason, error=excluded.error,
+           transcript_path=excluded.transcript_path, result_text=excluded.result_text,
+           usage_json=excluded.usage_json, push_state=excluded.push_state, acked_seq=excluded.acked_seq`,
+      )
+      .run(
+        r.id, r.scheduleId, r.tenantId, r.triggerSource, r.status,
+        r.sessionId ?? null, r.workflowId ?? null, r.startedAt ?? null, r.finishedAt ?? null,
+        r.exitReason ?? null, r.error ?? null, r.transcriptPath ?? null, r.resultText ?? null,
+        r.usageJson ?? null, r.pushState ?? "pending", r.ackedSeq ?? -1, r.createdAt,
+      );
+  }
+  getRun(id: string): Record<string, unknown> | undefined {
+    return this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Record<string, unknown> | undefined;
+  }
+  listRunsForSchedule(scheduleId: string, opts?: { status?: string; limit?: number }): Array<Record<string, unknown>> {
+    const where: string[] = ["schedule_id=?"];
+    const params: unknown[] = [scheduleId];
+    if (opts?.status) { where.push("status=?"); params.push(opts.status); }
+    const sql = `SELECT * FROM runs WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`;
+    params.push(opts?.limit ?? 50);
+    return this.db.prepare(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
+  }
+  /** 重启后恢复：未推送完成的 run（push_state != 'acked' 且已终态），用于补推。 */
+  listUnackedFinishedRuns(tenantId: string): Array<Record<string, unknown>> {
+    return this.db
+      .prepare("SELECT * FROM runs WHERE tenant_id=? AND push_state!='acked' AND status NOT IN ('pending','running') ORDER BY created_at")
+      .all(tenantId) as Array<Record<string, unknown>>;
   }
 }
