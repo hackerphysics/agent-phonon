@@ -304,7 +304,7 @@ export class WorkflowEngine {
     const memRun = this.runs.get(workflowId);
     if (memRun) return this.toStatus(memRun);
     if (this.opts.store) {
-      const row = this.opts.store.getWorkflow(workflowId);
+      const row = this.opts.store.getWorkflow(workflowId, this.opts.tenantId);
       if (row) return this.rowToStatus(row);
     }
     throw new PhononError("errInvalidParams", `workflow ${workflowId} not found`);
@@ -363,10 +363,10 @@ export class WorkflowEngine {
     if (run) {
       if (lastSeq > run.ackedSeq) {
         run.ackedSeq = lastSeq;
-        this.opts.store?.ackWorkflow(workflowId, lastSeq);
+        this.opts.store?.ackWorkflow(workflowId, lastSeq, this.opts.tenantId);
       }
     } else {
-      this.opts.store?.ackWorkflow(workflowId, lastSeq);
+      this.opts.store?.ackWorkflow(workflowId, lastSeq, this.opts.tenantId);
     }
   }
 
@@ -1365,7 +1365,7 @@ export class WorkflowEngine {
 
   private restoreFromCheckpoint(rf: WorkflowResumeFrom): WorkflowRunState | undefined {
     if (!this.opts.store) return undefined;
-    const row = this.opts.store.getWorkflow(rf.workflowId);
+    const row = this.opts.store.getWorkflow(rf.workflowId, this.opts.tenantId);
     if (!row) return undefined;
 
     const plan = JSON.parse(row.plan_json as string) as WorkflowPlan;

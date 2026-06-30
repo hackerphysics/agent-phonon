@@ -58,6 +58,77 @@ function runGit(cwd: string, args: string[], timeoutMs = 30000): Promise<string>
   });
 }
 
+/**
+ * Git argument-injection 防护（安全修复 A1）。
+ *
+ * runGit 走 spawn(shell:false) 已排除 shell 注入，但用户可控的
+ * branch/ref/remote/since/until 作为位置参数拼进 git。git 会把 `-` 开头的
+ * 值解析成选项（如 `--output=` `--upload-pack=`）→ 可任意写盘/执行。
+ * 这里在拼参前统一拒绝以 `-` 开头，并对 ref/branch 做保守白名单。
+ */
+/** 拒绝以 `-` 开头（避免被当选项）。用于任何用户可控的位置值。 */
+function assertNotOption(value: string, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new PhononError("errInvalidParams", `${label} must be a non-empty string`);
+  }
+  if (value.startsWith("-")) {
+    throw new PhononError("errInvalidParams", `${label} must not start with '-' (option injection): ${value}`);
+  }
+  if (value.includes("\n") || value.includes("\r") || value.includes("\0")) {
+    throw new PhononError("errInvalidParams", `${label} contains control characters`);
+  }
+  return value;
+}
+
+/**
+ * 校验 git ref / branch 名。拒 `-` 开头 + 保守字符集（git check-ref-format 的子集）。
+ * 允许：字母数字 . _ / - + ~ ^ : @ { } （覆盖 refspec / HEAD@{u} / a..b 等常见形式）。
+ * 拒：空格、`..` 开头、控制符、`-` 开头、`--`。
+ */
+function assertRefName(value: string, label: string): string {
+  assertNotOption(value, label);
+  if (value.length > 255) throw new PhononError("errInvalidParams", `${label} too long`);
+  if (value.includes("--")) throw new PhononError("errInvalidParams", `${label} must not contain '--'`);
+  if (/\s/.test(value)) throw new PhononError("errInvalidParams", `${label} must not contain whitespace`);
+  // 保守白名单：ref/refspec/range 常见字符
+  if (!/^[A-Za-z0-9._/~^:@{}-]+$/.test(value)) {
+    throw new PhononError("errInvalidParams", `${label} contains disallowed characters: ${value}`);
+  }
+  return value;
+}
+
+/** 校验 remote（名字或 URL）。主要拒 `-` 开头 + 控制符；url 本身形式由 git 处理。 */
+function assertRemote(value: string, label = "remote"): string {
+  return assertNotOption(value, label);
+}
+
+/**
+ * A2/A3: project.exec 环境变量黑名单剔离。
+ * 防 server 注入 LD_PRELOAD / LD_LIBRARY_PATH / DYLD_xxx / NODE_OPTIONS / GIT_SSH_COMMAND / PATH 等
+ * 加载恶意动态库 / 劫持解释器 / 改 PATH 解析到恶意 binary → 走后门 RCE。
+ * 返回过滤后的 env（以 process.env 为基础，叠加用户变量但剔除危险键）。
+ */
+const DANGEROUS_ENV_KEYS = new Set([
+  "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+  "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+  "NODE_OPTIONS", "GIT_SSH_COMMAND", "GIT_SSH", "BASH_ENV", "ENV",
+  "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
+]);
+function sanitizeExecEnv(userEnv?: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) base[k] = v;
+  }
+  if (userEnv) {
+    for (const [k, v] of Object.entries(userEnv)) {
+      if (DANGEROUS_ENV_KEYS.has(k)) continue; // 拒危险变量
+      if (k === "PATH") continue; // 不允许覆写 PATH（防解析到恶意 binary）
+      base[k] = v;
+    }
+  }
+  return base;
+}
+
 export class ProjectManager {
   private projects = new Map<string, ProjectRecord>();
   private worktrees = new Map<string, WorktreeRecord>();
@@ -120,7 +191,7 @@ export class ProjectManager {
     const git = params.git !== false;
     if (git && !existsSync(join(path, ".git"))) {
       await runGit(path, ["init"]);
-      if (params.remote) await runGit(path, ["remote", "add", "origin", params.remote]).catch(() => {});
+      if (params.remote) { assertRemote(params.remote); await runGit(path, ["remote", "add", "origin", "--", params.remote]).catch(() => {}); }
     }
     const rec: ProjectRecord = { projectId, name: params.name, path, git, createdAt: new Date().toISOString() };
     this.projects.set(projectId, rec);
@@ -163,6 +234,9 @@ export class ProjectManager {
   // ---- worktree (D25) ----
   async worktreeCreate(params: { projectId: string; baseBranch: string; newBranch?: string; path?: string }): Promise<WorktreeRecord> {
     const proj = this.get(params.projectId);
+    // A1: 校验用户可控的 branch 名，拒选项注入
+    assertRefName(params.baseBranch, "baseBranch");
+    if (params.newBranch) assertRefName(params.newBranch, "newBranch");
     const worktreeId = `wt-${Date.now()}-${this.idSeq++}`;
     const wtPath = params.path ? resolve(params.path) : join(proj.path, "..", `${proj.name}-${params.newBranch ?? params.baseBranch}`.replace(/\//g, "-"));
     // 自定义 worktree path 同样走 policy 路径校验（bug-bash#2 B8）
@@ -204,12 +278,13 @@ export class ProjectManager {
 
   async deleteBranch(params: { projectId: string; branch: string; force?: boolean }): Promise<{ wasMerged: boolean; affectedWorktrees?: string[] }> {
     const proj = this.get(params.projectId);
+    assertRefName(params.branch, "branch"); // A1
     const inUse = this.worktreeList(params.projectId).filter((w) => w.branch === params.branch);
     if (inUse.length > 0 && !params.force)
       throw new PhononError("errBranchInUse", "branch is checked out by a worktree");
     const flag = params.force ? "-D" : "-d";
     try {
-      await runGit(proj.path, ["branch", flag, params.branch]);
+      await runGit(proj.path, ["branch", flag, "--", params.branch]);
     } catch (e) {
       if (String((e as Error)?.message).includes("not fully merged"))
         throw new PhononError("errBranchNotMerged", "branch not merged (use force)");
@@ -266,9 +341,13 @@ export class ProjectManager {
 
   async gitMerge(params: { projectId: string; sourceBranch: string; targetBranch?: string; strategy?: "merge" | "squash" | "rebase" | "ff-only"; message?: string; abortOnConflict?: boolean }): Promise<{ commitSha?: string; mergeCommitCreated: boolean; hasConflict: boolean; conflictFiles?: string[]; aborted?: boolean }> {
     const proj = this.get(params.projectId);
+    // A1: 校验用户可控的 branch
+    assertRefName(params.sourceBranch, "sourceBranch");
+    if (params.targetBranch) assertRefName(params.targetBranch, "targetBranch");
     const strategy = params.strategy ?? "merge";
     const abortOnConflict = params.abortOnConflict ?? true;
-    // 切到 targetBranch（不传 = 当前 branch）
+    // 切到 targetBranch（不传 = 当前 branch）。assertRefName 已防选项注入；
+    // checkout 切分支不能加 `--`（那会变成 checkout pathspec 语义）。
     if (params.targetBranch) {
       await runGit(proj.path, ["checkout", params.targetBranch]);
     }
@@ -323,6 +402,9 @@ export class ProjectManager {
 
   async gitDiff(params: { projectId: string; worktreeId?: string; ref1?: string; ref2?: string; paths?: string[]; contextLines?: number; statOnly?: boolean; maxBytes?: number }): Promise<{ patch?: string; filesChanged: number; insertions: number; deletions: number; truncated: boolean }> {
     const cwd = this.cwdFor(params.projectId, params.worktreeId);
+    // A1: 校验用户可控的 ref
+    if (params.ref1) assertRefName(params.ref1, "ref1");
+    if (params.ref2) assertRefName(params.ref2, "ref2");
     const context = params.contextLines ?? 3;
     const maxBytes = params.maxBytes ?? 1048576;
     const baseArgs: string[] = ["diff", `-U${context}`];
@@ -352,7 +434,8 @@ export class ProjectManager {
     const args = ["log", `--format=${FMT}`, `-n`, String(limit)];
     if (params.since) args.push(`--since=${params.since}`);
     if (params.until) args.push(`--until=${params.until}`);
-    if (params.branch) args.push(params.branch);
+    // A1: branch 是用户可控位置参数（在 -- 之前），必须防选项注入
+    if (params.branch) { assertRefName(params.branch, "branch"); args.push(params.branch); }
     if (params.paths && params.paths.length > 0) { args.push("--"); args.push(...params.paths); }
     const out = await runGit(cwd, args);
     const commits = out.split("\x1e").map((rec) => rec.trim()).filter(Boolean).map((rec) => {
@@ -373,11 +456,14 @@ export class ProjectManager {
   async gitPush(params: { projectId: string; worktreeId?: string; branch: string; remote?: string; force?: boolean; setUpstream?: boolean }): Promise<{ pushed: boolean; remote: string; branch: string; commitsPushed?: number; remoteHead?: string }> {
     const cwd = this.cwdFor(params.projectId, params.worktreeId);
     const remote = params.remote ?? "origin";
+    // A1: remote 与 branch 都是用户可控位置参数，防选项注入（--receive-pack= 等）
+    assertRemote(remote, "remote");
+    assertRefName(params.branch, "branch");
     const setUpstream = params.setUpstream ?? true;
     const args = ["push"];
     if (params.force) args.push("--force");
     if (setUpstream) args.push("--set-upstream");
-    args.push(remote, params.branch);
+    args.push("--", remote, params.branch);
     await runGit(cwd, args);
     // 拿远端 head
     let remoteHead: string | undefined;
@@ -421,7 +507,7 @@ export class ProjectManager {
     const max = params.maxOutputBytes ?? 1024 * 1024;
     const timeoutMs = params.timeoutMs ?? 120_000;
     return new Promise((resolveP, reject) => {
-      const child = spawn(params.command, params.args ?? [], { cwd, shell: false, env: { ...process.env, ...(params.env ?? {}) } });
+      const child = spawn(params.command, params.args ?? [], { cwd, shell: false, env: sanitizeExecEnv(params.env) });
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0); let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0); let truncated = false;
       const append = (cur: Buffer<ArrayBufferLike>, d: Buffer): Buffer<ArrayBufferLike> => {
         const next = Buffer.concat([cur, d]);

@@ -422,16 +422,23 @@ export class PhononStore {
       );
   }
 
-  getWorkflow(workflowId: string): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT * FROM workflows WHERE workflow_id=?").get(workflowId) as Record<string, unknown> | undefined;
+  getWorkflow(workflowId: string, tenantId?: string): Record<string, unknown> | undefined {
+    const row = this.db.prepare("SELECT * FROM workflows WHERE workflow_id=?").get(workflowId) as Record<string, unknown> | undefined;
+    // B1: tenant 越权防护——传了 tenantId 就强制校验归属
+    if (row && tenantId !== undefined && row.tenant_id !== tenantId) return undefined;
+    return row;
   }
 
   listWorkflows(tenantId: string): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM workflows WHERE tenant_id=? ORDER BY created_at DESC").all(tenantId) as Array<Record<string, unknown>>;
   }
 
-  ackWorkflow(workflowId: string, lastSeq: number): void {
-    this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=?").run(lastSeq, workflowId);
+  ackWorkflow(workflowId: string, lastSeq: number, tenantId?: string): void {
+    if (tenantId !== undefined) {
+      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=? AND tenant_id=?").run(lastSeq, workflowId, tenantId);
+    } else {
+      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=?").run(lastSeq, workflowId);
+    }
   }
 
   // ---- schedules (L4 定时任务定义；device 为真相源) ----
@@ -457,11 +464,15 @@ export class PhononStore {
         s.webhookToken ?? null, s.createdAt, s.updatedAt, s.lastRunAt ?? null, s.nextRunAt ?? null,
       );
   }
-  getSchedule(id: string): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT * FROM schedules WHERE id=?").get(id) as Record<string, unknown> | undefined;
+  getSchedule(id: string, tenantId?: string): Record<string, unknown> | undefined {
+    const row = this.db.prepare("SELECT * FROM schedules WHERE id=?").get(id) as Record<string, unknown> | undefined;
+    if (row && tenantId !== undefined && row.tenant_id !== tenantId) return undefined; // B1 tenant 隔离
+    return row;
   }
-  getScheduleByWebhookToken(token: string): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT * FROM schedules WHERE webhook_token=?").get(token) as Record<string, unknown> | undefined;
+  getScheduleByWebhookToken(token: string, tenantId?: string): Record<string, unknown> | undefined {
+    const row = this.db.prepare("SELECT * FROM schedules WHERE webhook_token=?").get(token) as Record<string, unknown> | undefined;
+    if (row && tenantId !== undefined && row.tenant_id !== tenantId) return undefined; // B1
+    return row;
   }
   listSchedules(tenantId: string): Array<Record<string, unknown>> {
     return this.db.prepare("SELECT * FROM schedules WHERE tenant_id=? ORDER BY created_at DESC").all(tenantId) as Array<Record<string, unknown>>;
@@ -496,12 +507,15 @@ export class PhononStore {
         r.usageJson ?? null, r.pushState ?? "pending", r.ackedSeq ?? -1, r.createdAt,
       );
   }
-  getRun(id: string): Record<string, unknown> | undefined {
-    return this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Record<string, unknown> | undefined;
+  getRun(id: string, tenantId?: string): Record<string, unknown> | undefined {
+    const row = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Record<string, unknown> | undefined;
+    if (row && tenantId !== undefined && row.tenant_id !== tenantId) return undefined; // B1
+    return row;
   }
-  listRunsForSchedule(scheduleId: string, opts?: { status?: string; limit?: number }): Array<Record<string, unknown>> {
+  listRunsForSchedule(scheduleId: string, opts?: { status?: string; limit?: number; tenantId?: string }): Array<Record<string, unknown>> {
     const where: string[] = ["schedule_id=?"];
     const params: unknown[] = [scheduleId];
+    if (opts?.tenantId !== undefined) { where.push("tenant_id=?"); params.push(opts.tenantId); } // B1
     if (opts?.status) { where.push("status=?"); params.push(opts.status); }
     const sql = `SELECT * FROM runs WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`;
     params.push(opts?.limit ?? 50);

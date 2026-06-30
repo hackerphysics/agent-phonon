@@ -23,12 +23,25 @@ export const TenantPolicy = z.object({
   allowGlobalSkillInstall: z.boolean().default(false),
   /** 是否允许从 url 安装 skill（供应链入口，危险）。默认 false。 */
   allowUrlSkillInstall: z.boolean().default(false),
+  /** 是否允许从本地任意路径安装 skill（localPath 源，可复制任意目录 → 任意读）。默认 false。 */
+  allowLocalPathSkillInstall: z.boolean().default(false),
   /** 是否允许物理删盘（project.remove deleteFiles / worktree force 等）。默认 false。 */
   allowDeleteFiles: z.boolean().default(false),
   /** document.send 是否允许发送项目/worktree 目录之外的文件。默认 false（project-scoped）。 */
   allowExternalDocuments: z.boolean().default(false),
   /** env.list reveal=true 是否允许返回环境变量明文。默认 false（只能脱敏查看）。 */
   allowEnvReveal: z.boolean().default(false),
+  /**
+   * 是否允许 project.exec 跨设备执行任意命令（A2/A3）。默认 false（严格）。
+   * exec 能指定任意 binary 且继承环境，等同设备远程代码执行——必须独立 gate，
+   * 不能只靠 allowedMethods。trustLocal（单机自用）下默认开。
+   */
+  allowExec: z.boolean().default(false),
+  /**
+   * 是否允许 device.fs.* 浏览整个文件系统（A4）。默认 true（保留能力）。
+   * 设为 false 可把 device.fs.list/roots 锁到 allowedProjectRoots；需要锁定的部署可关。
+   */
+  allowDeviceFsBrowse: z.boolean().default(true),
   /** 单文件上传上限（字节）；超出走 prepare_upload 或拒绝。 */
   maxUploadBytes: z.number().int().positive().optional(),
   /** 敏感路径黑名单（即使在 allowedProjectRoots 内也拒绝，如 .ssh/.aws/.env）。 */

@@ -545,8 +545,13 @@ export class PhononDevice extends EventEmitter {
 export interface PhononServerOptions {
   port?: number;
   host?: string;
-  /** 鉴权：返回 tenantId 表示通过，返回 null 拒绝。缺省全部放行（本地测试）。 */
+  /** 鉴权：返回 tenantId 表示通过，返回 null 拒绝。缺省仅在 loopback 放行（本地测试）。 */
   authenticate?: (deviceId: string, deviceKey: string | undefined) => { tenantId: string } | null | Promise<{ tenantId: string } | null>;
+  /**
+   * A5: 显式允许非 loopback 绑定时无 authenticate 匿名放行（默认 false）。
+   * 不设 authenticate 且绑非 loopback 又不设 allowAnonymous=true → listen 报错。
+   */
+  allowAnonymous?: boolean;
 }
 
 export class PhononServer extends EventEmitter {
@@ -561,6 +566,15 @@ export class PhononServer extends EventEmitter {
   }
 
   listen(): Promise<number> {
+    // A5: 非 loopback 绑定 + 无 authenticate + 未显式 allowAnonymous → 拒绝启动
+    const host = this.opts.host;
+    const isLoopback = host === undefined || host === "127.0.0.1" || host === "::1" || host === "localhost";
+    if (!this.opts.authenticate && !this.opts.allowAnonymous && !isLoopback) {
+      throw new Error(
+        `PhononServer refuses to listen on non-loopback host "${host}" without authenticate(); ` +
+        `provide authenticate or set allowAnonymous=true (A5)`,
+      );
+    }
     return new Promise((resolve) => {
       const wss = new WebSocketServer({ port: this.opts.port ?? 0, host: this.opts.host });
       this.wss = wss;

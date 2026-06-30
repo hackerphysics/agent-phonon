@@ -35,6 +35,7 @@ export class PolicyEnforcer {
         allowGlobalSkillInstall: true,
         allowUrlSkillInstall: false, // url 装仍默认禁（供应链风险）
         allowExternalDocuments: false,
+        allowExec: true, // 单机自用：exec 默认开（A2/A3，不影响本机使用）
       });
     } else {
       this.policy = DEFAULT_TENANT_POLICY;
@@ -75,6 +76,15 @@ export class PolicyEnforcer {
     if (!this.policy.allowUrlSkillInstall) throw new PhononError("errPolicyDenied", "url skill install disabled by policy");
   }
 
+  /**
+   * B2: localPath skill 源默认禁。localPath 会把设备上任意本地目录复制进 skill 区→
+   * 绕过文件沙箱的任意读取。复用 allowUrlSkillInstall 的“供应链风险”语义档。
+   * trustLocal 下也默认不开（需显式 allowLocalPathSkillInstall）。
+   */
+  assertLocalPathSkillInstall(): void {
+    if (!this.policy.allowLocalPathSkillInstall) throw new PhononError("errPolicyDenied", "localPath skill install disabled by policy (allowLocalPathSkillInstall)");
+  }
+
   assertMethodAllowed(method: string): void {
     if (this.policy.allowedMethods.length > 0 && !this.policy.allowedMethods.includes(method)) {
       throw new PhononError("errPolicyDenied", `method ${method} not in allowedMethods (read-only tenant)`);
@@ -83,6 +93,16 @@ export class PolicyEnforcer {
 
   allowEnvReveal(): boolean {
     return !!this.policy.allowEnvReveal;
+  }
+
+  /** A2/A3: project.exec 需独立 gate（默认禁；trustLocal 开）。 */
+  assertExec(): void {
+    if (!this.policy.allowExec) throw new PhononError("errPolicyDenied", "project.exec disabled by policy (allowExec)");
+  }
+
+  /** A4: device.fs.* 浏览整个文件系统需 allowDeviceFsBrowse（默认开）。 */
+  allowDeviceFsBrowse(): boolean {
+    return this.policy.allowDeviceFsBrowse !== false;
   }
 
   assertUploadSize(bytes: number): void {

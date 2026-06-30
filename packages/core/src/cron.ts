@@ -97,24 +97,16 @@ function partsInTz(date: Date, tz?: string): { year: number; month: number; day:
   };
 }
 
-function matches(parsed: ParsedCron, p: { month: number; day: number; hour: number; minute: number; weekday: number }): boolean {
-  if (!parsed.minute.values.has(p.minute)) return false;
-  if (!parsed.hour.values.has(p.hour)) return false;
-  if (!parsed.month.values.has(p.month)) return false;
-  // dom / dow 并集语义
-  const domWild = parsed.dom.isWildcard;
-  const dowWild = parsed.dow.isWildcard;
-  const domOk = parsed.dom.values.has(p.day);
-  const dowOk = parsed.dow.values.has(p.weekday);
-  if (domWild && dowWild) return true;
-  if (!domWild && !dowWild) return domOk || dowOk; // 经典 cron 并集
-  if (!domWild) return domOk;
-  return dowOk;
-}
-
 /**
  * 计算严格晚于 `after` 的下一次 cron 触发（按 tz wall-clock 匹配）。
- * 逐分钟向前扫描，最多扫 366 天，找不到返回 undefined。
+ *
+ * 安全修复 B3：原实现逐分钟扫描最多 366 天（527040 次 Intl 调用），
+ * 给一个永不匹配的合法表达式（如 `0 0 30 2 *` = 2月30日）会同步阻塞 ~24s（DoS）。
+ * 且 366 天上限会误杀 `0 0 29 2 *`（Feb 29，每 4 年一次）这类合法表达式。
+ *
+ * 新实现：**按天跳过**不匹配的日期（每个非匹配日仅 1 次 Intl 调用，直接跳到该 tz 日的次日 00:00），
+ * 仅在日期匹配的当天才逐分钟扫。水平线设 1500 天（~4.1 年，覆盖闰年 Feb 29 周期），
+ * 扫满仍无匹配（真不可能日期）→ 返回 undefined。最坏情况 Intl 调用 ~3000 次（毫秒级）。
  */
 export function nextCronAfter(expr: string, after: Date, tz?: string): Date | undefined {
   const parsed = parseCron(expr);
@@ -122,11 +114,41 @@ export function nextCronAfter(expr: string, after: Date, tz?: string): Date | un
   const start = new Date(after.getTime());
   start.setUTCSeconds(0, 0);
   let cursor = new Date(start.getTime() + 60_000);
-  const limit = 366 * 24 * 60; // 一年内的分钟数
-  for (let i = 0; i < limit; i++) {
+  const maxDays = 1500; // ~4.1 年，覆盖闰年 Feb 29；不可能日期扫满即返回 undefined
+  let dayChecks = 0;
+  // 绝对安全阀：即便逻辑异常也不会无界循环
+  const hardIterCap = maxDays * 1440 + 10_000;
+  let iters = 0;
+  while (dayChecks < maxDays && iters < hardIterCap) {
+    iters++;
     const p = partsInTz(cursor, tz);
-    if (matches(parsed, p)) return cursor;
+    if (!dateMatches(parsed, p)) {
+      // 当前 tz 日期不匹配 → 整天都不会匹配，一跳到该 tz 日的次日 00:00
+      const minsToMidnight = 24 * 60 - (p.hour * 60 + p.minute);
+      cursor = new Date(cursor.getTime() + Math.max(1, minsToMidnight) * 60_000);
+      dayChecks++;
+      continue;
+    }
+    if (timeMatches(parsed, p)) return cursor;
     cursor = new Date(cursor.getTime() + 60_000);
   }
   return undefined;
+}
+
+/** 日期字段是否匹配（month + dom∪dow），不看时分。 */
+function dateMatches(parsed: ParsedCron, p: { month: number; day: number; weekday: number }): boolean {
+  if (!parsed.month.values.has(p.month)) return false;
+  const domWild = parsed.dom.isWildcard;
+  const dowWild = parsed.dow.isWildcard;
+  const domOk = parsed.dom.values.has(p.day);
+  const dowOk = parsed.dow.values.has(p.weekday);
+  if (domWild && dowWild) return true;
+  if (!domWild && !dowWild) return domOk || dowOk;
+  if (!domWild) return domOk;
+  return dowOk;
+}
+
+/** 时分字段是否匹配。 */
+function timeMatches(parsed: ParsedCron, p: { hour: number; minute: number }): boolean {
+  return parsed.hour.values.has(p.hour) && parsed.minute.values.has(p.minute);
 }

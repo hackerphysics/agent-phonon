@@ -31,10 +31,16 @@ export type RunId = z.infer<typeof RunId>;
 /** 定时触发：本地时钟按 cron 表达式触发。tz 缺省取设备时区。 */
 export const CronTrigger = z.object({
   kind: z.literal("cron"),
-  /** 标准 5 段 cron 表达式：分 时 日 月 周。 */
-  expr: z.string().min(1),
+  /** 标准 5 段 cron 表达式：分 时 日 月 周。限长 200，恰好 5 段（防 DoS/畸形输入）。 */
+  expr: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine((s) => s.trim().split(/\s+/).length === 5, {
+      message: "cron expr must have exactly 5 fields (minute hour day month weekday)",
+    }),
   /** IANA 时区名，如 "Asia/Shanghai"。缺省用设备本地时区。 */
-  tz: z.string().optional(),
+  tz: z.string().max(64).optional(),
 });
 export type CronTrigger = z.infer<typeof CronTrigger>;
 

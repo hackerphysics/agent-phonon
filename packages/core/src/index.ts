@@ -312,8 +312,10 @@ export class PhononConnection {
       case "device.resources":
         return collectDeviceResources(this.policy.workspaceRoot);
       case "device.fs.roots":
+        if (!this.policy.allowDeviceFsBrowse()) throw new PhononError("errPolicyDenied", "device.fs browse disabled by policy (allowDeviceFsBrowse)");
         return this.deviceFsRoots();
       case "device.fs.list":
+        if (!this.policy.allowDeviceFsBrowse()) throw new PhononError("errPolicyDenied", "device.fs browse disabled by policy (allowDeviceFsBrowse)");
         return this.deviceFsList(p as { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number });
       case "discovery.list": {
         // 聚合所有 runtime 的 sub-agents（OpenClaw 多 agent / Codex 单 agent）
@@ -432,6 +434,7 @@ export class PhononConnection {
       case "project.git.status":
         return this.projects.gitStatus(p as { projectId: string; worktreeId?: string });
       case "project.exec":
+        this.policy.assertExec(); // A2/A3: exec 需独立 gate（默认禁；trustLocal 开）
         return this.projects.exec(p as { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number });
 
       // ---- file workspace IO (project/worktree scoped) ----
@@ -455,10 +458,11 @@ export class PhononConnection {
 
       // ---- skill (D24 + 边界规则) ----
       case "skill.install": {
-        // policy：global 装 / url 源 检查（P0-1）
+        // policy：global 装 / url 源 / localPath 源 检查（P0-1 / B2）
         if ((p.scope as string) === "global") this.policy.assertGlobalSkillInstall();
         const src = p.source as { kind?: string } | undefined;
         if (src?.kind === "url") this.policy.assertUrlSkillInstall();
+        if (src?.kind === "localPath") this.policy.assertLocalPathSkillInstall(); // B2
         const r = await this.skills.install({
           agent: p.agent as string, name: p.name as string,
           scope: p.scope as "global" | "project", projectId: p.projectId as string | undefined,
@@ -599,6 +603,7 @@ export { OpenClawGatewayAdapter } from "./adapters/openclaw-gateway.js";
 export { GatewayClient } from "./gateway-client.js";
 export type { GatewayConfig } from "./gateway-client.js";
 export { PhononClient } from "./client.js";
+export { assertSecureServerUrl } from "./client.js";
 export { HookBridge } from "./hook-bridge.js";
 export type { HookRouteResolver } from "./hook-bridge.js";
 export { ProjectManager } from "./project-manager.js";

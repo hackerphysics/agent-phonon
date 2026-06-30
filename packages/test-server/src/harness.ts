@@ -140,7 +140,7 @@ export class TestConn {
   private hookDecider?: (fired: Record<string, unknown>) => Record<string, unknown>;
   private requestResponders = new Map<string, (params: unknown) => unknown>();
 
-  constructor(opts: { registry: ConstructorParameters<typeof PhononConnection>[0]["registry"]; tenantId?: string; trustLocal?: boolean; workspaceRoot?: string; store?: ConstructorParameters<typeof PhononConnection>[0]["store"] }) {
+  constructor(opts: { registry: ConstructorParameters<typeof PhononConnection>[0]["registry"]; tenantId?: string; trustLocal?: boolean; workspaceRoot?: string; store?: ConstructorParameters<typeof PhononConnection>[0]["store"]; policy?: ConstructorParameters<typeof PhononConnection>[0]["policy"] }) {
     const transport: RpcTransport = {
       send: (data: string) => this.onServerInbound(data),
       close: () => {},
@@ -152,6 +152,7 @@ export class TestConn {
       trustLocal: opts.trustLocal ?? true,
       workspaceRoot: opts.workspaceRoot,
       store: opts.store,
+      policy: opts.policy,
       resolveProjectCwd: (p) => p,
     });
   }

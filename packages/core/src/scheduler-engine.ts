@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { PhononError } from "./rpc.js";
-import { nextCronAfter } from "./cron.js";
+import { nextCronAfter, parseCron } from "./cron.js";
 import type { SessionEngine } from "./session-engine.js";
 import type { WorkflowEngine } from "./workflow-engine.js";
 import type { PhononStore } from "./store.js";
@@ -135,6 +135,17 @@ export class SchedulerEngine {
     const id = `sch-${this.now()}-${this.idSeq++}`;
     const nowIso = new Date(this.now()).toISOString();
     let trigger = params.trigger;
+    // B3: cron 表达式创建时即校验可解析 + 能算出下次触发（拒不可能日期等永不触发的表达式）
+    if (trigger.kind === "cron") {
+      try { parseCron(trigger.expr); } catch (e) {
+        throw new PhononError("errInvalidParams", `invalid cron expr: ${(e as Error)?.message ?? "parse error"}`);
+      }
+      const tz = trigger.tz ?? this.opts.defaultTz;
+      const probe = nextCronAfter(trigger.expr, new Date(this.now()), tz);
+      if (!probe) {
+        throw new PhononError("errInvalidParams", `cron expr "${trigger.expr}" never fires (impossible date?)`);
+      }
+    }
     let webhookToken: string | undefined;
     if (trigger.kind === "webhook") {
       webhookToken = trigger.webhookToken || `whk_${randomBytes(24).toString("hex")}`;
@@ -207,11 +218,12 @@ export class SchedulerEngine {
   }
 
   delete(scheduleId: string): { scheduleId: string; deleted: boolean } {
-    const exists = this.opts.store.getSchedule(scheduleId);
+    const exists = this.opts.store.getSchedule(scheduleId, this.opts.tenantId); // B1
+    if (!exists) return { scheduleId, deleted: false }; // 不跨租户删除
     this.disarm(scheduleId);
     this.opts.store.deleteSchedule(scheduleId);
     this.opts.emit("schedule.changed", { scheduleId, deleted: true });
-    return { scheduleId, deleted: !!exists };
+    return { scheduleId, deleted: true };
   }
 
   list(filter?: { enabled?: boolean; triggerKind?: "cron" | "webhook" | "manual"; reveal?: boolean; limit?: number }): { schedules: Schedule[] } {
@@ -242,7 +254,7 @@ export class SchedulerEngine {
 
   /** webhook 入口：server 验签后按 token 找 schedule 并触发。 */
   async triggerByWebhook(token: string, input?: Record<string, unknown>): Promise<{ scheduleId: string; runId: string; status: RunStatus }> {
-    const row = this.opts.store.getScheduleByWebhookToken(token);
+    const row = this.opts.store.getScheduleByWebhookToken(token, this.opts.tenantId); // B1
     if (!row) throw new PhononError("errInvalidParams", "no schedule for webhook token");
     const schedule = this.rowToSchedule(row);
     if (!schedule.enabled) throw new PhononError("errPolicyDenied", "schedule disabled");
@@ -257,7 +269,7 @@ export class SchedulerEngine {
 
   runGet(runId: string): { run: Run } {
     const live = this.runtimes.get(runId);
-    const row = this.opts.store.getRun(runId);
+    const row = this.opts.store.getRun(runId, this.opts.tenantId); // B1
     if (!row) throw new PhononError("errInvalidParams", `run ${runId} not found`);
     const run = this.rowToRun(row);
     if (live) run.status = live.status; // 内存里更新（running）优先
@@ -265,17 +277,32 @@ export class SchedulerEngine {
   }
 
   runsList(scheduleId: string, opts?: { status?: string; limit?: number }): { runs: Run[] } {
-    const rows = this.opts.store.listRunsForSchedule(scheduleId, opts);
+    // B1: 先确认 schedule 属于本租户，再列 run
+    if (!this.opts.store.getSchedule(scheduleId, this.opts.tenantId)) {
+      throw new PhononError("errInvalidParams", `schedule ${scheduleId} not found`);
+    }
+    const rows = this.opts.store.listRunsForSchedule(scheduleId, { ...opts, tenantId: this.opts.tenantId });
     return { runs: rows.map((r) => this.rowToRun(r)) };
   }
 
   subscribe(runId: string): { runId: string; subscribed: boolean; sessionId?: string } {
     const rt = this.runtimes.get(runId);
     if (!rt) {
-      // 已结束的 run：无实时流可订阅，返回 false（server 应改用 transcript / runs.list）
-      const row = this.opts.store.getRun(runId);
+      // 已结束的 run：无实时流可订阅。仍需 consent 门（B4）：
+      // 非 full consent 不能拿到 sessionId 等关联信息，避免内容/元数据泄露。
+      const row = this.opts.store.getRun(runId, this.opts.tenantId); // B1
       if (!row) throw new PhononError("errInvalidParams", `run ${runId} not found`);
+      const schedRow = this.opts.store.getSchedule(row.schedule_id as string, this.opts.tenantId);
+      const push = schedRow ? this.rowToSchedule(schedRow).consent.push : "summary";
+      if (push !== "full") {
+        throw new PhononError("errPolicyDenied", `run.events.subscribe requires schedule consent.push="full" (current: ${push})`);
+      }
       return { runId, subscribed: false, sessionId: (row.session_id as string) ?? undefined };
+    }
+    // B4: consent 门——非 full consent 的 schedule 不允许订阅实时 event 流。
+    // 这是“status-only/summary 内容不出设备”承诺的落地：subscribe 是拿完整内容的路径。
+    if (rt.consent !== "full") {
+      throw new PhononError("errPolicyDenied", `run.events.subscribe requires schedule consent.push="full" (current: ${rt.consent})`);
     }
     rt.subscribed = true;
     return { runId, subscribed: true, sessionId: rt.sessionId };
@@ -290,7 +317,7 @@ export class SchedulerEngine {
   async cancel(runId: string, reason?: string): Promise<{ runId: string; status: RunStatus }> {
     const rt = this.runtimes.get(runId);
     if (!rt) {
-      const row = this.opts.store.getRun(runId);
+      const row = this.opts.store.getRun(runId, this.opts.tenantId); // B1
       if (!row) throw new PhononError("errInvalidParams", `run ${runId} not found`);
       return { runId, status: this.rowToRun(row).status };
     }
@@ -316,8 +343,9 @@ export class SchedulerEngine {
 
     const evAny = ev as Record<string, unknown>;
 
-    // 订阅了就实时转发（带 runId 标记）
-    if (rt.subscribed) {
+    // 订阅了就实时转发（带 runId 标记）——但受 consent 约束（B4）：
+    // 只有 full consent 才转发原始事件内容；summary/status-only 不推 run.event（防内容外汄）。
+    if (rt.subscribed && rt.consent === "full") {
       const seq = rt.seq++;
       this.opts.emit("run.event", { runId, scheduleId: rt.scheduleId, seq, event: ev });
     }
@@ -602,7 +630,7 @@ export class SchedulerEngine {
   }
 
   private loadSchedule(scheduleId: string): Schedule {
-    const row = this.opts.store.getSchedule(scheduleId);
+    const row = this.opts.store.getSchedule(scheduleId, this.opts.tenantId); // B1 tenant 隔离
     if (!row) throw new PhononError("errInvalidParams", `schedule ${scheduleId} not found`);
     return this.rowToSchedule(row);
   }

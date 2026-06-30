@@ -2,7 +2,30 @@ import { WebSocket } from "ws";
 import { PhononConnection } from "./index.js";
 import { AdapterRegistry } from "./session-engine.js";
 import { PROTOCOL_VERSION } from "@agent-phonon/protocol";
+import { PhononError } from "./rpc.js";
 import type { RpcTransport } from "./rpc.js";
+
+/**
+ * A5: 校验 server URL 的传输安全。
+ * 非 loopback 地址必须 wss://（否则 deviceKey 明文传输 + 可被中间人/DNS 劫持冲充 server）。
+ * loopback（127.0.0.1 / ::1 / localhost）允许 ws://；wss:// 始终允许。
+ * allowInsecure=true 可显式绕过（自担风险）。
+ */
+export function assertSecureServerUrl(url: string, allowInsecure?: boolean): void {
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { throw new PhononError("errInvalidParams", `invalid server url: ${url}`); }
+  const proto = parsed.protocol.toLowerCase();
+  if (proto === "wss:" || proto === "https:") return; // 加密，放行
+  if (allowInsecure) return; // 显式绕过
+  const host = parsed.hostname.toLowerCase();
+  const isLoopback = host === "127.0.0.1" || host === "::1" || host === "localhost" || host === "[::1]";
+  if (!isLoopback) {
+    throw new PhononError(
+      "errPolicyDenied",
+      `insecure ws:// to non-loopback host "${host}" rejected; use wss:// or pass allowInsecure=true (A5)`,
+    );
+  }
+}
 
 /**
  * phonon 拨出客户端（design §6）：主动连到一个 server URL。
@@ -27,6 +50,10 @@ export class PhononClient {
   private started = false;
   private backoffMs = 1000;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** A5: 期望的 tenantId；server welcome 不匹配则拒连。 */
+  private expectedTenantId?: string;
+  /** A5: 显式允许非 loopback 的明文 ws://（默认禁）。 */
+  private allowInsecure?: boolean;
 
   constructor(opts: {
     serverUrl: string;
@@ -45,6 +72,10 @@ export class PhononClient {
     obs?: import("./observability.js").ObsBus;
     /** 设备鉴权 key（随 connect.hello 发送）。 */
     deviceKey?: string;
+    /** A5: 期望的 tenantId；server 返回不一致则拒连（防恶意 server 返回别人的 tenant）。 */
+    expectedTenantId?: string;
+    /** A5: 显式允许非 loopback 的明文 ws://。默认 false（非 loopback 必须 wss://）。 */
+    allowInsecure?: boolean;
   }) {
     this.serverUrl = opts.serverUrl;
     this.deviceId = opts.deviceId;
@@ -57,6 +88,10 @@ export class PhononClient {
     this.store = opts.store;
     this.policy = opts.policy;
     this.obs = opts.obs;
+    this.expectedTenantId = opts.expectedTenantId;
+    this.allowInsecure = opts.allowInsecure;
+    // A5: 非 loopback 的明文 ws:// 默认拒绝（防 deviceKey 明文传输 + 中间人冲 server）
+    assertSecureServerUrl(opts.serverUrl, opts.allowInsecure);
   }
 
   /** 连接并完成握手，resolve 后即可接收 server 的 session.* 下发。 */
@@ -90,6 +125,16 @@ export class PhononClient {
             ...(this.deviceKey ? { auth: { deviceKey: this.deviceKey } } : {}),
             at: new Date().toISOString(),
           })) as { tenantId: string };
+
+          // A5: server 身份校验——期望的 tenantId 不匹配则拒连（防恶意 server 返回别人的 tenant）。
+          if (this.expectedTenantId !== undefined && welcome.tenantId !== this.expectedTenantId) {
+            ws.off("message", tmpListener);
+            try { ws.close(); } catch { /* ignore */ }
+            throw new PhononError(
+              "errUnauthorized",
+              `server returned tenantId "${welcome.tenantId}" but expected "${this.expectedTenantId}" (A5 identity check)`,
+            );
+          }
 
           // 切换到正式连接处理器
           ws.off("message", tmpListener);
