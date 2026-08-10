@@ -36,6 +36,40 @@ Phase 1 目标 = **验证「拨出→discovery→建项目→create→send→流
 - **定位**：这是 agent-phonon 的下一阶段核心，不在当前 Phase 1 基础协议里做。
 - **备注**：底层应复用现有 session/project/stream/HITL 能力，不重写 L1。
 
+### N1b. 中央「大脑」/ 编排指挥中心 + 可演化 Persona Registry（Phase 2，与 N1 同一个东西）
+> 来源：2026-06-30 Stephen 看到 The Agency（`msitarzewski/agency-agents`，MIT）后提出分层设想；2026-08-09 按最新代码复查并补全。复查时该项目约 14.0w star、255 个源角色、17 个部门，并有独立桌面安装器。结论：值得借鉴，但只放在 phonon **上层**，不焊进设备。
+
+- **核心判断**：persona/角色是**数据/策略**，不是机制。phonon daemon 要保持「薄 + 诚实 + 只暴露真实能力」；persona 变化极快（每个任务都可能定制），daemon 必须稳。把快变内容焊进慢变基础设施 = 反模式。
+- **为什么不放设备**：焊在每台设备的 daemon 上 → N 台 N 份拷贝，改一次同步 N 次，立刻「死」且漂移。放中央大脑 → 单一事实来源，热编辑、可版本化、可按任务 fork 临时变体，设备侧零改动。
+- **分层**：The Agency 提供「角色内容资产」；phonon 提供「身体+神经」（稳定执行底座）；大脑做「中枢」（实时调度 + persona 管理 + 按任务定制）。大脑 ≈ N1 任务编排层，Persona Registry 是它的子系统，不是全新概念。
+- **The Agency 的准确定位**：它是结构化 Persona/Prompt 内容库 + 多工具格式转换器 + 安装器，**不是**多 Agent 编排引擎、持久记忆、任务状态机、跨设备控制面或自动演化系统。不要被其 `production-ready` 文案替代真实 eval 证据。
+
+#### 可直接借鉴
+
+1. **Canonical Persona Schema**：身份/性格、使命、范围与非目标、沟通方式、关键规则、工作流、输入/输出契约、交付物、成功指标、工具/权限需求、上下文需求、示例。
+2. **Persona Compiler**：一份 canonical source 按目标 runtime 编译成 OpenClaw、Claude Code、Codex、Copilot、OpenCode 等格式；修改一次，所有目标同步生成，避免设备/工具间漂移。
+3. **内容治理门禁**：schema lint、重复角色检测、原创度/来源检查、目录一致性、多目标转换检查；在此基础上增加行为 eval、安全 eval、token 成本和版本回归。
+4. **角色市场 UX**：浏览、搜索、分类、查看权限/成本/效果、fork 私有版本、编辑、试运行、比较、发布、回滚。可借鉴其桌面 App 的「浏览→选择→安装→更新」，但升级为中央管理而非复制静态文件。
+5. **首批角色种子**：优先精选 10–20 个高价值角色（产品、架构、UI、前后端、review、安全、测试、SRE、技术写作、Minimal Change、Reality Checker 等），不要把数百个角色全量塞进上下文。
+
+#### 我们必须补上的能力
+
+- **动态检索与组装**：大脑先理解任务，再检索候选角色；只注入本次任务需要的片段。The Agency 角色平均很长，全量加载会造成上下文膨胀、路由混淆和角色重叠。
+- **版本化与可追溯**：每个 persona 有稳定 id、version/hash、provenance、license、change history；每次任务记录实际使用版本，支持回放与回滚。
+- **效果闭环**：把任务结果、review、用户反馈、成本与失败原因关联到 persona 版本；支持基线、A/B、回归测试和有证据的演化，而不是只改 Markdown。
+- **角色边界治理**：区分硬规则、可配置默认值、经验建议和待验证假设；避免把未经验证的具体数字/经验写成普遍定律。
+- **编排闭环**：理解意图 → 拆任务 → 选 persona/agent/model/device → 执行 → evaluator/reviewer 验收 → 反馈更新。The Agency 只提供中间的角色内容，不提供整个闭环。
+
+#### 设计约束（开发大脑时必须遵守）
+
+1. **大脑经现有协议注入 persona，不往设备装文件**：复用 `session.send` 的 skills/context（具体协议形态开发时核对），建会话/每任务时动态注入；保证大脑与 phonon 解耦，phonon 继续当薄底座。
+2. **persona 带 version/hash，大脑决定每任务用哪版**：任务执行记录必须能回答「哪个角色的哪一版导致了这个结果」。
+3. **设备最终否决权不可绕过**：大脑下发的 persona 不能覆盖 phonon 设备侧 tenant / HITL / allowExec / local policy；双层防线不因增加大脑而失效。
+4. **大脑是独立服务**（Stephen 明确：单独建设多设备指挥中心）；Web、iOS、Figma 4 AI 等是同一大脑和连续数据流上的角色化界面，不各自复制 persona。
+5. **合规复用**：The Agency 为 MIT，可作为初始种子，但导入时保留来源、许可证与修改记录；不要把上游内容无来源地内化成自有资产。
+
+- **触发条件**：进入 Phase 2 开发中央大脑时启动。先定义 Persona Schema + Registry + Compiler + Eval，再精选导入 The Agency 角色；不要先复制全部角色。
+
 ### N2. 长期任务 / 计划任务（Phase 2）
 - **内容**：支持 long-running job、定时任务、周期任务、延迟任务；任务状态可查询，结果走 stream/notification 回传。
 - **定位**：下一阶段做。当前先通过服务端侧调度或 OpenClaw 自身 cron 兜底。
