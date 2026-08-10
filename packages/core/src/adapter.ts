@@ -1,3 +1,4 @@
+import type { MaintenanceRuntime } from "./maintenance.js";
 import type {
   AgentCapabilities,
   AgentDescriptor,
@@ -74,6 +75,13 @@ export interface SendOptions {
 }
 
 /** adapter 创建 session 的参数。 */
+export interface AdapterRuntimeContext {
+  /** Tenant-bound, policy-enforced deterministic host-maintenance broker. */
+  maintenance?: MaintenanceRuntime;
+  /** Device policy re-check for internal/scheduled session creation. */
+  assertAgentAllowed?: (agentId: string) => void;
+}
+
 export interface CreateSessionParams {
   sessionId: string;
   /** discover 返回的完整 agentId（多 agent runtime 带前缀，如 openclaw:phonon）。 */
@@ -86,6 +94,8 @@ export interface CreateSessionParams {
   initialContext?: ContextItem[];
   /** Core is rebuilding a persisted session after daemon restart. */
   reattach?: boolean;
+  /** Internal-only device capabilities; never accepted from the wire. */
+  runtimeContext?: AdapterRuntimeContext;
 }
 
 /**

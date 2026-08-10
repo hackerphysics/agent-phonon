@@ -120,6 +120,31 @@ class PhononDevice:
         """Device-level directory listing under safe roots or absolute root paths."""
         return await self._peer.request("device.fs.list", opts)
 
+    # ---- deterministic host maintenance (no external agent/LLM required) ----
+    async def maintenance_targets(self) -> dict:
+        return await self._peer.request("maintenance.targets", {})
+
+    async def maintenance_diagnose(self, target_id: str | None = None) -> dict:
+        return await self._peer.request("maintenance.diagnose", {"targetId": target_id} if target_id else {})
+
+    async def maintenance_config_get(self, target_id: str, config_id: str) -> dict:
+        return await self._peer.request("maintenance.config.get", {"targetId": target_id, "configId": config_id})
+
+    async def maintenance_config_patch(self, target_id: str, config_id: str, expected_sha256: str, patch: dict, **opts: Any) -> dict:
+        return await self._peer.request("maintenance.config.patch", {"targetId": target_id, "configId": config_id, "expectedSha256": expected_sha256, "patch": patch, **opts})
+
+    async def maintenance_rollback(self, backup_id: str, expected_current_sha256: str, **opts: Any) -> dict:
+        return await self._peer.request("maintenance.rollback", {"backupId": backup_id, "expectedCurrentSha256": expected_current_sha256, **opts})
+
+    async def maintenance_package_update(self, target_id: str, **opts: Any) -> dict:
+        return await self._peer.request("maintenance.package.update", {"targetId": target_id, **opts})
+
+    async def maintenance_service_status(self, target_id: str, service_id: str) -> dict:
+        return await self._peer.request("maintenance.service.status", {"targetId": target_id, "serviceId": service_id})
+
+    async def maintenance_service_restart(self, target_id: str, service_id: str, **opts: Any) -> dict:
+        return await self._peer.request("maintenance.service.restart", {"targetId": target_id, "serviceId": service_id, **opts})
+
     # ---- project / file / skill 便捷封装 ----
     async def project_create(self, name: str, git: bool = True, **opts: Any) -> dict:
         return await self._peer.request("project.create", {"name": name, "git": git, **opts})

@@ -4,7 +4,7 @@ import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { AdapterRegistry, PhononStore, ProjectManager, nextCronAfter, assertSecureServerUrl } from "@agent-phonon/core";
+import { AdapterRegistry, PhononStore, ProjectManager, SessionEngine, PolicyEnforcer, nextCronAfter, assertSecureServerUrl } from "@agent-phonon/core";
 import { MockAdapter, TestConn } from "./harness.js";
 
 /**
@@ -173,6 +173,18 @@ test("B4: run.events.subscribe denied for non-full consent (status-only)", async
 // ===========================================================================
 // A2/A3 — project.exec gating + env stripping
 // ===========================================================================
+
+test("allowedAgents is enforced by SessionEngine, including internal workflow/schedule paths", async () => {
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({ name: "fake", agentIds: ["fake"], models: ["m"] }));
+  const policy = new PolicyEnforcer({ policy: { allowedAgents: ["fake" as never] } });
+  const engine = new SessionEngine(reg, () => {}, undefined, undefined, {
+    assertAgentAllowed: (agentId) => policy.assertAgentAllowed(agentId),
+  });
+  await assert.rejects(() => engine.create({
+    tenantId: "t", project: "p", cwd: tmpdir(), agent: "phonon-rescue", model: "m", verbosity: "messages",
+  }), /not in allowedAgents/);
+});
 
 test("A2/A3: project.exec denied when allowExec=false (strict policy)", async () => {
   const reg = new AdapterRegistry();

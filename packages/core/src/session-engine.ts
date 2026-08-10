@@ -1,6 +1,7 @@
 import type {
   AgentAdapter,
   AdapterSession,
+  AdapterRuntimeContext,
 } from "./adapter.js";
 import type { ContextItem, StreamEvent } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
@@ -82,12 +83,14 @@ export class SessionEngine {
   private obs?: import("./observability.js").ObsBus;
   /** 会话快照写入器（store 落盘时启用）。 */
   private transcripts?: TranscriptWriter;
+  private runtimeContext?: AdapterRuntimeContext;
 
-  constructor(registry: AdapterRegistry, sink: StreamSink, obs?: import("./observability.js").ObsBus, store?: import("./store.js").PhononStore) {
+  constructor(registry: AdapterRegistry, sink: StreamSink, obs?: import("./observability.js").ObsBus, store?: import("./store.js").PhononStore, runtimeContext?: AdapterRuntimeContext) {
     this.registry = registry;
     this.sink = sink;
     this.obs = obs;
     this.store = store;
+    this.runtimeContext = runtimeContext;
     const tdir = store?.transcriptDir();
     if (tdir) this.transcripts = new TranscriptWriter(tdir);
     if (store) this.restoreSessions(store);
@@ -179,6 +182,7 @@ export class SessionEngine {
     /** L3 归属（workflow node 创建 session 时传入）。 */
     workflowAttr?: { workflowId: string; nodeId: string; role?: string };
   }): Promise<{ sessionId: string; status: string; createdAt: string }> {
+    this.runtimeContext?.assertAgentAllowed?.(params.agent);
     const adapter = this.registry.resolve(params.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${params.agent} not found`);
 
@@ -190,6 +194,7 @@ export class SessionEngine {
       cwd: params.cwd,
       agentConfig: params.agentConfig,
       initialContext: params.initialContext,
+      runtimeContext: this.runtimeContext,
     });
 
     // 自发输出水槽（D16）：adapter 在无 active turn 时的输出走这里，core 统一打 seq 后转发
@@ -237,12 +242,14 @@ export class SessionEngine {
   /** 重新附着游离 session（重启恢复后首次使用）。
    * native-session adapter 重建会复用原生会话（如 OpenClaw sessionKey / Claude --resume）。 */
   private async reattach(rec: SessionRecord): Promise<void> {
+    this.runtimeContext?.assertAgentAllowed?.(rec.agent);
     const adapter = this.registry.resolve(rec.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${rec.agent} unavailable for reattach`);
     const cwd = this.resolveCwdForReattach?.(rec.project) ?? rec.project;
     rec.adapterSession = await adapter.createSession({
       sessionId: rec.sessionId, agentId: rec.agent, model: rec.model, cwd,
       reattach: true,
+      runtimeContext: this.runtimeContext,
     });
     rec.adapterSession.setUnsolicitedSink?.((event) => {
       const r = this.sessions.get(rec.sessionId);
@@ -399,6 +406,10 @@ export class SessionEngine {
     const rec = this.assertTenant(sessionId, tenantId);
     if (rec.status === "running")
       throw new PhononError("errSessionBusy", "cannot switch model while running (whenRunning=reject)");
+    const adapter = this.registry.resolve(rec.agent);
+    if (!adapter?.capabilities.modelSwitch) {
+      throw new PhononError("errCapabilityUnsupported", `model switch not supported by ${rec.agent}`);
+    }
     const previousModel = rec.model;
     let warnings: string[] | undefined;
     if (!rec.detached && rec.adapterSession?.switchModel) {

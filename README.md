@@ -26,7 +26,8 @@ puts a small daemon in front of them so a server can:
 - create/send/interrupt/terminate sessions through one protocol,
 - stream output and receive unsolicited/proactive agent output,
 - manage projects, worktrees, skills, files, env vars, and HITL hooks,
-- orchestrate many devices while each device still enforces its own local policy.
+- orchestrate many devices while each device still enforces its own local policy,
+- keep a built-in `phonon-rescue` recovery agent and deterministic maintenance plane available even when every external agent is broken.
 
 Adapters declare their real capabilities; agent-phonon does **not** pretend every
 agent works the same way.
@@ -200,6 +201,40 @@ Adapter auto-detection is conservative:
   with provider fallbacks when the catalog is incomplete.
 - No user-specific provider names, endpoints, or local machine paths are
   hard-coded.
+
+## Built-in recovery agent and maintenance plane
+
+`phonon-rescue` is built into the daemon. It does not depend on OpenClaw,
+Claude Code, Codex, Copilot, OpenCode, or Hermes. Configure any endpoint that
+supports **OpenAI Chat Completions plus tool calling**:
+
+```bash
+agent-phonon rescue configure \
+  --base-url https://your-endpoint.example/v1 \
+  --model your-tool-capable-model \
+  --api-key-ref ~/.agent-phonon/rescue.key
+```
+
+The CLI probes Chat Completions and tool calling before saving. `--api-key-env`
+or `--api-key` are also supported; a `0600` key file is recommended for a
+background service.
+
+The rescue agent has no arbitrary shell or host filesystem tool. It can only
+invoke locally registered semantic maintenance operations. The same operations
+are also exposed directly through the server SDK as `device.maintenance.*`, so
+recovery still works when the rescue model endpoint is unavailable:
+
+- inventory and diagnostics,
+- redacted JSON config reads,
+- optimistic-lock JSON merge patch with automatic backup,
+- checksum-verified rollback,
+- allowlisted user-level npm/pnpm package updates,
+- allowlisted user-service status and restart.
+
+All maintenance capabilities are controlled by independent device policy flags
+and default to **off**. `trustLocal` enables them for local single-user setups;
+remote tenants should opt in explicitly. Raw paths, package names, service names,
+and shell strings are never accepted over the wire.
 
 ## Adapter overrides
 

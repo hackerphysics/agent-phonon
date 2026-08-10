@@ -56,3 +56,24 @@ jobs:
       - name: Run e2e
         working-directory: sdk-python
         run: python3 test_e2e.py
+
+  maintenance-cross-platform:
+    name: Maintenance/rescue (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @agent-phonon/protocol build
+      - run: pnpm --filter @agent-phonon/core build
+      - run: pnpm --filter @agent-phonon/test-server build
+      - name: Run maintenance/rescue tests
+        run: node --test packages/test-server/dist/fn-maintenance.test.js packages/test-server/dist/fn-maintenance-rpc.test.js packages/test-server/dist/fn-rescue-adapter.test.js

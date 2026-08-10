@@ -36,6 +36,10 @@ export class PolicyEnforcer {
         allowUrlSkillInstall: false, // url 装仍默认禁（供应链风险）
         allowExternalDocuments: false,
         allowExec: true, // 单机自用：exec 默认开（A2/A3，不影响本机使用）
+        allowMaintenanceRead: true,
+        allowMaintenanceConfigWrite: true,
+        allowMaintenancePackageUpdate: true,
+        allowMaintenanceServiceRestart: true,
       });
     } else {
       this.policy = DEFAULT_TENANT_POLICY;
@@ -103,6 +107,37 @@ export class PolicyEnforcer {
   /** A4: device.fs.* 浏览整个文件系统需 allowDeviceFsBrowse（默认开）。 */
   allowDeviceFsBrowse(): boolean {
     return this.policy.allowDeviceFsBrowse !== false;
+  }
+
+  assertAgentAllowed(agentId: string): void {
+    if (this.policy.allowedAgents.length > 0 && !this.policy.allowedAgents.includes(agentId as never)) {
+      throw new PhononError("errPolicyDenied", `agent ${agentId} not in allowedAgents`);
+    }
+  }
+
+  assertMaintenanceRead(): void {
+    if (!this.policy.allowMaintenanceRead) throw new PhononError("errPolicyDenied", "maintenance read disabled by policy");
+  }
+
+  assertMaintenanceConfigWrite(): void {
+    if (!this.policy.allowMaintenanceConfigWrite) throw new PhononError("errPolicyDenied", "maintenance config write disabled by policy");
+  }
+
+  assertMaintenancePackageUpdate(): void {
+    if (!this.policy.allowMaintenancePackageUpdate) throw new PhononError("errPolicyDenied", "maintenance package update disabled by policy");
+  }
+
+  assertMaintenanceServiceRestart(): void {
+    if (!this.policy.allowMaintenanceServiceRestart) throw new PhononError("errPolicyDenied", "maintenance service restart disabled by policy");
+  }
+
+  maintenancePermissions(): { read: boolean; configWrite: boolean; packageUpdate: boolean; serviceRestart: boolean } {
+    return {
+      read: !!this.policy.allowMaintenanceRead,
+      configWrite: !!this.policy.allowMaintenanceConfigWrite,
+      packageUpdate: !!this.policy.allowMaintenancePackageUpdate,
+      serviceRestart: !!this.policy.allowMaintenanceServiceRestart,
+    };
   }
 
   assertUploadSize(bytes: number): void {

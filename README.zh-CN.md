@@ -23,7 +23,8 @@ WebSocket/JSON 协议暴露给服务端。
 - 用统一协议创建、发送、打断、终止会话；
 - 接收流式输出和主动输出；
 - 管理项目、worktree、skill、文件、环境变量和 HITL hook；
-- 编排多台设备，同时每台设备仍保留自己的本地安全策略。
+- 编排多台设备，同时每台设备仍保留自己的本地安全策略；
+- 即使全部外部 Agent 都坏掉，仍保留内置 `phonon-rescue` 和确定性维护通道完成诊断与恢复。
 
 Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全一样。
 
@@ -182,6 +183,36 @@ agent-phonon discover
 - GitHub Copilot CLI 会从 `copilot help config` 解析模型清单，并使用 JSONL 真流式输出和原生命名会话续接；
 - Hermes 会读取 profile/config/catalog，并在 catalog 不完整时使用 provider fallback；
 - 不硬编码任何用户个人 provider 名、endpoint 或本机路径。
+
+## 内置救援 Agent 与确定性维护通道
+
+`phonon-rescue` 直接内置在 daemon 中，不依赖 OpenClaw、Claude Code、
+Codex、Copilot、OpenCode 或 Hermes。可配置任意同时支持 **OpenAI Chat
+Completions 与 tool calling** 的 endpoint：
+
+```bash
+agent-phonon rescue configure \
+  --base-url https://your-endpoint.example/v1 \
+  --model your-tool-capable-model \
+  --api-key-ref ~/.agent-phonon/rescue.key
+```
+
+CLI 会先实测 Chat Completions + 工具调用，成功后才保存。也支持
+`--api-key-env` 和 `--api-key`；后台服务推荐使用权限为 `0600` 的 key 文件。
+
+救援 Agent 没有任意 shell，也不能任意读写宿主机。它只能调用设备本地预注册的
+语义化维护操作。同一套操作也通过 Server SDK 的 `device.maintenance.*` 直接暴露，
+因此即使救援模型 endpoint 也不可用，仍可走确定性 break-glass 通道：
+
+- 目标清单和诊断；
+- 脱敏 JSON 配置读取；
+- 带 hash 乐观锁、自动备份的 JSON Merge Patch；
+- 校验备份 checksum 的回滚；
+- 白名单内用户态 npm/pnpm 包更新；
+- 白名单内用户服务状态和重启。
+
+四类维护权限由独立设备 policy 控制，默认全部关闭。`trustLocal` 适合本地单用户场景；
+远程 tenant 必须显式开放。线协议不接受任意路径、包名、服务名或 shell 字符串。
 
 ## Adapter override
 

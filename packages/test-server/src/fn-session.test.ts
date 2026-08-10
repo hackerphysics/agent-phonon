@@ -90,6 +90,14 @@ test("session.compress custom → errCapabilityUnsupported", async () => {
   await assert.rejects(() => tc.call("session.compress", { sessionId, mode: "custom" }), (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errCapabilityUnsupported");
 });
 
+test("session.switchModel rejects adapters that declare modelSwitch=false", async () => {
+  const { tc, root } = setup({ caps: { modelSwitch: false } });
+  const { sessionId } = await mkSession(tc, root);
+  await assert.rejects(() => tc.call("session.switchModel", { sessionId, model: "m2" }), (err: unknown) => {
+    return (err as { data?: { appCode?: string } }).data?.appCode === "errCapabilityUnsupported";
+  });
+});
+
 test("session.switchModel idle → switches + warnings", async () => {
   const { tc, root } = setup();
   const { sessionId } = await mkSession(tc, root, "mock:default", "m1");

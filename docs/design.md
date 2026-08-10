@@ -87,6 +87,7 @@ L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等�
 | D35 | **服务端需要受控文件读写能力，文件同步/产物管理仍走 Git** | `file.read/write/list/stat/mkdir` 允许 server 主动操作 project/worktree 内文件；与 `document.send`（agent 主动发产物）区分。所有路径必须限定在 project/worktree 根内，禁止任意路径读写。文件同步、产物版本和 diff 仍统一交给 Git/project/worktree，不另做 artifact sync 系统。 |
 | D36 | **Skill 依赖的环境变量独立配置，不随 skill 包分发** | 有些 skill 需要 API key/token 等环境变量；安全起见，skill 包只包含代码/说明，环境变量走 `env.set/list/delete` 单独配置。scope 支持 global/project/skill；查询默认脱敏，只有本地 policy `allowEnvReveal` 才允许 reveal 明文。执行时按 global < project < skill 优先级合并注入 adapter 子进程环境。 |
 | D37 | **env 变量 at-rest 加密 + 受控文件读写沙箱（realpath）** | env 变量值落 sqlite 前用 AES-256-GCM 加密（每条独立 IV，前缀 `enc:v1:`），设备密钥存同目录 `device.key`（0600，与库分离、不入 git）；老明文值无前缀→读时原样返回，平滑迁移。`file.*` 沙箱不能只做字符串前缀判断（in-project symlink 如 `evil→/etc` 会逃逸）：必须 realpath 解析最深已存在祖先再做 containment 校验；`stat` 用 lstat 不跟随最终软链（仍可上报 type=symlink），`list` 用 lstat 不递归进软链目录。 |
+| D38 | **内置 `phonon-rescue` + 确定性 maintenance 双通道** | 外部 Agent 全坏时仍需恢复。daemon 内置 OpenAI-compatible 轻量 Agent，但模型只拿到语义化 Maintenance Broker，不拿 shell/任意路径；同一 broker 通过 `maintenance.*` RPC 直接暴露，模型 endpoint 坏时 server 仍能 break-glass。所有 target/config/package/service 必须设备本地预注册，协议不接收 raw path/package/service/shell；配置修改走脱敏读取 + SHA-256 乐观锁 + 原子写 + 自动备份/回滚；包更新/服务重启分开授权，默认全拒。agent-phonon 自身进程死亡仍需进程外 service manager/watchdog，不伪称自愈。 |
 
 ---
 

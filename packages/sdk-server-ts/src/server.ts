@@ -194,6 +194,18 @@ export class PhononDevice extends EventEmitter {
     return this.peer.request(method, params);
   }
 
+  /** 确定性宿主机维护面：不依赖任何外部 Agent/LLM。 */
+  readonly maintenance = {
+    targets: () => this.peer.request("maintenance.targets", {}),
+    diagnose: (targetId?: string) => this.peer.request("maintenance.diagnose", targetId ? { targetId } : {}),
+    configGet: (targetId: string, configId: string) => this.peer.request("maintenance.config.get", { targetId, configId }),
+    configPatch: (p: { targetId: string; configId: string; expectedSha256: string; patch: Record<string, unknown>; reason?: string; clientRequestId?: string }) => this.peer.request("maintenance.config.patch", p),
+    rollback: (backupId: string, expectedCurrentSha256: string, opts?: { reason?: string; clientRequestId?: string }) => this.peer.request("maintenance.rollback", { backupId, expectedCurrentSha256, ...opts }),
+    packageUpdate: (targetId: string, opts?: { version?: string; clientRequestId?: string }) => this.peer.request("maintenance.package.update", { targetId, ...opts }),
+    serviceStatus: (targetId: string, serviceId: string) => this.peer.request("maintenance.service.status", { targetId, serviceId }),
+    serviceRestart: (targetId: string, serviceId: string, clientRequestId?: string) => this.peer.request("maintenance.service.restart", { targetId, serviceId, ...(clientRequestId ? { clientRequestId } : {}) }),
+  };
+
   /** 列设备上可用 agent。 */
   async discover(): Promise<AgentDescriptor[]> {
     const r = (await this.peer.request("discovery.list", {})) as { agents: AgentDescriptor[] };

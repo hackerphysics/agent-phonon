@@ -42,6 +42,14 @@ export const TenantPolicy = z.object({
    * 设为 false 可把 device.fs.list/roots 锁到 allowedProjectRoots；需要锁定的部署可关。
    */
   allowDeviceFsBrowse: z.boolean().default(true),
+  /** 是否允许只读宿主机维护诊断/读取脱敏配置。默认 false。 */
+  allowMaintenanceRead: z.boolean().default(false),
+  /** 是否允许修改本地预注册的 JSON 配置（自动备份 + 乐观锁）。默认 false。 */
+  allowMaintenanceConfigWrite: z.boolean().default(false),
+  /** 是否允许更新本地预注册的用户态 npm/pnpm 包。默认 false。 */
+  allowMaintenancePackageUpdate: z.boolean().default(false),
+  /** 是否允许重启本地预注册的服务。默认 false。 */
+  allowMaintenanceServiceRestart: z.boolean().default(false),
   /** 单文件上传上限（字节）；超出走 prepare_upload 或拒绝。 */
   maxUploadBytes: z.number().int().positive().optional(),
   /** 敏感路径黑名单（即使在 allowedProjectRoots 内也拒绝，如 .ssh/.aws/.env）。 */

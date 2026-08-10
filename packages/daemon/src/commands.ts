@@ -4,7 +4,7 @@ import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chm
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
 
 /**
@@ -164,7 +164,7 @@ export async function cmdDoctor(): Promise<void> {
 export async function cmdDiscover(): Promise<void> {
   let cfg: DaemonConfig;
   try { cfg = loadConfig(); } catch { console.error("config not initialized — run 'agent-phonon init' first"); process.exit(1); return; }
-  const reg = buildRegistry(cfg.adapters);
+  const reg = buildRegistry(cfg.adapters, cfg.rescueAgent);
   const nested = await Promise.all(reg.all().map((a) => a.discoverAgents()));
   const agents = nested.flat();
   console.log(`discovered ${agents.length} agent(s):\n`);
@@ -175,8 +175,19 @@ export async function cmdDiscover(): Promise<void> {
 }
 
 /** 从 adapter 配置构造 registry（discover/doctor 用）。 */
-export function buildRegistry(adapters: AdapterConfig[]): AdapterRegistry {
+export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["rescueAgent"]): AdapterRegistry {
   const reg = new AdapterRegistry();
+  if (rescue?.enabled !== false) {
+    reg.register(new RescueAdapter({
+      baseUrl: rescue?.baseUrl,
+      apiKey: rescue?.apiKey,
+      apiKeyEnv: rescue?.apiKeyEnv,
+      apiKeyRef: rescue?.apiKeyRef,
+      defaultModel: rescue?.model,
+      maxSteps: rescue?.maxSteps,
+      timeoutMs: rescue?.timeoutMs,
+    }));
+  }
   for (const a of autoDetectAdapters(adapters)) {
     if (a.type === "openclaw-gateway") {
       const token = a.gatewayToken ?? readOpenClawGatewayToken();

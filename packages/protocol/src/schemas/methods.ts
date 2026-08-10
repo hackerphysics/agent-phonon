@@ -112,6 +112,16 @@ import {
   WorkflowResumeParams,
 } from "./workflow.js";
 import {
+  MaintenanceTargetsParams, MaintenanceTargetsResult,
+  MaintenanceDiagnoseParams, MaintenanceDiagnoseResult,
+  MaintenanceConfigGetParams, MaintenanceConfigGetResult,
+  MaintenanceConfigPatchParams, MaintenanceConfigPatchResult,
+  MaintenanceRollbackParams, MaintenanceRollbackResult,
+  MaintenancePackageUpdateParams, MaintenancePackageUpdateResult,
+  MaintenanceServiceStatusParams, MaintenanceServiceStatusResult,
+  MaintenanceServiceRestartParams, MaintenanceServiceRestartResult,
+} from "./maintenance.js";
+import {
   ScheduleCreateParams,
   ScheduleCreateResult,
   ScheduleUpdateParams,
@@ -191,6 +201,40 @@ export const METHODS = {
     kind: "request",
     params: DeviceFsListParams,
     result: DeviceFsListResult,
+  },
+
+  // --- 宿主机确定性维护面（即使外部 Agent 全部不可用仍可调用）---
+  "maintenance.targets": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceTargetsParams, result: MaintenanceTargetsResult,
+  },
+  "maintenance.diagnose": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceDiagnoseParams, result: MaintenanceDiagnoseResult,
+  },
+  "maintenance.config.get": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceConfigGetParams, result: MaintenanceConfigGetResult,
+  },
+  "maintenance.config.patch": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceConfigPatchParams, result: MaintenanceConfigPatchResult,
+  },
+  "maintenance.rollback": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceRollbackParams, result: MaintenanceRollbackResult,
+  },
+  "maintenance.package.update": {
+    direction: "s2p", kind: "request",
+    params: MaintenancePackageUpdateParams, result: MaintenancePackageUpdateResult,
+  },
+  "maintenance.service.status": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceServiceStatusParams, result: MaintenanceServiceStatusResult,
+  },
+  "maintenance.service.restart": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceServiceRestartParams, result: MaintenanceServiceRestartResult,
   },
 
   // --- 发现（server 查询；phonon 主动推变更）---

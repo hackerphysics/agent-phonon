@@ -16,6 +16,7 @@ import { collectDeviceInfo } from "./device-info.js";
 import { WorkflowEngine } from "./workflow-engine.js";
 import { SchedulerEngine } from "./scheduler-engine.js";
 import { EnvManager } from "./env-manager.js";
+import { MaintenanceManager, type MaintenanceManagerConfig } from "./maintenance.js";
 import type { AgentAdapter } from "./adapter.js";
 import { PROTOCOL_VERSION, parseParams, METHODS, type StreamEvent, type TenantPolicy, type MethodName, type WorkflowPlan } from "@agent-phonon/protocol";
 
@@ -37,6 +38,10 @@ const MUTATING_METHODS = new Set<string>([
   "file.mkdir",
   "env.set",
   "env.delete",
+  "maintenance.config.patch",
+  "maintenance.rollback",
+  "maintenance.package.update",
+  "maintenance.service.restart",
   "workflow.run",
   "workflow.cancel",
   "schedule.create",
@@ -71,6 +76,7 @@ export class PhononConnection {
   private store: PhononStore;
   private files: FileManager;
   private env: EnvManager;
+  private maintenance: MaintenanceManager;
   private obs?: import("./observability.js").ObsBus;
   private workflows?: WorkflowEngine;
   private scheduler?: SchedulerEngine;
@@ -91,6 +97,8 @@ export class PhononConnection {
     store?: PhononStore;
     /** 可观测事件总线（可选）。 */
     obs?: import("./observability.js").ObsBus;
+    /** 设备本地预注册的确定性维护目标。 */
+    maintenance?: MaintenanceManagerConfig;
   }) {
     this.tenantId = opts.tenantId;
     this.registry = opts.registry;
@@ -98,6 +106,7 @@ export class PhononConnection {
     // 持久化（D6）：projects/skills/worktrees/outbox 落 sqlite；dbPath 缺省内存库
     this.store = opts.store ?? new PhononStore(opts.dbPath ?? ":memory:");
     this.idempotency = new IdempotencyStore({ store: this.store });
+    this.maintenance = new MaintenanceManager(this.policy, opts.maintenance);
 
     // 先建 engine（ProjectManager 要用它查 active session）
     this.outbox = new Outbox({ store: this.store, tenantId: opts.tenantId });
@@ -107,7 +116,10 @@ export class PhononConnection {
       // 下行可靠投递（D29）：先入 outbox（含 sqlite）再发；server ack 后清理
       this.outbox.enqueue(event);
       this.peer.notifyRaw("stream.event", event);
-    }, opts.obs, this.store);
+    }, opts.obs, this.store, {
+      maintenance: this.maintenance,
+      assertAgentAllowed: (agentId) => this.policy.assertAgentAllowed(agentId),
+    });
     this.engine.resolveCwdForReattach = (projectId) => this.resolveProjectCwd(projectId);
     this.obs = opts.obs;
 
@@ -306,6 +318,21 @@ export class PhononConnection {
   }
 
   private async dispatchInner(method: string, p: Record<string, unknown>): Promise<unknown> {
+    const maintenanceMutation = method === "maintenance.config.patch" || method === "maintenance.rollback" || method === "maintenance.package.update" || method === "maintenance.service.restart";
+    if (maintenanceMutation) {
+      this.obs?.emitEvent({
+        category: "tool", level: "info", event: method, tenantId: this.tenantId,
+        msg: `${method} requested`,
+        data: {
+          targetId: p.targetId,
+          configId: p.configId,
+          serviceId: p.serviceId,
+          backupId: p.backupId,
+          version: p.version,
+          reason: p.reason,
+        },
+      });
+    }
     switch (method) {
       case "device.info":
         return collectDeviceInfo();
@@ -317,6 +344,22 @@ export class PhononConnection {
       case "device.fs.list":
         if (!this.policy.allowDeviceFsBrowse()) throw new PhononError("errPolicyDenied", "device.fs browse disabled by policy (allowDeviceFsBrowse)");
         return this.deviceFsList(p as { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number });
+      case "maintenance.targets":
+        return this.maintenance.targets();
+      case "maintenance.diagnose":
+        return this.maintenance.diagnose(p.targetId as string | undefined);
+      case "maintenance.config.get":
+        return this.maintenance.configGet(p.targetId as string, p.configId as string);
+      case "maintenance.config.patch":
+        return this.maintenance.configPatch(p as never);
+      case "maintenance.rollback":
+        return this.maintenance.rollback(p.backupId as string, p.expectedCurrentSha256 as string, p.reason as string | undefined);
+      case "maintenance.package.update":
+        return this.maintenance.packageUpdate(p.targetId as string, p.version as string | undefined);
+      case "maintenance.service.status":
+        return this.maintenance.serviceStatus(p.targetId as string, p.serviceId as string);
+      case "maintenance.service.restart":
+        return this.maintenance.serviceRestart(p.targetId as string, p.serviceId as string);
       case "discovery.list": {
         // 聚合所有 runtime 的 sub-agents（OpenClaw 多 agent / Codex 单 agent）
         const nested = await Promise.all(this.registry.all().map((a) => a.discoverAgents()));
@@ -330,6 +373,7 @@ export class PhononConnection {
         return { agent: found };
       }
       case "session.create": {
+        this.policy.assertAgentAllowed(p.agent as string);
         // worktreeId 指定时，cwd = 该 worktree 路径（修 P0#12）
         let cwd = this.resolveProjectCwd(p.project as string);
         if (p.worktreeId) {
@@ -637,5 +681,9 @@ export { OpenCodeAdapter } from "./adapters/opencode.js";
 export type { OpenCodeEnv } from "./adapters/opencode.js";
 export { CopilotAdapter, parseCopilotEvent, parseCopilotModelsHelp } from "./adapters/copilot.js";
 export type { CopilotEnv, ParsedCopilotEvent } from "./adapters/copilot.js";
+export { RescueAdapter } from "./adapters/rescue.js";
+export type { RescueAdapterOptions } from "./adapters/rescue.js";
 export { spawnAgent, spawnSyncAgent, quoteWinArg } from "./proc.js";
 export { TranscriptWriter } from "./transcript.js";
+export { MaintenanceManager, applyJsonMergePatch } from "./maintenance.js";
+export type { MaintenanceRuntime, MaintenanceManagerConfig, MaintenanceTargetConfig, MaintenanceConfigTarget, MaintenancePackageTarget, MaintenanceServiceTarget } from "./maintenance.js";

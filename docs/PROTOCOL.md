@@ -1,13 +1,13 @@
 # agent-phonon 协议总览（一页速读）
 
 > 自动对照 `packages/protocol` 源码的人话版总览。字段级看 `src/schemas/*.ts`，决策看 `docs/design.md`。
-> 当前 81 个方法，协议版本 `0.1.0`。
+> 当前 89 个方法，协议版本 `0.1.0`。
 
 ## 一句话
 
 phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 JSON-RPC 2.0。服务端下发 session 操作，phonon 上推流式结果 / 自发输出 / hook 请求。
 
-## 63 个方法
+## 89 个方法
 
 | 方法 | 方向 | 类型 | 干啥 |
 |------|------|------|------|
@@ -16,6 +16,14 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `device.resources` | server→phonon | request | 查设备资源快照：CPU/内存/磁盘/进程/GPU best-effort（仅监控，不调度） |
 | `device.fs.roots` | server→phonon | request | 返回设备可浏览根：workspaceRoot/home，以及 Linux/macOS `/` 或 Windows 盘符 |
 | `device.fs.list` | server→phonon | request | 设备级目录浏览：按 root+相对路径或 absolutePath 列目录项元数据，不读取文件内容 |
+| `maintenance.targets` | server→phonon | request | 列设备本地预注册的维护 target/config/service 及当前权限 |
+| `maintenance.diagnose` | server→phonon | request | 确定性诊断 executable、JSON 配置和用户服务，不依赖 LLM/外部 Agent |
+| `maintenance.config.get` | server→phonon | request | 读取预注册 JSON 配置，secret 字段递归脱敏，并返回 SHA-256 乐观锁 |
+| `maintenance.config.patch` | server→phonon | request | RFC 7396 merge patch；本地 policy gate，自动备份、原子写，拒绝 raw path 和 `***` secret 占位符 |
+| `maintenance.rollback` | server→phonon | request | 按本地 backupId 校验 checksum 后回滚预注册配置 |
+| `maintenance.package.update` | server→phonon | request | 更新设备本地白名单中的用户态 npm/pnpm 包，协议不接受包名 |
+| `maintenance.service.status` | server→phonon | request | 查询设备本地白名单用户服务状态 |
+| `maintenance.service.restart` | server→phonon | request | 重启设备本地白名单用户服务，协议不接受任意服务名 |
 | `discovery.list` | server→phonon | request | 列本机可用 agent + 各自模型 |
 | `discovery.get` | server→phonon | request | 单个 agent 详情 |
 | `discovery.changed` | phonon→server | notify | 可用性变化主动推 |

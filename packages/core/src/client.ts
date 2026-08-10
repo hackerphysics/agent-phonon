@@ -44,7 +44,7 @@ export class PhononClient {
   private trustLocal?: boolean;
   private dbPath?: string;
   private store?: import("./store.js").PhononStore;
-  private policy?: import("@agent-phonon/protocol").TenantPolicy;
+  private policy?: Partial<import("@agent-phonon/protocol").TenantPolicy>;
   private obs?: import("./observability.js").ObsBus;
   private workspaceRoot?: string;
   private started = false;
@@ -54,6 +54,7 @@ export class PhononClient {
   private expectedTenantId?: string;
   /** A5: 显式允许非 loopback 的明文 ws://（默认禁）。 */
   private allowInsecure?: boolean;
+  private maintenance?: import("./maintenance.js").MaintenanceManagerConfig;
 
   constructor(opts: {
     serverUrl: string;
@@ -67,9 +68,11 @@ export class PhononClient {
     dbPath?: string;
     store?: import("./store.js").PhononStore;
     /** 可选：policy 覆盖。 */
-    policy?: import("@agent-phonon/protocol").TenantPolicy;
+    policy?: Partial<import("@agent-phonon/protocol").TenantPolicy>;
     /** 可观测事件总线。 */
     obs?: import("./observability.js").ObsBus;
+    /** 设备本地预注册的确定性维护目标。 */
+    maintenance?: import("./maintenance.js").MaintenanceManagerConfig;
     /** 设备鉴权 key（随 connect.hello 发送）。 */
     deviceKey?: string;
     /** A5: 期望的 tenantId；server 返回不一致则拒连（防恶意 server 返回别人的 tenant）。 */
@@ -88,6 +91,7 @@ export class PhononClient {
     this.store = opts.store;
     this.policy = opts.policy;
     this.obs = opts.obs;
+    this.maintenance = opts.maintenance;
     this.expectedTenantId = opts.expectedTenantId;
     this.allowInsecure = opts.allowInsecure;
     // A5: 非 loopback 的明文 ws:// 默认拒绝（防 deviceKey 明文传输 + 中间人冲 server）
@@ -149,6 +153,7 @@ export class PhononClient {
             store: this.store,
             policy: this.policy,
             obs: this.obs,
+            maintenance: this.maintenance,
           });
           this.conn = conn;
           ws.on("message", (raw: Buffer) => conn.handle(raw.toString()));

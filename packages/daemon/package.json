@@ -22,6 +22,8 @@
     "test:all": "pnpm build:test && node --test dist-test/*.test.js"
   },
   "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.28",
+    "ai": "^7.0.58",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },

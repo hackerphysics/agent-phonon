@@ -309,6 +309,10 @@ test("P0-1 default policy is strictest (writes off, whitelists empty)", () => {
   assert.equal(DEFAULT_TENANT_POLICY.allowUrlSkillInstall, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowExternalDocuments, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowGlobalSkillInstall, false);
+  assert.equal(DEFAULT_TENANT_POLICY.allowMaintenanceRead, false);
+  assert.equal(DEFAULT_TENANT_POLICY.allowMaintenanceConfigWrite, false);
+  assert.equal(DEFAULT_TENANT_POLICY.allowMaintenancePackageUpdate, false);
+  assert.equal(DEFAULT_TENANT_POLICY.allowMaintenanceServiceRestart, false);
   assert.ok(DEFAULT_TENANT_POLICY.denyPathPatterns.length > 0);
 });
 
@@ -323,6 +327,22 @@ test("P0-1 policy parse fills defaults", () => {
   assert.deepEqual(p.allowedProjectRoots, ["/work"]);
   assert.equal(p.allowDeleteFiles, true);
   assert.equal(p.allowUrlSkillInstall, false); // 未指定仍默认严格
+});
+
+test("maintenance schemas reject arbitrary paths/packages/commands", () => {
+  const patch = parseParams("maintenance.config.patch", {
+    targetId: "openclaw", configId: "main", expectedSha256: "abc",
+    patch: { agents: { defaults: { model: "provider/model" } } },
+  });
+  assert.equal(patch.targetId, "openclaw");
+  assert.throws(() => parseParams("maintenance.config.patch", {
+    targetId: "openclaw", configId: "main", expectedSha256: "abc",
+    path: "/etc/passwd", patch: {},
+  }));
+  assert.throws(() => parseParams("maintenance.package.update", {
+    targetId: "openclaw", packageName: "evil-package",
+  }));
+  assert.equal(METHODS["maintenance.diagnose"].direction, "s2p");
 });
 
 // ============ P0-2: turn 终态事件 ============

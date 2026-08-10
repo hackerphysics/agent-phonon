@@ -10,6 +10,7 @@ import {
   HermesAdapter,
   OpenCodeAdapter,
   CopilotAdapter,
+  RescueAdapter,
   ObsBus,
   StructuredLogger,
   Metrics,
@@ -47,6 +48,17 @@ export class PhononDaemon {
     new StructuredLogger({ level: cfg.logLevel ?? "info" }).attach(this.obs);
     this.metrics.attach(this.obs);
     new AuditSink(this.store).attach(this.obs);
+    if (cfg.rescueAgent?.enabled !== false) {
+      this.registry.register(new RescueAdapter({
+        baseUrl: cfg.rescueAgent?.baseUrl,
+        apiKey: cfg.rescueAgent?.apiKey,
+        apiKeyEnv: cfg.rescueAgent?.apiKeyEnv,
+        apiKeyRef: cfg.rescueAgent?.apiKeyRef,
+        defaultModel: cfg.rescueAgent?.model,
+        maxSteps: cfg.rescueAgent?.maxSteps,
+        timeoutMs: cfg.rescueAgent?.timeoutMs,
+      }));
+    }
     this.registerAdapters();
   }
 
@@ -119,6 +131,8 @@ export class PhononDaemon {
         trustLocal: s.trustLocal,
         workspaceRoot: this.cfg.workspaceRoot,
         deviceKey: s.deviceKey,
+        policy: s.policy,
+        maintenance: this.cfg.maintenance,
         resolveProjectCwd: (p) => p,
       });
       this.clients.push(client);
