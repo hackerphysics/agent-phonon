@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MaintenanceManager, PolicyEnforcer, applyJsonMergePatch } from "@agent-phonon/core";
@@ -52,6 +52,7 @@ test("maintenance config get redacts secrets, patch is optimistic, backup rollba
 
   const rolled = await manager.rollback(patched.backupId!, patched.sha256);
   assert.equal(rolled.restored, true);
+  assert.ok(rolled.reversibleBackupId);
   assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), { model: "old", apiKey: "secret", nested: { value: 1 } });
 });
 
@@ -77,6 +78,31 @@ test("maintenance writable config enforces root-key allowlist", async () => {
   });
   const before = await manager.configGet("demo", "main");
   await assert.rejects(() => manager.configPatch({ targetId: "demo", configId: "main", expectedSha256: before.sha256!, patch: { policy: { allowExec: true } } }), /non-allowlisted root keys/);
+});
+
+test("maintenance backup retention is bounded per config", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "phonon-maint-retention-"));
+  const backupDir = join(dir, "backups");
+  const configPath = join(dir, "config.json");
+  writeFileSync(configPath, JSON.stringify({ model: "m0" }, null, 2) + "\n");
+  const manager = new MaintenanceManager(new PolicyEnforcer({ policy: { allowMaintenanceRead: true, allowMaintenanceConfigWrite: true } }), {
+    backupDir, backupRetentionPerConfig: 2,
+    targets: [{ targetId: "demo", label: "Demo", configs: [{ configId: "main", path: configPath, format: "json", writable: true, allowedRootKeys: ["model"] }] }],
+  });
+  for (let i = 1; i <= 4; i++) {
+    const before = await manager.configGet("demo", "main");
+    await manager.configPatch({ targetId: "demo", configId: "main", expectedSha256: before.sha256!, patch: { model: `m${i}` } });
+  }
+  assert.equal(readdirSync(backupDir).filter((name) => name.endsWith(".meta.json")).length, 2);
+  assert.equal(readdirSync(backupDir).filter((name) => name.endsWith(".data")).length, 2);
+});
+
+test("maintenance package update requires exact semver before spawning", async () => {
+  const manager = new MaintenanceManager(new PolicyEnforcer({ policy: { allowMaintenancePackageUpdate: true } }), {
+    targets: [{ targetId: "demo", label: "Demo", package: { manager: "npm", packageName: "demo" } }],
+  });
+  await assert.rejects(() => manager.packageUpdate("demo", "latest"), /exact semver/);
+  await assert.rejects(() => manager.packageUpdate("demo"), /exact semver/);
 });
 
 test("maintenance is denied by strict device policy", async () => {

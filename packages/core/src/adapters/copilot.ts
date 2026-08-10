@@ -41,7 +41,9 @@ const CAPABILITIES: AgentCapabilities = {
   interrupt: true, // kill child process
   injectMidTurn: false,
   skillManagement: true, // Copilot CLI loads Agent Skills/custom agents
-  hooks: ["pre_tool", "pre_command"],
+  // Copilot CLI exposes tool events, but no blocking pre-tool hook in this adapter.
+  // Be honest so orchestrators do not assume HITL can stop a command.
+  hooks: [],
   streaming: true, // --output-format json --stream on
   workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4 },
@@ -187,9 +189,15 @@ class CopilotSession implements AdapterSession {
   private run(args: string[], stdin: string, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
       const { turnId, emit } = opts;
+      const blockedEnv = /^(LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_|NODE_OPTIONS|GIT_SSH_COMMAND|GIT_SSH|BASH_ENV|ENV|PYTHONSTARTUP|PERL5OPT|RUBYOPT)$/;
+      const childEnv: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of Object.keys(childEnv)) if (blockedEnv.test(key)) delete childEnv[key];
+      for (const [key, value] of Object.entries(opts.environment ?? {})) {
+        if (!blockedEnv.test(key) && key !== "PATH") childEnv[key] = value;
+      }
       const child = spawnAgent(this.env.binPath ?? "copilot", args, {
         cwd: this.cwd,
-        env: { ...process.env, ...(opts.environment ?? {}) } as NodeJS.ProcessEnv,
+        env: childEnv,
       });
       this.current = child;
       let stdoutBuf = "";

@@ -232,8 +232,8 @@ recovery still works when the rescue model endpoint is unavailable:
 - allowlisted user-service status and restart.
 
 All maintenance capabilities are controlled by independent device policy flags
-and default to **off**. `trustLocal` enables them for local single-user setups;
-remote tenants should opt in explicitly. Raw paths, package names, service names,
+and default to **off**. `trustLocal` does **not** enable host maintenance;
+each server must opt in explicitly with its local `policy`. Raw paths, package names, service names,
 and shell strings are never accepted over the wire.
 
 ## Adapter overrides

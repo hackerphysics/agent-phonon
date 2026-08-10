@@ -16,7 +16,9 @@ const CAPABILITIES: AgentCapabilities = {
   interrupt: true,
   injectMidTurn: false,
   skillManagement: false,
-  hooks: ["pre_tool", "pre_command"],
+  // Maintenance tools are policy-gated semantic operations, but this adapter
+  // does not currently expose a blocking HITL hook contract.
+  hooks: [],
   streaming: true,
   workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 2 },

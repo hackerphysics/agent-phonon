@@ -174,6 +174,14 @@ test("B4: run.events.subscribe denied for non-full consent (status-only)", async
 // A2/A3 — project.exec gating + env stripping
 // ===========================================================================
 
+test("trustLocal does not implicitly grant host maintenance", () => {
+  const policy = new PolicyEnforcer({ trustLocal: true });
+  assert.equal(policy.maintenancePermissions().read, false);
+  assert.equal(policy.maintenancePermissions().configWrite, false);
+  assert.equal(policy.maintenancePermissions().packageUpdate, false);
+  assert.equal(policy.maintenancePermissions().serviceRestart, false);
+});
+
 test("allowedAgents is enforced by SessionEngine, including internal workflow/schedule paths", async () => {
   const reg = new AdapterRegistry();
   reg.register(new MockAdapter({ name: "fake", agentIds: ["fake"], models: ["m"] }));

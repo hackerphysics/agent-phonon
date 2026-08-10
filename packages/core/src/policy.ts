@@ -36,10 +36,8 @@ export class PolicyEnforcer {
         allowUrlSkillInstall: false, // url 装仍默认禁（供应链风险）
         allowExternalDocuments: false,
         allowExec: true, // 单机自用：exec 默认开（A2/A3，不影响本机使用）
-        allowMaintenanceRead: true,
-        allowMaintenanceConfigWrite: true,
-        allowMaintenancePackageUpdate: true,
-        allowMaintenanceServiceRestart: true,
+        // Maintenance is host-level recovery, not merely project-local trust.
+        // It must be opted into explicitly per server policy even for trustLocal.
       });
     } else {
       this.policy = DEFAULT_TENANT_POLICY;

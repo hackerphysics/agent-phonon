@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseCopilotEvent, parseCopilotModelsHelp } from "@agent-phonon/core";
+import { CopilotAdapter, parseCopilotEvent, parseCopilotModelsHelp } from "@agent-phonon/core";
+
+test("Copilot adapter honestly declares no blocking HITL hooks", () => {
+  assert.deepEqual(new CopilotAdapter().capabilities.hooks, []);
+});
 
 test("Copilot adapter parses streamed assistant deltas", () => {
   assert.deepEqual(parseCopilotEvent({

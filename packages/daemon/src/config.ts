@@ -99,7 +99,6 @@ function defaultMaintenance(): MaintenanceManagerConfig {
         targetId: "agent-phonon", label: "agent-phonon", command: "agent-phonon",
         // Self config is diagnostic-only: never let a remote tenant rewrite policy/maintenance allowlists.
         configs: [{ configId: "main", label: "agent-phonon config", path: DEFAULT_CONFIG_PATH, format: "json", writable: false }],
-        package: { manager: "npm", packageName: "agent-phonon" },
         services: [{ serviceId: "daemon", label: "agent-phonon daemon", linuxUserUnit: "agent-phonon.service", macLabel: "ai.phonon.agent", windowsService: "agent-phonon" }],
       },
       {
@@ -115,12 +114,8 @@ function defaultMaintenance(): MaintenanceManagerConfig {
       {
         targetId: "claude-code", label: "Claude Code", command: "claude",
         configs: [{ configId: "settings", label: "Claude settings", path: join(homedir(), ".claude", "settings.json"), format: "json", writable: false }],
-        package: { manager: "npm", packageName: "@anthropic-ai/claude-code" },
       },
-      {
-        targetId: "codex", label: "Codex CLI", command: "codex",
-        package: { manager: "npm", packageName: "@openai/codex" },
-      },
+      { targetId: "codex", label: "Codex CLI", command: "codex" },
       {
         targetId: "copilot", label: "GitHub Copilot CLI", command: "copilot",
         configs: [{ configId: "settings", label: "Copilot settings", path: join(homedir(), ".copilot", "settings.json"), format: "json", writable: true, allowedRootKeys: ["model"] }],

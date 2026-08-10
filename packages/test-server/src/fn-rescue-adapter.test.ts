@@ -13,6 +13,10 @@ const stubMaintenance = {
   serviceRestart: async () => ({ targetId: "x", serviceId: "s", restarted: false, status: "not_configured" as const }),
 };
 
+test("phonon-rescue honestly declares no blocking HITL hooks", () => {
+  assert.deepEqual(new RescueAdapter().capabilities.hooks, []);
+});
+
 test("phonon-rescue is always discoverable but unavailable without endpoint config", async () => {
   const adapter = new RescueAdapter();
   const [agent] = await adapter.discoverAgents();

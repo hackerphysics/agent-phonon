@@ -211,8 +211,8 @@ CLI 会先实测 Chat Completions + 工具调用，成功后才保存。也支�
 - 白名单内用户态 npm/pnpm 包更新；
 - 白名单内用户服务状态和重启。
 
-四类维护权限由独立设备 policy 控制，默认全部关闭。`trustLocal` 适合本地单用户场景；
-远程 tenant 必须显式开放。线协议不接受任意路径、包名、服务名或 shell 字符串。
+四类维护权限由独立设备 policy 控制，默认全部关闭。`trustLocal` **不会**自动开放宿主机维护；
+每条 server 连接都必须在本地 `policy` 中显式授权。线协议不接受任意路径、包名、服务名或 shell 字符串。
 
 ## Adapter override
 

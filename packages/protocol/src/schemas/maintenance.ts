@@ -120,6 +120,8 @@ export const MaintenanceRollbackResult = z.object({
   configId: z.string(),
   restored: z.literal(true),
   sha256: z.string(),
+  /** Backup of the state replaced by rollback, allowing an immediate roll-forward. */
+  reversibleBackupId: z.string().optional(),
 });
 
 export const MaintenancePackageUpdateParams = z.object({

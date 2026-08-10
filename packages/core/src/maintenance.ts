@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -54,6 +54,8 @@ export interface MaintenanceTargetConfig {
 
 export interface MaintenanceManagerConfig {
   backupDir?: string;
+  /** Maximum backups retained per target/config bucket. Default 20. */
+  backupRetentionPerConfig?: number;
   targets: MaintenanceTargetConfig[];
 }
 
@@ -116,11 +118,10 @@ export function applyJsonMergePatch(target: unknown, patch: unknown): unknown {
 }
 
 function sanitizeVersion(version?: string): string {
-  const v = version ?? "latest";
-  if (!/^(latest|next|beta|canary|\d+[A-Za-z0-9._+-]*)$/.test(v)) {
-    throw new PhononError("errInvalidParams", `invalid package version: ${v}`);
+  if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new PhononError("errInvalidParams", "package update requires an exact semver version");
   }
-  return v;
+  return version;
 }
 
 async function runBounded(command: string, args: string[], opts: { timeoutMs?: number; maxBytes?: number; signal?: AbortSignal } = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -162,6 +163,7 @@ export class MaintenanceManager implements MaintenanceRuntime {
   private readonly policy: PolicyEnforcer;
   private readonly targetsById = new Map<string, MaintenanceTargetConfig>();
   private readonly backupDir: string;
+  private readonly backupRetentionPerConfig: number;
   private readonly configLocks = new Map<string, Promise<void>>();
 
   constructor(policy: PolicyEnforcer, config?: MaintenanceManagerConfig) {
@@ -184,6 +186,7 @@ export class MaintenanceManager implements MaintenanceRuntime {
       this.targetsById.set(target.targetId, target);
     }
     this.backupDir = config?.backupDir ?? join(homedir(), ".agent-phonon", "maintenance-backups");
+    this.backupRetentionPerConfig = Math.max(1, Math.min(config?.backupRetentionPerConfig ?? 20, 200));
   }
 
   async targets(): Promise<MaintenanceTargetsResult> {
@@ -310,9 +313,9 @@ export class MaintenanceManager implements MaintenanceRuntime {
       const raw = await readFile(join(this.backupDir, `${backupId}.data`));
       if (sha256(raw) !== metadata.sha256) throw new PhononError("errInternal", "backup checksum mismatch");
       // Preserve the state being replaced so rollback is itself reversible.
-      await this.createBackup(metadata.targetId, metadata.configId, config.path, current.toString("utf8"), `pre-rollback ${backupId}`);
+      const reversible = await this.createBackup(metadata.targetId, metadata.configId, config.path, current.toString("utf8"), `pre-rollback ${backupId}`);
       await this.atomicWrite(config.path, raw);
-      return { backupId, targetId: metadata.targetId, configId: metadata.configId, restored: true as const, sha256: metadata.sha256 };
+      return { backupId, targetId: metadata.targetId, configId: metadata.configId, restored: true as const, sha256: metadata.sha256, reversibleBackupId: reversible.backupId };
     });
   }
 
@@ -427,7 +430,24 @@ export class MaintenanceManager implements MaintenanceRuntime {
     const metadata: BackupMetadata = { backupId, targetId, configId, originalPath, sha256: sha256(raw), createdAt: new Date().toISOString(), reason };
     await writeFile(join(this.backupDir, `${backupId}.data`), raw, { mode: 0o600 });
     await writeFile(join(this.backupDir, `${backupId}.meta.json`), JSON.stringify(metadata, null, 2) + "\n", { mode: 0o600 });
+    await this.pruneBackups(targetId, configId);
     return metadata;
+  }
+
+  private async pruneBackups(targetId: string, configId: string): Promise<void> {
+    const entries = await readdir(this.backupDir).catch(() => [] as string[]);
+    const metadata = [] as Array<{ id: string; createdAt: string }>;
+    for (const name of entries.filter((entry) => entry.endsWith(".meta.json"))) {
+      try {
+        const value = JSON.parse(await readFile(join(this.backupDir, name), "utf8")) as BackupMetadata;
+        if (value.targetId === targetId && value.configId === configId) metadata.push({ id: value.backupId, createdAt: value.createdAt });
+      } catch { /* corrupt metadata is left for manual inspection */ }
+    }
+    metadata.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    for (const old of metadata.slice(this.backupRetentionPerConfig)) {
+      await rm(join(this.backupDir, `${old.id}.data`), { force: true });
+      await rm(join(this.backupDir, `${old.id}.meta.json`), { force: true });
+    }
   }
 
   private async atomicWrite(path: string, data: string | Buffer): Promise<void> {
