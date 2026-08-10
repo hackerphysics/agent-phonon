@@ -5,7 +5,7 @@
 > 把多种本地 Agent 编排成一个系统——在你的设备上运行，从任何地方调度。
 
 **agent-phonon** 是一个设备侧 daemon。它会发现本机已安装的 AI Coding Agent
-（Claude Code、Codex、OpenCode、OpenClaw、Hermes 等），并通过统一的
+（Claude Code、Codex、GitHub Copilot CLI、OpenCode、OpenClaw、Hermes 等），并通过统一的
 WebSocket/JSON 协议暴露给服务端。
 
 名字来自凝聚态物理里的 **phonon（声子）**：大量原子共同振动时涌现出的集体准粒子。
@@ -36,6 +36,7 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
    │  (TS / Python) │                   │   ├─ adapter: OpenClaw      │
    │  console / app │                   │   ├─ adapter: Claude Code   │
    └────────────────┘                   │   ├─ adapter: Codex         │
+                                        │   ├─ adapter: Copilot CLI   │
                                         │   ├─ adapter: OpenCode      │
                                         │   └─ adapter: Hermes        │
                                         └────────────────────────────┘
@@ -59,6 +60,7 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
 - 可选本地 Agent：
   - Claude Code：`claude`
   - Codex CLI：`codex`
+  - GitHub Copilot CLI：`copilot`
   - OpenCode：`opencode`
   - Hermes：`hermes`
   - OpenClaw Gateway / plugin
@@ -177,6 +179,7 @@ agent-phonon discover
 - 通过执行 CLI 的 version 命令判断是否可用；
 - 尽量解析成绝对路径，避免 systemd/launchd 的 PATH 和交互 shell 不一致；
 - Codex 会读取用户自己的 `~/.codex/config.toml`，从 provider endpoint 请求 `GET <base_url>/models`；失败时使用安全 fallback；
+- GitHub Copilot CLI 会从 `copilot help config` 解析模型清单，并使用 JSONL 真流式输出和原生命名会话续接；
 - Hermes 会读取 profile/config/catalog，并在 catalog 不完整时使用 provider fallback；
 - 不硬编码任何用户个人 provider 名、endpoint 或本机路径。
 
@@ -187,6 +190,7 @@ agent-phonon discover
 ```bash
 agent-phonon adapter add codex --bin /path/to/codex --model default
 agent-phonon adapter add claude-code --bin /path/to/claude --model default
+agent-phonon adapter add copilot --bin /path/to/copilot --model default
 agent-phonon adapter add hermes --bin /path/to/hermes
 agent-phonon adapter add opencode --bin /path/to/opencode
 ```

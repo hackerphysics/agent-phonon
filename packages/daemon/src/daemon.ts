@@ -9,6 +9,7 @@ import {
   CodexAdapter,
   HermesAdapter,
   OpenCodeAdapter,
+  CopilotAdapter,
   ObsBus,
   StructuredLogger,
   Metrics,
@@ -71,6 +72,8 @@ export class PhononDaemon {
         this.registry.register(new HermesAdapter({ env: { binPath: a.hermesBinPath, defaultModel: a.hermesModel, provider: a.hermesProvider } }));
       } else if (a.type === "opencode") {
         this.registry.register(new OpenCodeAdapter({ env: { binPath: a.opencodeBinPath, defaultModel: a.opencodeModel } }));
+      } else if (a.type === "copilot") {
+        this.registry.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels } }));
       } else if (a.type === "openclaw-cli") {
         this.registry.register(new OpenClawAdapter({ defaultAgent: a.defaultAgent ?? "main" }));
       }

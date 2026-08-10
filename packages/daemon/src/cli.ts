@@ -166,6 +166,7 @@ async function main(): Promise<void> {
       console.log("\nadapter add examples:");
       console.log("  agent-phonon adapter add openclaw --agent phonon");
       console.log("  agent-phonon adapter add codex --base-url https://gw/v1 --api-key <k> --model gpt-5.5");
+      console.log("  agent-phonon adapter add copilot --model gpt-5.4");
       console.log("  agent-phonon adapter add hermes");
       break;
   }

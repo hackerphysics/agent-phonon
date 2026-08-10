@@ -84,6 +84,8 @@ export interface CreateSessionParams {
   /** 透传的 agent 私有配置。 */
   agentConfig?: Record<string, unknown>;
   initialContext?: ContextItem[];
+  /** Core is rebuilding a persisted session after daemon restart. */
+  reattach?: boolean;
 }
 
 /**

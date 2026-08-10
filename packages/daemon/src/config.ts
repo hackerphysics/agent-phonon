@@ -20,7 +20,7 @@ export interface ServerConfig {
 
 export interface AdapterConfig {
   /** adapter 类型：openclaw-gateway | openclaw-cli。 */
-  type: "openclaw-gateway" | "openclaw-cli" | "claude-code" | "codex" | "hermes" | "opencode";
+  type: "openclaw-gateway" | "openclaw-cli" | "claude-code" | "codex" | "hermes" | "opencode" | "copilot";
   /** OpenClaw Gateway WS URL（openclaw-gateway 用）。 */
   gatewayUrl?: string;
   /** Gateway token（openclaw-gateway 用；缺省从 ~/.openclaw/openclaw.json 读）。 */
@@ -47,6 +47,10 @@ export interface AdapterConfig {
   /** opencode：binary 路径/默认模型。 */
   opencodeBinPath?: string;
   opencodeModel?: string;
+  /** GitHub Copilot CLI：binary 路径/默认模型/模型清单。 */
+  copilotBinPath?: string;
+  copilotModel?: string;
+  copilotModels?: ModelInfo[];
 }
 
 export interface DaemonConfig {

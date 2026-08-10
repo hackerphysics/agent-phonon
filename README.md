@@ -5,7 +5,7 @@
 > Orchestrate many agents as one — run them on your device, command them from anywhere.
 
 **agent-phonon** is a device-side daemon that discovers local AI coding agents
-(Claude Code, Codex, OpenCode, OpenClaw, Hermes, and more) and exposes them to a
+(Claude Code, Codex, GitHub Copilot CLI, OpenCode, OpenClaw, Hermes, and more) and exposes them to a
 server through one uniform WebSocket/JSON protocol.
 
 The name comes from the **phonon** in condensed-matter physics: a collective
@@ -40,6 +40,7 @@ agent works the same way.
    │  (TS / Python) │                   │   ├─ adapter: OpenClaw      │
    │  console / app │                   │   ├─ adapter: Claude Code   │
    └────────────────┘                   │   ├─ adapter: Codex         │
+                                        │   ├─ adapter: Copilot CLI   │
                                         │   ├─ adapter: OpenCode      │
                                         │   └─ adapter: Hermes        │
                                         └────────────────────────────┘
@@ -65,6 +66,7 @@ for development and integration testing.
 - Optional local agents:
   - Claude Code: `claude`
   - Codex CLI: `codex`
+  - GitHub Copilot CLI: `copilot`
   - OpenCode: `opencode`
   - Hermes: `hermes`
   - OpenClaw Gateway/plugin for OpenClaw integration
@@ -192,6 +194,8 @@ Adapter auto-detection is conservative:
   differences do not hide globally installed CLIs.
 - Codex models are discovered from the user's Codex config provider endpoint
   (`GET <base_url>/models`) when available, with safe fallback models.
+- GitHub Copilot CLI models are parsed from `copilot help config`; the adapter
+  uses JSONL streaming and native named-session resume.
 - Hermes models are discovered from Hermes profile/config/catalog information
   with provider fallbacks when the catalog is incomplete.
 - No user-specific provider names, endpoints, or local machine paths are
@@ -205,6 +209,7 @@ need to force a path/model/provider:
 ```bash
 agent-phonon adapter add codex --bin /path/to/codex --model default
 agent-phonon adapter add claude-code --bin /path/to/claude --model default
+agent-phonon adapter add copilot --bin /path/to/copilot --model default
 agent-phonon adapter add hermes --bin /path/to/hermes
 agent-phonon adapter add opencode --bin /path/to/opencode
 ```

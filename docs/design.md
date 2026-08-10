@@ -34,7 +34,7 @@ L2  统一协议 + 双向连接层            ← Phase 1 核心；**tenant 在�
         ↑
 L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等公民；**不感知 tenant**
         ↓ adapter 层
-   OpenClaw / Claude Code / Codex / OpenCode / Hermes
+   OpenClaw / Claude Code / Codex / GitHub Copilot CLI / OpenCode / Hermes
 ```
 
 - **L1**：与单个 agent 通信，做会话管理 + 上下文管理。**发任务＝在 session 里对话。**只认 sessionId，**不感知 tenant**。
@@ -59,7 +59,7 @@ L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等�
 | D7 | **压缩双模：native + custom** | native＝透传 agent 原生压缩；custom＝phonon 自有压缩引擎，便于统一自定义上下文管理。第一版 custom 策略为 `dropToolIO`：删除结构化 tool_use/tool_result/tool_call（含 Codex `function_call`/`function_call_output`）内容和返回结果，保留纯文本；默认保留最近 3 个 tool call 及其 result，可用 `keepRecentToolCalls` 配置，因为最近工具上下文通常更重要。保留计数按「tool call 锚点」位置算（非按 id），所以没有 id 的最近 tool 块也能正确保留。已接入：OpenClaw spawn/Gateway + Claude Code（编辑 session JSONL）、Codex（rollout JSONL，按 thread_id 定位）、OpenCode（`opencode.db` 的 `part` 表，删 tool part 行）、Hermes（`state.db`，按 title 定位 session：删 `role=tool` 行、清 assistant 行的 tool_calls 列以保留推理）。sqlite 改动前用 `VACUUM INTO` 一致性备份（正确处理 WAL）、IMMEDIATE 事务、FTS 触发器自动同步。 |
 | D8 | **Adapter 声明能力，core 补齐缺口** | 各 agent 厚薄不一：对外协议恒统一，对内 adapter 按 `capabilities` 声明原生支持，core 缺啥补啥。OpenClaw adapter 极薄，CLI adapter 较厚。 |
 | D9 | **单设备，不感知其他设备** | 多设备互联由上层服务管理；phonon 装到多台，各管各的。不做设备发现/互联。 |
-| D10 | **agent 支持顺序（✅ OpenClaw ✅ Claude Code ✅ Codex ✅ OpenCode ✅ Hermes（全部完成））** | 先搬 LMA 现成代码零迁移跑通。 |
+| D10 | **agent 支持顺序（✅ OpenClaw ✅ Claude Code ✅ Codex ✅ GitHub Copilot CLI ✅ OpenCode ✅ Hermes）** | 核心 adapter 均已完成；新增 runtime 必须继续声明真实能力并提供可验证的非交互/会话/流式映射。 |
 | D11 | **phonon 是独立的底层能力** | phonon 是通用的设备侧 agent 调度底层，其上可延伸更多项目。与其他任何项目无绑定关系。 |
 | D12 | **部署＝CLI + systemd 类守护（Linux/Mac）** | Docker 太重且不便调度本机 agent。Windows 无 systemd，后续单独想办法（NSSM / Windows Service / 计划任务，待定）。 |
 | D13 | **多服务端 / 多租户，底层硬隔离，配置驱动 + CLI 管理** | phonon 同时维护 N 条到不同服务端的拨出连接，每条一把 device key，构成一个 tenant；session 及所有资源按 tenant 严格隔离（server A 不可见/不可控 server B 的 session）；隔离在 RPC 分发层强制。隔离单元＝「一条服务端连接」。 |
@@ -81,7 +81,7 @@ L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等�
 | D29 | **可靠投递闭环：stream.ack + 重连 resume** | 之前 outbox 重放「只写了一半」。补：`stream.ack{lastSeq}`（server→phonon，确认已收 seq≤N，phonon 据此清 outbox / 控背压）；重连时 `connect.hello.resumeFrom`（phonon 告知未 ack 起始 seq）与 `welcome.ackedSeqs`（server 告知各 session 最后收到的 seq）双向对齐，从å outbox 精确补发。 |
 | D30 | **interaction 生命周期：timeout/cancel/状态 + 持久化（P1-5）** | `interaction.request` 加 `timeoutSeconds`（0=不超时，人可能去开会/带娃）；状态 pending→submitted|cancelled|timeout；新增 `interaction.cancel` 主动取消。发出即落 sqlite `pending_interactions`，重连握手时 re-sync，人填完数据重入 session 不丢。 |
 | D31 | **大文件走 HTTP 凭证上传（P1-6）** | `document.send` 不走 WS 发文件主体（内存暴涨/断线重传痛）：`document.prepare_upload{filename,size,sha256}` → server 返预签名 URL → phonon 本地 HTTP PUT（断点续传）→ 上传成功用 ref 关联。小文件仍可 inline。 |
-| D32 | **runtime vs agent：一个 runtime 可含多个 agent** | adapter 管的是 **runtime**（OpenClaw/Hermes/Codex/Claude Code/OpenCode）；对外暴露给 server 选的是 **agent**。单 agent runtime（Codex/Claude Code/OpenCode）= runtime 本身一个 agent；**多 agent runtime（OpenClaw/Hermes）按 workspace 枚举多个 agent**。agentId 复合形式 `<runtime>:<subAgent>`（如 `openclaw:main` / `openclaw:phonon`）。`adapter.discoverAgents()` 返回多个；session.create 按复合 agentId 选，registry.resolve() 按 runtime 前缀路由。OpenClaw 用 Gateway `agents.list` RPC 枚举子 agent。 |
+| D32 | **runtime vs agent：一个 runtime 可含多个 agent** | adapter 管的是 **runtime**（OpenClaw/Hermes/Codex/Claude Code/Copilot/OpenCode）；对外暴露给 server 选的是 **agent**。单 agent runtime（Codex/Claude Code/Copilot/OpenCode）= runtime 本身一个 agent；**多 agent runtime（OpenClaw/Hermes）按 workspace 枚举多个 agent**。agentId 复合形式 `<runtime>:<subAgent>`（如 `openclaw:main` / `openclaw:phonon`）。`adapter.discoverAgents()` 返回多个；session.create 按复合 agentId 选，registry.resolve() 按 runtime 前缀路由。OpenClaw 用 Gateway `agents.list` RPC 枚举子 agent。 |
 | D33 | **发布策略＝单仓库，多包独立发布** | agent-phonon 保持一个 monorepo，便于 protocol/core/SDK/console/test-server 同步演进和跨语言 e2e；但面向用户的模块作为独立 npm/PyPI 包发布：`agent-phonon` daemon、`@agent-phonon/protocol`、`@agent-phonon/server-sdk`、Python SDK、`@agent-phonon/console`。用户按需安装包，不需要关心仓库结构；等协议/API 稳定且 SDK 发版节奏独立后，再考虑物理拆仓库。 |
 | D34 | **设备信息用于调度，资源监控属于可观测性，不做资源调度** | 暴露 `device.info` 提供 OS/机器信息与调度标签（如 macOS→iOS 开发、Windows→桌面开发），服务端可按需派活；暴露 `device.resources` 用于 debug agent 执行异常：CPU/内存/磁盘/进程/GPU best-effort。只监控，不做 CPU/GPU/内存的调度、限制或抢占；资源管理留到真实需要时再设计。 |
 | D35 | **服务端需要受控文件读写能力，文件同步/产物管理仍走 Git** | `file.read/write/list/stat/mkdir` 允许 server 主动操作 project/worktree 内文件；与 `document.send`（agent 主动发产物）区分。所有路径必须限定在 project/worktree 根内，禁止任意路径读写。文件同步、产物版本和 diff 仍统一交给 Git/project/worktree，不另做 artifact sync 系统。 |

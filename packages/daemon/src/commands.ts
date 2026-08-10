@@ -4,7 +4,7 @@ import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chm
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
 
 /**
@@ -104,10 +104,16 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
   const ocBin = openCodeBin();
   if (!has("opencode") && probe(ocBin).ok) out.push({ type: "opencode", opencodeBinPath: ocBin === "opencode" ? undefined : ocBin });
 
+  if (!has("copilot")) {
+    const copilotPath = commandPath("copilot");
+    if (copilotPath && probe(copilotPath).ok) out.push({ type: "copilot", copilotBinPath: copilotPath });
+  }
+
   for (const a of out) {
     if (a.type === "hermes" && !a.hermesBinPath) a.hermesBinPath = commandPath("hermes");
     if (a.type === "claude-code" && !a.claudeBinPath) a.claudeBinPath = commandPath("claude");
     if (a.type === "codex" && !a.codexBinPath) a.codexBinPath = commandPath("codex");
+    if (a.type === "copilot" && !a.copilotBinPath) a.copilotBinPath = commandPath("copilot");
   }
 
   if (!has("claude-code")) {
@@ -135,7 +141,7 @@ export async function cmdDoctor(): Promise<void> {
   console.log(`OpenClaw HITL plugin: ${existsSync(pluginDir) ? "✓ installed" : "✗ not installed (run: agent-phonon plugin install openclaw)"}`);
   // CLI agents
   console.log("\nCLI agents:");
-  for (const [name, bin] of [["Claude Code", "claude"], ["Codex", "codex"], ["Hermes", "hermes"]] as const) {
+  for (const [name, bin] of [["Claude Code", "claude"], ["Codex", "codex"], ["GitHub Copilot CLI", "copilot"], ["Hermes", "hermes"]] as const) {
     const p = probe(bin);
     console.log(`  ${name} (${bin}): ${p.ok ? "✓ " + p.out : "✗ not found"}`);
   }
@@ -183,6 +189,8 @@ export function buildRegistry(adapters: AdapterConfig[]): AdapterRegistry {
       reg.register(new HermesAdapter({ env: { binPath: a.hermesBinPath, defaultModel: a.hermesModel, provider: a.hermesProvider } }));
     } else if (a.type === "opencode") {
       reg.register(new OpenCodeAdapter({ env: { binPath: a.opencodeBinPath, defaultModel: a.opencodeModel } }));
+    } else if (a.type === "copilot") {
+      reg.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels } }));
     }
   }
   return reg;
@@ -209,8 +217,11 @@ export function cmdAdapterAdd(type: string, opts: Record<string, string | undefi
     case "opencode":
       a = { type: "opencode", opencodeBinPath: opts.bin, opencodeModel: opts.model };
       break;
+    case "copilot":
+      a = { type: "copilot", copilotBinPath: opts.bin, copilotModel: opts.model ?? "default" };
+      break;
     default:
-      return fail(`unknown adapter type: ${type} (openclaw|claude-code|codex|hermes|opencode)`);
+      return fail(`unknown adapter type: ${type} (openclaw|claude-code|codex|copilot|hermes|opencode)`);
   }
   // 去重：同 type 覆盖
   cfg.adapters = cfg.adapters.filter((x) => x.type !== a.type);

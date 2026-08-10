@@ -242,6 +242,7 @@ export class SessionEngine {
     const cwd = this.resolveCwdForReattach?.(rec.project) ?? rec.project;
     rec.adapterSession = await adapter.createSession({
       sessionId: rec.sessionId, agentId: rec.agent, model: rec.model, cwd,
+      reattach: true,
     });
     rec.adapterSession.setUnsolicitedSink?.((event) => {
       const r = this.sessions.get(rec.sessionId);

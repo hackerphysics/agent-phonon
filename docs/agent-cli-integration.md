@@ -85,8 +85,8 @@ openclaw plugins install <path-to-built-plugin>
 - **Multi-agent runtimes** (OpenClaw, Hermes): one runtime, many agents (keyed by
   workspace/profile). `discoverAgents()` enumerates several; composite agentId is
   `<runtime>:<subAgent>` (e.g. `openclaw:main`, `hermes:default`).
-- **Single-agent runtimes** (Codex, Claude Code, OpenCode): the runtime *is* the
-  agent; `discoverAgents()` returns one.
+- **Single-agent runtimes** (Codex, Claude Code, GitHub Copilot CLI, OpenCode):
+  the runtime *is* the agent; `discoverAgents()` returns one.
 - `AdapterRegistry.resolve(agentId)` routes by runtime prefix.
 
 ---
@@ -149,6 +149,42 @@ Single-agent runtime (`discoverAgents` returns one `codex`).
    `turn.started` → `item.completed` (item.type: `agent_message` /
    `command_execution` / …) → `turn.completed` (usage).
    - session_id = thread_id (captured from `thread.started`, not pre-assigned).
+
+---
+
+## GitHub Copilot CLI adapter
+
+Single-agent runtime (`discoverAgents` returns one `copilot`). This integrates
+with the current official CLI command, **`copilot`**, not the retired
+`gh copilot` extension.
+
+### Invocation
+
+1. The prompt is piped over stdin in programmatic mode so it does not leak into
+   the process list. The CLI is invoked with:
+   ```text
+   copilot --name=agent-phonon-<sessionId>
+     --output-format json --stream on --allow-all --no-ask-user
+     --no-remote --no-auto-update --no-color [--model <model>]
+   ```
+2. Later turns use `--resume=agent-phonon-<sessionId>`. After a daemon restart,
+   core marks the reconstructed adapter session as a reattachment, so its first
+   turn resumes the existing Copilot Chronicle session instead of creating a
+   duplicate display name.
+3. The JSONL mapping is:
+   - `assistant.message_delta` → streaming `message`
+   - `tool.execution_start` → `tool_call`
+   - `tool.execution_complete` → `tool_result`
+   - final `result.sessionId` → native Copilot session identity
+4. Available models are parsed from `copilot help config`; an explicit adapter
+   model list or configured/default model is used as fallback.
+
+### Verified gotcha
+
+Copilot CLI 1.0.49 help text says a previously unseen UUID can be passed to
+`--resume` to start a session, but the real command rejects it with “No session,
+task, or name matched”. The adapter therefore creates with `--name` and resumes
+by that stable name; it does not rely on the inaccurate UUID behavior.
 
 ---
 
