@@ -32,7 +32,6 @@ async function spawnRealPhonon(serverUrl: string, deviceId: string) {
   const client = new PhononClient({
     serverUrl, deviceId, registry: reg, trustLocal: true,
     workspaceRoot: cwd,
-    resolveProjectCwd: () => cwd,
   });
   return { client, workspace: cwd };
 }

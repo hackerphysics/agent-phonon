@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { mkdir, rm, readdir, stat, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, resolve, basename, sep } from "node:path";
+import { join, resolve, basename, sep, relative, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { PhononError } from "./rpc.js";
+import { buildChildProcessEnvironment } from "./child-env.js";
 
 /**
  * 项目管理（design §8c / D23 + D25）。
@@ -102,33 +103,6 @@ function assertRemote(value: string, label = "remote"): string {
   return assertNotOption(value, label);
 }
 
-/**
- * A2/A3: project.exec 环境变量黑名单剔离。
- * 防 server 注入 LD_PRELOAD / LD_LIBRARY_PATH / DYLD_xxx / NODE_OPTIONS / GIT_SSH_COMMAND / PATH 等
- * 加载恶意动态库 / 劫持解释器 / 改 PATH 解析到恶意 binary → 走后门 RCE。
- * 返回过滤后的 env（以 process.env 为基础，叠加用户变量但剔除危险键）。
- */
-const DANGEROUS_ENV_KEYS = new Set([
-  "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
-  "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
-  "NODE_OPTIONS", "GIT_SSH_COMMAND", "GIT_SSH", "BASH_ENV", "ENV",
-  "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
-]);
-function sanitizeExecEnv(userEnv?: Record<string, string>): Record<string, string> {
-  const base: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) base[k] = v;
-  }
-  if (userEnv) {
-    for (const [k, v] of Object.entries(userEnv)) {
-      if (DANGEROUS_ENV_KEYS.has(k)) continue; // 拒危险变量
-      if (k === "PATH") continue; // 不允许覆写 PATH（防解析到恶意 binary）
-      base[k] = v;
-    }
-  }
-  return base;
-}
-
 export class ProjectManager {
   private projects = new Map<string, ProjectRecord>();
   private worktrees = new Map<string, WorktreeRecord>();
@@ -162,15 +136,27 @@ export class ProjectManager {
   /** 受控项目根（与 PolicyEnforcer.workspaceRoot 一致，避免路径校验不一致）。 */
   private workspaceRoot?: string;
 
+  /**
+   * Project records are device-scoped (D23), while each tenant connection owns
+   * its own ProjectManager. Refresh from the shared store before reads so a
+   * project registered through one connection is immediately usable by the
+   * other connections on the same device.
+   */
+  private refreshFromStore(): void {
+    if (!this.store) return;
+    this.projects = new Map(this.store.loadProjects().map((p) => [p.projectId, p]));
+    this.worktrees = new Map(this.store.loadWorktrees().map((w) => [w.worktreeId, w]));
+  }
+
   /** 解析 projectId → 工作目录（session.create / file.* 用）。 */
   resolveCwd(projectId: string, worktreeId?: string): string {
+    const project = this.get(projectId);
     if (worktreeId) {
       const wt = this.worktrees.get(worktreeId);
       if (!wt || wt.projectId !== projectId) throw new PhononError("errWorktreeNotFound", `worktree ${worktreeId} not found`);
       return wt.path;
     }
-    const rec = this.projects.get(projectId);
-    return rec?.path ?? projectId; // 兼容：未注册时把 projectId 当路径
+    return project.path;
   }
 
   async create(params: { name: string; path?: string; git?: boolean; remote?: string }): Promise<ProjectRecord> {
@@ -200,10 +186,12 @@ export class ProjectManager {
   }
 
   list(): ProjectRecord[] {
+    this.refreshFromStore();
     return [...this.projects.values()];
   }
 
   get(projectId: string): ProjectRecord {
+    this.refreshFromStore();
     const rec = this.projects.get(projectId);
     if (!rec) throw new PhononError("errProjectNotFound", `project ${projectId} not found`);
     return rec;
@@ -253,6 +241,7 @@ export class ProjectManager {
   }
 
   worktreeList(projectId: string): WorktreeRecord[] {
+    this.get(projectId);
     return [...this.worktrees.values()].filter((w) => w.projectId === projectId);
   }
 
@@ -300,9 +289,10 @@ export class ProjectManager {
 
   /** 内部：解析 worktree cwd（不传走主目录）。 */
   private cwdFor(projectId: string, worktreeId?: string): string {
-    if (!worktreeId) return this.get(projectId).path;
+    const project = this.get(projectId);
+    if (!worktreeId) return project.path;
     const wt = this.worktrees.get(worktreeId);
-    if (!wt) throw new PhononError("errWorktreeNotFound", `worktree ${worktreeId} not found`);
+    if (!wt || wt.projectId !== projectId) throw new PhononError("errWorktreeNotFound", `worktree ${worktreeId} not found`);
     return wt.path;
   }
 
@@ -499,15 +489,24 @@ export class ProjectManager {
 
   async exec(params: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number }): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; truncated: boolean }> {
     const root = this.cwdFor(params.projectId, params.worktreeId);
-    const cwd = params.cwd ? resolve(root, params.cwd) : root;
-    const normRoot = resolve(root);
-    if (!(cwd === normRoot || cwd.startsWith(normRoot + sep))) throw new PhononError("errPolicyDenied", "project.exec cwd escapes project/worktree root");
+    let rootReal: string;
+    let cwd: string;
+    try {
+      rootReal = await realpath(root);
+      cwd = await realpath(params.cwd ? resolve(rootReal, params.cwd) : rootReal);
+    } catch {
+      throw new PhononError("errInvalidParams", "project.exec root/cwd must exist");
+    }
+    const rel = relative(rootReal, cwd);
+    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new PhononError("errPolicyDenied", "project.exec cwd escapes project/worktree root");
+    }
     if (params.command.includes("\n") || params.command.includes("\r") || params.command.includes("\0")) throw new PhononError("errInvalidParams", "invalid command");
     const started = Date.now();
     const max = params.maxOutputBytes ?? 1024 * 1024;
     const timeoutMs = params.timeoutMs ?? 120_000;
     return new Promise((resolveP, reject) => {
-      const child = spawn(params.command, params.args ?? [], { cwd, shell: false, env: sanitizeExecEnv(params.env) });
+      const child = spawn(params.command, params.args ?? [], { cwd, shell: false, env: buildChildProcessEnvironment(params.env) });
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0); let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0); let truncated = false;
       const append = (cur: Buffer<ArrayBufferLike>, d: Buffer): Buffer<ArrayBufferLike> => {
         const next = Buffer.concat([cur, d]);

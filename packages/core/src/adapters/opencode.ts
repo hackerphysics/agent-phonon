@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
+import { buildChildProcessEnvironment } from "../child-env.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -102,7 +103,7 @@ class OpenCodeSession implements AdapterSession {
     return new Promise((resolve) => {
       // 关键：stdin 设 ignore(=DEVNULL)，否则 OpenCode 检测到 stdin pipe 会等交互输入卡死
       // shell:win32 — bin 回退为 PATH 上的 `opencode`（.cmd shim），Node 22 不带 shell spawn .cmd 会抛 EINVAL（与其它 adapter 一致）。
-      const child = spawnAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...(opts.environment ?? {}) } as NodeJS.ProcessEnv });
+      const child = spawnAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: buildChildProcessEnvironment(opts.environment) });
       this.current = child;
       let buf = "";
       let acc = "";

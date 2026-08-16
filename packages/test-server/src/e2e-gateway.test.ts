@@ -29,7 +29,7 @@ test("e2e-gateway: streaming via OpenClaw Gateway WS", { timeout: 240000 }, asyn
     deviceId: "dev-gw",
     registry,
     trustLocal: true,
-    resolveProjectCwd: () => cwd,
+    workspaceRoot: cwd,
   });
   await client.connect();
   const device = await server.firstDevice();
@@ -39,8 +39,9 @@ test("e2e-gateway: streaming via OpenClaw Gateway WS", { timeout: 240000 }, asyn
   assert.equal(disco.agents.find((a) => a.agentId === "openclaw:phonon")?.available, true);
 
   // create
+  const project = (await device.peer.requestRaw("project.create", { name: "gateway-e2e", path: cwd, git: false })) as { project: { projectId: string } };
   const created = (await device.peer.requestRaw("session.create", {
-    project: cwd, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages",
+    project: project.project.projectId, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages",
   })) as { sessionId: string };
 
   // send

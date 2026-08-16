@@ -72,8 +72,10 @@ export class PhononTestServer {
       deviceId: device.deviceId,
       peer: { requestRaw: (method, params) => this.driveRequest(device, method, params, streamEvents) },
       streamEvents,
-      waitForTurnEnd: (turnId, timeoutMs = 120000) =>
-        this.waitFor((e) => (e as { turnId?: string }).turnId === turnId && (e as { final?: boolean }).final === true, timeoutMs),
+      waitForTurnEnd: (turnId, timeoutMs = 120000) => {
+        const predicate = (e: StreamEvent) => (e as { turnId?: string }).turnId === turnId && (e as { final?: boolean }).final === true;
+        return this.waitForBuffered(streamEvents, predicate, timeoutMs);
+      },
     };
     this.conns.push(conn);
   }
@@ -106,9 +108,29 @@ export class PhononTestServer {
     });
   }
 
+  private waitForBuffered(events: StreamEvent[], predicate: (e: StreamEvent) => boolean, timeoutMs: number): Promise<StreamEvent> {
+    const buffered = [...events].reverse().find(predicate);
+    if (buffered) return Promise.resolve(buffered);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("waitFor timeout")), timeoutMs);
+      const waiter = { predicate, resolve: (e: StreamEvent) => { clearTimeout(timer); resolve(e); } };
+      this.waiters.push(waiter);
+      // The event can arrive between the first scan and waiter registration.
+      // Re-scan after registration and consume it immediately if it raced us.
+      const raced = [...events].reverse().find(predicate);
+      if (raced) {
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+        waiter.resolve(raced);
+      }
+    });
+  }
+
   close(): Promise<void> {
     return this.sdk.close();
   }
 }
 
+// Deterministic in-process adapter used by daemon integration tests and embedders.
+export { MockAdapter } from "./harness.js";
 export type { StreamEvent };

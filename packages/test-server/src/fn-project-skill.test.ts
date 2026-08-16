@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { AdapterRegistry } from "@agent-phonon/core";
+import { AdapterRegistry, ProjectManager } from "@agent-phonon/core";
 import { MockAdapter, TestConn } from "./harness.js";
 
 /** project + worktree + git + skill 功能覆盖。 */
@@ -33,6 +33,30 @@ test("project: create → list → get → remove", async () => {
   assert.equal(rm.removed, true);
   assert.equal(rm.filesDeleted, true);
   assert.equal(existsSync(c.project.path), false);
+});
+
+test("unregistered absolute projectId is not treated as a project path", () => {
+  const projects = new ProjectManager();
+  assert.throws(
+    () => projects.resolveCwd("/etc"),
+    (e: { appCode?: string }) => e?.appCode === "errProjectNotFound",
+  );
+});
+
+test("session.create rejects an unregistered absolute project path", async () => {
+  const { tc } = setup();
+  await assert.rejects(
+    () => tc.call("session.create", { project: "/etc", agent: "mock:default", model: "m1", verbosity: "messages" }),
+    (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errProjectNotFound",
+  );
+});
+
+test("file operations reject an unregistered absolute project path", async () => {
+  const { tc } = setup();
+  await assert.rejects(
+    () => tc.call("file.stat", { projectId: "/etc", path: "passwd" }),
+    (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errProjectNotFound",
+  );
 });
 
 test("project.create path outside workspace rejected by policy", async () => {
@@ -63,6 +87,17 @@ test("project.exec rejects cwd escaping project root", async () => {
   const { tc } = setup();
   const c = (await tc.call("project.create", { name: "exec-escape", git: false })) as { project: { projectId: string } };
   await assert.rejects(() => tc.call("project.exec", { projectId: c.project.projectId, command: process.execPath, cwd: "..", args: ["-e", "console.log('no')"] }), (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errPolicyDenied");
+});
+
+test("project.exec rejects cwd symlink escaping project root", async () => {
+  const { tc } = setup();
+  const outside = mkdtempSync(join(tmpdir(), "phonon-exec-outside-"));
+  const c = (await tc.call("project.create", { name: "exec-symlink", git: false })) as { project: { projectId: string; path: string } };
+  symlinkSync(outside, join(c.project.path, "escape"), "dir");
+  await assert.rejects(
+    () => tc.call("project.exec", { projectId: c.project.projectId, command: process.execPath, cwd: "escape", args: ["-e", "console.log(process.cwd())"] }),
+    (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errPolicyDenied",
+  );
 });
 
 test("project.remove with active session → errProjectHasActiveSessions", async () => {

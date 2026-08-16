@@ -25,8 +25,7 @@ test("e2e: dial → discovery → create → send → stream → terminate", { t
     deviceId: "dev-e2e",
     registry,
     trustLocal: true,
-    // projectId → 工作目录（v0：直接用临时目录）
-    resolveProjectCwd: () => cwd,
+    workspaceRoot: cwd,
   });
   const { tenantId } = await client.connect();
   assert.equal(tenantId, "tenant-A");
@@ -40,8 +39,9 @@ test("e2e: dial → discovery → create → send → stream → terminate", { t
   assert.equal(oc!.available, true, "openclaw should be available");
 
   // 4) create session（必绑 project+agent+model）
+  const project = (await device.peer.requestRaw("project.create", { name: "e2e", path: cwd, git: false })) as { project: { projectId: string } };
   const created = (await device.peer.requestRaw("session.create", {
-    project: cwd,
+    project: project.project.projectId,
     agent: "openclaw:phonon",
     model: "github-copilot/claude-opus-4.8",
     verbosity: "messages",
@@ -84,7 +84,7 @@ test("e2e: cross-tenant session access is rejected", { timeout: 60000 }, async (
   const port = await server.listen();
   const cwd = mkdtempSync(join(tmpdir(), "phonon-iso-"));
   const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "dev-iso", registry,
-    trustLocal: true, resolveProjectCwd: () => cwd });
+    trustLocal: true, workspaceRoot: cwd });
   await client.connect();
   const device = await server.firstDevice();
 

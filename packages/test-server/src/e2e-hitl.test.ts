@@ -31,13 +31,14 @@ test("hitl: before_tool_call → server abort flows back to plugin", { timeout: 
   registry.register(new OpenClawAdapter({ defaultAgent: "phonon" }));
   const cwd = mkdtempSync(join(tmpdir(), "phonon-hitl-"));
   const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "dev-hitl", registry,
-    trustLocal: true, resolveProjectCwd: () => cwd });
+    trustLocal: true, workspaceRoot: cwd });
   await client.connect();
   const device = await server.firstDevice();
 
   // 建一个 session（不真跑，只为有 sessionId）
+  const project = (await device.peer.requestRaw("project.create", { name: "hitl", path: cwd, git: false })) as { project: { projectId: string } };
   const created = (await device.peer.requestRaw("session.create", {
-    project: cwd, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages",
+    project: project.project.projectId, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages",
   })) as { sessionId: string };
 
   // HookBridge：sessionKey 形如 agent:phonon:phonon-<sessionId> → 抽出 sessionId 路由

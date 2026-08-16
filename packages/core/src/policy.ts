@@ -35,6 +35,7 @@ export class PolicyEnforcer {
         allowGlobalSkillInstall: true,
         allowUrlSkillInstall: false, // url 装仍默认禁（供应链风险）
         allowExternalDocuments: false,
+        allowEnvWrite: true,
         allowExec: true, // 单机自用：exec 默认开（A2/A3，不影响本机使用）
         // Maintenance is host-level recovery, not merely project-local trust.
         // It must be opted into explicitly per server policy even for trustLocal.
@@ -95,6 +96,11 @@ export class PolicyEnforcer {
 
   allowEnvReveal(): boolean {
     return !!this.policy.allowEnvReveal;
+  }
+
+  /** 环境变量写入/删除是独立危险能力；读取脱敏列表不受此 gate 影响。 */
+  assertEnvWrite(): void {
+    if (!this.policy.allowEnvWrite) throw new PhononError("errPolicyDenied", "env write disabled by policy (allowEnvWrite)");
   }
 
   /** A2/A3: project.exec 需独立 gate（默认禁；trustLocal 开）。 */

@@ -55,7 +55,6 @@ function spawnPhonon(serverUrl: string, deviceId: string, opts?: {
     client: new PhononClient({
       serverUrl, deviceId, registry: reg, trustLocal: true,
       workspaceRoot: cwd,
-      resolveProjectCwd: () => cwd,
     }),
     workspace: cwd,
   };

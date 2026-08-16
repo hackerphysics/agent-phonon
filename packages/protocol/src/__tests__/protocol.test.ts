@@ -309,6 +309,7 @@ test("P0-1 default policy is strictest (writes off, whitelists empty)", () => {
   assert.equal(DEFAULT_TENANT_POLICY.allowUrlSkillInstall, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowExternalDocuments, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowGlobalSkillInstall, false);
+  assert.equal(DEFAULT_TENANT_POLICY.allowEnvWrite, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowMaintenanceRead, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowMaintenanceConfigWrite, false);
   assert.equal(DEFAULT_TENANT_POLICY.allowMaintenancePackageUpdate, false);

@@ -20,7 +20,7 @@ function spawnPhonon(serverUrl: string, deviceId: string, reply?: (i: string) =>
   const cwd = mkdtempSync(join(tmpdir(), `phonon-l4-e2e-${deviceId}-`));
   const dbPath = join(cwd, "db.sqlite");
   return {
-    client: new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, dbPath, resolveProjectCwd: () => cwd }),
+    client: new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, dbPath }),
     workspace: cwd,
   };
 }

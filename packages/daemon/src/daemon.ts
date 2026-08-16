@@ -16,6 +16,7 @@ import {
   Metrics,
   AuditSink,
   type PhononConnection,
+  type AgentAdapter,
 } from "@agent-phonon/core";
 import { type DaemonConfig, readOpenClawGatewayToken } from "./config.js";
 import { autoDetectAdapters } from "./commands.js";
@@ -29,6 +30,11 @@ import { ObsServer } from "./obs-server.js";
  *
  * HookBridge 跨所有连接路由：sessionKey → 找到 owns 该 session 的连接。
  */
+export interface PhononDaemonDeps {
+  /** Deterministic adapter injection for embedded use/tests. When provided, configured auto-detection is skipped. */
+  adapters?: AgentAdapter[];
+}
+
 export class PhononDaemon {
   private cfg: DaemonConfig;
   private store: PhononStore;
@@ -41,7 +47,7 @@ export class PhononDaemon {
   private obsServer?: ObsServer;
   private startedAt = Date.now();
 
-  constructor(cfg: DaemonConfig) {
+  constructor(cfg: DaemonConfig, deps: PhononDaemonDeps = {}) {
     this.cfg = cfg;
     this.store = new PhononStore(cfg.dbPath);
     // 可观测堆栈：结构化日志 + 指标 + audit 落库，都从同一 ObsBus 消费
@@ -59,7 +65,11 @@ export class PhononDaemon {
         timeoutMs: cfg.rescueAgent?.timeoutMs,
       }));
     }
-    this.registerAdapters();
+    if (deps.adapters) {
+      for (const adapter of deps.adapters) this.registry.register(adapter);
+    } else {
+      this.registerAdapters();
+    }
   }
 
   private registerAdapters(): void {
@@ -133,7 +143,6 @@ export class PhononDaemon {
         deviceKey: s.deviceKey,
         policy: s.policy,
         maintenance: this.cfg.maintenance,
-        resolveProjectCwd: (p) => p,
       });
       this.clients.push(client);
       void client.start(); // 长期运行 + 自动重连

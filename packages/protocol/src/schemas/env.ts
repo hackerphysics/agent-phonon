@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { ProjectId, AgentId } from "./common.js";
 
-/** Skill / agent 执行环境变量配置。明文存储在设备本地，list 默认脱敏。 */
+/** Skill / agent 执行环境变量配置。值在设备本地以 AES-256-GCM 加密存储，list 默认脱敏。 */
 export const EnvScope = z.enum(["global", "project", "skill"]);
 export type EnvScope = z.infer<typeof EnvScope>;
 

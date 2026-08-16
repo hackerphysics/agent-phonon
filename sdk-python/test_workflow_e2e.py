@@ -18,7 +18,7 @@ const [url, deviceId] = process.argv.slice(2);
 const reg = new AdapterRegistry();
 reg.register(new MockAdapter({ name:"mock", agentIds:["mock:a","mock:b","mock:c","mock:exec"], models:["m1"], reply:(i)=>"echo:"+i.slice(0,40) }));
 const cwd = mkdtempSync(join(tmpdir(),"py-wf-"));
-const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, workspaceRoot:cwd, resolveProjectCwd:()=>cwd });
+const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, workspaceRoot:cwd });
 await client.connect();
 console.error("CONNECTED " + deviceId);
 process.on("SIGTERM", ()=>{ client.close(); process.exit(0); });
@@ -160,7 +160,7 @@ reg.register(new MockAdapter({
   },
 }));
 const cwd = mkdtempSync(join(tmpdir(),"py-wf-hr-"));
-const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, workspaceRoot:cwd, resolveProjectCwd:()=>cwd });
+const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, workspaceRoot:cwd });
 await client.connect();
 console.error("CONNECTED " + deviceId);
 process.on("SIGTERM", ()=>{ client.close(); process.exit(0); });

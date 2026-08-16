@@ -68,6 +68,20 @@ test("L4: create manual schedule + trigger → run reaches success", async () =>
   store.close();
 });
 
+test("L4: schedule.create rejects an unregistered absolute project path", async () => {
+  const { tc, store } = setup();
+  await assert.rejects(
+    () => tc.call("schedule.create", {
+      name: "unsafe",
+      trigger: { kind: "manual" },
+      target: { runKind: "session", project: "/etc", agent: "mock:default", model: "m1", prompt: "no" },
+      consent: { push: "summary" },
+    }),
+    (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errProjectNotFound",
+  );
+  store.close();
+});
+
 test("L4: run.finished pushed with consent=summary (no transcriptPath leak)", async () => {
   const { tc, store } = setup();
   const project = await mkProject(tc);

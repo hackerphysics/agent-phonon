@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AdapterRegistry } from "@agent-phonon/core";
+import { AdapterRegistry, PhononStore } from "@agent-phonon/core";
 import { MockAdapter, TestConn } from "./harness.js";
 
 /** tenant 隔离 + policy + HITL + 可靠性（stream.ack/幂等）功能覆盖。 */
@@ -15,6 +15,21 @@ function reg() {
 }
 
 // ============ tenant 隔离 ============
+test("D23: registered projects are shared across tenant connections on one device", async () => {
+  const sharedRegistry = reg();
+  const sharedStore = new PhononStore(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "phonon-shared-project-"));
+  const a = new TestConn({ registry: sharedRegistry, tenantId: "A", workspaceRoot: root, trustLocal: true, store: sharedStore });
+  const b = new TestConn({ registry: sharedRegistry, tenantId: "B", workspaceRoot: root, trustLocal: true, store: sharedStore });
+
+  const created = (await a.call("project.create", { name: "shared", git: false })) as { project: { projectId: string; path: string } };
+  const seen = (await b.call("project.get", { projectId: created.project.projectId })) as { project: { path: string } };
+  assert.equal(seen.project.path, created.project.path);
+  await b.call("session.create", { project: created.project.projectId, agent: "mock:default", model: "m1", verbosity: "messages" });
+
+  sharedStore.close();
+});
+
 test("tenant isolation: A cannot access B's session", async () => {
   const shared = reg();
   const rootA = mkdtempSync(join(tmpdir(), "phonon-a-"));

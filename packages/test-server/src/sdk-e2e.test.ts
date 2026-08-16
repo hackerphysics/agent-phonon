@@ -16,7 +16,7 @@ function dialPhonon(serverUrl: string, deviceId: string, deviceKey?: string) {
   const reg = new AdapterRegistry();
   reg.register(new MockAdapter({ name: "mock", agentIds: ["mock:default"], reply: (i: string) => `echo:${i}` }));
   const cwd = mkdtempSync(join(tmpdir(), "phonon-sdk-"));
-  return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, resolveProjectCwd: () => cwd, deviceKey });
+  return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, deviceKey });
 }
 
 function dialPhononHR(serverUrl: string, deviceId: string, deviceKey?: string) {
@@ -39,7 +39,7 @@ function dialPhononHR(serverUrl: string, deviceId: string, deviceKey?: string) {
     },
   }));
   const cwd = mkdtempSync(join(tmpdir(), "phonon-sdk-hr-"));
-  return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, resolveProjectCwd: () => cwd, deviceKey });
+  return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, deviceKey });
 }
 
 test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, async () => {

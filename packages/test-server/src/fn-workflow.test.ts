@@ -79,6 +79,47 @@ test("workflow.run DAG: stream.event carries workflowId/nodeId; node.result popu
   assert.ok(tc.notifications.some((e) => e.workflowId === run.workflowId && e.type === "artifact.written"));
 });
 
+test("workflow.run rejects an unregistered absolute project path", async () => {
+  const tc = makeConn();
+  await assert.rejects(
+    () => tc.call("workflow.run", {
+      project: "/etc",
+      plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "mock:a", model: "m1", input: "no" }] },
+    }),
+    (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errProjectNotFound",
+  );
+});
+
+test("workflow worktreeId remains a caller isolation key and is not prevalidated as an internal handle", async () => {
+  const tc = makeConn();
+  const project = await tc.call("project.create", { name: "workflow-worktree-key", git: true }) as { project: { projectId: string } };
+  // The arbitrary key must pass synchronous validation. Runtime worktree
+  // creation may fail asynchronously in an empty repo, but run() must queue it.
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    worktreeId: "exp1",
+    plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "mock:a", model: "m1" }] },
+  }) as { workflowId: string };
+  assert.match(run.workflowId, /^wf-/);
+});
+
+test("workflow validates every per-node project before persisting a checkpoint", async () => {
+  const tc = makeConn();
+  const plans = [
+    { mode: "dag", nodes: [{ nodeId: "a", agent: "mock:a", model: "m1", project: "/etc" }] },
+    { mode: "graph", executor: { nodeId: "e", agent: "mock:a", model: "m1", role: "executor", project: "/etc" }, workers: [{ nodeId: "w", agent: "mock:b", model: "m1", project: "/etc" }], communicationGraph: { edges: [{ from: "e", to: "w" }], maxIterations: 1, allowSelfLoop: false } },
+    { mode: "discussion", topic: "unsafe", participants: [{ nodeId: "p1", agent: "mock:a", model: "m1", project: "/etc" }, { nodeId: "p2", agent: "mock:b", model: "m1", project: "/etc" }], chairman: "p1", termination: { maxRounds: 1, chairmanSignal: "[END]" } },
+  ];
+  for (const plan of plans) {
+    await assert.rejects(
+      () => tc.call("workflow.run", { plan }),
+      (e: { data?: { appCode?: string } }) => e?.data?.appCode === "errProjectNotFound",
+    );
+  }
+  const listed = await tc.call("workflow.list", {}) as { workflows: unknown[] };
+  assert.equal(listed.workflows.length, 0, "invalid workflows must not leave queued checkpoints");
+});
+
 test("workflow.run DAG: onNodeFailure=skip_dependents skips downstream when upstream fails", async () => {
   // reply 让 nodeId 含 fail 的会失败
   const tc = makeConn((i) => {

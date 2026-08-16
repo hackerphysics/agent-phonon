@@ -53,7 +53,7 @@ export interface SchedulerEngineOptions {
   tenantId: string;
   engine: SessionEngine;
   store: PhononStore;
-  resolveProjectCwd: (project: string) => string;
+  resolveCwd: (projectId: string) => string;
   /** 可选 workflow 引擎（runKind=workflow）。 */
   workflows?: () => WorkflowEngine | undefined;
   /** 推送通道。owner 在断连时可换成 no-op。 */
@@ -426,7 +426,7 @@ export class SchedulerEngine {
         // v1：workflow 形态留接口位，先报不支持，避免半成品语义
         throw new PhononError("errCapabilityUnsupported", "runKind=workflow not implemented in L4 v1; use runKind=session");
       }
-      const cwd = this.opts.resolveProjectCwd(schedule.target.project);
+      const cwd = this.opts.resolveCwd(schedule.target.project);
       const created = await this.opts.engine.create({
         tenantId: this.opts.tenantId,
         project: schedule.target.project,

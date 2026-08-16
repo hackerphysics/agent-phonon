@@ -132,7 +132,7 @@ create ──▶ idle ──send──▶ running ──turn结束/interrupt─�
 多家 AI 模型 review 后，补齐工程化可靠性与安全边界：
 
 **P0（可靠+安全骨架）**
-- 本地 policy（D27）：`TenantPolicy` 设备授权边界，默认最严格；document 默认 project-scoped；url 装 skill/删盘/全局 skill 默认拒
+- 本地 policy（D27）：`TenantPolicy` 设备授权边界，默认最严格；document 默认 project-scoped；url 装 skill/删盘/全局 skill/env 写入默认拒
 - turn 终态（P0-2）：每个 turn 必有 `result.status` ∈ completed|interrupted|aborted|failed|timeout
 - 幂等（D28）：改状态请求带 `clientRequestId` 去重（不丢 + 不重）
 - 可靠投递闭环（D29）：`stream.ack` + 重连 `resumeFrom`/`ackedSeqs` 双向对齐

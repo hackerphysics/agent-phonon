@@ -21,7 +21,7 @@ const [url, deviceId] = process.argv.slice(2);
 const reg = new AdapterRegistry();
 reg.register(new MockAdapter({ name:"mock", agentIds:["mock:default"], reply:(i)=>"py-echo:"+i }));
 const cwd = mkdtempSync(join(tmpdir(),"pyphonon-"));
-const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, resolveProjectCwd:()=>cwd });
+const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, workspaceRoot:cwd });
 await client.connect();
 console.error("CONNECTED " + deviceId);
 process.on("SIGTERM", ()=>{ client.close(); process.exit(0); });

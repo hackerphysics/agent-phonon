@@ -31,6 +31,8 @@ export const TenantPolicy = z.object({
   allowExternalDocuments: z.boolean().default(false),
   /** env.list reveal=true 是否允许返回环境变量明文。默认 false（只能脱敏查看）。 */
   allowEnvReveal: z.boolean().default(false),
+  /** 是否允许 env.set/env.delete 修改设备本地环境变量。默认 false。 */
+  allowEnvWrite: z.boolean().default(false),
   /**
    * 是否允许 project.exec 跨设备执行任意命令（A2/A3）。默认 false（严格）。
    * exec 能指定任意 binary 且继承环境，等同设备远程代码执行——必须独立 gate，

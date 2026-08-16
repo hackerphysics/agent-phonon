@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnAgent } from "../proc.js";
+import { buildChildProcessEnvironment } from "../child-env.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -189,15 +190,9 @@ class CopilotSession implements AdapterSession {
   private run(args: string[], stdin: string, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
       const { turnId, emit } = opts;
-      const blockedEnv = /^(LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|DYLD_|NODE_OPTIONS|GIT_SSH_COMMAND|GIT_SSH|BASH_ENV|ENV|PYTHONSTARTUP|PERL5OPT|RUBYOPT)$/;
-      const childEnv: NodeJS.ProcessEnv = { ...process.env };
-      for (const key of Object.keys(childEnv)) if (blockedEnv.test(key)) delete childEnv[key];
-      for (const [key, value] of Object.entries(opts.environment ?? {})) {
-        if (!blockedEnv.test(key) && key !== "PATH") childEnv[key] = value;
-      }
       const child = spawnAgent(this.env.binPath ?? "copilot", args, {
         cwd: this.cwd,
-        env: childEnv,
+        env: buildChildProcessEnvironment(opts.environment),
       });
       this.current = child;
       let stdoutBuf = "";

@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { spawnAgent } from "../proc.js";
+import { buildChildProcessEnvironment } from "../child-env.js";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
@@ -174,7 +175,7 @@ class HermesSession implements AdapterSession {
     return new Promise((resolve) => {
       const child = spawnAgent(this.env.binPath ?? "hermes", args, {
         cwd: this.cwd,
-        env: { ...process.env, ...(opts.environment ?? {}), HERMES_PROFILE: this.profile } as NodeJS.ProcessEnv,
+        env: { ...buildChildProcessEnvironment(opts.environment), HERMES_PROFILE: this.profile },
       });
       this.current = child;
       let out = "";

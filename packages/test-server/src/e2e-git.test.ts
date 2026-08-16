@@ -21,7 +21,7 @@ async function setup(): Promise<{ device: PhononDevice; project: { projectId: st
   const reg = new AdapterRegistry();
   reg.register(new MockAdapter({ name: "mock", agentIds: ["mock:a"], reply: (i) => `echo:${i}` }));
   const ws = mkdtempSync(join(tmpdir(), "phonon-git-e2e-"));
-  const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "git-dev", registry: reg, trustLocal: true, workspaceRoot: ws, resolveProjectCwd: () => ws });
+  const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "git-dev", registry: reg, trustLocal: true, workspaceRoot: ws });
   await client.connect();
   const device = await ready;
   const project = await device.project.create({ name: "git-test", git: true }) as { project: { projectId: string; path: string } };

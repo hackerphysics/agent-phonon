@@ -5,6 +5,7 @@ import { writeFileSync, rmSync, mkdtempSync, existsSync, readdirSync } from "nod
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
+import { buildChildProcessEnvironment } from "../child-env.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -148,13 +149,13 @@ class ClaudeCodeSession implements AdapterSession {
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
       // 剥离 CLAUDECODE* env（避免外层污染）
-      const childEnv: Record<string, string> = {};
+      const inherited: NodeJS.ProcessEnv = {};
       for (const [k, v] of Object.entries(process.env)) {
         if (k === "CLAUDECODE" || k.startsWith("CLAUDECODE_") || k.startsWith("CLAUDE_CODE_")) continue;
-        if (v !== undefined) childEnv[k] = v;
+        if (v !== undefined) inherited[k] = v;
       }
 
-      const child = spawnAgent(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: { ...childEnv, ...(opts.environment ?? {}) } });
+      const child = spawnAgent(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: buildChildProcessEnvironment(opts.environment, inherited) });
       this.current = child;
       let buf = "";
       let acc = "";

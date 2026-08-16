@@ -120,6 +120,7 @@ export class PhononStore {
       CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, ts);
       CREATE TABLE IF NOT EXISTS env_vars (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id  TEXT,
         scope      TEXT NOT NULL,
         project_id TEXT,
         agent_id   TEXT,
@@ -129,8 +130,6 @@ export class PhononStore {
         secret     INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_env_scope ON env_vars(scope, project_id, agent_id, skill_name);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_env_unique ON env_vars(scope, IFNULL(project_id,''), IFNULL(agent_id,''), IFNULL(skill_name,''), name);
       CREATE TABLE IF NOT EXISTS workflows (
         workflow_id  TEXT PRIMARY KEY,
         tenant_id    TEXT NOT NULL,
@@ -196,6 +195,17 @@ export class PhononStore {
     // 用 PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN。
     // sessions.transcript_path：phonon 自存的会话快照 JSONL 路径（可观测/审计）。
     this.ensureColumn("sessions", "transcript_path", "TEXT");
+    // env_vars.tenant_id 必须保持 nullable：升级前的行没有可证明的 tenant
+    // 归属，留作隔离区，绝不能静默分配或作为所有 tenant 的共享兜底。
+    this.ensureColumn("env_vars", "tenant_id", "TEXT");
+    // 旧索引不含 tenant_id，会让不同 tenant 的同名变量互相冲突；迁移时
+    // 原地重建。NULL tenant 的 legacy 行仍留库，但所有 API 都要求 tenant_id=?。
+    this.db.exec(`
+      DROP INDEX IF EXISTS idx_env_scope;
+      DROP INDEX IF EXISTS idx_env_unique;
+      CREATE INDEX idx_env_scope ON env_vars(tenant_id, scope, project_id, agent_id, skill_name);
+      CREATE UNIQUE INDEX idx_env_unique ON env_vars(tenant_id, scope, IFNULL(project_id,''), IFNULL(agent_id,''), IFNULL(skill_name,''), name);
+    `);
   }
 
   /** 幂等加列：列不存在才 ALTER TABLE ADD COLUMN。 */
@@ -322,22 +332,22 @@ export class PhononStore {
   }
 
   // ---- env vars（设备本地环境变量配置，默认脱敏返回）----
-  envSet(r: { scope: string; projectId?: string; agent?: string; skillName?: string; name: string; value: string; secret?: boolean; updatedAt: string }): void {
+  envSet(r: { tenantId: string; scope: string; projectId?: string; agent?: string; skillName?: string; name: string; value: string; secret?: boolean; updatedAt: string }): void {
     this.envDelete(r);
     // 落库前加密 value(at-rest)。
     const stored = this.secrets.encrypt(r.value);
     this.db.prepare(
-      `INSERT INTO env_vars(scope,project_id,agent_id,skill_name,name,value,secret,updated_at)
-       VALUES(?,?,?,?,?,?,?,?)`,
-    ).run(r.scope, r.projectId ?? null, r.agent ?? null, r.skillName ?? null, r.name, stored, r.secret === false ? 0 : 1, r.updatedAt);
+      `INSERT INTO env_vars(tenant_id,scope,project_id,agent_id,skill_name,name,value,secret,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?)`,
+    ).run(r.tenantId, r.scope, r.projectId ?? null, r.agent ?? null, r.skillName ?? null, r.name, stored, r.secret === false ? 0 : 1, r.updatedAt);
   }
-  envDelete(r: { scope: string; projectId?: string; agent?: string; skillName?: string; name: string }): void {
-    this.db.prepare("DELETE FROM env_vars WHERE scope=? AND IFNULL(project_id,'')=IFNULL(?,'') AND IFNULL(agent_id,'')=IFNULL(?,'') AND IFNULL(skill_name,'')=IFNULL(?,'') AND name=?")
-      .run(r.scope, r.projectId ?? null, r.agent ?? null, r.skillName ?? null, r.name);
+  envDelete(r: { tenantId: string; scope: string; projectId?: string; agent?: string; skillName?: string; name: string }): void {
+    this.db.prepare("DELETE FROM env_vars WHERE tenant_id=? AND scope=? AND IFNULL(project_id,'')=IFNULL(?,'') AND IFNULL(agent_id,'')=IFNULL(?,'') AND IFNULL(skill_name,'')=IFNULL(?,'') AND name=?")
+      .run(r.tenantId, r.scope, r.projectId ?? null, r.agent ?? null, r.skillName ?? null, r.name);
   }
-  envList(filter?: { scope?: string; projectId?: string; agent?: string; skillName?: string }): Array<{ scope: string; projectId?: string; agent?: string; skillName?: string; name: string; value: string; secret: boolean; updatedAt: string }> {
-    const where: string[] = [];
-    const params: unknown[] = [];
+  envList(tenantId: string, filter?: { scope?: string; projectId?: string; agent?: string; skillName?: string }): Array<{ scope: string; projectId?: string; agent?: string; skillName?: string; name: string; value: string; secret: boolean; updatedAt: string }> {
+    const where: string[] = ["tenant_id=?"];
+    const params: unknown[] = [tenantId];
     if (filter?.scope) { where.push("scope=?"); params.push(filter.scope); }
     if (filter?.projectId) { where.push("project_id=?"); params.push(filter.projectId); }
     if (filter?.agent) { where.push("agent_id=?"); params.push(filter.agent); }

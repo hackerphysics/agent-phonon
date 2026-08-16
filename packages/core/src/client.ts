@@ -40,7 +40,6 @@ export class PhononClient {
   private serverUrl: string;
   private deviceId: string;
   private deviceKey?: string;
-  private resolveProjectCwd?: (project: string) => string;
   private trustLocal?: boolean;
   private dbPath?: string;
   private store?: import("./store.js").PhononStore;
@@ -60,7 +59,6 @@ export class PhononClient {
     serverUrl: string;
     deviceId: string;
     registry: AdapterRegistry;
-    resolveProjectCwd?: (project: string) => string;
     /** 本地自用：放宽 policy（允许写操作 + 受控根为 allowedProjectRoots）。 */
     trustLocal?: boolean;
     workspaceRoot?: string;
@@ -84,7 +82,6 @@ export class PhononClient {
     this.deviceId = opts.deviceId;
     this.deviceKey = opts.deviceKey;
     this.registry = opts.registry;
-    this.resolveProjectCwd = opts.resolveProjectCwd;
     this.trustLocal = opts.trustLocal;
     this.workspaceRoot = opts.workspaceRoot;
     this.dbPath = opts.dbPath;
@@ -146,7 +143,6 @@ export class PhononClient {
             tenantId: welcome.tenantId,
             transport,
             registry: this.registry,
-            resolveProjectCwd: this.resolveProjectCwd,
             trustLocal: this.trustLocal,
             workspaceRoot: this.workspaceRoot,
             dbPath: this.dbPath,

@@ -20,7 +20,7 @@ matters:
 - **Local policy is the authorization boundary.** phonon does not authenticate
   end users; the device owner configures a per-tenant `TenantPolicy`
   (allowed project roots, allowed agents, allowed methods, file-write,
-  skill-install, env-reveal, upload limits, deny-path patterns). Defaults are
+  skill-install, env-write, env-reveal, upload limits, deny-path patterns). Defaults are
   restrictive (writes off, allowlists empty, sensitive paths denied).
 - **Filesystem sandboxing.** `file.*` operations are constrained to a
   project/worktree root. Path resolution is realpath-based and rejects symlink

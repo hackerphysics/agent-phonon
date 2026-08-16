@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PhononTestServer } from "@agent-phonon/test-server";
+import { MockAdapter, PhononTestServer } from "@agent-phonon/test-server";
 import { PhononDaemon } from "./daemon.js";
 
 /**
  * 可观测性集成测试（B5）：daemon 起 obs server，验证
- * /health /sessions /metrics /events 反映真实状态（含真实 Gateway）。
+ * /health /sessions /metrics /events 反映真实状态。使用确定性 adapter，
+ * 使可观测性门禁不依赖外部 Gateway/model 的可用性或响应时延。
  */
 test("obs: health/sessions/metrics/events reflect real state", { timeout: 90000 }, async () => {
   const server = new PhononTestServer({ assignTenant: () => "tenant-O" });
@@ -22,8 +23,10 @@ test("obs: health/sessions/metrics/events reflect real state", { timeout: 90000 
     hookBridge: { port: 0 },
     obs: { enabled: true, port: 0 },
     logLevel: "warn",
-    adapters: [{ type: "openclaw-gateway", gatewayUrl: "ws://127.0.0.1:18789", defaultAgent: "phonon" }],
+    adapters: [],
     servers: [{ url: `ws://127.0.0.1:${port}`, trustLocal: true }],
+  }, {
+    adapters: [new MockAdapter({ name: "mock", agentIds: ["mock:default"] })],
   });
   await daemon.start();
   const device = await server.firstDevice(5000);
@@ -32,19 +35,19 @@ test("obs: health/sessions/metrics/events reflect real state", { timeout: 90000 
   // /health
   const health = (await (await fetch(`${base}/health`)).json()) as { ok: boolean; adapters: string[]; connections: unknown[] };
   assert.equal(health.ok, true);
-  assert.ok(health.adapters.includes("openclaw"));
+  assert.ok(health.adapters.includes("mock"));
   assert.equal(health.connections.length, 1);
 
   // create + send
   const proj = (await device.peer.requestRaw("project.create", { name: "obs-demo", git: false })) as { project: { projectId: string } };
-  const c = (await device.peer.requestRaw("session.create", { project: proj.project.projectId, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages" })) as { sessionId: string };
+  const c = (await device.peer.requestRaw("session.create", { project: proj.project.projectId, agent: "mock:default", model: "m1", verbosity: "messages" })) as { sessionId: string };
 
   // /sessions snapshot
   const sessions = (await (await fetch(`${base}/sessions`)).json()) as Array<{ sessionId: string; agent: string; status: string }>;
-  assert.ok(sessions.some((s) => s.sessionId === c.sessionId && s.agent === "openclaw:phonon"));
+  assert.ok(sessions.some((s) => s.sessionId === c.sessionId && s.agent === "mock:default"));
 
   const ack = (await device.peer.requestRaw("session.send", { sessionId: c.sessionId, input: "say OBS_OK" })) as { turnId: string };
-  await device.waitForTurnEnd(ack.turnId, 60000);
+  await device.waitForTurnEnd(ack.turnId, 5000);
 
   // /metrics
   const metrics = (await (await fetch(`${base}/metrics.json`)).json()) as { counters: Record<string, number> };

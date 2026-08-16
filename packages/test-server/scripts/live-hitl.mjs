@@ -40,7 +40,7 @@ const gwAdapter = new OpenClawGatewayAdapter({ gateway: { baseUrl: "ws://127.0.0
 registry.register(gwAdapter);
 const cwd = mkdtempSync(join(tmpdir(), "phonon-live-"));
 const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "dev-live", registry,
-    trustLocal: true, resolveProjectCwd: () => cwd });
+    trustLocal: true, workspaceRoot: cwd });
 await client.connect();
 const device = await server.firstDevice();
 console.log("[live] phonon connected");
@@ -55,7 +55,8 @@ const bridge = new HookBridge((sessionKey) => {
 await bridge.listen(4318);
 console.log("[live] HookBridge on 4318 (plugin default)");
 
-const created = await device.peer.requestRaw("session.create", { project: cwd, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "tools" });
+const project = await device.peer.requestRaw("project.create", { name: "live-hitl", path: cwd, git: false });
+const created = await device.peer.requestRaw("session.create", { project: project.project.projectId, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "tools" });
 console.log("[live] session:", created.sessionId, "sessionKey=agent:phonon:phonon-" + created.sessionId);
 
 const ack = await device.peer.requestRaw("session.send", {

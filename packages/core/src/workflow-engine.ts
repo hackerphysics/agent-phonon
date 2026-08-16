@@ -218,6 +218,7 @@ export class WorkflowEngine {
     if (params.resumeFrom) {
       const restored = this.restoreFromCheckpoint(params.resumeFrom);
       if (restored) {
+        this.validateExecutionTargets(restored.project, restored.plan);
         void this.executeWithTimeout(restored).catch((err) => this.fail(restored, err));
         return { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
       }
@@ -225,7 +226,9 @@ export class WorkflowEngine {
       throw new PhononError("errInvalidParams", `workflow ${params.resumeFrom.workflowId} has no resumable checkpoint`);
     }
 
-    // 2. 全新启动
+    // 2. 全新启动。必须在分配 workflowId/持久化 queued 状态之前验证所有
+    // node 的有效 project/worktree，避免半条无效 workflow 留在 store。
+    this.validateExecutionTargets(params.project, params.plan);
     const workflowId = `wf-${Date.now()}-${this.idSeq++}`;
     const now = new Date().toISOString();
     const nodes = this.initialNodes(params.plan);
@@ -279,6 +282,7 @@ export class WorkflowEngine {
     if (!restored) {
       throw new PhononError("errInvalidParams", `workflow ${params.workflowId} has no resumable checkpoint`);
     }
+    this.validateExecutionTargets(restored.project, restored.plan);
     // 合并 sharedContext patch + feedback
     if (params.sharedContextPatch || params.feedback) {
       const base = restored.sharedContext ?? {};
@@ -455,6 +459,30 @@ export class WorkflowEngine {
   // ---------------------------------------------------------------------------
   // Execution dispatch
   // ---------------------------------------------------------------------------
+
+  /**
+   * Validate every effective project/worktree before a workflow is persisted or
+   * resumed. The protocol allows per-node project overrides, so checking only
+   * the workflow-level project leaves invalid node paths to fail asynchronously
+   * after a queued checkpoint has already been written.
+   */
+  private validateExecutionTargets(defaultProject: string | undefined, plan: WorkflowPlan): void {
+    const nodes = plan.mode === "dag"
+      ? plan.nodes
+      : plan.mode === "graph"
+        ? [plan.executor, ...plan.workers]
+        : plan.participants;
+    for (const node of nodes) {
+      const projectId = node.project ?? defaultProject;
+      if (!projectId) {
+        throw new PhononError("errInvalidParams", `workflow node ${node.nodeId} has no project`);
+      }
+      // Workflow worktreeId is a caller-defined isolation key, not a persisted
+      // ProjectManager worktree handle. Only validate the registered project
+      // here; resolveExecution lazily creates/reuses the real worktree later.
+      this.opts.resolveCwd(projectId);
+    }
+  }
 
   private async executeWithTimeout(run: WorkflowRunState): Promise<void> {
     const timeoutMs = run.policy.timeoutSeconds ? run.policy.timeoutSeconds * 1000 : undefined;

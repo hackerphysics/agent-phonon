@@ -154,7 +154,6 @@ export class TestConn {
       store: opts.store,
       policy: opts.policy,
       maintenance: opts.maintenance,
-      resolveProjectCwd: (p) => p,
     });
   }
 

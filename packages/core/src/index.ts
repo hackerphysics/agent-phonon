@@ -80,14 +80,10 @@ export class PhononConnection {
   private obs?: import("./observability.js").ObsBus;
   private workflows?: WorkflowEngine;
   private scheduler?: SchedulerEngine;
-  /** 该 tenant 绑定的默认项目工作目录解析器（v0 简化：projectId 即绝对路径或映射）。 */
-  private resolveProjectCwd: (project: string) => string;
-
   constructor(opts: {
     tenantId: string;
     transport: RpcTransport;
     registry: AdapterRegistry;
-    resolveProjectCwd?: (project: string) => string;
     policy?: Partial<TenantPolicy>;
     trustLocal?: boolean;
     workspaceRoot?: string;
@@ -120,7 +116,6 @@ export class PhononConnection {
       maintenance: this.maintenance,
       assertAgentAllowed: (agentId) => this.policy.assertAgentAllowed(agentId),
     });
-    this.engine.resolveCwdForReattach = (projectId) => this.resolveProjectCwd(projectId);
     this.obs = opts.obs;
 
     this.projects = new ProjectManager(
@@ -133,6 +128,7 @@ export class PhononConnection {
         hasActiveSessionsForWorktree: (wtId) => this.engine.activeSessionsForWorktree(wtId), // 精确查询（B8）
       },
     );
+    this.engine.resolveCwdForReattach = (projectId) => this.projects.resolveCwd(projectId);
     this.skills = new SkillManager(
       opts.registry,
       (projectId) => {
@@ -145,8 +141,7 @@ export class PhononConnection {
       this.store,
     );
     this.files = new FileManager({ resolveCwd: (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId) });
-    this.env = new EnvManager(this.store, { allowReveal: () => this.policy.allowEnvReveal() });
-    this.resolveProjectCwd = opts.resolveProjectCwd ?? ((p) => this.projects.resolveCwd(p));
+    this.env = new EnvManager(this.tenantId, this.store, { allowReveal: () => this.policy.allowEnvReveal() });
 
     this.peer = new RpcPeer(opts.transport, (method, params) => this.dispatch(method, params));
     this.workflows = new WorkflowEngine({
@@ -172,7 +167,7 @@ export class PhononConnection {
       tenantId: this.tenantId,
       engine: this.engine,
       store: this.store,
-      resolveProjectCwd: (project) => this.resolveProjectCwd(project),
+      resolveCwd: (projectId) => this.projects.resolveCwd(projectId),
       emit: (method, params) => this.peer.notifyRaw(method, params),
       assertRunAllowed: () => this.policy.assertMethodAllowed("session.create"),
     });
@@ -374,12 +369,9 @@ export class PhononConnection {
       }
       case "session.create": {
         this.policy.assertAgentAllowed(p.agent as string);
-        // worktreeId 指定时，cwd = 该 worktree 路径（修 P0#12）
-        let cwd = this.resolveProjectCwd(p.project as string);
-        if (p.worktreeId) {
-          const wt = this.projects.worktreeList(p.project as string).find((w) => w.worktreeId === p.worktreeId);
-          if (wt) cwd = wt.path;
-        }
+        // ProjectManager is the sole project/worktree resolver. Unregistered
+        // IDs must never be interpreted as filesystem paths.
+        const cwd = this.projects.resolveCwd(p.project as string, p.worktreeId as string | undefined);
         const r = await this.engine.create({
           tenantId: this.tenantId,
           project: p.project as string,
@@ -494,10 +486,12 @@ export class PhononConnection {
         return this.files.mkdir(p as { projectId: string; worktreeId?: string; path: string; recursive?: boolean });
 
       case "env.set":
+        this.policy.assertEnvWrite();
         return this.env.set(p as { scope: "global" | "project" | "skill"; projectId?: string; agent?: string; skillName?: string; name: string; value: string; secret?: boolean });
       case "env.list":
         return this.env.list(p as { scope?: "global" | "project" | "skill"; projectId?: string; agent?: string; skillName?: string; reveal?: boolean });
       case "env.delete":
+        this.policy.assertEnvWrite();
         return this.env.delete(p as { scope: "global" | "project" | "skill"; projectId?: string; agent?: string; skillName?: string; name: string });
 
       // ---- skill (D24 + 边界规则) ----
@@ -526,6 +520,11 @@ export class PhononConnection {
 
       // ---- L3 workflow orchestration ----
       case "workflow.run":
+        if (p.project) {
+          // Workflow worktreeId is an isolation key. WorkflowEngine validates
+          // every node project and lazily creates the real worktree handle.
+          this.projects.resolveCwd(p.project as string);
+        }
         return this.workflows!.run({
           project: p.project as string,
           worktreeId: p.worktreeId as string | undefined,
@@ -563,25 +562,31 @@ export class PhononConnection {
         return this.workflows!.artifactsList(p.workflowId as string);
 
       // ---- L4 scheduling (cron / webhook / manual; device-authoritative) ----
-      case "schedule.create":
+      case "schedule.create": {
+        const target = p.target as { project: string };
+        this.projects.resolveCwd(target.project);
         return this.scheduler!.create({
           name: p.name as string,
           trigger: p.trigger as never,
-          target: p.target as never,
+          target: target as never,
           consent: p.consent as never,
           policy: p.policy as never,
           enabled: p.enabled as boolean | undefined,
         });
-      case "schedule.update":
+      }
+      case "schedule.update": {
+        const target = p.target as { project: string } | undefined;
+        if (target) this.projects.resolveCwd(target.project);
         return this.scheduler!.update({
           scheduleId: p.scheduleId as string,
           name: p.name as string | undefined,
           enabled: p.enabled as boolean | undefined,
           trigger: p.trigger as never,
-          target: p.target as never,
+          target: target as never,
           consent: p.consent as never,
           policy: p.policy as never,
         });
+      }
       case "schedule.delete":
         return this.scheduler!.delete(p.scheduleId as string);
       case "schedule.list":
@@ -662,6 +667,7 @@ export { PhononStore } from "./store.js";
 export { SecretBox } from "./secret-box.js";
 export { FileManager } from "./file-manager.js";
 export { EnvManager } from "./env-manager.js";
+export { DANGEROUS_CHILD_ENV_NAMES, isDangerousChildEnvName, sanitizeRemoteEnvironment, buildChildProcessEnvironment } from "./child-env.js";
 export { dropToolIOFromJsonlFiles, dropToolIOFromValue, computeKeepToolBlocks } from "./custom-compress.js";
 export { dropToolIORowsSqlite } from "./sqlite-compress.js";
 export { resolveCodexSessionFile } from "./adapters/codex.js";

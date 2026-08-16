@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { spawnAgent } from "../proc.js";
+import { buildChildProcessEnvironment } from "../child-env.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
@@ -199,7 +200,7 @@ class CodexSession implements AdapterSession {
     return new Promise((resolve) => {
       const child = spawnAgent(this.env.binPath ?? "codex", args, {
         cwd: this.cwd,
-        env: { ...process.env, ...(opts.environment ?? {}), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) } as NodeJS.ProcessEnv,
+        env: { ...buildChildProcessEnvironment(opts.environment), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) },
       });
       this.current = child;
       let buf = "";
