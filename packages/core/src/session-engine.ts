@@ -6,10 +6,32 @@ import type {
 import type { ContextItem, StreamEvent } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
 import { TranscriptWriter } from "./transcript.js";
+import { randomUUID } from "node:crypto";
+import { DiscoveryInventory, type DiscoveryOptions } from "./discovery-inventory.js";
+
+const DISPOSE_SETTLE_TIMEOUT_MS = 2_000;
+
+async function settleWithin(promises: Promise<unknown>[], timeoutMs = DISPOSE_SETTLE_TIMEOUT_MS): Promise<boolean> {
+  if (promises.length === 0) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([
+    Promise.allSettled(promises).then(() => true),
+    new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return settled;
+}
 
 /** adapter 注册表：runtime name → adapter 实例。复合 agentId 按 runtime 前缀路由。 */
 export class AdapterRegistry {
   private adapters = new Map<string, AgentAdapter>();
+  readonly inventory: DiscoveryInventory;
+
+  constructor(options: DiscoveryOptions = {}, obs?: import("./observability.js").ObsBus) {
+    this.inventory = new DiscoveryInventory(() => this.all(), options, obs);
+  }
+
+  unregister(name: string): void { this.adapters.delete(name); }
 
   register(adapter: AgentAdapter): void {
     this.adapters.set(adapter.name, adapter);
@@ -84,13 +106,16 @@ export class SessionEngine {
   /** 会话快照写入器（store 落盘时启用）。 */
   private transcripts?: TranscriptWriter;
   private runtimeContext?: AdapterRuntimeContext;
+  private tenantId?: string;
+  private disposed = false;
 
-  constructor(registry: AdapterRegistry, sink: StreamSink, obs?: import("./observability.js").ObsBus, store?: import("./store.js").PhononStore, runtimeContext?: AdapterRuntimeContext) {
+  constructor(registry: AdapterRegistry, sink: StreamSink, obs?: import("./observability.js").ObsBus, store?: import("./store.js").PhononStore, runtimeContext?: AdapterRuntimeContext, tenantId?: string) {
     this.registry = registry;
     this.sink = sink;
     this.obs = obs;
     this.store = store;
     this.runtimeContext = runtimeContext;
+    this.tenantId = tenantId;
     const tdir = store?.transcriptDir();
     if (tdir) this.transcripts = new TranscriptWriter(tdir);
     if (store) this.restoreSessions(store);
@@ -99,7 +124,7 @@ export class SessionEngine {
   /** 重启恢复（功能缺口）：从 sqlite 加载未 terminated 的 session，恢复为 paused（游离态）。
    * native-session adapter 可在下次 send 时 reattach；否则标记 needsRecreate。 */
   private restoreSessions(store: import("./store.js").PhononStore): void {
-    for (const row of store.loadSessions()) {
+    for (const row of store.loadSessions(this.tenantId)) {
       const sessionId = row.session_id as string;
       if (this.sessions.has(sessionId)) continue;
       this.sessions.set(sessionId, {
@@ -116,7 +141,10 @@ export class SessionEngine {
         verbosity: (row.verbosity as "messages") ?? "messages",
         terminalTurns: new Set(),
         queue: [],
-        seq: 0,
+        seq: Math.max(
+          Number(row.stream_seq ?? 0),
+          store.outboxNextSeq(row.tenant_id as string, sessionId),
+        ),
         createdAt: row.created_at as string,
         lastActiveAt: (row.last_active as string) ?? undefined,
         transcriptPath: (row.transcript_path as string) ?? undefined,
@@ -132,8 +160,15 @@ export class SessionEngine {
       sessionId: rec.sessionId, tenantId: rec.tenantId, projectId: rec.project,
       worktreeId: rec.worktreeId, agent: rec.agent, model: rec.model,
       status: rec.status, verbosity: rec.verbosity, createdAt: rec.createdAt, lastActive: rec.lastActiveAt,
-      transcriptPath: rec.transcriptPath,
+      transcriptPath: rec.transcriptPath, streamSeq: rec.seq,
     });
+  }
+
+  /** Reserve the next in-memory sequence; Outbox persists it atomically with the event row. */
+  private nextStreamSeq(rec: SessionRecord): number {
+    const seq = rec.seq;
+    rec.seq = seq + 1;
+    return seq;
   }
 
   private emit2(category: "session" | "turn" | "tool" | "stream" | "error", level: "debug" | "info" | "warn" | "error", event: string, rec: { sessionId: string; tenantId: string; agent: string; project: string } | undefined, extra?: { turnId?: string; msg?: string; data?: Record<string, unknown> }): void {
@@ -182,11 +217,12 @@ export class SessionEngine {
     /** L3 归属（workflow node 创建 session 时传入）。 */
     workflowAttr?: { workflowId: string; nodeId: string; role?: string };
   }): Promise<{ sessionId: string; status: string; createdAt: string }> {
+    if (this.disposed) throw new Error("session engine disposed");
     this.runtimeContext?.assertAgentAllowed?.(params.agent);
     const adapter = this.registry.resolve(params.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${params.agent} not found`);
 
-    const sessionId = `s-${Date.now()}-${this.idSeq++}`;
+    const sessionId = `s-${Date.now()}-${randomUUID()}`;
     const adapterSession = await adapter.createSession({
       sessionId,
       agentId: params.agent,
@@ -196,11 +232,15 @@ export class SessionEngine {
       initialContext: params.initialContext,
       runtimeContext: this.runtimeContext,
     });
+    if (this.disposed) {
+      await Promise.resolve(adapterSession.terminate()).catch(() => {});
+      throw new Error("session engine disposed");
+    }
 
     // 自发输出水槽（D16）：adapter 在无 active turn 时的输出走这里，core 统一打 seq 后转发
     adapterSession.setUnsolicitedSink?.((event) => {
       const rec = this.sessions.get(sessionId);
-      if (rec) this.sink(this.decorateEvent(rec, { ...event, seq: rec.seq++ }) as StreamEvent);
+      if (rec) this.sink(this.decorateEvent(rec, { ...event, seq: this.nextStreamSeq(rec) }) as StreamEvent);
     });
 
     const createdAt = new Date().toISOString();
@@ -237,7 +277,7 @@ export class SessionEngine {
   }
 
   /** 可选：reattach 时解析 project cwd（由 connection 注入）。 */
-  resolveCwdForReattach?: (projectId: string) => string;
+  resolveCwdForReattach?: (projectId: string, worktreeId?: string) => string;
 
   /** 重新附着游离 session（重启恢复后首次使用）。
    * native-session adapter 重建会复用原生会话（如 OpenClaw sessionKey / Claude --resume）。 */
@@ -245,15 +285,20 @@ export class SessionEngine {
     this.runtimeContext?.assertAgentAllowed?.(rec.agent);
     const adapter = this.registry.resolve(rec.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${rec.agent} unavailable for reattach`);
-    const cwd = this.resolveCwdForReattach?.(rec.project) ?? rec.project;
-    rec.adapterSession = await adapter.createSession({
+    const cwd = this.resolveCwdForReattach?.(rec.project, rec.worktreeId) ?? rec.project;
+    const adapterSession = await adapter.createSession({
       sessionId: rec.sessionId, agentId: rec.agent, model: rec.model, cwd,
       reattach: true,
       runtimeContext: this.runtimeContext,
     });
+    if (this.disposed) {
+      await Promise.resolve(adapterSession.terminate()).catch(() => {});
+      throw new Error("session engine disposed");
+    }
+    rec.adapterSession = adapterSession;
     rec.adapterSession.setUnsolicitedSink?.((event) => {
       const r = this.sessions.get(rec.sessionId);
-      if (r) this.sink(this.decorateEvent(r, { ...event, seq: r.seq++ }) as StreamEvent);
+      if (r) this.sink(this.decorateEvent(r, { ...event, seq: this.nextStreamSeq(r) }) as StreamEvent);
     });
     rec.detached = false;
     rec.status = "idle";
@@ -273,11 +318,13 @@ export class SessionEngine {
       environment?: Record<string, string>;
     },
   ): Promise<{ turnId: string; disposition: string; queuePosition?: number }> {
+    if (this.disposed) throw new Error("session engine disposed");
     const rec = this.assertTenant(sessionId, tenantId);
     if (rec.status === "terminated")
       throw new PhononError("errSessionTerminated", "session terminated");
     // 重启恢复：游离 session 首次 send 时 reattach（重建 adapterSession）
     if (rec.detached) await this.reattach(rec);
+    if (this.disposed) throw new Error("session engine disposed");
 
     const turnId = opts.turnId ?? `t-${Date.now()}-${this.idSeq++}`;
     const verbosity = opts.verbosity ?? rec.verbosity;
@@ -291,7 +338,7 @@ export class SessionEngine {
       if (mode === "inject" && !adapter?.capabilities.injectMidTurn) mode = opts.fallback ?? "queue";
 
       if (mode === "interrupt") {
-        await this.interrupt(tenantId, sessionId);
+        await this.interrupt(tenantId, sessionId, undefined, false);
         // 中断后立即跑本轮
       } else {
         // queue（默认）：FIFO 排队，上轮结束自动出队
@@ -322,6 +369,7 @@ export class SessionEngine {
     // 会话快照：本轮 input 写一行（完整，不截断；审计要原始）。
     this.transcripts?.append(rec.sessionId, "input", { turnId, input, verbosity, skills });
     const emit = (event: StreamEvent) => {
+      if (this.disposed) return;
       const t = (event as { type?: string }).type;
       // 终态事件去重（避免双终态）：engine 统一发，adapter 重复发的丢弃
       const isFinal = (event as { final?: boolean }).final === true;
@@ -340,7 +388,7 @@ export class SessionEngine {
       } else if (t === "tool_result") {
         this.emit2("tool", "debug", "tool.result", rec, { turnId, data: { toolName: (event as { toolName?: string }).toolName } });
       }
-      this.sink(this.decorateEvent(rec, { ...event, seq: rec.seq++ }) as StreamEvent);
+      this.sink(this.decorateEvent(rec, { ...event, seq: this.nextStreamSeq(rec) }) as StreamEvent);
       // 会话快照：tee 完整事件流（message/tool/result 等，含工具细节）。
       this.transcripts?.append(rec.sessionId, "event", { turnId, event });
     };
@@ -359,7 +407,7 @@ export class SessionEngine {
       } as StreamEvent);
     } finally {
       // 竞态守卫：只有本 turn 仍是当前 turn 才能收尾（避免旧 turn 覆盖新 turn 状态）
-      if (rec.currentTurnId === turnId && rec.status !== "terminated") {
+      if (!this.disposed && rec.currentTurnId === turnId && rec.status !== "terminated") {
         rec.abort = undefined;
         rec.status = "idle";
         rec.currentTurnId = undefined;
@@ -377,7 +425,7 @@ export class SessionEngine {
     }
   }
 
-  async interrupt(tenantId: string, sessionId: string, reason?: string): Promise<{ interruptedTurnId?: string; status: string }> {
+  async interrupt(tenantId: string, sessionId: string, reason?: string, drainQueue = true): Promise<{ interruptedTurnId?: string; status: string }> {
     const rec = this.assertTenant(sessionId, tenantId);
     const turnId = rec.currentTurnId;
     // 先发 engine 统一终态（标记 terminalTurns），确保 interrupted 是唯一终态；
@@ -388,7 +436,7 @@ export class SessionEngine {
         type: "result",
         sessionId,
         turnId,
-        seq: rec.seq++,
+        seq: this.nextStreamSeq(rec),
         at: new Date().toISOString(),
         text: "",
         status: "interrupted",
@@ -397,9 +445,38 @@ export class SessionEngine {
     }
     // 再触发 abort + 停底层执行
     rec.abort?.abort();
-    if (!rec.detached && rec.adapterSession?.interrupt) await rec.adapterSession.interrupt(reason);
-    if (!turnId && rec.status !== "terminated") rec.status = "idle";
-    return { interruptedTurnId: turnId, status: rec.status === "running" ? "idle" : rec.status };
+    let adapterSettled = true;
+    let adapterSucceeded = true;
+    if (!rec.detached && rec.adapterSession?.interrupt) {
+      const operation = Promise.resolve()
+        .then(() => rec.adapterSession.interrupt!(reason))
+        .catch(() => { adapterSucceeded = false; });
+      adapterSettled = await settleWithin([operation]);
+    }
+    // dispose() owns the final paused checkpoint. An interrupt that started
+    // just before teardown must not resume later and overwrite it with idle.
+    if (this.disposed) return { interruptedTurnId: turnId, status: rec.status === "running" ? "paused" : rec.status };
+    if (rec.status !== "terminated") {
+      rec.status = "idle";
+      rec.currentTurnId = undefined;
+      // If the adapter ignored interrupt, never reuse that live object for the
+      // next turn. Reattach creates a fresh runtime while the stale send is
+      // fenced by terminalTurns/currentTurnId.
+      if (!adapterSettled || !adapterSucceeded) rec.detached = true;
+      this.persist(rec);
+      if (drainQueue) {
+        const next = rec.queue.shift();
+        if (next) {
+          const n = JSON.parse(next) as { turnId: string; input: string; verbosity: "final" | "messages" | "tools" | "trace"; skills?: string[]; environment?: Record<string, string> };
+          if (rec.detached) await this.reattach(rec);
+          rec.status = "running";
+          rec.currentTurnId = n.turnId;
+          rec.lastActiveAt = new Date().toISOString();
+          void this.runTurn(rec, n.input, n.turnId, n.verbosity, n.skills, n.environment);
+        }
+      }
+    }
+    return { interruptedTurnId: turnId, status: rec.status };
   }
 
   async switchModel(tenantId: string, sessionId: string, model: string): Promise<{ previousModel: string; model: string; warnings?: string[] }> {
@@ -474,9 +551,18 @@ export class SessionEngine {
 
   async terminate(tenantId: string, sessionId: string): Promise<{ status: "terminated" }> {
     const rec = this.assertTenant(sessionId, tenantId);
-    if (!rec.detached) await rec.adapterSession?.terminate();
+    // Persist the terminal fence before invoking adapter code. A buggy adapter
+    // may never settle, but it cannot keep the RPC or durable state nonterminal.
+    const activeTurnId = rec.currentTurnId;
+    if (activeTurnId) rec.terminalTurns.add(activeTurnId);
+    rec.abort?.abort();
+    rec.queue.length = 0;
     rec.status = "terminated";
+    rec.currentTurnId = undefined;
     this.persist(rec);
+    if (!rec.detached && rec.adapterSession?.terminate) {
+      await settleWithin([Promise.resolve().then(() => rec.adapterSession.terminate()).catch(() => {})]);
+    }
     this.emit2("session", "info", "session.terminate", rec, { msg: `session ${sessionId} terminated` });
     return { status: "terminated" };
   }
@@ -501,19 +587,57 @@ export class SessionEngine {
     return meta;
   }
 
-  /** server ack 了 seq≤lastSeq（P0-4）。v0 内存模型 no-op；接 sqlite outbox 后在此清理。 */
-  ackStream(_sessionId: string | undefined, _lastSeq: number): void {
-    // TODO: 接 outbox 持久化后清理 <= lastSeq
+  /**
+   * Release live adapter processes on connection replacement. Sessions are
+   * persisted as detached/paused so a later connection can reattach them, but
+   * an in-flight turn is intentionally interrupted (the old connection cannot
+   * safely deliver its terminal stream to the replacement peer).
+   */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    const closing: Promise<unknown>[] = [];
+    for (const rec of this.sessions.values()) {
+      rec.queue.length = 0;
+      rec.abort?.abort();
+      rec.abort = undefined;
+      if (!rec.detached && rec.adapterSession) {
+        rec.adapterSession.setUnsolicitedSink?.(() => {});
+        const wasRunning = rec.status === "running";
+        closing.push(Promise.resolve().then(async () => {
+          if (wasRunning && rec.adapterSession.interrupt) {
+            try { await rec.adapterSession.interrupt("connection disposed"); } catch {}
+          }
+          await rec.adapterSession.terminate();
+        }).catch(() => {}));
+      }
+      if (rec.status !== "terminated") {
+        rec.status = "paused";
+        rec.currentTurnId = undefined;
+        rec.detached = true;
+        this.persist(rec);
+      }
+    }
+    for (const resolve of this.interactionWaiters.values()) {
+      resolve({ error: "connection disposed" });
+    }
+    this.interactionWaiters.clear();
+    // A buggy adapter must not make reconnect/close wait forever. The process
+    // supervisor still escalates termination independently after this bound.
+    await settleWithin(closing);
+    this.sessions.clear();
   }
 
   /** server 回填 interaction（P1-5）。v0：如果有等待者则 resolve。 */
   private interactionWaiters = new Map<string, (v: unknown) => void>();
-  resolveInteraction(requestId: string, payload: unknown): void {
+  resolveInteraction(requestId: string, payload: unknown): boolean {
     const w = this.interactionWaiters.get(requestId);
     if (w) {
       w(payload);
       this.interactionWaiters.delete(requestId);
+      return true;
     }
+    return false;
   }
   registerInteractionWaiter(requestId: string, resolve: (v: unknown) => void): void {
     this.interactionWaiters.set(requestId, resolve);

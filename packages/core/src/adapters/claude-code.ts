@@ -1,9 +1,9 @@
-import type { ChildProcess } from "node:child_process";
-import { spawnAgent } from "../proc.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
+import { discoveryProbe } from "../discovery-probe.js";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, rmSync, mkdtempSync, existsSync, readdirSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, isAbsolute } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import type {
@@ -20,10 +20,9 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, Mode
  *
  * 调用方式（详见 docs/agent-cli-integration.md）：
  *   claude -p --output-format stream-json --input-format stream-json --verbose
- *     --permission-mode bypassPermissions --settings <env-json>
  *     [--model X] [--session-id <uuid> | --resume <uuid>]
  *   prompt 走 stdin envelope（不是 argv），剥离 CLAUDECODE env，
- *   认证用 --settings 注入完整 ANTHROPIC env 集（CC Switch 范式）。
+ *   认证沿用 native HOME；显式宿主机覆盖仅通过子进程环境传入，不写临时凭据文件。
  *
  * 单 agent runtime：discoverAgents 只返回一个 claude-code。
  */
@@ -46,6 +45,8 @@ const CAPABILITIES: AgentCapabilities = {
 export interface ClaudeCodeEnv {
   /** Claude executable path. Prefer an absolute path when running under systemd/launchd. */
   binPath?: string;
+  /** Owner-selected standalone settings file; replaces legacy endpoint/auth/default-model overrides. */
+  settingsPath?: string;
   /** Optional Anthropic-compatible endpoint override. Omit to use the user's native Claude Code login/config. */
   baseUrl?: string;
   /** Optional auth token for baseUrl. Omit to use the user's native Claude Code login/config. */
@@ -56,29 +57,28 @@ export interface ClaudeCodeEnv {
   models?: ModelInfo[];
 }
 
-/**
- * 写 settings 到临时 0600 文件（避免 token 进 argv 被 ps 看到，bug-bash#2 B4）。
- * 返回文件路径；调用方负责用后删（cleanup）。
- */
-function writeSettingsFile(env: ClaudeCodeEnv, model: string): string | undefined {
-  if (!env.baseUrl || !env.authToken) return undefined;
-  const dir = mkdtempSync(join(tmpdir(), "phonon-cc-"));
-  const file = join(dir, "settings.json");
-  const content = JSON.stringify({
-    env: {
-      ANTHROPIC_BASE_URL: env.baseUrl,
-      ANTHROPIC_AUTH_TOKEN: env.authToken,
-      ...(model !== "default" ? {
-        ANTHROPIC_MODEL: model,
-        ANTHROPIC_DEFAULT_OPUS_MODEL: model,
-        ANTHROPIC_DEFAULT_SONNET_MODEL: model,
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
-      } : {}),
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-    },
-  });
-  writeFileSync(file, content, { mode: 0o600 });
-  return file;
+/** Owner config only: no session/RPC parameter can choose this file. */
+export function claudeSettingsEnvironment(env: ClaudeCodeEnv, environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (!env.settingsPath) {
+    if (env.baseUrl && env.authToken) {
+      environment.ANTHROPIC_BASE_URL = env.baseUrl;
+      environment.ANTHROPIC_AUTH_TOKEN = env.authToken;
+    }
+    return environment;
+  }
+  if (!isAbsolute(env.settingsPath) || !statSync(env.settingsPath).isFile()) throw new Error("claudeSettingsPath must be an absolute owner-configured file");
+  const settings = JSON.parse(readFileSync(env.settingsPath, "utf8"));
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error("Claude settings must be a JSON object");
+  const selected = settings.env ?? {};
+  if (!selected || typeof selected !== "object" || Array.isArray(selected) || Object.values(selected).some(v => typeof v !== "string")) throw new Error("Claude settings.env must contain string values");
+  if (selected.ANTHROPIC_BASE_URL && !selected.ANTHROPIC_API_KEY && !selected.ANTHROPIC_AUTH_TOKEN && !settings.apiKeyHelper) throw new Error("Standalone Claude endpoint settings must supply their own auth or apiKeyHelper; refusing inherited credentials");
+  // Do not combine an old endpoint's credentials or model with a selected file.
+  // --setting-sources '' also prevents user/project/local settings from merging.
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith("ANTHROPIC_") || key.startsWith("CLAUDE_CODE_USE_") || key === "CLAUDE_CODE_OAUTH_TOKEN") delete environment[key];
+  }
+  Object.assign(environment, selected);
+  return environment;
 }
 
 class ClaudeCodeSession implements AdapterSession {
@@ -88,16 +88,8 @@ class ClaudeCodeSession implements AdapterSession {
   private cwd: string;
   private env: ClaudeCodeEnv;
   private started = false; // 是否已建过（决定 --session-id vs --resume）
-  private current?: ChildProcess;
+  private current?: ProcessSupervisor;
   private pendingInject: string[] = [];
-  private settingsPath?: string;
-
-  /** 本轮 settings 临时文件路径（每次 send 重建，finish 时删）。 */
-  private settingsFile(): string | undefined {
-    this.settingsPath = writeSettingsFile(this.env, this.model);
-    return this.settingsPath;
-  }
-
   constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
@@ -126,12 +118,9 @@ class ClaudeCodeSession implements AdapterSession {
       "--output-format", "stream-json",
       "--input-format", "stream-json",
       "--verbose",
-      // 最高权限：bypassPermissions 跳过所有权限确认；不限定 allowedTools = 所有工具可用
-      // （phonon 定位：全自动执行，牺牲安全换自动化）
-      "--permission-mode", "bypassPermissions",
+      // Retain native approval policy; the adapter must not auto-elevate tools.
     ];
-    const settings = this.settingsFile();
-    if (settings) args.push("--settings", settings);
+    if (this.env.settingsPath) args.push("--setting-sources", "", "--settings", this.env.settingsPath);
     if (this.model !== "default") args.push("--model", this.model);
     // 首轮 --session-id，后续 --resume（持续会话）
     if (this.started) args.push("--resume", this.uuid);
@@ -151,25 +140,33 @@ class ClaudeCodeSession implements AdapterSession {
       // 剥离 CLAUDECODE* env（避免外层污染）
       const inherited: NodeJS.ProcessEnv = {};
       for (const [k, v] of Object.entries(process.env)) {
-        if (k === "CLAUDECODE" || k.startsWith("CLAUDECODE_") || k.startsWith("CLAUDE_CODE_")) continue;
+        if (k === "CLAUDECODE" || k.startsWith("CLAUDECODE_")) continue;
         if (v !== undefined) inherited[k] = v;
       }
 
-      const child = spawnAgent(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: buildChildProcessEnvironment(opts.environment, inherited) });
-      this.current = child;
+      const environment = buildChildProcessEnvironment(opts.environment, inherited);
+      // Trusted host configuration is passed only in the child environment, never
+      // copied into a settings file or command-line argument. Native auth stays intact.
+      try { claudeSettingsEnvironment(this.env, environment); }
+      catch {
+        emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: "Invalid standalone Claude settings: expected an absolute JSON file with self-contained endpoint authentication", status: "failed", final: true } as StreamEvent);
+        resolve(); return;
+      }
+      const supervisor = spawnSupervisedAgent(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: environment });
+      const child = supervisor.child;
+      this.current = supervisor;
+      const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
+      child.once("close", releaseCurrent);
+      child.once("error", releaseCurrent);
       let buf = "";
       let acc = "";
       let settled = false;
+      const abort = (): void => { void supervisor.terminate(); finish("interrupted", acc); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
-        this.current = undefined;
-        // 清理 settings 临时文件（含 token）
-        if (this.settingsPath) {
-          try { rmSync(this.settingsPath, { force: true }); rmSync(join(this.settingsPath, ".."), { recursive: true, force: true }); } catch { /* ignore */ }
-          this.settingsPath = undefined;
-        }
+        opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
           emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: message ?? "claude failed", status: "failed", final: true } as StreamEvent);
         } else {
@@ -178,8 +175,9 @@ class ClaudeCodeSession implements AdapterSession {
         resolve();
       };
 
-      const guard = setTimeout(() => finish("timeout", acc), 1800000);
-      opts.signal?.addEventListener("abort", () => { child.kill("SIGTERM"); finish("interrupted", acc); }, { once: true });
+      const guard = setTimeout(() => { void supervisor.terminate(); finish("timeout", acc); }, 1800000);
+      if (opts.signal?.aborted) abort();
+      else opts.signal?.addEventListener("abort", abort, { once: true });
 
       child.stdout.on("data", (d) => {
         buf += d.toString();
@@ -259,7 +257,7 @@ class ClaudeCodeSession implements AdapterSession {
   }
 
   async interrupt(): Promise<void> {
-    if (this.current) { this.current.kill("SIGTERM"); this.current = undefined; }
+    if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
@@ -277,8 +275,8 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     this.env = opts.env;
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
-    const version = await this.probeVersion();
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
+    const version = await this.probeVersion(signal);
     const available = version !== null;
     return [{
       agentId: "claude-code" as AgentDescriptor["agentId"],
@@ -287,7 +285,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       available,
       ...(available ? {} : { unavailableReason: "claude CLI not found" }),
       ...(version ? { version } : {}),
-      models: this.env.models?.length
+      models: this.env.settingsPath ? [{ id: "default", displayName: "Selected standalone Claude settings", available: true }] : this.env.models?.length
         ? this.env.models
         : [{ id: this.env.defaultModel, available: true }],
       capabilities: CAPABILITIES,
@@ -299,13 +297,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     return new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
   }
 
-  private probeVersion(): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "claude", ["--version"], {});
-      let out = "";
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.on("error", () => resolve(null));
-      child.on("close", (code) => resolve(code === 0 ? out.trim() : null));
-    });
+  private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    return (await discoveryProbe(this.env.binPath ?? "claude", ["--version"], signal));
   }
 }

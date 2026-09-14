@@ -17,10 +17,16 @@ export const MaintenancePermission = z.object({
 });
 export type MaintenancePermission = z.infer<typeof MaintenancePermission>;
 
+export const MaintenanceConfigFormat = z.enum(["json", "jsonc", "yaml", "toml", "text"]);
+export type MaintenanceConfigFormat = z.infer<typeof MaintenanceConfigFormat>;
+
 export const MaintenanceConfigDescriptor = z.object({
   configId: z.string().min(1),
   label: z.string().optional(),
-  format: z.literal("json"),
+  format: MaintenanceConfigFormat,
+  textVisibility: z.enum(["hidden", "public"]).optional(),
+  wholeFileWritable: z.boolean().optional(),
+  allowedRootKeys: z.array(z.string()).optional(),
   exists: z.boolean(),
   writable: z.boolean(),
 });
@@ -84,7 +90,10 @@ export const MaintenanceConfigGetResult = z.object({
   configId: z.string(),
   exists: z.boolean(),
   sha256: z.string().optional(),
-  /** Parsed JSON with secret-looking fields recursively redacted. */
+  format: MaintenanceConfigFormat.optional(),
+  text: z.string().optional(),
+  textWithheld: z.boolean().optional(),
+  /** Parsed value with secret-looking fields recursively redacted; TOML special types use tagged diagnostic projections. */
   value: z.unknown().optional(),
 });
 
@@ -101,11 +110,24 @@ export const MaintenanceConfigPatchParams = z.object({
 export const MaintenanceConfigPatchResult = z.object({
   targetId: z.string(),
   configId: z.string(),
+  format: MaintenanceConfigFormat.optional(),
   changed: z.boolean(),
   previousSha256: z.string(),
   sha256: z.string(),
   backupId: z.string().optional(),
 });
+
+export const MaintenanceConfigEditParams = z.object({
+  targetId: z.string().min(1),
+  configId: z.string().min(1),
+  expectedSha256: z.string().min(1),
+  edits: z.array(z.object({ oldText: z.string().min(1).max(1048576), newText: z.string().max(1048576) }).strict()).min(1).max(100),
+  reason: z.string().max(500).optional(),
+  clientRequestId: z.string().optional(),
+}).strict();
+export const MaintenanceConfigEditResult = MaintenanceConfigPatchResult;
+export type MaintenanceConfigEditParams = z.infer<typeof MaintenanceConfigEditParams>;
+export type MaintenanceConfigEditResult = z.infer<typeof MaintenanceConfigEditResult>;
 
 export const MaintenanceRollbackParams = z.object({
   backupId: z.string().min(1).regex(/^[A-Za-z0-9._-]+$/),

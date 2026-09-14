@@ -206,7 +206,7 @@ Adapter auto-detection is conservative:
 
 `phonon-rescue` is built into the daemon. It does not depend on OpenClaw,
 Claude Code, Codex, Copilot, OpenCode, or Hermes. Configure any endpoint that
-supports **OpenAI Chat Completions plus tool calling**:
+supports **OpenAI Chat Completions or Responses plus tool calling**:
 
 ```bash
 agent-phonon rescue configure \
@@ -215,9 +215,101 @@ agent-phonon rescue configure \
   --api-key-ref ~/.agent-phonon/rescue.key
 ```
 
-The CLI probes Chat Completions and tool calling before saving. `--api-key-env`
-or `--api-key` are also supported; a `0600` key file is recommended for a
+The CLI probes the selected transport and tool calling using the runtime provider before saving. `--api-key-env`
+is also supported; a `0600` key file is recommended for a
 background service.
+
+For an explicitly unauthenticated loopback endpoint, use `--no-auth` (saved as
+`rescueAgent.authMode: "none"`). Only `127.0.0.1`, `localhost`, and `[::1]` are
+accepted; remote endpoints still require authentication. This mode rejects
+explicit key settings, ignores the fallback key environment variable, and sends
+no Authorization, x-api-key, x-goog-api-key or query key. The default remains `"api-key"`. Discovery checks
+configuration readiness, not live endpoint compatibility. A failed CLI tool
+probe does not save configuration.
+
+Transport defaults to `chat` for existing configurations. Select Responses with
+`--wire-api responses` (saved as `rescueAgent.wireApi: "responses"`), for example:
+
+```bash
+agent-phonon rescue configure --base-url http://127.0.0.1:4000/v1 \
+  --model gpt-5.6-sol --wire-api responses --no-auth
+```
+
+### Bundled Rescue repair knowledge
+
+Fresh Rescue sessions can query a read-only, version-scoped repair pack with `query_knowledge` before using maintenance tools. The pack ships inside the daemon bundle, not in a previous chat or a global skill directory. It covers OpenCode, Claude protocol/roles and conditional GPT compatibility, Hermes YAML, limited Codex/Copilot facts, and five-format checksum/rollback safety. Unknown versions/platforms do not receive repair procedures; native verification and stopped-service limitations remain explicit. See [knowledge architecture, boundaries and provenance](docs/rescue-knowledge.md).
+
+### Rescue wire protocols
+
+`rescueAgent.wireApi` / `--wire-api` selects the protocol **independently of the
+model ID**. The default remains `chat`; there is no model-name inference, HTTP
+error fallback, or automatic retry that could re-execute maintenance tools.
+Supply an explicit endpoint and a model ID listed by that endpoint. Rescue never
+falls back to a provider's public default URL.
+
+| wireApi | Official AI SDK provider | baseUrl example (include API prefix) | SDK suffix | Text delivery |
+|---|---|---|---|---|
+| `chat` | `@ai-sdk/openai-compatible` | `https://endpoint.example/v1` | `/chat/completions` | token stream |
+| `responses` | `@ai-sdk/openai` | `https://endpoint.example/v1` | `/responses` | completed step |
+| `anthropic` | `@ai-sdk/anthropic` | `https://endpoint.example/v1` | `/messages` | completed step |
+| `gemini` | `@ai-sdk/google` | `https://endpoint.example/v1beta` | `/models/{model}:generateContent` | completed step |
+
+The examples are placeholders, not configured services. Custom path prefixes are
+preserved; trailing slashes are removed. Do not supply the operation suffix or
+append another `/v1`. For official services the corresponding prefixes are
+`https://api.anthropic.com/v1` and
+`https://generativelanguage.googleapis.com/v1beta`. Gemini accepts a bare model ID
+or the endpoint's resource ID (`models/...`); the SDK does not double `models/`.
+`baseUrl` must not contain userinfo, query parameters (including keys), or a fragment.
+
+For an already provisioned key file, use the native **`--api-key-ref <file>`**
+entry point; the secret value stays out of command arguments, shell history and
+the persisted rescue settings. Provision the file through your local secure
+credential workflow, with owner-only `0600` permissions. Do not paste a secret
+into chat or a CLI argument. For example, using only endpoint/model placeholders:
+
+```bash
+agent-phonon rescue configure --base-url https://endpoint.example/v1 \
+  --model endpoint-listed-model --wire-api anthropic \
+  --api-key-ref /secure/path/rescue-key
+agent-phonon rescue configure --base-url https://endpoint.example/v1beta \
+  --model endpoint-listed-model --wire-api gemini \
+  --api-key-ref /secure/path/rescue-key
+```
+
+Authenticated Anthropic uses the official `x-api-key` plus `anthropic-version`;
+Gemini uses `x-goog-api-key`; Chat/Responses use Bearer Authorization. Rescue
+resolves explicit key/ref/env settings (or its existing `PHONON_RESCUE_API_KEY`
+fallback) itself, rather than implicitly reading provider-specific key env vars.
+Explicit loopback `--no-auth` works for all four protocols, rejects key settings,
+and does not read key env variables. Pinned official `/internal` constructors
+bypass mandatory key-loading factories for Responses/Anthropic/Gemini, without
+fake keys or stripping a factory-generated secret. These version-sensitive
+exports require regression tests on upgrades: openai `4.0.43`, anthropic `4.0.41`,
+google `4.0.50` (provider `4.0.7`, compatible with ai `7.0.58`).
+
+Responses/Anthropic/Gemini use official `ToolLoopAgent.generate`: complete step
+text is emitted as one append message, not fabricated token deltas; real tool
+execution callbacks are forwarded live. Invalid tool inputs rejected before
+execution are reported from the SDK step content with their real call IDs.
+Responses retains stateless replay (`store: false`, `parallelToolCalls: false`)
+to support endpoints that omit SSE text deltas. Chat retains token streaming.
+All protocols keep Zod validation, local maintenance policy and expected-SHA
+checks. Only Gemini's `patch_config.patch` is a JSON-encoded object string,
+because the official OpenAPI converter drops open-ended `additionalProperties`.
+The tool parses it and validates the decoded object with Zod before calling the
+same maintenance manager; other protocols keep the object argument. This is a
+tool schema adaptation, not an HTTP protocol converter. Timeout/abort, unfinished tool loops at the step limit, truncation and
+filtered/error finishes are not reported as completed. No HTTP redirects are
+followed. Protocol implementation and simulated regressions do **not** imply
+that any particular endpoint supports it; discovery is only a configuration
+readiness check, while the CLI performs a live tool-call probe before saving.
+Native Anthropic/Gemini probes select `toolChoice: auto` up front because some
+thinking endpoints reject forced tool choice; an actual `phonon_probe` call is
+still required. Chat/Responses retain forced tool choice. A 200 response with no
+probe call fails, without saving, retrying or switching protocols.
+Restart a daemon separately to load saved settings; configuring or probing does
+not start production.
 
 The rescue agent has no arbitrary shell or host filesystem tool. It can only
 invoke locally registered semantic maintenance operations. The same operations
@@ -225,8 +317,8 @@ are also exposed directly through the server SDK as `device.maintenance.*`, so
 recovery still works when the rescue model endpoint is unavailable:
 
 - inventory and diagnostics,
-- redacted JSON config reads,
-- optimistic-lock JSON merge patch with automatic backup,
+- redacted JSON/JSONC/YAML/TOML config reads and explicitly public UTF-8 text,
+- optimistic-lock JSON/JSONC/YAML merge patch and exact public text edits with automatic raw-byte backup,
 - checksum-verified rollback,
 - allowlisted user-level npm/pnpm package updates,
 - allowlisted user-service status and restart.
@@ -235,6 +327,8 @@ All maintenance capabilities are controlled by independent device policy flags
 and default to **off**. `trustLocal` does **not** enable host maintenance;
 each server must opt in explicitly with its local `policy`. Raw paths, package names, service names,
 and shell strings are never accepted over the wire.
+
+See [multi-format maintenance](docs/PROTOCOL.md#多格式维护配置与文本编辑) for exact edit authorization, size/syntax limits, comment handling and TOML edit-only semantics. Hermes YAML and Codex TOML defaults are registered read-only.
 
 ## Adapter overrides
 
@@ -325,3 +419,22 @@ operations are denied unless local policy explicitly allows them.
 ## License
 
 [MIT](./LICENSE) © agent-phonon contributors
+
+### Secure server connection defaults
+
+Daemon `servers[]` supports `expectedTenantId` (optional non-empty exact tenant
+identity; surrounding whitespace/control characters rejected) and `allowInsecure`
+(optional **boolean**, default false). Both reach the device client. A mismatched
+welcome tenant is rejected; non-loopback plaintext still requires an explicit
+owner exception. Prefer WSS: tenant pinning does not replace TLS authentication.
+No production configuration is changed by these options or tests.
+
+TS `new PhononServer()` binds **127.0.0.1** when `host` is omitted. Explicit
+non-loopback binds require `authenticate`, unless the owner deliberately opts
+into `allowAnonymous: true`. Python provides equivalent `allow_anonymous=True`
+and keeps its async authentication callback contract. A supplied callback still
+controls acceptance even when anonymous opt-in is set.
+
+For isolated default/local E2E/Python tests and separately gated live tests, see
+[Local testing](docs/LOCAL_TESTING.md). RPC method presence checks alone do not
+prove authentication or bind-address parity.

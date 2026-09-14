@@ -67,6 +67,8 @@ agent-phonon L3 是建立在 L1 session 与 L2 tenant 隔离之上的**任务级
 6. `maxIterations` 兜底防止无限 loop
 7. `workflow.finalText` = `workflow.done.finalSummary`（如有）或最后一轮 executor 输出
 
+Graph 校验是严格的：nodeId 唯一；communication edge 必须从 executor 指向已声明 worker；directive 广播中只要一个 target 未授权，整条 directive 都拒绝（不会部分执行）；同一 executor turn 内重复 directive 及恢复后已完成的 target 按 checkpoint 幂等键跳过。`maxIterations` 精确计数已完成的 route/review round。
+
 每轮还会发 `round.started` / `round.completed` 事件，便于服务端追踪迭代进度。
 
 ### 3. Discussion mode (v0.5 新增)
@@ -90,7 +92,7 @@ agent-phonon L3 是建立在 L1 session 与 L2 tenant 隔离之上的**任务级
 ```
 
 **每轮语义**：
-1. 阶段 A：所有非主席 participant **并行**发言（首轮收到 topic；后续轮收到 topic + 截短的历史 transcript）
+1. 阶段 A：所有非主席 participant 并行发言，并发上限受 `policy.maxParallel` 约束
 2. 阶段 B：chairman 看本轮各方发言，summary + 决定是否继续
 3. 终止判定：chairman 输出含 chairmanSignal → 终止；任一 participant 输出含 consensusSignal → 终止；否则继续到 maxRounds
 4. `workflow.finalText` = 最后一轮 chairman 的发言
@@ -146,9 +148,13 @@ phonon 在**每个 node** 的 `session.create` 时把 sharedContext 拼接到 sy
 - API 文档摘要
 - 给所有 node 看的"约束清单"
 
-## Checkpoint + Resume (v0.5 新增)
+## Checkpoint + Resume / Recovery
 
-每次 workflow 状态变化（status / node terminal / emit event）都会自动落 sqlite `workflows` 表。失败/取消/超时的 workflow 可通过 resumeFrom 恢复：
+每次 workflow 状态变化都会落 sqlite `workflows` 表。除 node 状态外，checkpoint 还持久化：DAG 终态边界；Graph iteration/阶段/current directives/逐 target 幂等键/worker results；Discussion round/阶段/participant 与 chairman 输出；持久 session、node attempt→session→turn 映射、自动 worktree 映射，以及总超时的绝对 deadline。自动恢复不会重置总 timeout。
+
+daemon/connection 建立后会自动 claim 并继续 `queued/running` checkpoint。owner lease + `owner_epoch` fencing 保证同一 tenant/workflow 最多一个 executor；每次外部执行边界会原子续租并复核 owner，正常断线立即释放，进程硬崩溃则在租约过期（当前最多约 5 秒）后由周期 recovery scan 接管。旧 owner 的持久化、迟到事件和后续 turn 都会被拒绝。session 恢复按 tenant 过滤，Graph/Discussion reattach 会同时恢复原 worktree cwd。
+
+失败/取消/超时/暂停的 workflow 也可显式恢复：
 
 ```ts
 {
@@ -156,6 +162,7 @@ phonon 在**每个 node** 的 `session.create` 时把 sharedContext 拼接到 sy
   resumeFrom?: {
     workflowId: string,
     strategy: "failed_node"               // 默认：只重跑失败的 node
+            | "continue"                  // 从持久化的当前边界继续
             | "last_success_dependents"   // 所有非 completed 都重跑
             | "node:<nodeId>",            // 从指定 node 开始
     rerunNodes?: nodeId[]                 // 显式指定要重跑的 node 列表
@@ -169,11 +176,20 @@ phonon 在**每个 node** 的 `session.create` 时把 sharedContext 拼接到 sy
 ```
 
 恢复后：
+- 只有 `paused/failed/timeout/cancelled` 可显式 resume；completed workflow 和不存在的 rerun node 会被拒绝
 - 已 completed 的 node 不重做（session 不重建）
 - 标记为 rerun 的 node 重置为 pending，重新走 DAG ready 检测/Graph executor 循环/Discussion 轮次
 - 原 workflowId 沿用，原历史可在 status 里查到
 
-`WorkflowStatusResult.resumable` 字段标识当前 workflow 是否可恢复（store 存在 + status ∈ failed/timeout/cancelled）。
+`WorkflowStatusResult.resumable` 字段标识当前 workflow 是否可恢复（store 存在 + status ∈ paused/failed/timeout/cancelled）。
+
+### Pause / Resume / Cancel 确定性
+
+- `workflow.pause` 先推进 control epoch，再中断当前 turn；workflow 和当前 node 落 `paused`，迟到 result 不得改写状态。
+- `workflow.resume({strategy:"continue"})` 保留模式游标，只重跑被中断的当前边界；其他策略用于显式回滚节点。
+- `workflow.cancel`/timeout 同样先 fencing 并持久化终态，再以 2 秒有界等待终止 adapter、清理安全可删的 worktree；清理后的资源映射再次落盘。
+- Graph/Discussion 的持久 session 在恢复时按原 project+worktree reattach；DAG 的中断 burner node 新建 attempt。`nodes[].attempts` 可审计每次 sessionId/turnId。
+- `workflow.human_review` 使用由 workflow/iteration/directive 派生的稳定 `requestId`；重放时服务端可对同一表单去重。
 
 ## Methods
 
@@ -182,8 +198,10 @@ phonon 在**每个 node** 的 `session.create` 时把 sharedContext 拼接到 sy
 | `workflow.run` | server→phonon | request | 提交 DAG/Graph/Discussion plan，或 resumeFrom |
 | `workflow.status` | server→phonon | request | 查询 workflow + nodes 状态 |
 | `workflow.cancel` | server→phonon | request | 取消运行中的 workflow |
+| `workflow.pause` | server→phonon | request | 在当前执行边界暂停并 fence 迟到事件 |
+| `workflow.resume` | server→phonon | request | 按 continue/failed_node/依赖/指定节点策略恢复 |
 | `workflow.list` | server→phonon | request | 列 workflow（按 status/projectId/时间窗筛） |
-| `workflow.event` | phonon→server | notify | 工作流级元事件流 |
+| `workflow.event` | phonon→server | notify | 工作流级可靠元事件流；checkpoint+payload 原子落盘，重连补发未 ACK 事件 |
 | `workflow.ack` | server→phonon | notify | 确认收到 workflow.event seq≤N（SDK 自动 ack） |
 
 ### `workflow.run` 完整入参
@@ -328,6 +346,7 @@ print(status.get("finalText"))
 
 ## 已知边界 / 后续
 
-- **persistence**：workflow 状态已落 sqlite（v0.5），重启可 resume。但**正在运行**的 workflow 进程崩溃恢复仍需手动 resume；自动恢复需要 daemon 启动钩子（留下一阶段）
+- **crash window**：外部 agent 已产生副作用、但 sqlite 边界尚未提交的极窄窗口无法提供 exactly-once；恢复保证 checkpoint 边界级 at-least-once，已提交的 node/route/speech 不重跑。
+- **worktree**：恢复复用持久化的内部 worktree；终态只删除 `git status --porcelain` 干净的 worktree，dirty 或检查失败一律保留并在 workflow.status payload 报告。
 - **N1 N2 BACKLOG**：cross-device workflow（多 phonon 联动）、定时/周期 workflow，协议无需大改
 - **审计**：`audit_logs` 沉淀仍在 BACKLOG

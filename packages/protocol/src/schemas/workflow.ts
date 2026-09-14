@@ -154,6 +154,7 @@ export type WorkflowPlan = z.infer<typeof WorkflowPlan>;
 export const WorkflowStatus = z.enum([
   "queued",
   "running",
+  "paused",
   "completed",
   "failed",
   "cancelled",
@@ -165,6 +166,7 @@ export const WorkflowNodeStatus = z.enum([
   "pending",
   "ready",
   "running",
+  "paused",
   "completed",
   "failed",
   "skipped",
@@ -218,6 +220,7 @@ export const WorkflowResumeFrom = z.object({
    * - "node:<nodeId>"            : 显式指定从某 node 开始
    */
   strategy: z.union([
+    z.literal("continue"),
     z.literal("last_success_dependents"),
     z.literal("failed_node"),
     z.string().regex(/^node:/),
@@ -234,6 +237,7 @@ export type WorkflowResumeFrom = z.infer<typeof WorkflowResumeFrom>;
 export const WorkflowResumeParams = z.object({
   workflowId: WorkflowId,
   strategy: z.union([
+    z.literal("continue"),
     z.literal("last_success_dependents"),
     z.literal("failed_node"),
     z.string().regex(/^node:/),
@@ -317,6 +321,17 @@ export const WorkflowNodeRuntime = z.object({
   result: WorkflowNodeResult.optional(),
   /** 该节点完成的轮次计数（discussion 用；DAG/Graph 一次执行 = 1）。 */
   iterations: z.number().int().nonnegative().optional(),
+  /** 每次执行的 session/turn 映射；用于崩溃恢复、审计和 late-event fencing。 */
+  attempts: z.array(z.object({
+    attempt: z.number().int().positive(),
+    iteration: z.number().int().positive().optional(),
+    sessionId: SessionId.optional(),
+    turnId: TurnId.optional(),
+    status: z.enum(["running", "completed", "failed", "interrupted", "timeout", "cancelled"]),
+    startedAt: Timestamp,
+    completedAt: Timestamp.optional(),
+    error: z.string().optional(),
+  })).optional(),
 });
 export type WorkflowNodeRuntime = z.infer<typeof WorkflowNodeRuntime>;
 
@@ -348,6 +363,11 @@ export const WorkflowCancelParams = z.object({ workflowId: WorkflowId, reason: z
 export type WorkflowCancelParams = z.infer<typeof WorkflowCancelParams>;
 export const WorkflowCancelResult = z.object({ workflowId: WorkflowId, status: z.literal("cancelled") });
 export type WorkflowCancelResult = z.infer<typeof WorkflowCancelResult>;
+
+export const WorkflowPauseParams = z.object({ workflowId: WorkflowId, reason: z.string().optional() });
+export type WorkflowPauseParams = z.infer<typeof WorkflowPauseParams>;
+export const WorkflowPauseResult = z.object({ workflowId: WorkflowId, status: z.literal("paused") });
+export type WorkflowPauseResult = z.infer<typeof WorkflowPauseResult>;
 
 export const WorkflowListParams = z.object({
   status: WorkflowStatus.optional(),
@@ -392,6 +412,8 @@ export const WorkflowEvent = z.object({
   agent: AgentId.optional(),
   model: ModelId.optional(),
   role: WorkflowRoleId.optional(),
+  /** Scheduling/orchestration correlation metadata. */
+  metadata: z.record(z.unknown()).optional(),
   status: z.union([WorkflowStatus, WorkflowNodeStatus]).optional(),
   result: WorkflowNodeResult.optional(),
   /** 自由载荷。常见字段：iteration, from, to, reason, terminationReason 等。 */

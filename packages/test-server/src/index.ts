@@ -85,10 +85,20 @@ export class PhononTestServer {
     if (method === "session.create") {
       const p = params as { project: string; agent: string; model: string; worktreeId?: string; verbosity?: never };
       const session = await device.createSession(p);
-      // 挂 stream 收集 + 唤醒等待者
+      // Attach stream collection before exposing the session to callers.
       session.on("stream", (ev: StreamEvent) => { streamEvents.push(ev); this.wake(ev); });
       this.sessionMap.set(session.sessionId, session);
       return { sessionId: session.sessionId, project: p.project, agent: p.agent, model: p.model, status: "idle", createdAt: new Date().toISOString() };
+    }
+    if (method === "session.send") {
+      // Route through the SDK session object registered above. Calling the raw
+      // device RPC here bypasses the object only nominally, but keeping all
+      // session traffic on one object makes stream ownership explicit.
+      const p = params as { sessionId: string; input: string; verbosity?: "final" | "messages" | "tools" | "trace"; skills?: string[]; whenBusy?: "queue" | "interrupt" | "inject"; clientRequestId?: string };
+      const session = this.sessionMap.get(p.sessionId) as { send: (input: string, opts?: Omit<typeof p, "sessionId" | "input">) => Promise<unknown> } | undefined;
+      if (!session) throw new Error(`unknown test session ${p.sessionId}`);
+      const { sessionId: _sessionId, input, ...opts } = p;
+      return session.send(input, opts);
     }
     // 其余直接走 device.call（底层 peer.request）
     return device.call(method, params);

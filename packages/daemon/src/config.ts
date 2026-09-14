@@ -1,6 +1,8 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { generateText, tool } from "ai";
+import { z } from "zod";
 import type { ModelInfo, TenantPolicy } from "@agent-phonon/protocol";
-import type { MaintenanceManagerConfig } from "@agent-phonon/core";
+import { discoveryOptions, type DiscoveryOptions, createRescueModel, rescueProviderOptions, validateRescueEndpoint, type RescueConnectionOptions, type MaintenanceManagerConfig } from "@agent-phonon/core";
 import { homedir, hostname } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -17,6 +19,10 @@ export interface ServerConfig {
   trustLocal?: boolean;
   /** 该连接的可选 device key（鉴权由 server 做，phonon 仅携带）。 */
   deviceKey?: string;
+  /** Pin the welcome tenant identity; mismatch rejects the connection. */
+  expectedTenantId?: string;
+  /** Explicit non-loopback plaintext transport exception. Default remains false. */
+  allowInsecure?: boolean;
   /** 该 tenant 的本地设备授权边界；设备始终拥有最终否决权。 */
   policy?: Partial<TenantPolicy>;
 }
@@ -32,6 +38,8 @@ export interface AdapterConfig {
   defaultAgent?: string;
   /** claude-code：网关 baseUrl/token/默认模型。 */
   claudeBinPath?: string;
+  /** Local owner-selected standalone settings; takes precedence over legacy endpoint/auth/model overrides. */
+  claudeSettingsPath?: string;
   claudeBaseUrl?: string;
   claudeAuthToken?: string;
   claudeDefaultModel?: string;
@@ -56,14 +64,9 @@ export interface AdapterConfig {
   copilotModels?: ModelInfo[];
 }
 
-export interface RescueAgentConfig {
+export interface RescueAgentConfig extends RescueConnectionOptions {
   /** 内置救援 Agent 默认启用；未配置 endpoint 时 discovery 显示 unavailable。 */
   enabled?: boolean;
-  baseUrl?: string;
-  apiKey?: string;
-  /** 优先从环境变量取 key；apiKeyRef 则从 0600 文件读取，适合守护进程。 */
-  apiKeyEnv?: string;
-  apiKeyRef?: string;
   model?: string;
   maxSteps?: number;
   timeoutMs?: number;
@@ -77,6 +80,8 @@ export interface DaemonConfig {
   workspaceRoot: string;
   /** 结构化日志级别。 */
   logLevel?: "debug" | "info" | "warn" | "error";
+  /** Shared discovery inventory; owner-only polling and per-adapter deadline. */
+  discovery?: DiscoveryOptions;
   hookBridge?: { port?: number; token?: string };
   /** 可观测 HTTP 服务。 */
   obs?: { enabled?: boolean; port?: number; token?: string };
@@ -115,13 +120,13 @@ function defaultMaintenance(): MaintenanceManagerConfig {
         targetId: "claude-code", label: "Claude Code", command: "claude",
         configs: [{ configId: "settings", label: "Claude settings", path: join(homedir(), ".claude", "settings.json"), format: "json", writable: false }],
       },
-      { targetId: "codex", label: "Codex CLI", command: "codex" },
+      { targetId: "codex", label: "Codex CLI", command: "codex", configs: [{ configId: "main", path: join(homedir(), ".codex", "config.toml"), format: "toml", writable: false }] },
       {
         targetId: "copilot", label: "GitHub Copilot CLI", command: "copilot",
         configs: [{ configId: "settings", label: "Copilot settings", path: join(homedir(), ".copilot", "settings.json"), format: "json", writable: true, allowedRootKeys: ["model"] }],
       },
       { targetId: "opencode", label: "OpenCode", command: "opencode" },
-      { targetId: "hermes", label: "Hermes", command: "hermes" },
+      { targetId: "hermes", label: "Hermes", command: "hermes", configs: [{ configId: "main", path: join(homedir(), ".hermes", "config.yaml"), format: "yaml", writable: false }] },
     ],
   };
 }
@@ -131,6 +136,7 @@ export function defaultConfig(): DaemonConfig {
     deviceId: `dev-${hostname()}`,
     dbPath: join(DEFAULT_DIR, "phonon.db"),
     workspaceRoot: join(homedir(), "phonon-projects"),
+    discovery: discoveryOptions(),
     hookBridge: { port: 4318 },
     obs: { enabled: true, port: 4319 },
     maintenance: defaultMaintenance(),
@@ -145,11 +151,13 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): DaemonConfig {
     throw new Error(`config not found at ${path} — run 'agent-phonon init' first`);
   }
   const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<DaemonConfig>;
+  validateServerConfigs(raw.servers ?? []);
   const d = defaultConfig();
   return {
     deviceId: raw.deviceId ?? d.deviceId,
     dbPath: raw.dbPath ?? d.dbPath,
     workspaceRoot: raw.workspaceRoot ?? d.workspaceRoot,
+    discovery: discoveryOptions(raw.discovery),
     hookBridge: { ...d.hookBridge, ...raw.hookBridge },
     obs: { ...d.obs, ...raw.obs },
     logLevel: raw.logLevel ?? d.logLevel,
@@ -160,56 +168,50 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): DaemonConfig {
   };
 }
 
-export async function probeRescueEndpoint(input: { baseUrl: string; model: string; apiKey?: string; apiKeyEnv?: string; apiKeyRef?: string }): Promise<{ ok: boolean; status?: number; error?: string }> {
-  let parsedBase: URL;
-  try { parsedBase = new URL(input.baseUrl); } catch { return { ok: false, error: "invalid base URL" }; }
-  const loopback = ["127.0.0.1", "::1", "localhost", "[::1]"].includes(parsedBase.hostname.toLowerCase());
-  if (parsedBase.protocol !== "https:" && !(parsedBase.protocol === "http:" && loopback)) return { ok: false, error: "base URL must use HTTPS (HTTP only for loopback)" };
-  let key = input.apiKeyEnv ? process.env[input.apiKeyEnv] : undefined;
-  if (!key && input.apiKeyRef) {
-    try { key = readFileSync(input.apiKeyRef, "utf8").trim(); } catch (err) { return { ok: false, error: `cannot read API key file: ${(err as Error).message}` }; }
-  }
-  key ??= input.apiKey;
-  if (!key) return { ok: false, error: "API key unavailable" };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
-  try {
-    const response = await fetch(`${input.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: input.model,
-        messages: [{ role: "user", content: "Call the phonon_probe tool with no arguments." }],
-        max_tokens: 32,
-        stream: false,
-        tools: [{ type: "function", function: { name: "phonon_probe", description: "Capability probe", parameters: { type: "object", properties: {}, additionalProperties: false } } }],
-        tool_choice: { type: "function", function: { name: "phonon_probe" } },
-      }),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const body = (await response.text()).slice(0, 500);
-      return { ok: false, status: response.status, error: body || `HTTP ${response.status}` };
+/** Validate security options without coercion, trimming identity, or logging config values. */
+export function validateServerConfigs(servers: ServerConfig[]): void {
+  if (!Array.isArray(servers)) throw new Error("servers must be an array");
+  for (const [i, server] of servers.entries()) {
+    if (!server || typeof server !== "object") throw new Error(`servers[${i}] must be an object`);
+    if (server.allowInsecure !== undefined && typeof server.allowInsecure !== "boolean") {
+      throw new Error(`servers[${i}].allowInsecure must be a boolean`);
     }
-    const body = await response.json() as { choices?: Array<{ message?: { tool_calls?: Array<{ function?: { name?: string } }> } }> };
-    const called = body.choices?.some((choice) => choice.message?.tool_calls?.some((call) => call.function?.name === "phonon_probe"));
-    if (!called) return { ok: false, status: response.status, error: "endpoint returned 2xx but did not produce the required tool call" };
-    return { ok: true, status: response.status };
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
-  } finally {
-    clearTimeout(timer);
+    const tenant = server.expectedTenantId;
+    if (tenant !== undefined && (typeof tenant !== "string" || !tenant.trim() || tenant !== tenant.trim() || /[\x00-\x1f\x7f]/.test(tenant))) {
+      throw new Error(`servers[${i}].expectedTenantId must be a non-empty string without surrounding whitespace or control characters`);
+    }
   }
 }
 
-export function configureRescueAgent(cfg: DaemonConfig, input: { baseUrl: string; model: string; apiKey?: string; apiKeyEnv?: string; apiKeyRef?: string }): DaemonConfig {
-  const parsedBase = new URL(input.baseUrl);
-  const loopback = ["127.0.0.1", "::1", "localhost", "[::1]"].includes(parsedBase.hostname.toLowerCase());
-  if (parsedBase.protocol !== "https:" && !(parsedBase.protocol === "http:" && loopback)) {
-    throw new Error("rescue base URL must use HTTPS (HTTP is allowed only for loopback)");
+export async function probeRescueEndpoint(input: RescueConnectionOptions & { baseUrl: string; model: string }): Promise<{ ok: boolean; status?: number; error?: string }> {
+  try {
+    const result = await generateText({
+      model: createRescueModel(input, input.model),
+      providerOptions: rescueProviderOptions(input),
+      prompt: "Call the phonon_probe tool with no arguments.",
+      tools: { phonon_probe: tool({ description: "Capability probe", inputSchema: z.object({}), strict: false }) },
+      // Native thinking endpoints may reject forced tool_choice. Choose auto
+      // up front (never retry/fallback), then require an actual probe call below.
+      toolChoice: input.wireApi === "anthropic" || input.wireApi === "gemini"
+        ? "auto" : { type: "tool", toolName: "phonon_probe" },
+      maxOutputTokens: 128,
+      maxRetries: 0,
+      abortSignal: AbortSignal.timeout(20_000),
+    });
+    if (!result.toolCalls.some((call) => call.toolName === "phonon_probe")) {
+      return { ok: false, error: "endpoint returned success but did not produce the required tool call" };
+    }
+    return { ok: true };
+  } catch (err) {
+    const error = err as Error & { statusCode?: number };
+    return { ok: false, status: error.statusCode, error: error.message };
   }
+}
+
+export function configureRescueAgent(cfg: DaemonConfig, input: RescueConnectionOptions & { baseUrl: string; model: string }): DaemonConfig {
+  validateRescueEndpoint(input);
   if (!input.model.trim()) throw new Error("rescue model is required");
-  if (!input.apiKey && !input.apiKeyEnv && !input.apiKeyRef) throw new Error("rescue API key, --api-key-env, or --api-key-ref is required");
+  if (input.authMode !== "none" && !input.apiKey && !input.apiKeyEnv && !input.apiKeyRef) throw new Error("rescue API key, --api-key-env, --api-key-ref, or explicit loopback --no-auth is required");
   return {
     ...cfg,
     rescueAgent: {
@@ -217,6 +219,8 @@ export function configureRescueAgent(cfg: DaemonConfig, input: { baseUrl: string
       enabled: true,
       baseUrl: input.baseUrl.replace(/\/+$/, ""),
       model: input.model,
+      wireApi: input.wireApi ?? "chat",
+      authMode: input.authMode ?? "api-key",
       apiKey: input.apiKey,
       apiKeyEnv: input.apiKeyEnv,
       apiKeyRef: input.apiKeyRef,

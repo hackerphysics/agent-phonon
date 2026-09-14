@@ -56,3 +56,43 @@ asyncio.run(main())
 ## 协议
 
 JSON-RPC 2.0 over WebSocket。与 TS SDK（`@agent-phonon/server-sdk`）完全协议兼容——Python 服务端能指挥 TS phonon，反之亦然。
+
+
+## Registered configuration editing
+
+`await device.maintenance_config_edit(target_id, config_id, expected_sha256,
+[{"oldText": "before", "newText": "after"}], reason="authorized repair",
+clientRequestId="unique-id")` matches TS `device.maintenance.configEdit`.
+Get the SHA with `maintenance_config_get`, verify with another get, and use
+`maintenance_rollback(backup_id, expected_current_sha256)` to restore original bytes.
+The device must explicitly register public text visibility and write permissions;
+structured root allowlists still apply. No arbitrary paths, shell or redacted-document replacement.
+JSON/JSONC/YAML also support the existing RFC7396 `maintenance_config_patch`;
+TOML and plain UTF-8 text are exact-edit only. See `docs/PROTOCOL.md` for limits.
+
+## Listener authentication and local regression tests
+
+`PhononServer()` binds **127.0.0.1**, not a wildcard. Local loopback use may omit
+`authenticate`; any explicit non-loopback host requires authentication by
+**default** and otherwise `await server.listen()` raises `ValueError` **before
+binding**. To deliberately expose an anonymous server, the keyword-only option
+is `allow_anonymous=True` (TS: `allowAnonymous: true`). This is an unsafe opt-in,
+not the recommended deployment mode; it never bypasses a supplied callback.
+
+`authenticate` retains its existing **async** contract: awaitable returning a
+tenant-ID string on acceptance or `None` on rejection, for example:
+
+```python
+async def authenticate(device_id, device_key):
+    # Look up and verify the device using your server-side credential store.
+    return await verify_registered_device(device_id, device_key)  # tenant ID or None
+
+server = PhononServer(host="127.0.0.1", authenticate=authenticate)
+```
+
+Transport encryption and tenant pinning belong to the device client configuration:
+remote plaintext is rejected unless the owner explicitly sets `allowInsecure`;
+`expectedTenantId` rejects a mismatched welcome. Tenant string equality is not a
+substitute for TLS or credential verification. See [local test entrypoints](../docs/LOCAL_TESTING.md)
+for `pnpm test:python` (three SDK scenarios + authentication unittest/cross-language
+Node-client checks). RPC method-string consistency alone does not test security behavior.

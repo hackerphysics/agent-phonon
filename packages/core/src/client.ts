@@ -3,6 +3,7 @@ import { PhononConnection } from "./index.js";
 import { AdapterRegistry } from "./session-engine.js";
 import { PROTOCOL_VERSION } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
+import { PhononStore } from "./store.js";
 import type { RpcTransport } from "./rpc.js";
 
 /**
@@ -36,24 +37,31 @@ export function assertSecureServerUrl(url: string, allowInsecure?: boolean): voi
 export class PhononClient {
   private ws?: WebSocket;
   private conn?: PhononConnection;
+  private wsMessageListener?: (raw: Buffer) => void;
+  private dialing = new Set<WebSocket>();
   private registry: AdapterRegistry;
   private serverUrl: string;
   private deviceId: string;
   private deviceKey?: string;
   private trustLocal?: boolean;
-  private dbPath?: string;
-  private store?: import("./store.js").PhononStore;
+  private store: PhononStore;
+  private ownsStore: boolean;
+  private storeClosed = false;
   private policy?: Partial<import("@agent-phonon/protocol").TenantPolicy>;
   private obs?: import("./observability.js").ObsBus;
   private workspaceRoot?: string;
   private started = false;
   private backoffMs = 1000;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** Monotonic lifecycle generation: stale dial/close callbacks cannot publish or reconnect. */
+  private generation = 0;
   /** A5: 期望的 tenantId；server welcome 不匹配则拒连。 */
   private expectedTenantId?: string;
   /** A5: 显式允许非 loopback 的明文 ws://（默认禁）。 */
   private allowInsecure?: boolean;
   private maintenance?: import("./maintenance.js").MaintenanceManagerConfig;
+  /** Last verified binding for reconnect resume; persisted by server URL across process restarts. */
+  private lastTenantId?: string;
 
   constructor(opts: {
     serverUrl: string;
@@ -84,8 +92,8 @@ export class PhononClient {
     this.registry = opts.registry;
     this.trustLocal = opts.trustLocal;
     this.workspaceRoot = opts.workspaceRoot;
-    this.dbPath = opts.dbPath;
-    this.store = opts.store;
+    this.ownsStore = !opts.store;
+    this.store = opts.store ?? new PhononStore(opts.dbPath ?? ":memory:");
     this.policy = opts.policy;
     this.obs = opts.obs;
     this.maintenance = opts.maintenance;
@@ -97,81 +105,155 @@ export class PhononClient {
 
   /** 连接并完成握手，resolve 后即可接收 server 的 session.* 下发。 */
   connect(): Promise<{ tenantId: string }> {
+    const generation = ++this.generation;
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.serverUrl);
-      this.ws = ws;
+      this.dialing.add(ws);
+      let settled = false;
+      let tmpPeer: import("./rpc.js").RpcPeer | undefined;
+      let tmpListener: ((raw: Buffer) => void) | undefined;
+      let ownedConn: PhononConnection | undefined;
+      const inboundQueue: string[] = [];
 
+      const settleReject = (err: unknown): void => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
       const transport: RpcTransport = {
         send: (data) => ws.send(data),
         close: () => ws.close(),
       };
 
       ws.on("open", async () => {
-        // 握手前先建连接处理器，但 tenantId 要等 welcome；先用占位，再在 welcome 后重建
-        // 简化：先发 hello 作为一个 request，拿到 welcome.tenantId 后再建 PhononConnection。
         try {
-          // 临时 peer 仅用于 hello/welcome
           const { RpcPeer } = await import("./rpc.js");
-          const tmpPeer = new RpcPeer(transport, () => {
-            throw new Error("not ready");
-          });
-          // 把 message 暂时喂给 tmpPeer
-          const tmpListener = (raw: Buffer) => tmpPeer.handle(raw.toString());
+          tmpPeer = new RpcPeer(transport, () => { throw new Error("not ready"); });
+          // connect.hello is the temporary peer's first request (id=1). Only
+          // that response belongs to the handshake peer; every other frame is
+          // buffered from the moment the listener is installed.
+          tmpListener = (raw: Buffer) => {
+            const data = raw.toString();
+            try {
+              const msg = JSON.parse(data) as { id?: string | number; result?: unknown; error?: unknown };
+              if (msg.id === 1 && ("result" in msg || "error" in msg)) {
+                void tmpPeer?.handle(data);
+                return;
+              }
+            } catch { /* formal connection will report malformed frames */ }
+            inboundQueue.push(data);
+          };
           ws.on("message", tmpListener);
 
+          const resumeTenantId = this.expectedTenantId ?? this.lastTenantId ?? this.store.connectionTenant(this.serverUrl);
+          const resumeFrom = resumeTenantId
+            ? (this.conn?.tenantId === resumeTenantId ? this.conn.resumeFrom() : this.store.outboxResumeFrom(resumeTenantId))
+            : [];
           const welcome = (await tmpPeer.request("connect.hello", {
             protocolVersion: PROTOCOL_VERSION,
             deviceId: this.deviceId as never,
             features: [],
             ...(this.deviceKey ? { auth: { deviceKey: this.deviceKey } } : {}),
+            ...(resumeFrom.length > 0 ? { resumeFrom } : {}),
             at: new Date().toISOString(),
-          })) as { tenantId: string };
+          })) as { tenantId: string; ackedSeqs?: Array<{ sessionId: string; lastSeq: number }> };
 
-          // A5: server 身份校验——期望的 tenantId 不匹配则拒连（防恶意 server 返回别人的 tenant）。
           if (this.expectedTenantId !== undefined && welcome.tenantId !== this.expectedTenantId) {
-            ws.off("message", tmpListener);
-            try { ws.close(); } catch { /* ignore */ }
             throw new PhononError(
               "errUnauthorized",
               `server returned tenantId "${welcome.tenantId}" but expected "${this.expectedTenantId}" (A5 identity check)`,
             );
           }
 
-          // 切换到正式连接处理器
-          ws.off("message", tmpListener);
+          tmpPeer.dispose("handshake complete");
+          tmpPeer = undefined;
+          if (generation !== this.generation) throw new Error("connection attempt superseded");
+          this.lastTenantId = welcome.tenantId;
+          this.store.rememberConnectionTenant(this.serverUrl, welcome.tenantId, new Date().toISOString());
+
+          // A manual connect or reconnect may overlap an existing healthy
+          // socket. Tear down the old connection before publishing its
+          // replacement so no scheduler/runtime survives in parallel.
+          const previousConn = this.conn;
+          const previousWs = this.ws;
+          const previousMessageListener = this.wsMessageListener;
+          if (previousMessageListener && previousWs) previousWs.off("message", previousMessageListener);
+          if (previousConn) await previousConn.dispose("connection replaced");
+          if (generation !== this.generation) throw new Error("connection attempt superseded");
+          if (ws.readyState !== WebSocket.OPEN) throw new Error("connection closed during handshake");
+
           const conn = new PhononConnection({
             tenantId: welcome.tenantId,
             transport,
             registry: this.registry,
             trustLocal: this.trustLocal,
             workspaceRoot: this.workspaceRoot,
-            dbPath: this.dbPath,
             store: this.store,
             policy: this.policy,
             obs: this.obs,
             maintenance: this.maintenance,
           });
-          this.conn = conn;
-          ws.on("message", (raw: Buffer) => conn.handle(raw.toString()));
-          this.backoffMs = 1000; // 连上重置 backoff
-          // 重连补发（D29）：server welcome.ackedSeqs → resumeFrom
-          const wAck = (welcome as { ackedSeqs?: Array<{ sessionId: string; lastSeq: number }> }).ackedSeqs;
-          if (wAck && wAck.length > 0) {
-            conn.replayPending(wAck.map((a) => ({ sessionId: a.sessionId, fromSeq: a.lastSeq })));
+          ownedConn = conn;
+          // welcome ACK is authoritative for already-received events. Persist it
+          // before any replay so a crash during replay cannot resurrect them.
+          for (const ack of welcome.ackedSeqs ?? []) conn.acknowledgeStream(ack.sessionId, ack.lastSeq);
+          let inboundChain = Promise.resolve();
+          for (const data of inboundQueue.splice(0)) {
+            inboundChain = inboundChain.then(() => conn.handle(data));
           }
+          const messageListener = (raw: Buffer): void => {
+            inboundChain = inboundChain.then(() => conn.handle(raw.toString()));
+          };
+          if (tmpListener) ws.off("message", tmpListener);
+          tmpListener = undefined;
+          ws.on("message", messageListener);
+          // Process welcome-adjacent ACKs before replay. New frames are chained
+          // behind the buffered frames, preserving wire order.
+          await inboundChain;
+          if (generation !== this.generation) throw new Error("connection attempt superseded");
+          this.ws = ws;
+          this.conn = conn;
+          this.wsMessageListener = messageListener;
+          this.dialing.delete(ws);
+          // Publish the replacement before closing the incumbent socket so its
+          // close callback cannot clear the newly active connection.
+          if (previousWs && previousWs !== ws) {
+            try { previousWs.close(); } catch { /* ignore */ }
+          }
+          this.backoffMs = 1000;
+          conn.replayPending();
+          settled = true;
           resolve({ tenantId: welcome.tenantId });
         } catch (err) {
-          reject(err);
+          if (tmpListener) ws.off("message", tmpListener);
+          tmpPeer?.dispose("handshake failed");
+          this.dialing.delete(ws);
+          try { ws.close(); } catch { /* ignore */ }
+          settleReject(err);
         }
       });
 
-      ws.on("error", (err) => {
-        if (!this.started) reject(err);
-      });
+      ws.on("error", (err) => settleReject(err));
       ws.on("close", () => {
-        this.conn?.onClose();
-        this.conn = undefined; // 清 conn，health 不误报 connected（修 B8）
-        if (this.started) this.scheduleReconnect();
+        this.dialing.delete(ws);
+        if (tmpListener) ws.off("message", tmpListener);
+        tmpPeer?.dispose("connection closed during handshake");
+        settleReject(new Error("connection closed"));
+        if (this.ws === ws) {
+          if (this.wsMessageListener) ws.off("message", this.wsMessageListener);
+          this.ws = undefined;
+          this.wsMessageListener = undefined;
+          this.conn = undefined;
+          void (async () => {
+            await ownedConn?.dispose("connection closed");
+            // Socket identity, not the latest dial generation, determines
+            // ownership: a failed candidate dial must not disable reconnect for
+            // the still-active incumbent connection.
+            if (this.started) this.scheduleReconnect();
+          })();
+        } else if (ownedConn) {
+          void ownedConn.dispose("connection closed");
+        }
       });
     });
   }
@@ -203,13 +285,29 @@ export class PhononClient {
     }, delay);
   }
 
-  close(): void {
-    this.started = false; // 停止重连
+  async close(): Promise<void> {
+    this.started = false;
+    this.generation++;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
-    this.ws?.close();
+    const conn = this.conn;
+    const ws = this.ws;
+    if (this.wsMessageListener && ws) ws.off("message", this.wsMessageListener);
+    this.conn = undefined;
+    this.ws = undefined;
+    this.wsMessageListener = undefined;
+    for (const dialing of this.dialing) {
+      try { dialing.close(); } catch { /* ignore */ }
+    }
+    this.dialing.clear();
+    try { ws?.close(); } catch { /* ignore */ }
+    await conn?.dispose("client closed");
+    if (this.ownsStore && !this.storeClosed) {
+      this.storeClosed = true;
+      this.store.close();
+    }
   }
 
   /** 本连接的 PhononConnection（HookBridge 路由用）。 */

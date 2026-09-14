@@ -45,7 +45,7 @@ test("hitl: before_tool_call → server abort flows back to plugin", { timeout: 
   const conn = client.connection;
   assert.ok(conn, "client should expose its connection");
   const bridge = new HookBridge((sessionKey: string) => {
-    const m = sessionKey.match(/phonon-(s-\d+-\d+)$/);
+    const m = sessionKey.match(/phonon-(s-[A-Za-z0-9-]+)$/);
     const sessionId = m?.[1];
     if (sessionId && conn!.ownsSession(sessionId)) return { conn: conn!, sessionId };
     return undefined;
@@ -80,6 +80,6 @@ test("hitl: before_tool_call → server abort flows back to plugin", { timeout: 
   assert.equal(d3.action, "continue");
 
   await bridge.close();
-  client.close();
+  await client.close();
   await server.close();
 });

@@ -17,6 +17,8 @@ export interface GatewayConfig {
   /** ws 或 http URL（http 会自动转 ws）。 */
   baseUrl: string;
   token: string;
+  /** Optional narrower connection scopes; model switching must not persist agent defaults. */
+  scopes?: string[];
 }
 
 interface Pending {
@@ -81,7 +83,7 @@ export class GatewayClient {
                   maxProtocol: GATEWAY_PROTOCOL_MAX,
                   client: { id: "gateway-client", version: "0.0.1", platform: "linux", mode: "backend" },
                   role: "operator",
-                  scopes: ["operator.read", "operator.write", "operator.admin"],
+                  scopes: this.config.scopes ?? ["operator.read", "operator.write", "operator.admin"],
                   auth: { token: this.config.token },
                   userAgent: "agent-phonon/0.0.1",
                 },
@@ -148,6 +150,13 @@ export class GatewayClient {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       this.ws!.send(JSON.stringify({ type: "req", id, method, params }));
     });
+  }
+
+  /** A write-only model patch cannot acquire Gateway sticky-config admin authority. */
+  async patchSessionModel(key: string, model: string): Promise<Record<string, unknown>> {
+    const client = new GatewayClient({ ...this.config, scopes: ["operator.read", "operator.write"] });
+    try { return await client.rpc("sessions.patch", { key, model }, 10000); }
+    finally { client.close(); }
   }
 
   close(): void {

@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AdapterRegistry, PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry, PhononStore, SchedulerEngine } from "@agent-phonon/core";
+import type { SessionEngine } from "@agent-phonon/core";
 import { MockAdapter, TestConn } from "./harness.js";
 
 /**
  * L4 scheduling 功能测试（通过 TestConn 走真实 dispatch 链路）。
  * 覆盖：schedule CRUD、manual trigger → run 终态、consent push 粒度、
- * webhook token 脱敏、runs.list/run.get、持久化、overlap=skip。
+ * webhook token 脱敏、workflow、queue/retry/catch-up/cancel、restart/dispose。
  */
 
 function setup() {
@@ -199,16 +200,258 @@ test("L4: delete schedule removes it and its runs", async () => {
   store.close();
 });
 
-test("L4: workflow runKind rejected in v1", async () => {
+test("L4: workflow schedule persists workflowId and maps terminal result", async () => {
   const { tc, store } = setup();
   const project = await mkProject(tc);
   const created = (await tc.call("schedule.create", {
-    name: "wf", trigger: { kind: "manual" },
-    target: { runKind: "workflow", project, plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "mock:default", model: "m1" }] } },
+    name: "wf", trigger: { kind: "manual" }, consent: { push: "full" },
+    target: { runKind: "workflow", project, plan: { mode: "dag", finalNodeId: "a", nodes: [{ nodeId: "a", agent: "mock:default", model: "m1" }] } },
+  })) as { schedule: { id: string } };
+  const trig = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "workflow-input" })) as { runId: string };
+  const run = await waitRunFinished(tc, trig.runId);
+  assert.equal(run.status, "success");
+  assert.ok(run.workflowId, "run bound to workflow");
+  assert.match(String(run.resultText), /workflow-input/);
+  assert.equal(run.sessionId, undefined);
+  const wf = (await tc.call("workflow.status", { workflowId: run.workflowId })) as { status: string; finalText?: string };
+  assert.equal(wf.status, "completed");
+  assert.equal(wf.finalText, run.resultText);
+  store.close();
+});
+
+test("L4: full-consent workflow run.events forwards workflow.event", async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-l4-wf-events-")), "db.sqlite");
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({ name: "mock", agentIds: ["mock:default"], models: ["m1"], sendDelayMs: 80, reply: () => "wf-result" }));
+  const store = new PhononStore(dbPath);
+  const tc = new TestConn({ registry: reg, trustLocal: true, store });
+  const project = await mkProject(tc);
+  const created = (await tc.call("schedule.create", {
+    name: "wf-events", trigger: { kind: "manual" }, consent: { push: "full" },
+    target: { runKind: "workflow", project, plan: { mode: "dag", finalNodeId: "a", nodes: [{ nodeId: "a", agent: "mock:default", model: "m1" }] } },
   })) as { schedule: { id: string } };
   const trig = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
-  const run = await waitRunFinished(tc, trig.runId);
-  assert.equal(run.status, "failed");
-  assert.match(String(run.error), /workflow/);
+  const subscribed = (await tc.call("run.events.subscribe", { runId: trig.runId })) as { subscribed: boolean };
+  assert.equal(subscribed.subscribed, true);
+  await waitRunFinished(tc, trig.runId);
+  const forwarded = tc.notifications.filter((n) => n.__method === "run.event" && n.runId === trig.runId);
+  assert.ok(forwarded.length > 0);
+  assert.ok(forwarded.some((n) => (n.event as { type?: string }).type === "workflow.status"));
+  store.close();
+});
+
+test("L4: overlap=queue launches FIFO exactly once and disable cancels queued items", async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-l4-queue-")), "db.sqlite");
+  const seen: string[] = [];
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({
+    name: "mock", agentIds: ["mock:default"], models: ["m1"], sendDelayMs: 80,
+    reply: (input) => { seen.push(input); return `done:${input}`; },
+  }));
+  const store = new PhononStore(dbPath);
+  const tc = new TestConn({ registry: reg, trustLocal: true, store });
+  const project = await mkProject(tc);
+  const created = (await tc.call("schedule.create", {
+    name: "queue", trigger: { kind: "manual" }, policy: { overlap: "queue", maxRetries: 0, catchUp: false },
+    target: { runKind: "session", project, agent: "mock:default", model: "m1", prompt: "base" },
+  })) as { schedule: { id: string } };
+
+  const first = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "one" })) as { runId: string };
+  const second = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "two" })) as { runId: string; status: string };
+  assert.equal(second.status, "pending");
+  assert.equal(((await tc.call("run.get", { runId: second.runId })) as { run: { startedAt?: string } }).run.startedAt, undefined);
+  const firstDone = await waitRunFinished(tc, first.runId);
+  const secondDone = await waitRunFinished(tc, second.runId);
+  assert.equal(firstDone.status, "success");
+  assert.equal(secondDone.status, "success");
+  assert.deepEqual(seen, ["base\n\none", "base\n\ntwo"]);
+
+  const third = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "three" })) as { runId: string };
+  const fourth = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "four" })) as { runId: string };
+  await tc.call("schedule.disable", { scheduleId: created.schedule.id });
+  assert.equal((await waitRunFinished(tc, fourth.runId)).status, "cancelled");
+  assert.equal((await waitRunFinished(tc, third.runId)).status, "success", "disable does not kill already running work");
+  assert.equal(seen.filter((value) => value.endsWith("four")).length, 0);
+
+  await tc.call("schedule.enable", { scheduleId: created.schedule.id });
+  const fifth = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "five" })) as { runId: string };
+  const sixth = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "six" })) as { runId: string };
+  await tc.call("schedule.update", {
+    scheduleId: created.schedule.id,
+    policy: { overlap: "skip", maxRetries: 0, catchUp: false },
+  });
+  assert.equal((await waitRunFinished(tc, sixth.runId)).status, "cancelled", "policy update drains queued work to an audit terminal");
+  assert.equal((await waitRunFinished(tc, fifth.runId)).status, "success");
+
+  await tc.call("schedule.update", {
+    scheduleId: created.schedule.id,
+    policy: { overlap: "queue", maxRetries: 0, catchUp: false },
+  });
+  const seventh = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "seven" })) as { runId: string };
+  const eighth = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "eight" })) as { runId: string };
+  await tc.call("schedule.delete", { scheduleId: created.schedule.id });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(store.getRun(seventh.runId, "tenant-test"), undefined);
+  assert.equal(store.getRun(eighth.runId, "tenant-test"), undefined);
+  store.close();
+});
+
+test("L4: overlap=skip and allow retain their existing semantics", async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-l4-overlap-")), "db.sqlite");
+  let calls = 0;
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({
+    name: "mock", agentIds: ["mock:default"], models: ["m1"], sendDelayMs: 70,
+    reply: (input) => { calls++; return input; },
+  }));
+  const store = new PhononStore(dbPath);
+  const tc = new TestConn({ registry: reg, trustLocal: true, store });
+  const project = await mkProject(tc);
+  const created = (await tc.call("schedule.create", {
+    name: "overlap", trigger: { kind: "manual" }, policy: { overlap: "skip", maxRetries: 0, catchUp: false },
+    target: { runKind: "session", project, agent: "mock:default", model: "m1", prompt: "x" },
+  })) as { schedule: { id: string } };
+  const first = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
+  const skipped = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string; status: string };
+  assert.equal(skipped.status, "skipped");
+  await waitRunFinished(tc, first.runId);
+  assert.equal(calls, 1);
+
+  await tc.call("schedule.update", {
+    scheduleId: created.schedule.id,
+    policy: { overlap: "allow", maxRetries: 0, catchUp: false },
+  });
+  const a = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
+  const b = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
+  await Promise.all([waitRunFinished(tc, a.runId), waitRunFinished(tc, b.runId)]);
+  assert.equal(calls, 3);
+  store.close();
+});
+
+test("L4: runtime and launch failures retry exactly 1 + maxRetries with audit", async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-l4-retry-")), "db.sqlite");
+  let attempts = 0;
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({
+    name: "mock", agentIds: ["mock:default"], models: ["m1"],
+    reply: (input) => { attempts++; if (attempts === 1) throw new Error("first runtime failure"); return `ok:${input}`; },
+  }));
+  const store = new PhononStore(dbPath);
+  const tc = new TestConn({ registry: reg, trustLocal: true, store });
+  const project = await mkProject(tc);
+  const created = (await tc.call("schedule.create", {
+    name: "retry", trigger: { kind: "manual" }, policy: { overlap: "skip", maxRetries: 1, catchUp: false },
+    target: { runKind: "session", project, agent: "mock:default", model: "m1", prompt: "x" },
+  })) as { schedule: { id: string } };
+  const trig = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
+  const run = await waitRunFinished(tc, trig.runId) as { status: string; attempt: number; maxAttempts: number; retryHistory: Array<{ attempt: number; phase: string; error: string }>; resultText: string };
+  assert.equal(run.status, "success");
+  assert.equal(attempts, 2);
+  assert.equal(run.attempt, 2);
+  assert.equal(run.maxAttempts, 2);
+  assert.equal(run.retryHistory.length, 1);
+  assert.deepEqual({ attempt: run.retryHistory[0]!.attempt, phase: run.retryHistory[0]!.phase }, { attempt: 1, phase: "runtime" });
+  assert.match(run.retryHistory[0]!.error, /runtime failure/);
+
+  const bad = (await tc.call("schedule.create", {
+    name: "launch-retry", trigger: { kind: "manual" }, policy: { overlap: "skip", maxRetries: 2, catchUp: false },
+    target: { runKind: "session", project, agent: "missing:agent", model: "m1", prompt: "x" },
+  })) as { schedule: { id: string } };
+  const badTrig = (await tc.call("schedule.trigger", { scheduleId: bad.schedule.id })) as { runId: string };
+  const failed = await waitRunFinished(tc, badTrig.runId) as { status: string; attempt: number; maxAttempts: number; retryHistory: unknown[] };
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.attempt, 3);
+  assert.equal(failed.maxAttempts, 3);
+  assert.equal(failed.retryHistory.length, 3);
+  store.close();
+});
+
+test("L4: workflow cancel fences late completion and cancels underlying workflow", async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-l4-cancel-")), "db.sqlite");
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({ name: "mock", agentIds: ["mock:default"], models: ["m1"], sendDelayMs: 150 }));
+  const store = new PhononStore(dbPath);
+  const tc = new TestConn({ registry: reg, trustLocal: true, store });
+  const project = await mkProject(tc);
+  const created = (await tc.call("schedule.create", {
+    name: "wf-cancel", trigger: { kind: "manual" },
+    target: { runKind: "workflow", project, plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "mock:default", model: "m1" }] } },
+  })) as { schedule: { id: string } };
+  const trig = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "slow" })) as { runId: string };
+  const live = ((await tc.call("run.get", { runId: trig.runId })) as { run: { workflowId: string } }).run;
+  assert.ok(live.workflowId);
+  const cancelled = (await tc.call("run.cancel", { runId: trig.runId, reason: "test cancel" })) as { status: string };
+  assert.equal(cancelled.status, "cancelled");
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  assert.equal(((await tc.call("run.get", { runId: trig.runId })) as { run: { status: string } }).run.status, "cancelled");
+  assert.equal(((await tc.call("workflow.status", { workflowId: live.workflowId })) as { status: string }).status, "cancelled");
+  store.close();
+});
+
+test("L4: startup catchUp advances first and launches only one; false only advances", async () => {
+  const now = Date.parse("2026-08-16T12:00:30.000Z");
+  const store = new PhononStore(":memory:");
+  const createCounts = new Map<string, number>();
+  const fakeEngine = {
+    create: async (params: { project: string }) => {
+      createCounts.set(params.project, (createCounts.get(params.project) ?? 0) + 1);
+      const row = store.getSchedule(params.project === "p-catch" ? "catch" : "no-catch", "tenant-test");
+      assert.ok(row?.next_run_at && Date.parse(row.next_run_at as string) > now, "nextRunAt persisted before launch");
+      return { sessionId: `s-${params.project}-${createCounts.get(params.project)}` };
+    },
+    send: async () => ({ turnId: "t", disposition: "started" }),
+    terminate: async () => {},
+    interrupt: async () => {},
+  } as unknown as SessionEngine;
+  const put = (id: string, project: string, catchUp: boolean) => store.upsertSchedule({
+    id, tenantId: "tenant-test", name: id, enabled: true,
+    triggerJson: JSON.stringify({ kind: "cron", expr: "* * * * *", tz: "UTC" }),
+    targetJson: JSON.stringify({ runKind: "session", project, agent: "mock:default", model: "m1", prompt: "x" }),
+    consentJson: JSON.stringify({ push: "summary" }),
+    policyJson: JSON.stringify({ overlap: "skip", maxRetries: 0, catchUp }),
+    createdAt: "2026-08-16T10:00:00.000Z", updatedAt: "2026-08-16T10:00:00.000Z",
+    nextRunAt: "2026-08-16T10:01:00.000Z",
+  });
+  put("catch", "p-catch", true);
+  put("no-catch", "p-no-catch", false);
+  store.upsertRun({
+    id: "orphan-pending", scheduleId: "catch", tenantId: "tenant-test", triggerSource: "cron",
+    status: "pending", createdAt: "2026-08-16T11:00:00.000Z",
+  });
+  const scheduler = new SchedulerEngine({
+    tenantId: "tenant-test", engine: fakeEngine, store, now: () => now,
+    resolveCwd: () => "/tmp", emit: () => {},
+  });
+  scheduler.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(createCounts.get("p-catch"), 1);
+  assert.equal(createCounts.get("p-no-catch") ?? 0, 0);
+  assert.equal(store.getRun("orphan-pending", "tenant-test")?.status, "cancelled", "restart audits orphaned pending work");
+  scheduler.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(createCounts.get("p-catch"), 1, "same startup cannot replay catch-up twice");
+  scheduler.dispose("test done");
+  assert.equal(store.listActiveRuns("tenant-test").length, 0);
+  store.close();
+});
+
+test("L4: dispose audits queued/running runs and late events cannot revive them", async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-l4-dispose-")), "db.sqlite");
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({ name: "mock", agentIds: ["mock:default"], models: ["m1"], sendDelayMs: 120 }));
+  const store = new PhononStore(dbPath);
+  const tc = new TestConn({ registry: reg, trustLocal: true, store });
+  const project = await mkProject(tc);
+  const created = (await tc.call("schedule.create", {
+    name: "dispose", trigger: { kind: "manual" }, policy: { overlap: "queue", maxRetries: 0, catchUp: false },
+    target: { runKind: "session", project, agent: "mock:default", model: "m1", prompt: "x" },
+  })) as { schedule: { id: string } };
+  const first = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
+  const second = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id })) as { runId: string };
+  await tc.conn.dispose("test disconnect");
+  await new Promise((resolve) => setTimeout(resolve, 170));
+  assert.equal(store.getRun(first.runId, "tenant-test")?.status, "failed");
+  assert.equal(store.getRun(second.runId, "tenant-test")?.status, "cancelled");
+  assert.equal(store.listActiveRuns("tenant-test").length, 0);
   store.close();
 });

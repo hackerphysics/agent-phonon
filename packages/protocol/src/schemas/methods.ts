@@ -99,6 +99,8 @@ import {
   WorkflowStatusResult,
   WorkflowCancelParams,
   WorkflowCancelResult,
+  WorkflowPauseParams,
+  WorkflowPauseResult,
   WorkflowListParams,
   WorkflowListResult,
   WorkflowEvent,
@@ -116,6 +118,7 @@ import {
   MaintenanceDiagnoseParams, MaintenanceDiagnoseResult,
   MaintenanceConfigGetParams, MaintenanceConfigGetResult,
   MaintenanceConfigPatchParams, MaintenanceConfigPatchResult,
+  MaintenanceConfigEditParams, MaintenanceConfigEditResult,
   MaintenanceRollbackParams, MaintenanceRollbackResult,
   MaintenancePackageUpdateParams, MaintenancePackageUpdateResult,
   MaintenanceServiceStatusParams, MaintenanceServiceStatusResult,
@@ -219,6 +222,10 @@ export const METHODS = {
   "maintenance.config.patch": {
     direction: "s2p", kind: "request",
     params: MaintenanceConfigPatchParams, result: MaintenanceConfigPatchResult,
+  },
+  "maintenance.config.edit": {
+    direction: "s2p", kind: "request",
+    params: MaintenanceConfigEditParams, result: MaintenanceConfigEditResult,
   },
   "maintenance.rollback": {
     direction: "s2p", kind: "request",
@@ -552,6 +559,12 @@ export const METHODS = {
     kind: "request",
     params: WorkflowCancelParams,
     result: WorkflowCancelResult,
+  },
+  "workflow.pause": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowPauseParams,
+    result: WorkflowPauseResult,
   },
   "workflow.list": {
     direction: "s2p",

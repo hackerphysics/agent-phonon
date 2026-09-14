@@ -1,5 +1,5 @@
-import type { ChildProcess } from "node:child_process";
-import { spawnAgent } from "../proc.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
+import { discoveryProbe } from "../discovery-probe.js";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -55,7 +55,7 @@ class OpenClawSession implements AdapterSession {
   private sessionKey: string;
   private cwd: string;
   private openclawAgent: string;
-  private current?: ChildProcess;
+  private current?: ProcessSupervisor;
   /** 暂存的注入上下文（下次 send 拼进 input，不单独跑一轮，修 P0#13）。 */
   private pendingInject: string[] = [];
 
@@ -140,8 +140,9 @@ class OpenClawSession implements AdapterSession {
 
   async interrupt(): Promise<void> {
     if (this.current) {
-      this.current.kill("SIGTERM");
+      const current = this.current;
       this.current = undefined;
+      await current.terminate();
     }
   }
 
@@ -200,8 +201,9 @@ class OpenClawSession implements AdapterSession {
   private run(args: string[], signal?: AbortSignal, environment?: Record<string, string>): Promise<string | null> {
     return new Promise((resolve, reject) => {
       // shell:win32 — npm 全局 `openclaw` 在 Windows 是 .cmd shim，Node 22 不带 shell 直接 spawn .cmd 会抛 EINVAL（与 claude/codex/hermes adapter 保持一致）。
-      const child = spawnAgent("openclaw", args, { cwd: this.cwd, env: buildChildProcessEnvironment(environment) });
-      this.current = child;
+      const supervisor = spawnSupervisedAgent("openclaw", args, { cwd: this.cwd, env: buildChildProcessEnvironment(environment) });
+      const child = supervisor.child;
+      this.current = supervisor;
       let out = "";
       let err = "";
       let killed = false;
@@ -209,13 +211,14 @@ class OpenClawSession implements AdapterSession {
       child.stderr.on("data", (d) => (err += d.toString()));
       const onAbort = () => {
         killed = true;
-        child.kill("SIGTERM");
+        void supervisor.terminate();
       };
-      signal?.addEventListener("abort", onAbort, { once: true });
-      child.on("error", reject);
-      child.on("close", (code) => {
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+      child.once("error", reject);
+      child.once("close", (code) => {
         signal?.removeEventListener("abort", onAbort);
-        this.current = undefined;
+        if (this.current === supervisor) this.current = undefined;
         if (killed) return resolve(null);
         if (code === 0) resolve(out);
         else reject(new Error(`openclaw exited ${code}: ${err.slice(0, 500)}`));
@@ -238,9 +241,9 @@ export class OpenClawAdapter implements AgentAdapter {
     return (await this.discoverAgents())[0]!;
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     // 探测 openclaw 是否可用 + 版本
-    const version = await this.probeVersion();
+    const version = await this.probeVersion(signal);
     const available = version !== null;
     if (!available) {
       return [{
@@ -277,13 +280,7 @@ export class OpenClawAdapter implements AgentAdapter {
     return new OpenClawSession(params.sessionId, params.model, params.cwd, openclawAgent, params.initialContext);
   }
 
-  private probeVersion(): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawnAgent("openclaw", ["--version"], {});
-      let out = "";
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.on("error", () => resolve(null));
-      child.on("close", (code) => resolve(code === 0 ? out.trim() : null));
-    });
+  private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    return (await discoveryProbe("openclaw", ["--version"], signal));
   }
 }

@@ -1,0 +1,396 @@
+{
+  "schemaVersion": 1,
+  "packVersion": "2026.09.14.1",
+  "authoring": {
+    "tool": "skill_workshop",
+    "proposalId": "phonon-rescue-repairs-20260909-c7f535f960",
+    "proposalVersion": "v4",
+    "publication": "pending OpenClaw proposal, NOT applied or installed; user-authorized product resource import only",
+    "source": "packages/core/src/rescue-knowledge-source.md",
+    "sourceSha256": "7816d3fc2f6d85854969e03a1980e7c44e14b8b3c034c2ebcdf5cc440f04390b"
+  },
+  "entries": [
+    {
+      "id": "common-config-safety",
+      "title": "Checksum edits and rollback across five formats",
+      "agents": [
+        "opencode",
+        "claude-code",
+        "hermes",
+        "codex",
+        "copilot",
+        "phonon-rescue"
+      ],
+      "versions": [],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "any"
+      ],
+      "kind": "runtime-safety",
+      "symptoms": [
+        "stale SHA",
+        "redacted config",
+        "JSONC YAML TOML text",
+        "ACK is not success"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/rescue-text-config-20260909-170156.json",
+          "sha256": "78e503e5d8931e9742b628ce52edf68f7018852dd2c7a50e30aae770ef529be7",
+          "original": {
+            "path": "acceptance/rescue-text-config-20260909-170156/REPORT.zh-CN.md",
+            "sha256": "404b2b0c52e5e1ebbd07eba70abb5603000a59a3e739f6ad2c546220a29846f9",
+            "kind": "report-excerpts"
+          },
+          "level": "live-five-format-edit-rollback"
+        }
+      ],
+      "versionAliases": {}
+    },
+    {
+      "id": "opencode-custom-provider",
+      "title": "OpenCode native custom provider and defaults",
+      "agents": [
+        "opencode"
+      ],
+      "versions": [
+        "1.14.48"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "chat"
+      ],
+      "kind": "repair",
+      "symptoms": [
+        "ProviderModelNotFound",
+        "provider model not found",
+        "default model",
+        "模型找不到"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/rescue-agent-model-repair-20260909-163743.json",
+          "sha256": "17b42d5f7d7cb0de82ff5a3c109cbe7e9c5ff24800c82be8eda95f2ebe23c21b",
+          "original": {
+            "path": "acceptance/rescue-agent-model-repair-20260909-163743/REPORT.zh-CN.md",
+            "sha256": "5a7c2bae6607a53daf87774a717a9eb154c3aaa1ff92045a1fcad2e31eee439c",
+            "kind": "report-excerpts"
+          },
+          "level": "live-native-read-finaltext"
+        }
+      ],
+      "versionAliases": {}
+    },
+    {
+      "id": "claude-native-messages",
+      "title": "Claude independent Messages settings and role aliases",
+      "agents": [
+        "claude-code"
+      ],
+      "versions": [
+        "2.1.123"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "anthropic"
+      ],
+      "kind": "repair",
+      "symptoms": [
+        "role alias",
+        "opus sonnet haiku",
+        "native daemon override",
+        "Messages",
+        "claudeSettingsPath",
+        "settingsPath",
+        "legacy token",
+        "daemon settings"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence",
+        "Native CLI version is distinct from Phonon app version; verify deployed implementation against the unreleased adapter-fixes-20260909-192727 revision, not npm 0.9.1 alone"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/rescue-agent-model-repair-20260909-163743.json",
+          "sha256": "17b42d5f7d7cb0de82ff5a3c109cbe7e9c5ff24800c82be8eda95f2ebe23c21b",
+          "original": {
+            "path": "acceptance/rescue-agent-model-repair-20260909-163743/REPORT.zh-CN.md",
+            "sha256": "5a7c2bae6607a53daf87774a717a9eb154c3aaa1ff92045a1fcad2e31eee439c",
+            "kind": "report-excerpts"
+          },
+          "level": "live-native-read-finaltext"
+        },
+        {
+          "path": "docs/rescue-evidence/claude-gpt-compat-20260909-173426.json",
+          "sha256": "92000fe4b12f6952dbf5acf3c8ad8d350a6633e69be1d9eec88bac0e26a1dfa8",
+          "original": {
+            "path": "acceptance/claude-gpt-compat-20260909-173426/REPORT.zh-CN.md",
+            "sha256": "e88695b2af3c137db02bc5dc1c40bed00b3b70dca511e000fd9c5e3a8d449367",
+            "kind": "report-excerpts"
+          },
+          "level": "live-native-role-aliases"
+        },
+        {
+          "path": "docs/rescue-evidence/adapter-fixes-20260909-192727.json",
+          "sha256": "df082256388ffcd692f69aaf1dd9933a54c36e62f280c56935a06986a01ac39a",
+          "original": {
+            "path": "acceptance/adapter-fixes-20260909-192727/REPORT.zh-CN.md",
+            "sha256": "1a316b5e4765a18d9fbc2e1cf9d05375741bce293dada2c41a64120f52ad79b3",
+            "kind": "report-excerpts"
+          },
+          "level": "live-isolated-daemon-settings-native-tools-failure-retry"
+        },
+        {
+          "path": "docs/rescue-evidence/adapter-fixes-20260909-192727-patch.json",
+          "sha256": "d4f098cd53e0903568846b205f20da14dc6f55fdb0a6700b2757242116412f5b",
+          "original": {
+            "path": "acceptance/adapter-fixes-20260909-192727/incremental.diff",
+            "sha256": "76e66934f439f072150dcef42ad59b51b5f92c0a2198178b5b9807ee8074ba87",
+            "kind": "exact-public-patch"
+          },
+          "level": "unreleased-implementation-revision-not-npm-version"
+        }
+      ],
+      "versionAliases": {
+        "2.1.123 (Claude Code)": "2.1.123"
+      }
+    },
+    {
+      "id": "claude-responses-final-items",
+      "title": "Claude GPT final-item-only SSE and stopped sidecar",
+      "agents": [
+        "claude-code"
+      ],
+      "versions": [
+        "2.1.123"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "responses",
+        "anthropic"
+      ],
+      "kind": "conditional-repair",
+      "symptoms": [
+        "empty final text",
+        "final-item-only",
+        "GPT",
+        "sidecar stopped",
+        "工具执行但文字空"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/claude-gpt-compat-20260909-173426.json",
+          "sha256": "92000fe4b12f6952dbf5acf3c8ad8d350a6633e69be1d9eec88bac0e26a1dfa8",
+          "original": {
+            "path": "acceptance/claude-gpt-compat-20260909-173426/REPORT.zh-CN.md",
+            "sha256": "e88695b2af3c137db02bc5dc1c40bed00b3b70dca511e000fd9c5e3a8d449367",
+            "kind": "report-excerpts"
+          },
+          "level": "live-native-two-dependent-reads-finaltext"
+        }
+      ],
+      "versionAliases": {
+        "2.1.123 (Claude Code)": "2.1.123"
+      }
+    },
+    {
+      "id": "hermes-named-provider",
+      "title": "Hermes YAML named provider",
+      "agents": [
+        "hermes"
+      ],
+      "versions": [
+        "0.16.0"
+      ],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "chat"
+      ],
+      "kind": "repair",
+      "symptoms": [
+        "provider not configured",
+        "named provider",
+        "YAML",
+        "provider未配置",
+        "-z -m",
+        "structured error",
+        "HTTP404",
+        "streaming false",
+        "resume"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence",
+        "Native CLI version is distinct from Phonon app version; verify deployed implementation against the unreleased adapter-fixes-20260909-192727 revision, not npm 0.9.1 alone"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/rescue-text-config-20260909-170156.json",
+          "sha256": "78e503e5d8931e9742b628ce52edf68f7018852dd2c7a50e30aae770ef529be7",
+          "original": {
+            "path": "acceptance/rescue-text-config-20260909-170156/REPORT.zh-CN.md",
+            "sha256": "404b2b0c52e5e1ebbd07eba70abb5603000a59a3e739f6ad2c546220a29846f9",
+            "kind": "report-excerpts"
+          },
+          "level": "live-native-read-finaltext"
+        },
+        {
+          "path": "docs/rescue-evidence/adapter-fixes-20260909-192727.json",
+          "sha256": "df082256388ffcd692f69aaf1dd9933a54c36e62f280c56935a06986a01ac39a",
+          "original": {
+            "path": "acceptance/adapter-fixes-20260909-192727/REPORT.zh-CN.md",
+            "sha256": "1a316b5e4765a18d9fbc2e1cf9d05375741bce293dada2c41a64120f52ad79b3",
+            "kind": "report-excerpts"
+          },
+          "level": "live-isolated-daemon-settings-native-tools-failure-retry"
+        },
+        {
+          "path": "docs/rescue-evidence/adapter-fixes-20260909-192727-patch.json",
+          "sha256": "d4f098cd53e0903568846b205f20da14dc6f55fdb0a6700b2757242116412f5b",
+          "original": {
+            "path": "acceptance/adapter-fixes-20260909-192727/incremental.diff",
+            "sha256": "76e66934f439f072150dcef42ad59b51b5f92c0a2198178b5b9807ee8074ba87",
+            "kind": "exact-public-patch"
+          },
+          "level": "unreleased-implementation-revision-not-npm-version"
+        }
+      ],
+      "versionAliases": {
+        "Hermes Agent v0.16.0 (2026.6.5) · upstream c6b0eb4d": "0.16.0"
+      }
+    },
+    {
+      "id": "codex-copilot-boundaries",
+      "title": "Codex TOML and Copilot default: limited evidence only",
+      "agents": [
+        "codex",
+        "copilot"
+      ],
+      "versions": [],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "any"
+      ],
+      "kind": "boundary-only",
+      "symptoms": [
+        "TOML",
+        "native default",
+        "diagnostic exit 0"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/rescue-text-config-20260909-170156.json",
+          "sha256": "78e503e5d8931e9742b628ce52edf68f7018852dd2c7a50e30aae770ef529be7",
+          "original": {
+            "path": "acceptance/rescue-text-config-20260909-170156/REPORT.zh-CN.md",
+            "sha256": "404b2b0c52e5e1ebbd07eba70abb5603000a59a3e739f6ad2c546220a29846f9",
+            "kind": "report-excerpts"
+          },
+          "level": "live-format-edit-rollback-not-codex-provider"
+        },
+        {
+          "path": "docs/rescue-evidence/rescue-protocols-20260909-160740.json",
+          "sha256": "1b72628111d8c5371a22f99f70dcaac8adf289a9249308111da1550a6043a84e",
+          "original": {
+            "path": "acceptance/rescue-protocols-20260909-160740/REPORT.zh-CN.md",
+            "sha256": "8bc2904b17d66668e9c4f86233aa3360d3bb29e5511789ad3c7a7949f49a0b65",
+            "kind": "report-excerpts"
+          },
+          "level": "native-discovery-diagnostic-limited"
+        }
+      ],
+      "versionAliases": {}
+    },
+    {
+      "id": "rescue-wire-protocols",
+      "title": "Four explicit Rescue wire protocols with evidence levels",
+      "agents": [
+        "phonon-rescue"
+      ],
+      "versions": [],
+      "platforms": [
+        "linux"
+      ],
+      "protocols": [
+        "chat",
+        "responses",
+        "anthropic",
+        "gemini"
+      ],
+      "kind": "runtime-safety",
+      "symptoms": [
+        "wireApi",
+        "protocol",
+        "Gemini 404",
+        "final-item"
+      ],
+      "preconditions": [
+        "Registered target/config with owner-granted permissions",
+        "Discovered agent/version/platform and user-confirmed endpoint/model/protocol",
+        "Load common-config-safety; stop on missing or incompatible evidence"
+      ],
+      "verification": "Config readback/diagnose is separate from native actual tool + same-ID result + final file marker.",
+      "rollback": "Use common-config-safety: current SHA + returned backupId; verify restored bytes. No mutation needs no rollback.",
+      "evidence": [
+        {
+          "path": "docs/rescue-evidence/rescue-protocols-20260909-160740.json",
+          "sha256": "1b72628111d8c5371a22f99f70dcaac8adf289a9249308111da1550a6043a84e",
+          "original": {
+            "path": "acceptance/rescue-protocols-20260909-160740/REPORT.zh-CN.md",
+            "sha256": "8bc2904b17d66668e9c4f86233aa3360d3bb29e5511789ad3c7a7949f49a0b65",
+            "kind": "report-excerpts"
+          },
+          "level": "live-responses-mutation-anthropic-readonly-gemini-simulated"
+        }
+      ],
+      "versionAliases": {}
+    }
+  ]
+}

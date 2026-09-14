@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
-import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type {
   MaintenanceConfigGetResult,
+  MaintenanceConfigEditParams,
   MaintenanceConfigPatchParams,
   MaintenanceConfigPatchResult,
   MaintenanceDiagnoseResult,
@@ -14,6 +15,7 @@ import type {
   MaintenanceServiceStatusResult,
   MaintenanceTargetsResult,
 } from "@agent-phonon/protocol";
+import { readConfigBytes, decodeConfig, parseConfig, plainMapping, comparable, equalConfig, assertRootChanges, editConfigText, formatMergePatch, uncertainText, type ConfigFormat } from "./maintenance-file.js";
 import { PhononError } from "./rpc.js";
 import { spawnAgent } from "./proc.js";
 import type { PolicyEnforcer } from "./policy.js";
@@ -22,10 +24,14 @@ export interface MaintenanceConfigTarget {
   configId: string;
   label?: string;
   path: string;
-  format: "json";
+  format: ConfigFormat;
+  /** Owner attests this exact file contains only public text. Default hidden. */
+  textVisibility?: "hidden" | "public";
+  /** Required in addition to writable for unstructured text, never grants paths. */
+  wholeFileWritable?: boolean;
   /** Default false. Sensitive host configs must opt in explicitly. */
   writable?: boolean;
-  /** Root JSON keys that a merge patch may touch. Required when writable=true. */
+  /** Root structured keys that a merge patch may touch. Required when writable=true. */
   allowedRootKeys?: string[];
 }
 
@@ -63,6 +69,7 @@ export interface MaintenanceRuntime {
   targets(): Promise<MaintenanceTargetsResult>;
   diagnose(targetId?: string, signal?: AbortSignal): Promise<MaintenanceDiagnoseResult>;
   configGet(targetId: string, configId: string): Promise<MaintenanceConfigGetResult>;
+  configEdit(params: MaintenanceConfigEditParams): Promise<MaintenanceConfigPatchResult>;
   configPatch(params: MaintenanceConfigPatchParams): Promise<MaintenanceConfigPatchResult>;
   rollback(backupId: string, expectedCurrentSha256: string, reason?: string): Promise<MaintenanceRollbackResult>;
   packageUpdate(targetId: string, version?: string, signal?: AbortSignal): Promise<MaintenancePackageUpdateResult>;
@@ -88,6 +95,7 @@ function sha256(data: string | Buffer): string {
 
 function redact(value: unknown, key = ""): unknown {
   if (SECRET_KEY.test(key) && value !== undefined && value !== null) return "***";
+  if (value instanceof Date) return value;
   if (Array.isArray(value)) return value.map((v) => redact(v));
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redact(v, k)]));
@@ -127,7 +135,7 @@ function sanitizeVersion(version?: string): string {
 async function runBounded(command: string, args: string[], opts: { timeoutMs?: number; maxBytes?: number; signal?: AbortSignal } = {}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const safeEnv: NodeJS.ProcessEnv = { NO_COLOR: "1" };
-    for (const key of ["PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMP", "TEMP", "NPM_CONFIG_PREFIX", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
+    for (const key of ["PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMP", "TEMP", "NPM_CONFIG_PREFIX", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]) {
       if (process.env[key] !== undefined) safeEnv[key] = process.env[key];
     }
     const child = spawnAgent(command, args, { env: safeEnv });
@@ -176,6 +184,9 @@ export class MaintenanceManager implements MaintenanceRuntime {
         this.assertLocalId(entry.configId, "configId");
         if (configIds.has(entry.configId)) throw new Error(`duplicate config ${target.targetId}/${entry.configId}`);
         configIds.add(entry.configId);
+        if (!["json", "jsonc", "yaml", "toml", "text"].includes(entry.format)) throw new Error("unsupported maintenance config format");
+        if (entry.textVisibility !== undefined && !["hidden", "public"].includes(entry.textVisibility)) throw new Error("invalid textVisibility");
+        if (entry.format === "text" && entry.writable && (entry.wholeFileWritable !== true || entry.textVisibility !== "public")) throw new Error("writable text requires explicit public visibility and wholeFileWritable");
       }
       const serviceIds = new Set<string>();
       for (const service of target.services ?? []) {
@@ -202,6 +213,9 @@ export class MaintenanceManager implements MaintenanceRuntime {
           configId: config.configId,
           label: config.label,
           format: config.format,
+          textVisibility: config.textVisibility ?? "hidden",
+          wholeFileWritable: config.wholeFileWritable === true,
+          allowedRootKeys: config.allowedRootKeys,
           exists: existsSync(config.path),
           writable: config.writable === true,
         })),
@@ -235,8 +249,8 @@ export class MaintenanceManager implements MaintenanceRuntime {
           continue;
         }
         try {
-          const raw = await readFile(config.path, "utf8");
-          JSON.parse(raw);
+          const raw = await readConfigBytes(config.path);
+          parseConfig(decodeConfig(raw), config.format);
           configs.push({ configId: config.configId, exists: true, valid: true, sha256: sha256(raw) });
         } catch (err) {
           configs.push({ configId: config.configId, exists: true, valid: false, error: (err as Error).message.slice(0, 500) });
@@ -252,47 +266,73 @@ export class MaintenanceManager implements MaintenanceRuntime {
   async configGet(targetId: string, configId: string): Promise<MaintenanceConfigGetResult> {
     this.policy.assertMaintenanceRead();
     const config = this.getConfig(this.getTarget(targetId), configId);
-    if (!existsSync(config.path)) return { targetId, configId, exists: false };
-    const raw = await readFile(config.path, "utf8");
-    let parsed: unknown;
-    try { parsed = JSON.parse(raw); }
-    catch (err) { throw new PhononError("errInvalidParams", `configured JSON is invalid: ${(err as Error).message}`); }
-    return { targetId, configId, exists: true, sha256: sha256(raw), value: redact(parsed) };
+    if (!existsSync(config.path)) return { targetId, configId, format: config.format, exists: false };
+    const raw = await readConfigBytes(config.path);
+    const text = decodeConfig(raw);
+    const parsed = parseConfig(text, config.format);
+    const publicText = config.textVisibility === "public" && !uncertainText(text) && (config.format === "text" || equalConfig(parsed, redact(parsed)));
+    return { targetId, configId, format: config.format, exists: true, sha256: sha256(raw),
+      ...(config.format !== "text" ? { value: comparable(redact(parsed)) } : {}),
+      ...(publicText ? { text } : { textWithheld: true }) };
   }
 
   async configPatch(params: MaintenanceConfigPatchParams): Promise<MaintenanceConfigPatchResult> {
     this.policy.assertMaintenanceConfigWrite();
     if (containsRedactedSecret(params.patch)) {
-      throw new PhononError("errInvalidParams", "patch contains redacted secret placeholder; omit unchanged secrets or supply a real new value");
+      throw new PhononError("errInvalidParams", "patch contains redacted secret placeholder; omit unchanged secrets");
     }
-    const target = this.getTarget(params.targetId);
-    const config = this.getConfig(target, params.configId);
-    if (config.writable !== true) throw new PhononError("errPolicyDenied", `config ${params.targetId}/${params.configId} is read-only`);
+    const config = this.getConfig(this.getTarget(params.targetId), params.configId);
+    if (!plainMapping(params.patch)) throw new PhononError("errInvalidParams", "patch must be a mapping");
     const allowed = new Set(config.allowedRootKeys ?? []);
-    const patchKeys = Object.keys(params.patch);
-    if (allowed.size === 0 || patchKeys.some((key) => !allowed.has(key))) {
-      throw new PhononError("errPolicyDenied", `patch touches non-allowlisted root keys: ${patchKeys.filter((key) => !allowed.has(key)).join(", ") || "all"}`);
-    }
+    if (!allowed.size || Object.keys(params.patch).some(k => !allowed.has(k))) throw new PhononError("errPolicyDenied", "patch touches non-allowlisted root keys");
+    return this.mutateConfig(config, params, (text, current) => {
+      if (!plainMapping(current)) throw new PhononError("errInvalidParams", "maintenance config root must remain a plain mapping");
+      // Validate keys/types before RFC 7396 recursion, including prototype keys.
+      const formatted = formatMergePatch(text, config.format, current, params.patch);
+      const expected = applyJsonMergePatch(current, params.patch);
+      if (!equalConfig(parseConfig(formatted, config.format), expected)) throw new PhononError("errInvalidParams", "merge patch could not preserve config semantics");
+      return equalConfig(current, expected) ? text : formatted;
+    });
+  }
+
+  async configEdit(params: MaintenanceConfigEditParams): Promise<MaintenanceConfigPatchResult> {
+    this.policy.assertMaintenanceConfigWrite();
+    const config = this.getConfig(this.getTarget(params.targetId), params.configId);
+    return this.mutateConfig(config, params, (text, current) => {
+      // Secret-bearing files are edited structurally from server-owned originals,
+      // never by matching model-visible redacted text or hidden secret spans.
+      if (config.textVisibility !== "public" || uncertainText(text) || (config.format !== "text" && !equalConfig(current, redact(current)))) {
+        throw new PhononError("errPolicyDenied", "exact editing requires public text with no uncertain secret fragments; use structured patch");
+      }
+      if (config.format === "text" && config.wholeFileWritable !== true) throw new PhononError("errPolicyDenied", "text requires whole-file authorization");
+      const next = editConfigText(text, params.edits);
+      if (uncertainText(next)) throw new PhononError("errPolicyDenied", "edited text contains uncertain secret fragments");
+      return next;
+    });
+  }
+
+  private async mutateConfig(config: MaintenanceConfigTarget, params: { targetId: string; configId: string; expectedSha256: string; reason?: string }, transform: (text: string, current: unknown) => string): Promise<MaintenanceConfigPatchResult> {
+    if (config.writable !== true) throw new PhononError("errPolicyDenied", `config ${params.targetId}/${params.configId} is read-only`);
     return this.withConfigLock(config.path, async () => {
-      if (!existsSync(config.path)) throw new PhononError("errInvalidParams", `config does not exist: ${params.targetId}/${params.configId}`);
-      const raw = await readFile(config.path, "utf8");
+      await this.assertNoSymlinkTarget(config.path);
+      const raw = await readConfigBytes(config.path);
       const previousSha256 = sha256(raw);
-      if (previousSha256 !== params.expectedSha256) {
-        throw new PhononError("errInvalidParams", `config changed since read (expected ${params.expectedSha256}, got ${previousSha256})`);
+      if (previousSha256 !== params.expectedSha256) throw new PhononError("errInvalidParams", `config changed since read (expected ${params.expectedSha256}, got ${previousSha256})`);
+      const text = decodeConfig(raw);
+      const current = parseConfig(text, config.format);
+      const formatted = transform(text, current);
+      const next = parseConfig(formatted, config.format);
+      if (config.format !== "text") {
+        assertRootChanges(current, next, config.allowedRootKeys ?? []);
+        if (containsRedactedSecret(next)) throw new PhononError("errInvalidParams", "config contains redacted secret placeholder");
       }
-      let current: unknown;
-      try { current = JSON.parse(raw); }
-      catch (err) { throw new PhononError("errInvalidParams", `configured JSON is invalid: ${(err as Error).message}`); }
-      const next = applyJsonMergePatch(current, params.patch);
-      if (!next || typeof next !== "object" || Array.isArray(next)) throw new PhononError("errInvalidParams", "maintenance config root must remain a JSON object");
-      const formatted = JSON.stringify(next, null, 2) + "\n";
       const nextSha256 = sha256(formatted);
-      if (nextSha256 === previousSha256 || JSON.stringify(next) === JSON.stringify(current)) {
-        return { targetId: params.targetId, configId: params.configId, changed: false, previousSha256, sha256: previousSha256 };
-      }
+      if (nextSha256 === previousSha256) return { targetId: params.targetId, configId: params.configId, format: config.format, changed: false, previousSha256, sha256: previousSha256 };
       const backup = await this.createBackup(params.targetId, params.configId, config.path, raw, params.reason);
+      // Recheck after backup I/O as well as under the per-path broker lock.
+      if (sha256(await readConfigBytes(config.path)) !== previousSha256) throw new PhononError("errInvalidParams", "config changed during write preparation");
       await this.atomicWrite(config.path, formatted);
-      return { targetId: params.targetId, configId: params.configId, changed: true, previousSha256, sha256: nextSha256, backupId: backup.backupId };
+      return { targetId: params.targetId, configId: params.configId, format: config.format, changed: true, previousSha256, sha256: nextSha256, backupId: backup.backupId };
     });
   }
 
@@ -305,15 +345,20 @@ export class MaintenanceManager implements MaintenanceRuntime {
     if (config.writable !== true) throw new PhononError("errPolicyDenied", `config ${metadata.targetId}/${metadata.configId} is read-only`);
     if (config.path !== metadata.originalPath) throw new PhononError("errPolicyDenied", "backup target path no longer matches local configuration");
     return this.withConfigLock(config.path, async () => {
-      const current = await readFile(config.path);
+      const current = await readConfigBytes(config.path);
       const currentSha = sha256(current);
       if (currentSha !== expectedCurrentSha256) {
         throw new PhononError("errInvalidParams", `config changed before rollback (expected ${expectedCurrentSha256}, got ${currentSha})`);
       }
       const raw = await readFile(join(this.backupDir, `${backupId}.data`));
       if (sha256(raw) !== metadata.sha256) throw new PhononError("errInternal", "backup checksum mismatch");
+      const before = parseConfig(decodeConfig(current), config.format);
+      const after = parseConfig(decodeConfig(raw), config.format);
+      if (config.format !== "text") assertRootChanges(before, after, config.allowedRootKeys ?? []);
+      else if (config.wholeFileWritable !== true || config.textVisibility !== "public" || uncertainText(decodeConfig(raw))) throw new PhononError("errPolicyDenied", "rollback lacks public whole-file authorization");
       // Preserve the state being replaced so rollback is itself reversible.
-      const reversible = await this.createBackup(metadata.targetId, metadata.configId, config.path, current.toString("utf8"), `pre-rollback ${backupId}`);
+      const reversible = await this.createBackup(metadata.targetId, metadata.configId, config.path, current, `pre-rollback ${backupId}`);
+      if (sha256(await readConfigBytes(config.path)) !== currentSha) throw new PhononError("errInvalidParams", "config changed during rollback preparation");
       await this.atomicWrite(config.path, raw);
       return { backupId, targetId: metadata.targetId, configId: metadata.configId, restored: true as const, sha256: metadata.sha256, reversibleBackupId: reversible.backupId };
     });
@@ -424,7 +469,7 @@ export class MaintenanceManager implements MaintenanceRuntime {
     }
   }
 
-  private async createBackup(targetId: string, configId: string, originalPath: string, raw: string, reason?: string): Promise<BackupMetadata> {
+  private async createBackup(targetId: string, configId: string, originalPath: string, raw: string | Buffer, reason?: string): Promise<BackupMetadata> {
     await mkdir(this.backupDir, { recursive: true, mode: 0o700 });
     const backupId = `${targetId}-${configId}-${Date.now()}-${randomBytes(4).toString("hex")}`.replace(/[^A-Za-z0-9._-]/g, "_");
     const metadata: BackupMetadata = { backupId, targetId, configId, originalPath, sha256: sha256(raw), createdAt: new Date().toISOString(), reason };
@@ -455,17 +500,11 @@ export class MaintenanceManager implements MaintenanceRuntime {
     await mkdir(dirname(path), { recursive: true });
     const mode = await stat(path).then((s) => s.mode & 0o777).catch(() => 0o600);
     const temp = join(dirname(path), `.${basename(path)}.phonon-${process.pid}-${randomBytes(4).toString("hex")}.tmp`);
-    await writeFile(temp, data, { mode });
     try {
+      await writeFile(temp, data, { mode, flag: "wx" });
+      // Fail closed on platforms that cannot atomically replace; never copy-over.
       await rename(temp, path);
-    } catch (err) {
-      if (platform() !== "win32") {
-        await rm(temp, { force: true }).catch(() => {});
-        throw err;
-      }
-      // Windows may reject replacing an existing file. The original already has
-      // a checksum-verified backup, so fall back to copy-over and remove temp.
-      await copyFile(temp, path);
+    } finally {
       await rm(temp, { force: true }).catch(() => {});
     }
   }

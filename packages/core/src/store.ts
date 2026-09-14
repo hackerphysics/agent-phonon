@@ -9,8 +9,8 @@ import { SecretBox } from "./secret-box.js";
  * 用 Node 原生 `node:sqlite`（Node 22.5+，零第三方依赖、免编译）。
  * daemon 重启后 projects/skills/worktrees/sessions 元数据/outbox/幂等不丢。
  *
- * v0 落这些表：projects, worktrees, skills, sessions, outbox_events,
- * idempotency, pending_interactions。tenant/inbox_queue 后续按需。
+ * 主要表：projects, worktrees, skills, sessions, outbox_events/outbox_acks,
+ * connection_tenants, idempotency, pending_interactions。tenant/inbox_queue 后续按需。
  */
 export class PhononStore {
   private db: DatabaseSync;
@@ -88,6 +88,17 @@ export class PhononStore {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_outbox_tenant ON outbox_events(tenant_id, session_id, seq);
+      CREATE TABLE IF NOT EXISTS outbox_acks (
+        tenant_id  TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        last_seq   INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, session_id)
+      );
+      CREATE TABLE IF NOT EXISTS connection_tenants (
+        server_url TEXT PRIMARY KEY,
+        tenant_id  TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS idempotency (
         k          TEXT PRIMARY KEY,
         result     TEXT NOT NULL,
@@ -152,6 +163,24 @@ export class PhononStore {
       );
       CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id, created_at);
+      CREATE TABLE IF NOT EXISTS workflow_events (
+        workflow_id TEXT NOT NULL,
+        tenant_id   TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        payload     TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (workflow_id, seq)
+      );
+      CREATE INDEX IF NOT EXISTS idx_workflow_events_tenant ON workflow_events(tenant_id, workflow_id, seq);
+      CREATE TABLE IF NOT EXISTS run_events (
+        run_id      TEXT NOT NULL,
+        tenant_id   TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        payload     TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (run_id, seq)
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_events_tenant ON run_events(tenant_id, run_id, seq);
       CREATE TABLE IF NOT EXISTS schedules (
         id          TEXT PRIMARY KEY,
         tenant_id   TEXT NOT NULL,
@@ -195,6 +224,36 @@ export class PhononStore {
     // 用 PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN。
     // sessions.transcript_path：phonon 自存的会话快照 JSONL 路径（可观测/审计）。
     this.ensureColumn("sessions", "transcript_path", "TEXT");
+    // stream_seq 保存“下一条 stream.event 的 seq”。旧库从 outbox 最大值兜底恢复；
+    // 新事件在发送前推进此值，确保全部 ACK 后重启也不会从 0 碰撞。
+    this.ensureColumn("sessions", "stream_seq", "INTEGER NOT NULL DEFAULT 0");
+    // L4 retry audit：旧库增量升级时保留既有 run 数据。
+    this.ensureColumn("runs", "attempt", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runs", "max_attempts", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("runs", "retry_history_json", "TEXT NOT NULL DEFAULT '[]'");
+    // L3 recovery ownership + durable mode cursor. owner_epoch is a fencing
+    // token: a replaced connection can no longer overwrite its successor.
+    this.ensureColumn("workflows", "checkpoint_json", "TEXT");
+    this.ensureColumn("workflows", "owner_id", "TEXT");
+    this.ensureColumn("workflows", "owner_epoch", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("workflows", "lease_until", "INTEGER");
+    this.ensureColumn("workflows", "metadata_json", "TEXT");
+    this.ensureColumn("runs", "input_json", "TEXT");
+    this.ensureColumn("runs", "phase", "TEXT");
+    this.ensureColumn("runs", "retry_at", "INTEGER");
+    this.ensureColumn("runs", "owner_id", "TEXT");
+    this.ensureColumn("runs", "owner_epoch", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("runs", "lease_until", "INTEGER");
+    this.ensureColumn("runs", "event_seq", "INTEGER NOT NULL DEFAULT 0");
+    // 旧版本允许重复行。先确定性保留最早一条，再建立真正的幂等唯一约束。
+    this.db.exec(`
+      DELETE FROM outbox_events
+       WHERE id NOT IN (
+         SELECT MIN(id) FROM outbox_events GROUP BY tenant_id, session_id, seq
+       );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_unique
+        ON outbox_events(tenant_id, session_id, seq);
+    `);
     // env_vars.tenant_id 必须保持 nullable：升级前的行没有可证明的 tenant
     // 归属，留作隔离区，绝不能静默分配或作为所有 tenant 的共享兜底。
     this.ensureColumn("env_vars", "tenant_id", "TEXT");
@@ -293,17 +352,22 @@ export class PhononStore {
   }
 
   // ---- sessions（元数据，OpenClaw 原生可 resume）----
-  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string }): void {
+  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string; streamSeq?: number }): void {
     this.db
       .prepare(
-        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path,stream_seq)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, status=excluded.status, last_active=excluded.last_active,
-           transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path)`,
+           transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path),
+           stream_seq=MAX(sessions.stream_seq, excluded.stream_seq)
+         WHERE sessions.tenant_id=excluded.tenant_id`,
       )
-      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null);
+      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null, r.streamSeq ?? 0);
   }
-  loadSessions(): Array<Record<string, unknown>> {
+  loadSessions(tenantId?: string): Array<Record<string, unknown>> {
+    if (tenantId !== undefined) {
+      return this.db.prepare("SELECT * FROM sessions WHERE tenant_id=? AND status != 'terminated'").all(tenantId) as Record<string, unknown>[];
+    }
     return this.db.prepare("SELECT * FROM sessions WHERE status != 'terminated'").all() as Record<string, unknown>[];
   }
   /** 列出全部 session（含 terminated）—— prune/审计用。 */
@@ -316,19 +380,78 @@ export class PhononStore {
   }
 
   // ---- outbox ----
-  outboxAdd(tenantId: string, sessionId: string, seq: number, payload: string, createdAt: string): void {
-    this.db.prepare("INSERT INTO outbox_events(tenant_id,session_id,seq,payload,created_at) VALUES(?,?,?,?,?)").run(tenantId, sessionId, seq, payload, createdAt);
+  outboxAdd(tenantId: string, sessionId: string, seq: number, payload: string, createdAt: string): boolean {
+    // Event durability and sequence advancement are one transaction. Advancing
+    // sessions.stream_seq first would leave a permanent protocol gap if the
+    // process crashed before the outbox row was inserted.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare("INSERT OR IGNORE INTO outbox_events(tenant_id,session_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
+        .run(tenantId, sessionId, seq, payload, createdAt);
+      this.db.prepare("UPDATE sessions SET stream_seq=MAX(stream_seq, ?) WHERE session_id=? AND tenant_id=?")
+        .run(seq + 1, sessionId, tenantId);
+      this.db.exec("COMMIT");
+      return Number(result.changes) > 0;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* preserve the original failure */ }
+      throw err;
+    }
   }
-  outboxAck(tenantId: string, sessionId: string | undefined, lastSeq: number): void {
-    if (sessionId) this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq<=?").run(tenantId, sessionId, lastSeq);
-    else this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND seq<=?").run(tenantId, lastSeq);
+  outboxDelete(tenantId: string, sessionId: string, seq: number): void {
+    this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq=?")
+      .run(tenantId, sessionId, seq);
+  }
+  outboxMarkFinalized(tenantId: string, sessionId: string, lastSeq: number): void {
+    this.db.prepare(
+      `INSERT INTO outbox_acks(tenant_id,session_id,last_seq) VALUES(?,?,?)
+       ON CONFLICT(tenant_id,session_id) DO UPDATE SET last_seq=MAX(last_seq, excluded.last_seq)`,
+    ).run(tenantId, sessionId, lastSeq);
+  }
+  outboxAck(tenantId: string, sessionId: string, lastSeq: number): void {
+    this.outboxMarkFinalized(tenantId, sessionId, lastSeq);
+    this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq<=?").run(tenantId, sessionId, lastSeq);
   }
   outboxLoad(tenantId: string): Array<{ sessionId: string; seq: number; payload: string }> {
-    return (this.db.prepare("SELECT session_id,seq,payload FROM outbox_events WHERE tenant_id=? ORDER BY seq").all(tenantId) as Record<string, unknown>[]).map((r) => ({
+    return (this.db.prepare("SELECT session_id,seq,payload FROM outbox_events WHERE tenant_id=? ORDER BY id").all(tenantId) as Record<string, unknown>[]).map((r) => ({
       sessionId: r.session_id as string,
       seq: r.seq as number,
       payload: r.payload as string,
     }));
+  }
+  outboxLoadFinalized(tenantId: string): Array<{ sessionId: string; lastSeq: number }> {
+    return (this.db.prepare("SELECT session_id,last_seq FROM outbox_acks WHERE tenant_id=? ORDER BY session_id").all(tenantId) as Record<string, unknown>[]).map((r) => ({
+      sessionId: r.session_id as string,
+      lastSeq: r.last_seq as number,
+    }));
+  }
+  outboxNextSeq(tenantId: string, sessionId: string): number {
+    const row = this.db.prepare(
+      `SELECT MAX(seq) AS max_seq FROM (
+         SELECT seq FROM outbox_events WHERE tenant_id=? AND session_id=?
+         UNION ALL
+         SELECT last_seq AS seq FROM outbox_acks WHERE tenant_id=? AND session_id=?
+       )`,
+    ).get(tenantId, sessionId, tenantId, sessionId) as { max_seq: number | null } | undefined;
+    return row?.max_seq == null ? 0 : row.max_seq + 1;
+  }
+  outboxResumeFrom(tenantId: string): Array<{ sessionId: string; fromSeq: number }> {
+    return (this.db.prepare(
+      "SELECT session_id,MIN(seq) AS from_seq FROM outbox_events WHERE tenant_id=? GROUP BY session_id ORDER BY session_id",
+    ).all(tenantId) as Array<{ session_id: string; from_seq: number }>).map((r) => ({
+      sessionId: r.session_id,
+      fromSeq: r.from_seq,
+    }));
+  }
+
+  rememberConnectionTenant(serverUrl: string, tenantId: string, updatedAt: string): void {
+    this.db.prepare(
+      `INSERT INTO connection_tenants(server_url,tenant_id,updated_at) VALUES(?,?,?)
+       ON CONFLICT(server_url) DO UPDATE SET tenant_id=excluded.tenant_id, updated_at=excluded.updated_at`,
+    ).run(serverUrl, tenantId, updatedAt);
+  }
+  connectionTenant(serverUrl: string): string | undefined {
+    const row = this.db.prepare("SELECT tenant_id FROM connection_tenants WHERE server_url=?").get(serverUrl) as { tenant_id: string } | undefined;
+    return row?.tenant_id;
   }
 
   // ---- env vars（设备本地环境变量配置，默认脱敏返回）----
@@ -409,27 +532,124 @@ export class PhononStore {
     mode: string; planJson: string; input?: string; policyJson?: string; sharedJson?: string;
     status: string; finalText?: string; error?: string; nodesJson: string;
     seq: number; ackedSeq: number; createdAt: string; updatedAt: string; completedAt?: string;
-  }): void {
-    this.db
+    checkpointJson?: string; ownerId?: string; ownerEpoch?: number; leaseUntil?: number; metadataJson?: string;
+  }): boolean {
+    const result = this.db
       .prepare(
-        `INSERT INTO workflows(workflow_id,tenant_id,project_id,worktree_id,mode,plan_json,input,policy_json,shared_json,status,final_text,error,nodes_json,seq,acked_seq,created_at,updated_at,completed_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO workflows(workflow_id,tenant_id,project_id,worktree_id,mode,plan_json,input,policy_json,shared_json,status,final_text,error,nodes_json,seq,acked_seq,created_at,updated_at,completed_at,checkpoint_json,owner_id,owner_epoch,lease_until,metadata_json)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(workflow_id) DO UPDATE SET
            status=excluded.status,
            final_text=excluded.final_text,
            error=excluded.error,
+           shared_json=excluded.shared_json,
            nodes_json=excluded.nodes_json,
            seq=excluded.seq,
-           acked_seq=excluded.acked_seq,
+           acked_seq=MAX(workflows.acked_seq, excluded.acked_seq),
            updated_at=excluded.updated_at,
-           completed_at=excluded.completed_at`,
+           completed_at=excluded.completed_at,
+           checkpoint_json=excluded.checkpoint_json,
+           lease_until=excluded.lease_until,
+           metadata_json=excluded.metadata_json
+         WHERE workflows.tenant_id=excluded.tenant_id AND workflows.owner_id=excluded.owner_id AND workflows.owner_epoch=excluded.owner_epoch`,
       )
       .run(
         w.workflowId, w.tenantId, w.projectId ?? null, w.worktreeId ?? null, w.mode, w.planJson,
         w.input ?? null, w.policyJson ?? null, w.sharedJson ?? null,
         w.status, w.finalText ?? null, w.error ?? null, w.nodesJson,
         w.seq, w.ackedSeq, w.createdAt, w.updatedAt, w.completedAt ?? null,
+        w.checkpointJson ?? null, w.ownerId ?? null, w.ownerEpoch ?? 0, w.leaseUntil ?? null, w.metadataJson ?? null,
       );
+    return Number(result.changes) === 1;
+  }
+
+  /** Atomically persist the workflow checkpoint/seq and its emitted event. */
+  appendWorkflowEvent(
+    w: Parameters<PhononStore["upsertWorkflow"]>[0],
+    event: { seq: number; payload: string; createdAt: string },
+  ): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const persisted = this.upsertWorkflow(w);
+      if (!persisted) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+      this.db.prepare(
+        "INSERT OR IGNORE INTO workflow_events(workflow_id,tenant_id,seq,payload,created_at) VALUES(?,?,?,?,?)",
+      ).run(w.workflowId, w.tenantId, event.seq, event.payload, event.createdAt);
+      this.db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+  }
+
+  workflowEvents(workflowId: string, tenantId: string, afterSeq = -1, limit = 200): Array<{ seq: number; payload: string }> {
+    return this.db.prepare(
+      "SELECT seq,payload FROM workflow_events WHERE workflow_id=? AND tenant_id=? AND seq>? ORDER BY seq LIMIT ?",
+    ).all(workflowId, tenantId, afterSeq, limit) as Array<{ seq: number; payload: string }>;
+  }
+
+  unackedWorkflowEvents(tenantId: string): Array<{ workflowId: string; seq: number; payload: string }> {
+    return this.db.prepare(
+      `SELECT e.workflow_id AS workflowId,e.seq,e.payload
+         FROM workflow_events e JOIN workflows w ON w.workflow_id=e.workflow_id AND w.tenant_id=e.tenant_id
+        WHERE e.tenant_id=? AND e.seq>w.acked_seq
+        ORDER BY w.created_at,e.seq`,
+    ).all(tenantId) as Array<{ workflowId: string; seq: number; payload: string }>;
+  }
+
+  /** Atomically acquire the single executor lease for a tenant/workflow. */
+  claimWorkflow(workflowId: string, tenantId: string, ownerId: string, leaseMs = 30_000): number | undefined {
+    const now = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db.prepare(
+        "SELECT owner_id,owner_epoch,lease_until FROM workflows WHERE workflow_id=? AND tenant_id=?",
+      ).get(workflowId, tenantId) as { owner_id: string | null; owner_epoch: number; lease_until: number | null } | undefined;
+      if (!row || (row.owner_id !== null && row.owner_id !== ownerId && (row.lease_until ?? 0) > now)) {
+        this.db.exec("COMMIT");
+        return undefined;
+      }
+      const epoch = row.owner_id === ownerId ? row.owner_epoch : row.owner_epoch + 1;
+      this.db.prepare(
+        "UPDATE workflows SET owner_id=?,owner_epoch=?,lease_until=? WHERE workflow_id=? AND tenant_id=?",
+      ).run(ownerId, epoch, now + leaseMs, workflowId, tenantId);
+      this.db.exec("COMMIT");
+      return epoch;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+  }
+
+  isWorkflowOwner(workflowId: string, tenantId: string, ownerId: string, ownerEpoch: number): boolean {
+    const row = this.db.prepare(
+      "SELECT 1 AS owned FROM workflows WHERE workflow_id=? AND tenant_id=? AND owner_id=? AND owner_epoch=?",
+    ).get(workflowId, tenantId, ownerId, ownerEpoch) as { owned: number } | undefined;
+    return row?.owned === 1;
+  }
+
+  renewWorkflowLease(workflowId: string, tenantId: string, ownerId: string, ownerEpoch: number, leaseMs = 30_000): boolean {
+    const result = this.db.prepare(
+      "UPDATE workflows SET lease_until=? WHERE workflow_id=? AND tenant_id=? AND owner_id=? AND owner_epoch=?",
+    ).run(Date.now() + leaseMs, workflowId, tenantId, ownerId, ownerEpoch);
+    return Number(result.changes) === 1;
+  }
+
+  releaseWorkflow(workflowId: string, tenantId: string, ownerId: string, ownerEpoch: number): boolean {
+    const result = this.db.prepare(
+      "UPDATE workflows SET owner_id=NULL,owner_epoch=owner_epoch+1,lease_until=NULL WHERE workflow_id=? AND tenant_id=? AND owner_id=? AND owner_epoch=?",
+    ).run(workflowId, tenantId, ownerId, ownerEpoch);
+    return Number(result.changes) === 1;
+  }
+
+  listRecoverableWorkflows(tenantId: string): Array<Record<string, unknown>> {
+    return this.db.prepare(
+      "SELECT * FROM workflows WHERE tenant_id=? AND status IN ('queued','running') ORDER BY created_at",
+    ).all(tenantId) as Array<Record<string, unknown>>;
   }
 
   getWorkflow(workflowId: string, tenantId?: string): Record<string, unknown> | undefined {
@@ -445,9 +665,9 @@ export class PhononStore {
 
   ackWorkflow(workflowId: string, lastSeq: number, tenantId?: string): void {
     if (tenantId !== undefined) {
-      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=? AND tenant_id=?").run(lastSeq, workflowId, tenantId);
+      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, MIN(?, seq-1)) WHERE workflow_id=? AND tenant_id=?").run(lastSeq, workflowId, tenantId);
     } else {
-      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, ?) WHERE workflow_id=?").run(lastSeq, workflowId);
+      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, MIN(?, seq-1)) WHERE workflow_id=?").run(lastSeq, workflowId);
     }
   }
 
@@ -466,7 +686,8 @@ export class PhononStore {
            trigger_json=excluded.trigger_json, target_json=excluded.target_json,
            consent_json=excluded.consent_json, policy_json=excluded.policy_json,
            webhook_token=excluded.webhook_token,
-           updated_at=excluded.updated_at, last_run_at=excluded.last_run_at, next_run_at=excluded.next_run_at`,
+           updated_at=excluded.updated_at, last_run_at=excluded.last_run_at, next_run_at=excluded.next_run_at
+         WHERE schedules.tenant_id=excluded.tenant_id`,
       )
       .run(
         s.id, s.tenantId, s.name, s.enabled ? 1 : 0,
@@ -498,25 +719,118 @@ export class PhononStore {
     sessionId?: string; workflowId?: string; startedAt?: string; finishedAt?: string;
     exitReason?: string; error?: string; transcriptPath?: string; resultText?: string;
     usageJson?: string; pushState?: string; ackedSeq?: number; createdAt: string;
-  }): void {
-    this.db
+    attempt?: number; maxAttempts?: number; retryHistoryJson?: string; inputJson?: string;
+    phase?: string; retryAt?: number; ownerId?: string; ownerEpoch?: number; leaseUntil?: number; eventSeq?: number;
+  }): boolean {
+    const result = this.db
       .prepare(
-        `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at,attempt,max_attempts,retry_history_json,input_json,phase,retry_at,owner_id,owner_epoch,lease_until,event_seq)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
            status=excluded.status, session_id=excluded.session_id, workflow_id=excluded.workflow_id,
            started_at=excluded.started_at, finished_at=excluded.finished_at,
            exit_reason=excluded.exit_reason, error=excluded.error,
            transcript_path=excluded.transcript_path, result_text=excluded.result_text,
-           usage_json=excluded.usage_json, push_state=excluded.push_state, acked_seq=excluded.acked_seq`,
+           usage_json=excluded.usage_json,
+           push_state=CASE WHEN runs.push_state='acked' THEN 'acked' ELSE excluded.push_state END,
+           acked_seq=MAX(runs.acked_seq, excluded.acked_seq),
+           attempt=excluded.attempt, max_attempts=excluded.max_attempts,
+           retry_history_json=excluded.retry_history_json, input_json=excluded.input_json,
+           phase=excluded.phase, retry_at=excluded.retry_at, lease_until=excluded.lease_until,
+           event_seq=MAX(runs.event_seq, excluded.event_seq)
+         WHERE runs.tenant_id=excluded.tenant_id AND
+               ((runs.owner_id IS NULL AND excluded.owner_id IS NULL) OR
+                (runs.owner_id=excluded.owner_id AND runs.owner_epoch=excluded.owner_epoch))`,
       )
       .run(
         r.id, r.scheduleId, r.tenantId, r.triggerSource, r.status,
         r.sessionId ?? null, r.workflowId ?? null, r.startedAt ?? null, r.finishedAt ?? null,
         r.exitReason ?? null, r.error ?? null, r.transcriptPath ?? null, r.resultText ?? null,
         r.usageJson ?? null, r.pushState ?? "pending", r.ackedSeq ?? -1, r.createdAt,
+        r.attempt ?? 0, r.maxAttempts ?? 1, r.retryHistoryJson ?? "[]", r.inputJson ?? null,
+        r.phase ?? null, r.retryAt ?? null, r.ownerId ?? null, r.ownerEpoch ?? 0, r.leaseUntil ?? null, r.eventSeq ?? 0,
       );
+    return Number(result.changes) === 1;
   }
+  appendRunEvent(
+    run: Parameters<PhononStore["upsertRun"]>[0],
+    event: { seq: number; payload: string; createdAt: string },
+  ): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const persisted = this.upsertRun(run);
+      if (!persisted) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+      this.db.prepare("INSERT OR IGNORE INTO run_events(run_id,tenant_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
+        .run(run.id, run.tenantId, event.seq, event.payload, event.createdAt);
+      this.db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+  }
+
+  unackedRunEvents(tenantId: string): Array<{ runId: string; seq: number; payload: string }> {
+    return this.db.prepare(
+      `SELECT e.run_id AS runId,e.seq,e.payload
+         FROM run_events e JOIN runs r ON r.id=e.run_id AND r.tenant_id=e.tenant_id
+        WHERE e.tenant_id=? AND e.seq>r.acked_seq
+        ORDER BY r.created_at,e.seq`,
+    ).all(tenantId) as Array<{ runId: string; seq: number; payload: string }>;
+  }
+
+  ackRun(runId: string, tenantId: string, opts?: { lastSeq?: number; finished?: boolean }): boolean {
+    const row = this.db.prepare("SELECT acked_seq,event_seq,push_state FROM runs WHERE id=? AND tenant_id=?")
+      .get(runId, tenantId) as { acked_seq: number; event_seq: number; push_state: string } | undefined;
+    if (!row) return false;
+    const ackedSeq = opts?.lastSeq === undefined
+      ? row.acked_seq
+      : Math.max(row.acked_seq, Math.min(opts.lastSeq, row.event_seq - 1));
+    const pushState = opts?.finished === true ? "acked" : row.push_state;
+    const result = this.db.prepare("UPDATE runs SET acked_seq=?,push_state=? WHERE id=? AND tenant_id=?")
+      .run(ackedSeq, pushState, runId, tenantId);
+    return Number(result.changes) === 1;
+  }
+
+  claimRun(runId: string, tenantId: string, ownerId: string, leaseMs = 30_000): number | undefined {
+    const now = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db.prepare(
+        "SELECT owner_id,owner_epoch,lease_until FROM runs WHERE id=? AND tenant_id=?",
+      ).get(runId, tenantId) as { owner_id: string | null; owner_epoch: number; lease_until: number | null } | undefined;
+      if (!row || (row.owner_id !== null && row.owner_id !== ownerId && (row.lease_until ?? 0) > now)) {
+        this.db.exec("COMMIT");
+        return undefined;
+      }
+      const epoch = row.owner_id === ownerId ? row.owner_epoch : row.owner_epoch + 1;
+      this.db.prepare("UPDATE runs SET owner_id=?,owner_epoch=?,lease_until=? WHERE id=? AND tenant_id=?")
+        .run(ownerId, epoch, now + leaseMs, runId, tenantId);
+      this.db.exec("COMMIT");
+      return epoch;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw err;
+    }
+  }
+
+  renewRunLease(runId: string, tenantId: string, ownerId: string, ownerEpoch: number, leaseMs = 30_000): boolean {
+    const result = this.db.prepare(
+      "UPDATE runs SET lease_until=? WHERE id=? AND tenant_id=? AND owner_id=? AND owner_epoch=?",
+    ).run(Date.now() + leaseMs, runId, tenantId, ownerId, ownerEpoch);
+    return Number(result.changes) === 1;
+  }
+
+  releaseRun(runId: string, tenantId: string, ownerId: string, ownerEpoch: number): boolean {
+    const result = this.db.prepare(
+      "UPDATE runs SET owner_id=NULL,owner_epoch=owner_epoch+1,lease_until=NULL WHERE id=? AND tenant_id=? AND owner_id=? AND owner_epoch=?",
+    ).run(runId, tenantId, ownerId, ownerEpoch);
+    return Number(result.changes) === 1;
+  }
+
   getRun(id: string, tenantId?: string): Record<string, unknown> | undefined {
     const row = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Record<string, unknown> | undefined;
     if (row && tenantId !== undefined && row.tenant_id !== tenantId) return undefined; // B1
@@ -530,6 +844,12 @@ export class PhononStore {
     const sql = `SELECT * FROM runs WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`;
     params.push(opts?.limit ?? 50);
     return this.db.prepare(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
+  }
+  /** 重启时审计收敛：connection-scoped runtime 无法接管的 pending/running run。 */
+  listActiveRuns(tenantId: string): Array<Record<string, unknown>> {
+    return this.db
+      .prepare("SELECT * FROM runs WHERE tenant_id=? AND status IN ('pending','running') ORDER BY created_at")
+      .all(tenantId) as Array<Record<string, unknown>>;
   }
   /** 重启后恢复：未推送完成的 run（push_state != 'acked' 且已终态），用于补推。 */
   listUnackedFinishedRuns(tenantId: string): Array<Record<string, unknown>> {

@@ -46,7 +46,7 @@ const device = await server.firstDevice();
 console.log("[live] phonon connected");
 
 const bridge = new HookBridge((sessionKey) => {
-  const m = sessionKey.match(/phonon-(s-\d+-\d+)$/);
+  const m = sessionKey.match(/phonon-(s-[A-Za-z0-9-]+)$/);
   const sessionId = m?.[1];
   const conn = client.connection;
   if (sessionId && conn?.ownsSession(sessionId)) return { conn, sessionId };

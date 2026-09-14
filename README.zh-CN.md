@@ -187,8 +187,8 @@ agent-phonon discover
 ## 内置救援 Agent 与确定性维护通道
 
 `phonon-rescue` 直接内置在 daemon 中，不依赖 OpenClaw、Claude Code、
-Codex、Copilot、OpenCode 或 Hermes。可配置任意同时支持 **OpenAI Chat
-Completions 与 tool calling** 的 endpoint：
+Codex、Copilot、OpenCode 或 Hermes。可配置支持 **OpenAI Chat Completions 或
+Responses，以及 tool calling** 的 endpoint：
 
 ```bash
 agent-phonon rescue configure \
@@ -197,22 +197,100 @@ agent-phonon rescue configure \
   --api-key-ref ~/.agent-phonon/rescue.key
 ```
 
-CLI 会先实测 Chat Completions + 工具调用，成功后才保存。也支持
-`--api-key-env` 和 `--api-key`；后台服务推荐使用权限为 `0600` 的 key 文件。
+CLI 使用与 runtime 相同的官方 provider 实测所选协议 + 工具调用，成功后才保存。也支持
+`--api-key-env`；后台服务推荐使用权限为 `0600` 的 key 文件。
+
+显式无认证的 loopback endpoint 可使用 `--no-auth`（保存为
+`rescueAgent.authMode: "none"`），仅允许 `127.0.0.1`、`localhost`、`[::1]`。
+该模式拒绝同时设置 key/file/env 引用，忽略默认 key 环境变量，完全不发送
+Authorization、x-api-key、x-goog-api-key 或 query key；远程 endpoint 仍要求认证，默认模式仍为 `"api-key"`。
+Discovery 只判断配置齐备，不代表 endpoint 实测可用；CLI 工具探测失败不会保存配置。
+
+传输协议默认 `chat`，保持已有配置兼容。Responses 使用 `--wire-api responses`
+（保存为 `rescueAgent.wireApi: "responses"`），例如：
+
+```bash
+agent-phonon rescue configure --base-url http://127.0.0.1:4000/v1 \
+  --model gpt-5.6-sol --wire-api responses --no-auth
+```
+
+### Rescue 内置维修知识
+
+全新 Rescue 会话可先通过只读 `query_knowledge` 按 Agent、版本、平台和协议检索维修经验，再调用维护工具。知识静态打包进 daemon，不依赖旧聊天、本助手 workspace 或全局 skills。覆盖 OpenCode、Claude 协议/角色和有条件的 GPT 兼容、Hermes YAML、Codex/Copilot 有限事实及五格式 SHA/回滚规则；未知版本/平台不返回维修正文，原生验证不足和服务停止必须如实说明。详见[知识包架构、边界与来源](docs/rescue-knowledge.md)。
+
+### Rescue 主流协议
+
+`rescueAgent.wireApi` / `--wire-api` **与 model ID 分离显式配置**，默认仍为
+`chat`。不从模型名称猜协议，不在 HTTP 错误后自动切换协议或重试维护工具。
+必须填写自选 endpoint 和该 endpoint 已列出的模型；绝不回退至 provider 的默认公网域名。
+
+| wireApi | 官方 AI SDK provider | baseUrl 示例（包含 API 前缀） | SDK 自动添加的后缀 | 文本输出粒度 |
+|---|---|---|---|---|
+| `chat` | `@ai-sdk/openai-compatible` | `https://endpoint.example/v1` | `/chat/completions` | token 流式 |
+| `responses` | `@ai-sdk/openai` | `https://endpoint.example/v1` | `/responses` | 完整步骤 |
+| `anthropic` | `@ai-sdk/anthropic` | `https://endpoint.example/v1` | `/messages` | 完整步骤 |
+| `gemini` | `@ai-sdk/google` | `https://endpoint.example/v1beta` | `/models/{model}:generateContent` | 完整步骤 |
+
+表中是占位示例，不是已配置服务。保留自定义路径前缀、移除末尾斜杠；不要把具体操作
+后缀填入 baseUrl，也不要重复 `/v1`。官方服务相应前缀为
+`https://api.anthropic.com/v1` 和 `https://generativelanguage.googleapis.com/v1beta`。
+Gemini 可用裸模型 ID 或 endpoint 提供的资源 ID（`models/...`），SDK 不重复添加
+`models/`。baseUrl 禁止 userinfo、query 参数（包括 key）和 fragment。
+
+已有安全 key 文件时，原生安全入口为 **`--api-key-ref <file>`**：配置仅保存文件引用，
+秘密值不进入命令参数、shell 历史或 rescue 配置。通过本地安全凭据流程准备该文件，
+权限限制为所有者可读写的 `0600`；不要在聊天或 CLI 参数中粘贴秘密。例如以下仅为占位示例：
+
+```bash
+agent-phonon rescue configure --base-url https://endpoint.example/v1 \
+  --model endpoint-listed-model --wire-api anthropic \
+  --api-key-ref /secure/path/rescue-key
+agent-phonon rescue configure --base-url https://endpoint.example/v1beta \
+  --model endpoint-listed-model --wire-api gemini \
+  --api-key-ref /secure/path/rescue-key
+```
+
+认证 Anthropic 由官方 provider 使用 `x-api-key` 和 `anthropic-version`，Gemini 使用
+`x-goog-api-key`，Chat/Responses 使用 Bearer Authorization。Rescue 自行解析显式
+key/ref/env 配置及原有 `PHONON_RESCUE_API_KEY` 后备，不隐式读取 provider 的默认 key
+环境变量。四协议均支持显式 loopback `--no-auth`；拒绝同时设置 key，不读取 key env。
+Responses/Anthropic/Gemini 通过官方导出的 `/internal` 构造器绕开强制 key 工厂，
+不填假 key、不先生成认证头再删除。版本敏感入口已精确锁版：openai `4.0.43`、
+anthropic `4.0.41`、google `4.0.50`（provider `4.0.7`，兼容 ai `7.0.58`），升级须回归。
+
+Responses/Anthropic/Gemini 使用官方 `ToolLoopAgent.generate`：每个完成步骤的文本
+作为一次追加消息输出，不伪装逐 token delta；真实工具执行回调实时发出。Zod 在执行前
+拒绝的调用，从 SDK 步骤内容转发真实 call/error ID。Responses 保留 `store: false`、
+`parallelToolCalls: false` 的无状态工具结果重放，兼容缺少 SSE 文本 delta 的 endpoint。
+Chat 保留原 token 流式。所有协议均保留 Zod 参数验证、本地维护 policy 和 expectedSHA。
+仅 Gemini 的 `patch_config.patch` 使用 JSON 编码的对象字符串，因为官方 OpenAPI
+转换会丢弃开放对象的 additionalProperties。工具边界解析字符串并用 Zod 再验证为对象，
+然后调用完全相同的 maintenance manager；其他协议仍接收对象参数。这是工具 schema
+适配，不是 HTTP 协议转换器。
+超时/中断、工具循环步数耗尽未完成、截断或过滤/错误结束不会标记 completed；均拒绝
+HTTP 重定向。**协议实现及模拟回归通过不等于特定 endpoint 真实支持**：discovery
+只检查配置齐备，CLI 则真实探测工具调用，成功后才保存。原生 Anthropic/Gemini 的
+probe 在请求前固定选择 `toolChoice: auto`，兼容拒绝强制工具选择的 thinking endpoint；
+仍必须返回真实 `phonon_probe` 调用才通过。Chat/Responses 保留强制工具选择。HTTP 200
+但无工具调用也失败，不落盘、不重试、不切协议。保存配置不启动生产实例，
+运行实例需另行重启加载。
+
 
 救援 Agent 没有任意 shell，也不能任意读写宿主机。它只能调用设备本地预注册的
 语义化维护操作。同一套操作也通过 Server SDK 的 `device.maintenance.*` 直接暴露，
 因此即使救援模型 endpoint 也不可用，仍可走确定性 break-glass 通道：
 
 - 目标清单和诊断；
-- 脱敏 JSON 配置读取；
-- 带 hash 乐观锁、自动备份的 JSON Merge Patch；
+- JSON/JSONC/YAML/TOML 脱敏配置读取，以及显式 public 的 UTF-8 文本；
+- 带 hash 乐观锁和原始字节备份的 JSON/JSONC/YAML Merge Patch，以及通用精确文本编辑；
 - 校验备份 checksum 的回滚；
 - 白名单内用户态 npm/pnpm 包更新；
 - 白名单内用户服务状态和重启。
 
 四类维护权限由独立设备 policy 控制，默认全部关闭。`trustLocal` **不会**自动开放宿主机维护；
 每条 server 连接都必须在本地 `policy` 中显式授权。线协议不接受任意路径、包名、服务名或 shell 字符串。
+
+详见[多格式维护协议](docs/PROTOCOL.md#多格式维护配置与文本编辑)：文本可见及整文件授权默认关闭；TOML 只做 parse 校验后的局部 edit，不作有损 stringify；YAML patch 可能规范化格式。Hermes YAML、Codex TOML 新默认注册只读，不自动扩权。
 
 ## Adapter override
 
@@ -299,3 +377,21 @@ agent-phonon 是本地 Agent 的远程控制面，因此本地设备主人是授
 ## License
 
 [MIT](./LICENSE) © agent-phonon contributors
+
+### 安全连接默认值与本地测试
+
+Daemon 的 `servers[]` 正式支持 `expectedTenantId`（可选、非空的精确租户 ID，
+拒绝首尾空白/控制字符）和 `allowInsecure`（可选布尔值，默认 false），均传入
+真实设备客户端。welcome 租户不一致会拒绝连接；非 loopback 明文仍默认拒绝。
+推荐 WSS；租户字符串匹配不能替代 TLS/凭据鉴权。本轮不写任何生产配置。
+
+TS `new PhononServer()` 省略 host 时实际绑定 **127.0.0.1**。显式非 loopback
+且无 `authenticate` 时在 bind 前拒绝；仅显式 `allowAnonymous: true` 例外。
+Python 对应 keyword-only `allow_anonymous=True`，既有异步认证回调保持不变。
+有认证回调时匿名 opt-in 不会绕过它。
+
+`pnpm test`、`pnpm test:e2e`、`pnpm test:python` 使用隔离 HOME 和本地 fixture；
+E2E 明确包含 workflow、Git、scheduler、obs。Python 包含三个场景脚本与新增认证/
+Node 跨语言回归。真实 CLI/Gateway/模型保留独立显式 opt-in，compat 固定依赖
+为可选独立入口。详见 [本地测试说明](docs/LOCAL_TESTING.md)；RPC 方法字符串
+parity 不能证明构造参数、监听地址或鉴权行为一致。

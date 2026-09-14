@@ -135,7 +135,7 @@ export interface AgentAdapter {
    * 单 agent runtime 返回长度 1；多 agent runtime（OpenClaw）返回多个。
    * 不可用时返回空数组或 available=false 的项。
    */
-  discoverAgents(): Promise<AgentDescriptor[]>;
+  discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]>;
 
   /**
    * 创建一个 session。agentId 是 discover 返回的完整 id（可能带 runtime 前缀）。

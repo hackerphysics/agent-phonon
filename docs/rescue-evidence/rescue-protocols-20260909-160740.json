@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "path": "acceptance/rescue-protocols-20260909-160740/REPORT.zh-CN.md",
+    "sha256": "8bc2904b17d66668e9c4f86233aa3360d3bb29e5511789ad3c7a7949f49a0b65"
+  },
+  "scope": "Exact selected historical report lines, not raw wire/native evidence or a new acceptance. Omitted lines include host configuration, private artifacts and unrelated history; original source hash is provenance, not a claim that a fresh checkout can replay the original acceptance.",
+  "excerpts": [
+    {
+      "startLine": 5,
+      "endLine": 14,
+      "text": "**已实现显式 `chat | responses | anthropic | gemini`，默认继续 chat。官方 provider、共享配置类型/校验、CLI/help、probe、discovery、daemon 参数链路、运行时、依赖及中英文 README 已同步。没有协议自动切换，也没有根据模型名称选协议。**\n\n本轮真实独立 WS/SDK 验收：\n\n- **Responses / gpt-5.6-sol：PASS**。实际加载原有持久 rescue 配置，真实 list + 临时 JSON get/patch/verify/rollback/get，共 **8 次工具调用、8 次结果、10 次 HTTP 200**；fixture 字节级恢复。\n- **Anthropic Messages / qwen3.8-flash：PASS（有限只读样本）**。仅临时配置、同一个用户授权的本地代理，真实 list_targets → tool_result → 模型总结，**1 次工具调用、1 次结果、2 次 HTTP 200**。不是官方 Anthropic 托管服务验收，也没有对此协议进行真实修改/回滚验收。\n- **Gemini 原生：实现及模拟回归 PASS，真实工具闭环未验证。** `/v1beta/models` GET 404，已发现模型 `gemini-3.8-flash` 的原生 `generateContent` 请求也返回 404。没有改用 Chat 后算 Gemini 原生通过。\n- **Chat：保留既有实现与流式行为，本轮模拟回归 PASS，未新增真实 Chat 模型验收。** 不把其他协议的实测借作 Chat 通过。\n\n最终运行时实测合计 **9 次真实 maintenance tool_call/result、12 次 HTTP 200**；这些数字不包含能力 probe、最初失败的探测或模拟服务器。\n"
+    },
+    {
+      "startLine": 20,
+      "endLine": 38,
+      "text": "## 1. 支持矩阵与输出语义\n\n| 显式 wireApi | 官方 SDK | runtime 文本 | 本轮模拟回归 | 本轮真实工具闭环 |\n|---|---|---|---|---|\n| chat | @ai-sdk/openai-compatible 3.0.28 | token 流式 | 原有路径、无认证、超时、step exhaustion | 未重测 |\n| responses | @ai-sdk/openai 4.0.43 | 每完成一步追加整段文本 | 无认证/env/redirect、超时、step exhaustion | gpt-5.6-sol，list + fixture PASS |\n| anthropic | @ai-sdk/anthropic 4.0.41 | 每完成一步追加整段文本 | 正式认证头、无认证、工具 ID/结果、Zod/policy/SHA、失败路径 | qwen3.8-flash，只读 list PASS |\n| gemini | @ai-sdk/google 4.0.50 | 每完成一步追加整段文本 | 同上；另测缺失 ID 由 SDK 生成、资源模型名不重复前缀 | 本地原生路径 404，未验证 |\n\nResponses 保留原有官方 `ToolLoopAgent.generate` 设计及 `store: false`、`parallelToolCalls: false`；Anthropic/Gemini 复用 generate 工具循环。工具执行开始/结束回调实时发送，文本在 onStepEnd 输出，**不是 token delta**。Phonon message 的 `delta: true` 表示追加文本片段，本轮不把一个整步骤伪称逐 token 流式。Chat 原 `stream` 路径保留。\n\n所有 provider 仍使用原 maintenance 工具集、Zod 输入验证、本地 policy、expectedSha 锁和 rollback 校验；没有新增 shell/file 工具，也没有为原生协议降低维护执行校验。\n\nGemini 工具 schema 特别处理：检查官方 `google-prepare-tools.ts` / `convert-json-schema-to-openapi-schema.ts` 后确认其 `parameters` OpenAPI 转换会丢弃任意对象的 additionalProperties。仅 Gemini 的 `patch_config.patch` 因而使用 **JSON 编码的对象字符串**，在 execute 边界 JSON.parse 后用 Zod record 再验证，再调用相同 MaintenanceManager。其余三协议仍使用对象参数。没有自制 HTTP 协议转换器或改写官方请求；SDK call/replay 仍保留模型原始的字符串参数。5 项新增模拟回归验证非法 JSON、数组/null/数值全部拒绝，以及正确对象字符串带真实 SHA 能完成临时 JSON patch。原生请求还断言 schema 中 patch 为 string、expectedSha256 必填。**Gemini 真实 endpoint 仍未验证**，不把这项源代码级兼容处理当真实 PASS。\n\n\n针对官方 SDK 的执行前验证路径补齐事件映射：无效 Zod 输入不会进入 execution hooks，因此从真实 SDK `onStepEnd.content` 中转发未发出的 call/error，按真实 ID 去重；不伪造结果、不执行被拒绝的调用。模拟回归验证 schema、policy 和 stale SHA 三种拒绝均保留文件原字节，且 error 以同一 ID 回传模型。\n\n四协议中，超时/abort、工具循环仍未结束就耗尽 steps，以及 length/content-filter/error 等非正常 finish，都不会报告 completed。Chat 的 step exhaustion 也补上相同检查；这不是改变其 token 输出方式。\n"
+    },
+    {
+      "startLine": 141,
+      "endLine": 141,
+      "text": "- `maintenance.ts`、`workflow-engine.ts`、core `index.ts`、`fn-live-fixes.test.ts` 与基线 hash 一致；D03/D08 暂缓，未重新应用相关补丁、未修改敏感路径规则。没有诊断/YAML/其他 Agent 修复范围扩张。\n"
+    }
+  ]
+}

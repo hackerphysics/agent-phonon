@@ -43,7 +43,7 @@ test("e2e: dial → discovery → create → send → stream → terminate", { t
   const created = (await device.peer.requestRaw("session.create", {
     project: project.project.projectId,
     agent: "openclaw:phonon",
-    model: "github-copilot/claude-opus-4.8",
+    model: "phgeek-gw/gpt-5.6-sol",
     verbosity: "messages",
   })) as { sessionId: string; status: string };
   assert.ok(created.sessionId);
@@ -72,7 +72,7 @@ test("e2e: dial → discovery → create → send → stream → terminate", { t
   const term = (await device.peer.requestRaw("session.terminate", { sessionId: created.sessionId })) as { status: string };
   assert.equal(term.status, "terminated");
 
-  client.close();
+  await client.close();
   await server.close();
 });
 
@@ -97,6 +97,6 @@ test("e2e: cross-tenant session access is rejected", { timeout: 60000 }, async (
     },
   );
 
-  client.close();
+  await client.close();
   await server.close();
 });

@@ -161,6 +161,15 @@ export type RunStatus = z.infer<typeof RunStatus>;
 export const RunTriggerSource = z.enum(["cron", "webhook", "manual"]);
 export type RunTriggerSource = z.infer<typeof RunTriggerSource>;
 
+export const RunRetryAttempt = z.object({
+  /** 失败的是第几次尝试（从 1 开始）。 */
+  attempt: z.number().int().positive(),
+  at: z.string(),
+  phase: z.enum(["launch", "runtime"]),
+  error: z.string(),
+});
+export type RunRetryAttempt = z.infer<typeof RunRetryAttempt>;
+
 export const Run = z.object({
   id: RunId,
   scheduleId: ScheduleId,
@@ -180,6 +189,11 @@ export const Run = z.object({
   /** 终态产物文本（summary 推送用）。 */
   resultText: z.string().optional(),
   usage: z.record(z.unknown()).optional(),
+  /** 当前/最终尝试序号；总尝试次数上限恒为 1 + policy.maxRetries。 */
+  attempt: z.number().int().nonnegative().optional(),
+  maxAttempts: z.number().int().positive().optional(),
+  /** 每次触发重试的失败审计。 */
+  retryHistory: z.array(RunRetryAttempt).optional(),
 });
 export type Run = z.infer<typeof Run>;
 
@@ -275,8 +289,12 @@ export const ScheduleTriggerParams = z.object({
   scheduleId: ScheduleId,
   /** 触发来源标记（manual / 测试 cron / 重放 webhook）。默认 manual。 */
   source: RunTriggerSource.optional(),
-  /** 可选：注入到 target.prompt 的输入变量（webhook body 等）。 */
-  input: z.record(z.unknown()).optional(),
+  /**
+   * 可选触发输入。字符串直接注入；对象 JSON 序列化后注入。
+   * session 追加到 target.prompt，workflow 传给 workflow.run.input。
+   * record 形态保留，兼容既有 webhook/manual API。
+   */
+  input: z.union([z.string(), z.record(z.unknown())]).optional(),
   clientRequestId: z.string().optional(),
 });
 export type ScheduleTriggerParams = z.infer<typeof ScheduleTriggerParams>;

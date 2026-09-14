@@ -44,14 +44,15 @@ test("interaction.request: phonon → server blocking form (p2s emitter)", async
 });
 
 // ============ interaction.response / cancel（server → phonon）============
-test("interaction.response + cancel accepted via dispatch", async () => {
+test("interaction.response accepted; cancel without an actual pending waiter is false", async () => {
   const tc = mk();
   // server 下发 interaction.response（异步回填）
   const resp = await tc.call("interaction.response", { requestId: "r1", action: "submit", values: { style: "a" }, at: new Date().toISOString() });
   assert.equal(resp, null);
   // server 下发 interaction.cancel
   const cancel = (await tc.call("interaction.cancel", { requestId: "r1", reason: "superseded" })) as { cancelled: boolean };
-  assert.equal(cancel.cancelled, true);
+  assert.equal(cancel.cancelled, false);
+  await tc.conn.dispose();
 });
 
 // ============ document.prepare_upload (p2s) — 真测试 ============

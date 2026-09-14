@@ -180,6 +180,7 @@ export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["
   if (rescue?.enabled !== false) {
     reg.register(new RescueAdapter({
       baseUrl: rescue?.baseUrl,
+      authMode: rescue?.authMode,
       apiKey: rescue?.apiKey,
       apiKeyEnv: rescue?.apiKeyEnv,
       apiKeyRef: rescue?.apiKeyRef,
@@ -193,7 +194,7 @@ export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["
       const token = a.gatewayToken ?? readOpenClawGatewayToken();
       if (token) reg.register(new OpenClawGatewayAdapter({ gateway: { baseUrl: a.gatewayUrl ?? "ws://127.0.0.1:18789", token }, defaultAgent: a.defaultAgent ?? "main" }));
     } else if (a.type === "claude-code") {
-      reg.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
+      reg.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
     } else if (a.type === "codex") {
       reg.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
     } else if (a.type === "hermes") {

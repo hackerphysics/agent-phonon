@@ -45,10 +45,12 @@ test("e2e-full: project + skill + session full lifecycle", { timeout: 240000 }, 
 
   // 5) session.create 绑定该 project
   const created = (await device.peer.requestRaw("session.create", {
-    project: proj.project.projectId, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages",
+    project: proj.project.projectId, agent: "openclaw:phonon", model: "phgeek-gw/gpt-5.6-sol", verbosity: "messages",
   })) as { sessionId: string };
 
-  // 6) send + 流式
+  // 6) send + 流式。Avoid coupling a repository gate to one specific paid model:
+  // use the configured/default model so provider-side retirement cannot look like
+  // a core lifecycle regression.
   const ack = (await device.peer.requestRaw("session.send", { sessionId: created.sessionId, input: "Reply with exactly: FULL_OK" })) as { turnId: string };
   const result = await device.waitForTurnEnd(ack.turnId);
   assert.equal((result as { type: string }).type, "result");
@@ -57,9 +59,10 @@ test("e2e-full: project + skill + session full lifecycle", { timeout: 240000 }, 
   const comp = (await device.peer.requestRaw("session.compress", { sessionId: created.sessionId, mode: "native" })) as { mode: string };
   assert.equal(comp.mode, "native");
 
-  // 8) switchModel
-  const sw = (await device.peer.requestRaw("session.switchModel", { sessionId: created.sessionId, model: "github-copilot/gpt-5.5" })) as { model: string; previousModel: string };
-  assert.equal(sw.model, "github-copilot/gpt-5.5");
+  // 8) switchModel to the same stable model verifies the RPC/lifecycle without
+  // relying on an external model alias that may disappear.
+  const sw = (await device.peer.requestRaw("session.switchModel", { sessionId: created.sessionId, model: "phgeek-gw/gpt-5.6-sol" })) as { model: string; previousModel: string };
+  assert.equal(sw.model, "phgeek-gw/gpt-5.6-sol");
 
   // 9) terminate
   const term = (await device.peer.requestRaw("session.terminate", { sessionId: created.sessionId })) as { status: string };
@@ -69,7 +72,7 @@ test("e2e-full: project + skill + session full lifecycle", { timeout: 240000 }, 
   const rm = (await device.peer.requestRaw("project.remove", { projectId: proj.project.projectId, deleteFiles: true })) as { removed: boolean };
   assert.equal(rm.removed, true);
 
-  client.close();
+  await client.close();
   gwAdapter.close();
   await server.close();
 });

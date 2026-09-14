@@ -1,9 +1,12 @@
 import type { SessionEngine } from "./session-engine.js";
 import { PhononError } from "./rpc.js";
+import { assertRefName } from "./project-manager.js";
 import type { EnvManager } from "./env-manager.js";
 import type { PhononStore } from "./store.js";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { InteractionRequestParams as InteractionRequestParamsSchema } from "@agent-phonon/protocol";
 import type {
   WorkflowEvent,
   WorkflowPlan,
@@ -18,13 +21,25 @@ import type {
   StreamEvent,
 } from "@agent-phonon/protocol";
 
+const CONTROL_SETTLE_TIMEOUT_MS = 2_000;
+
+async function settleWithin(promises: Promise<unknown>[], timeoutMs = CONTROL_SETTLE_TIMEOUT_MS): Promise<void> {
+  if (promises.length === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled(promises).then(() => undefined),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
+
 // =============================================================================
 // In-memory runtime state
 // =============================================================================
 
 interface WorkflowNodeState {
   nodeId: string;
-  status: "pending" | "ready" | "running" | "completed" | "failed" | "skipped" | "cancelled";
+  status: "pending" | "ready" | "running" | "paused" | "completed" | "failed" | "skipped" | "cancelled";
   agent: string;
   model: string;
   role?: string;
@@ -35,6 +50,46 @@ interface WorkflowNodeState {
   error?: string;
   result?: WorkflowNodeResult;
   iterations?: number;
+  attempts?: Array<{
+    attempt: number;
+    iteration?: number;
+    sessionId?: string;
+    turnId?: string;
+    status: "running" | "completed" | "failed" | "interrupted" | "timeout" | "cancelled";
+    startedAt: string;
+    completedAt?: string;
+    error?: string;
+  }>;
+}
+
+interface GraphCursor {
+  iteration: number;
+  phase: "executor" | "directives";
+  currentDirectives: WorkflowRoutingDirective[];
+  handled: string[];
+  workerResults: Array<{ nodeId: string; text: string }>;
+  lastExecutorText?: string;
+  finalSummary?: string;
+  roundStarted?: boolean;
+}
+
+interface DiscussionCursor {
+  round: number;
+  phase: "participants" | "chairman";
+  outputs: Record<string, { text: string; role?: string }>;
+  transcript: Array<{ round: number; nodeId: string; role?: string; text: string }>;
+  roundStarted?: boolean;
+}
+
+interface WorkflowCheckpoint {
+  controlEpoch: number;
+  /** Absolute wall-clock deadline; automatic recovery never resets total budget. */
+  deadlineAt?: number;
+  graph?: GraphCursor;
+  discussion?: DiscussionCursor;
+  persistentSessions: Record<string, string>;
+  autoWorktrees: Record<string, { projectId: string; worktreeId: string; userKey: string }>;
+  mainBranchCheckedOut: Record<string, string>;
 }
 
 interface WorkflowRunState {
@@ -51,7 +106,8 @@ interface WorkflowRunState {
   input?: string;
   policy: Required<Pick<WorkflowPolicy, "onNodeFailure">> & WorkflowPolicy;
   sharedContext?: WorkflowSharedContext;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timeout";
+  metadata?: Record<string, unknown>;
+  status: "queued" | "running" | "paused" | "completed" | "failed" | "cancelled" | "timeout";
   nodes: WorkflowNodeState[];
   createdAt: string;
   updatedAt: string;
@@ -60,6 +116,12 @@ interface WorkflowRunState {
   seq: number;
   ackedSeq: number;
   finalText?: string;
+  checkpoint: WorkflowCheckpoint;
+  ownerEpoch: number;
+}
+
+class StaleExecutionError extends Error {
+  constructor() { super("stale workflow execution fenced"); }
 }
 
 // =============================================================================
@@ -87,11 +149,15 @@ function parseRoutingDirectives(text: string): WorkflowRoutingDirective[] {
 }
 
 function buildDirective(kindFromTag: string, obj: Record<string, unknown>): WorkflowRoutingDirective | null {
-  // body 里如果有 kind，优先用 body 的；否则用 fenced block 的 tag
-  const kind = (typeof obj.kind === "string" ? obj.kind : kindFromTag) as WorkflowRoutingDirective["kind"];
+  // Fence tag and body must agree. Silently letting the body override the tag
+  // made validation/auditing ambiguous and could execute a different action
+  // than the one shown by the markdown fence.
+  if (typeof obj.kind === "string" && obj.kind !== kindFromTag) return null;
+  const kind = kindFromTag as WorkflowRoutingDirective["kind"];
   switch (kind) {
     case "workflow.route":
-      if (!obj.to || typeof obj.message !== "string") return null;
+      if (typeof obj.message !== "string") return null;
+      if (!(typeof obj.to === "string" || (Array.isArray(obj.to) && obj.to.length > 0 && obj.to.every((v) => typeof v === "string")))) return null;
       return {
         kind: "workflow.route",
         to: obj.to as never,
@@ -117,6 +183,7 @@ function buildDirective(kindFromTag: string, obj: Record<string, unknown>): Work
         reason: obj.reason as string | undefined,
       };
     case "workflow.done":
+      if (obj.finalSummary !== undefined && typeof obj.finalSummary !== "string") return null;
       return {
         kind: "workflow.done",
         finalSummary: obj.finalSummary as string | undefined,
@@ -124,6 +191,7 @@ function buildDirective(kindFromTag: string, obj: Record<string, unknown>): Work
       };
     case "workflow.human_review":
       if (typeof obj.title !== "string" || typeof obj.summary !== "string") return null;
+      if (obj.timeoutSeconds !== undefined && (typeof obj.timeoutSeconds !== "number" || !Number.isFinite(obj.timeoutSeconds) || obj.timeoutSeconds <= 0)) return null;
       return {
         kind: "workflow.human_review",
         title: obj.title,
@@ -135,6 +203,10 @@ function buildDirective(kindFromTag: string, obj: Record<string, unknown>): Work
     default:
       return null;
   }
+}
+
+function directiveKey(directive: WorkflowRoutingDirective): string {
+  return createHash("sha256").update(JSON.stringify(directive)).digest("hex");
 }
 
 // =============================================================================
@@ -162,6 +234,12 @@ export class WorkflowEngine {
   private workflowEvents = new Map<string, WorkflowEvent[]>();
   private artifacts = new Map<string, WorkflowArtifact[]>();
   private idSeq = 1;
+  private disposed = false;
+  private readonly ownerId = `workflow-owner-${process.pid}-${randomUUID()}`;
+  private readonly leaseMs = 5_000;
+  private readonly leaseTimer: ReturnType<typeof setInterval>;
+  private recovering = false;
+  private finalizing = new Set<string>();
 
   /**
    * 隔离 key → 实际 worktreeId（v0.6）。
@@ -197,11 +275,137 @@ export class WorkflowEngine {
     emit: (event: WorkflowEvent) => void;
     /** v0.7: 反向请求 server 做 HITL（用于 workflow.human_review directive） */
     requestInteraction?: (params: unknown) => Promise<unknown>;
-  }) {}
+  }) {
+    this.leaseTimer = setInterval(() => {
+      try {
+        this.renewLeases();
+        // A real process crash cannot release its lease. Periodic scanning means
+        // the successor claims the checkpoint immediately after lease expiry
+        // instead of depending on a one-shot startup race.
+        void this.recover().catch(() => {});
+      } catch {
+        // Store shutdown/replacement is handled by the owning connection.
+      }
+    }, Math.max(500, Math.floor(this.leaseMs / 3)));
+    this.leaseTimer.unref?.();
+  }
+
+  /** Claim and continue queued/running checkpoints left by a prior owner. */
+  async recover(): Promise<number> {
+    if (this.disposed || !this.opts.store || this.recovering) return 0;
+    this.recovering = true;
+    let recovered = 0;
+    try {
+      for (const row of this.opts.store.listRecoverableWorkflows(this.opts.tenantId)) {
+        const workflowId = row.workflow_id as string;
+        if (this.runs.has(workflowId)) continue;
+        const ownerEpoch = this.opts.store.claimWorkflow(workflowId, this.opts.tenantId, this.ownerId, this.leaseMs);
+        if (ownerEpoch === undefined) continue;
+        const run = this.restoreRow(row, ownerEpoch, true);
+        try {
+          this.validateExecutionTargets(run.project, run.plan);
+          this.validatePlan(run.plan);
+          this.hydrateCheckpoint(run);
+          this.runs.set(workflowId, run);
+          this.persist(run);
+          void this.executeWithTimeout(run, run.checkpoint.controlEpoch).catch((err) => this.fail(run, err));
+          recovered++;
+        } catch (err) {
+          // One corrupt/stale checkpoint must not starve every later workflow.
+          run.status = "failed";
+          run.error = `automatic recovery validation failed: ${(err as Error)?.message ?? String(err)}`;
+          run.completedAt = new Date().toISOString();
+          run.updatedAt = run.completedAt;
+          this.persistDisposedRun(run);
+          this.opts.store.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
+        }
+      }
+      return recovered;
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  private renewLeases(): void {
+    if (this.disposed || !this.opts.store) return;
+    for (const run of this.runs.values()) {
+      if (["completed", "failed", "cancelled", "timeout"].includes(run.status) && !this.finalizing.has(run.workflowId)) continue;
+      const ok = this.opts.store.renewWorkflowLease(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch, this.leaseMs);
+      if (!ok) run.checkpoint.controlEpoch++;
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // RPC entry
   // ---------------------------------------------------------------------------
+
+  /** Permanently release connection-scoped workflow runtime state. */
+  async dispose(reason = "connection disposed"): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    clearInterval(this.leaseTimer);
+    for (const resolve of this.turnWaiters.values()) resolve({ status: "interrupted", text: "" });
+    this.turnWaiters.clear();
+    // Let an already-started cancel/timeout finalizer commit its cleaned
+    // resource mappings before this connection releases ownership. `persist`
+    // remains enabled for those finalizers even though ordinary execution is fenced.
+    const finalizerDeadline = Date.now() + CONTROL_SETTLE_TIMEOUT_MS + 1_000;
+    while (this.finalizing.size > 0 && Date.now() < finalizerDeadline) {
+      for (const workflowId of this.finalizing) {
+        const active = this.runs.get(workflowId);
+        if (active) this.opts.store?.renewWorkflowLease(active.workflowId, active.tenantId, this.ownerId, active.ownerEpoch, this.leaseMs);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const lingeringFinalizers = new Set(this.finalizing);
+    for (const workflowId of lingeringFinalizers) {
+      const active = this.runs.get(workflowId);
+      if (active) this.opts.store?.renewWorkflowLease(active.workflowId, active.tenantId, this.ownerId, active.ownerEpoch, 30_000);
+    }
+    const interrupts: Promise<unknown>[] = [];
+    for (const run of this.runs.values()) {
+      if (!["completed", "failed", "timeout", "cancelled", "paused"].includes(run.status)) {
+        // A connection is transport-scoped, a workflow is not. Fence the old
+        // executor and checkpoint the current boundary as queued for the next
+        // connection instead of converting a recoverable run into failure.
+        run.checkpoint.controlEpoch++;
+        run.status = "queued";
+        run.error = undefined;
+        run.completedAt = undefined;
+        run.updatedAt = new Date().toISOString();
+        for (const node of run.nodes) {
+          if (["ready", "running"].includes(node.status)) node.status = "pending";
+          const attempt = node.attempts?.at(-1);
+          if (attempt?.status === "running") {
+            attempt.status = "interrupted";
+            attempt.completedAt = run.updatedAt;
+            attempt.error = reason;
+          }
+          if (node.sessionId) interrupts.push(this.opts.engine.interrupt(run.tenantId, node.sessionId, reason).catch(() => {}));
+        }
+        this.persistDisposedRun(run);
+      }
+      if (!lingeringFinalizers.has(run.workflowId)) {
+        this.opts.store?.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
+      }
+    }
+    // Reconnect is a control-plane boundary. A non-settling adapter interrupt
+    // may continue its own process-supervisor escalation, but cannot hold the
+    // replacement connection hostage forever.
+    await settleWithin(interrupts);
+    this.runs.clear();
+    this.sessionToNode.clear();
+    const belongsToLingering = (key: string) => [...lingeringFinalizers].some((workflowId) => key.startsWith(`${workflowId}::`));
+    for (const key of [...this.persistentSessions.keys()]) if (!belongsToLingering(key)) this.persistentSessions.delete(key);
+    this.pendingResultText.clear();
+    this.turnResultCache.clear();
+    this.workflowEvents.clear();
+    this.artifacts.clear();
+    // Preserve maps still owned by a bounded finalizer. It will persist and
+    // release them itself; ordinary reconnect-owned maps can be dropped here.
+    for (const key of [...this.autoWorktrees.keys()]) if (!belongsToLingering(key)) this.autoWorktrees.delete(key);
+    for (const key of [...this.mainBranchCheckedOut.keys()]) if (!belongsToLingering(key)) this.mainBranchCheckedOut.delete(key);
+  }
 
   async run(params: {
     project?: string;
@@ -214,12 +418,14 @@ export class WorkflowEngine {
     resumeFrom?: WorkflowResumeFrom;
     metadata?: Record<string, unknown>;
   }): Promise<WorkflowRunResult> {
+    if (this.disposed) throw new Error("workflow engine disposed");
     // 1. 恢复路径
     if (params.resumeFrom) {
       const restored = this.restoreFromCheckpoint(params.resumeFrom);
       if (restored) {
         this.validateExecutionTargets(restored.project, restored.plan);
-        void this.executeWithTimeout(restored).catch((err) => this.fail(restored, err));
+        this.validatePlan(restored.plan);
+        void this.executeWithTimeout(restored, restored.checkpoint.controlEpoch).catch((err) => this.fail(restored, err));
         return { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
       }
       // 找不到 checkpoint → 错误（不静默 fallback）
@@ -229,7 +435,8 @@ export class WorkflowEngine {
     // 2. 全新启动。必须在分配 workflowId/持久化 queued 状态之前验证所有
     // node 的有效 project/worktree，避免半条无效 workflow 留在 store。
     this.validateExecutionTargets(params.project, params.plan);
-    const workflowId = `wf-${Date.now()}-${this.idSeq++}`;
+    this.validatePlan(params.plan);
+    const workflowId = `wf-${Date.now()}-${randomUUID()}`;
     const now = new Date().toISOString();
     const nodes = this.initialNodes(params.plan);
     const policy: WorkflowRunState["policy"] = {
@@ -249,17 +456,26 @@ export class WorkflowEngine {
       input: params.input,
       policy,
       sharedContext: params.sharedContext,
+      metadata: params.metadata,
       status: "queued",
       nodes,
       createdAt: now,
       updatedAt: now,
       seq: 0,
       ackedSeq: -1,
+      checkpoint: {
+        controlEpoch: 0,
+        deadlineAt: policy.timeoutSeconds ? Date.now() + policy.timeoutSeconds * 1000 : undefined,
+        persistentSessions: {},
+        autoWorktrees: {},
+        mainBranchCheckedOut: {},
+      },
+      ownerEpoch: 0,
     };
     this.runs.set(workflowId, run);
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "queued" });
-    void this.executeWithTimeout(run).catch((err) => this.fail(run, err));
+    void this.executeWithTimeout(run, run.checkpoint.controlEpoch).catch((err) => this.fail(run, err));
     return { workflowId, status: run.status, createdAt: run.createdAt, resumed: false };
   }
 
@@ -269,7 +485,7 @@ export class WorkflowEngine {
    */
   async resume(params: {
     workflowId: string;
-    strategy: "last_success_dependents" | "failed_node" | `node:${string}`;
+    strategy: "continue" | "last_success_dependents" | "failed_node" | `node:${string}`;
     rerunNodes?: string[];
     feedback?: string;
     sharedContextPatch?: WorkflowSharedContext;
@@ -283,6 +499,7 @@ export class WorkflowEngine {
       throw new PhononError("errInvalidParams", `workflow ${params.workflowId} has no resumable checkpoint`);
     }
     this.validateExecutionTargets(restored.project, restored.plan);
+    this.validatePlan(restored.plan);
     // 合并 sharedContext patch + feedback
     if (params.sharedContextPatch || params.feedback) {
       const base = restored.sharedContext ?? {};
@@ -299,7 +516,7 @@ export class WorkflowEngine {
       restored.sharedContext = merged;
       this.persist(restored);
     }
-    void this.executeWithTimeout(restored).catch((err) => this.fail(restored, err));
+    void this.executeWithTimeout(restored, restored.checkpoint.controlEpoch).catch((err) => this.fail(restored, err));
     return { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
   }
 
@@ -336,38 +553,93 @@ export class WorkflowEngine {
     return { workflows: filtered };
   }
 
-  async cancel(workflowId: string, reason?: string): Promise<{ workflowId: string; status: "cancelled" }> {
+  async pause(workflowId: string, reason?: string): Promise<{ workflowId: string; status: "paused" }> {
     const run = this.runs.get(workflowId);
     if (!run) {
-      // 已落盘但内存无 → 直接幂等
-      return { workflowId, status: "cancelled" };
+      const stored = this.opts.store?.getWorkflow(workflowId, this.opts.tenantId);
+      if (stored?.status === "paused") return { workflowId, status: "paused" };
+      throw new PhononError("errInvalidParams", `workflow ${workflowId} is not owned by this connection`);
     }
-    if (["completed", "failed", "timeout"].includes(run.status)) {
-      return { workflowId, status: "cancelled" };
+    if (run.status === "paused") return { workflowId, status: "paused" };
+    if (["completed", "failed", "cancelled", "timeout"].includes(run.status)) {
+      throw new PhononError("errInvalidParams", `workflow ${workflowId} is already terminal (${run.status})`);
     }
-    run.status = "cancelled";
-    run.completedAt = new Date().toISOString();
-    run.updatedAt = run.completedAt;
-    for (const n of run.nodes) {
-      if (n.sessionId && (n.status === "running" || n.status === "ready" || n.status === "pending")) {
-        n.status = "cancelled";
-        try { await this.opts.engine.terminate(this.opts.tenantId, n.sessionId); } catch {}
+    run.checkpoint.controlEpoch++;
+    run.status = "paused";
+    run.updatedAt = new Date().toISOString();
+    const interrupts: Promise<unknown>[] = [];
+    for (const node of run.nodes) {
+      if (node.status === "running" || node.status === "ready") node.status = "paused";
+      const attempt = node.attempts?.at(-1);
+      if (attempt?.status === "running") {
+        attempt.status = "interrupted";
+        attempt.completedAt = run.updatedAt;
+        attempt.error = reason ?? "workflow paused";
       }
+      this.resolveNodeWaiter(node, "interrupted");
+      if (node.sessionId) interrupts.push(this.opts.engine.interrupt(run.tenantId, node.sessionId, reason ?? "workflow paused").catch(() => {}));
     }
-    // 清理本 workflow 的所有 persistent session + worktree
-    await this.cleanupPersistent(run);
-    const wtKept1 = await this.cleanupAutoWorktrees(run);
     this.persist(run);
-    this.emit(run, { type: "workflow.status", status: "cancelled", payload: { reason, worktreesKept: wtKept1.kept } });
-    return { workflowId, status: "cancelled" };
+    this.emit(run, { type: "workflow.status", status: "paused", payload: { reason } });
+    await settleWithin(interrupts);
+    return { workflowId, status: "paused" };
+  }
+
+  async cancel(workflowId: string, reason?: string): Promise<{ workflowId: string; status: "cancelled" }> {
+    let run = this.runs.get(workflowId);
+    if (!run) {
+      const row = this.opts.store?.getWorkflow(workflowId, this.opts.tenantId);
+      if (!row) throw new PhononError("errInvalidParams", `workflow ${workflowId} not found`);
+      if (["completed", "failed", "timeout", "cancelled"].includes(row.status as string)) return { workflowId, status: "cancelled" };
+      const ownerEpoch = this.opts.store!.claimWorkflow(workflowId, this.opts.tenantId, this.ownerId, this.leaseMs);
+      if (ownerEpoch === undefined) throw new PhononError("errInvalidParams", `workflow ${workflowId} is owned by another executor`);
+      run = this.restoreRow(row, ownerEpoch, false);
+      this.hydrateCheckpoint(run);
+      this.runs.set(workflowId, run);
+    }
+    if (["completed", "failed", "timeout", "cancelled"].includes(run.status)) {
+      return { workflowId, status: "cancelled" };
+    }
+    this.finalizing.add(workflowId);
+    try {
+      run.checkpoint.controlEpoch++;
+      run.status = "cancelled";
+      run.completedAt = new Date().toISOString();
+      run.updatedAt = run.completedAt;
+      const terminations: Promise<unknown>[] = [];
+      for (const n of run.nodes) {
+        if (n.status === "running" || n.status === "ready" || n.status === "pending" || n.status === "paused") {
+          n.status = "cancelled";
+          const attempt = n.attempts?.at(-1);
+          if (attempt?.status === "running") { attempt.status = "cancelled"; attempt.completedAt = run.updatedAt; }
+          this.resolveNodeWaiter(n, "interrupted");
+          if (n.sessionId) terminations.push(this.opts.engine.terminate(this.opts.tenantId, n.sessionId).catch(() => {}));
+        }
+      }
+      // Commit the terminal fence before touching any potentially stuck adapter.
+      this.persist(run);
+      this.emit(run, { type: "workflow.status", status: "cancelled", payload: { reason } });
+      await settleWithin(terminations);
+      await this.cleanupPersistent(run, false);
+      const wtKept1 = await this.cleanupAutoWorktrees(run);
+      this.persist(run);
+      if (wtKept1.kept.length > 0) {
+        this.emit(run, { type: "workflow.status", status: "cancelled", payload: { reason, worktreesKept: wtKept1.kept } });
+      }
+      this.opts.store?.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
+      return { workflowId, status: "cancelled" };
+    } finally {
+      this.finalizing.delete(workflowId);
+    }
   }
 
   ack(workflowId: string, lastSeq: number): void {
     const run = this.runs.get(workflowId);
     if (run) {
-      if (lastSeq > run.ackedSeq) {
-        run.ackedSeq = lastSeq;
-        this.opts.store?.ackWorkflow(workflowId, lastSeq, this.opts.tenantId);
+      const bounded = Math.min(lastSeq, run.seq - 1);
+      if (bounded > run.ackedSeq) {
+        run.ackedSeq = bounded;
+        this.opts.store?.ackWorkflow(workflowId, bounded, this.opts.tenantId);
       }
     } else {
       this.opts.store?.ackWorkflow(workflowId, lastSeq, this.opts.tenantId);
@@ -375,13 +647,38 @@ export class WorkflowEngine {
   }
 
   eventsList(params: { workflowId: string; afterSeq?: number; limit?: number }): { events: WorkflowEvent[]; nextSeq?: number } {
-    const all = this.workflowEvents.get(params.workflowId) ?? [];
     const afterSeq = params.afterSeq ?? -1;
     const limit = params.limit ?? 200;
+    if (this.opts.store) {
+      if (!this.opts.store.getWorkflow(params.workflowId, this.opts.tenantId)) {
+        throw new PhononError("errInvalidParams", `workflow ${params.workflowId} not found`);
+      }
+      const rows = this.opts.store.workflowEvents(params.workflowId, this.opts.tenantId, afterSeq, limit + 1);
+      const hasMore = rows.length > limit;
+      const events = rows.slice(0, limit).map((row) => JSON.parse(row.payload) as WorkflowEvent);
+      const last = events.at(-1)?.seq;
+      return { events, ...(hasMore && last !== undefined ? { nextSeq: last } : {}) };
+    }
+    const all = this.workflowEvents.get(params.workflowId) ?? [];
     const events = all.filter((e) => e.seq > afterSeq).slice(0, limit);
     const last = events.at(-1)?.seq;
     const hasMore = last !== undefined && all.some((e) => e.seq > last);
     return { events, ...(hasMore && last !== undefined ? { nextSeq: last } : {}) };
+  }
+
+  /** Replay durable workflow events not yet acknowledged by the server. */
+  replayUnacked(): number {
+    if (!this.opts.store || this.disposed) return 0;
+    let sent = 0;
+    for (const row of this.opts.store.unackedWorkflowEvents(this.opts.tenantId)) {
+      try {
+        this.opts.emit(JSON.parse(row.payload) as WorkflowEvent);
+        sent++;
+      } catch {
+        break;
+      }
+    }
+    return sent;
   }
 
   artifactRegister(params: { workflowId: string; nodeId?: string; kind: WorkflowArtifact["kind"]; path: string; title?: string; mimeType?: string; metadata?: Record<string, unknown> }): { artifact: WorkflowArtifact } {
@@ -404,7 +701,15 @@ export class WorkflowEngine {
     const list = this.artifacts.get(params.workflowId) ?? [];
     list.push(artifact);
     this.artifacts.set(params.workflowId, list);
+    let temporaryOwner = false;
+    if (this.opts.store && !this.opts.store.isWorkflowOwner(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch)) {
+      const epoch = this.opts.store.claimWorkflow(run.workflowId, run.tenantId, this.ownerId, this.leaseMs);
+      if (epoch === undefined) throw new PhononError("errInvalidParams", `workflow ${run.workflowId} is owned by another executor`);
+      run.ownerEpoch = epoch;
+      temporaryOwner = true;
+    }
     this.emit(run, { type: "artifact.written", nodeId: params.nodeId, payload: artifact });
+    if (temporaryOwner) this.opts.store?.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
     return { artifact };
   }
 
@@ -414,6 +719,7 @@ export class WorkflowEngine {
 
   /** SessionEngine sink → 提取 result 文本到 turnWaiters；不再产生 node.stream 事件。 */
   onStreamEvent(ev: StreamEvent): void {
+    if (this.disposed) return;
     const sessionId = (ev as { sessionId?: string }).sessionId;
     if (!sessionId) return;
     const mapping = this.sessionToNode.get(sessionId);
@@ -421,6 +727,12 @@ export class WorkflowEngine {
 
     const evAny = ev as Record<string, unknown>;
     const turnId = evAny.turnId as string | undefined;
+    const run = this.runs.get(mapping.workflowId);
+    const node = run?.nodes.find((n) => n.nodeId === mapping.nodeId);
+    // Pause/cancel/timeout/dispose advance the control boundary before the
+    // adapter is interrupted. Ignore all later output from that fenced turn;
+    // otherwise it accumulates in turnResultCache and can confuse recovery.
+    if (!run || run.status !== "running" || (node?.turnId && turnId !== node.turnId)) return;
     const key = `${sessionId}::${turnId ?? ""}`;
 
     if (evAny.type === "message" && typeof evAny.text === "string") {
@@ -430,8 +742,6 @@ export class WorkflowEngine {
       const text = (evAny.text as string | undefined) || this.pendingResultText.get(key) || "";
       this.pendingResultText.delete(key);
       const rawUsage = evAny.usage as WorkflowNodeResult["usage"] | undefined;
-      const run = this.runs.get(mapping.workflowId);
-      const node = run?.nodes.find((n) => n.nodeId === mapping.nodeId);
       const durationMs = node?.startedAt ? Math.max(0, Date.now() - Date.parse(node.startedAt)) : undefined;
       const usage = rawUsage || durationMs !== undefined ? { ...(rawUsage ?? {}), ...(durationMs !== undefined && rawUsage?.durationMs === undefined ? { durationMs } : {}) } : undefined;
       const status = (evAny.status as WorkflowNodeResult["status"]) ?? "completed";
@@ -484,52 +794,128 @@ export class WorkflowEngine {
     }
   }
 
-  private async executeWithTimeout(run: WorkflowRunState): Promise<void> {
-    const timeoutMs = run.policy.timeoutSeconds ? run.policy.timeoutSeconds * 1000 : undefined;
-    const exec = this.execute(run);
-    if (!timeoutMs) { await exec; return; }
+  private validatePlan(plan: WorkflowPlan): void {
+    const defs = plan.mode === "dag" ? plan.nodes : plan.mode === "graph" ? [plan.executor, ...plan.workers] : plan.participants;
+    const ids = new Set<string>();
+    for (const node of defs) {
+      if (ids.has(node.nodeId)) throw new PhononError("errInvalidParams", `duplicate workflow nodeId ${node.nodeId}`);
+      ids.add(node.nodeId);
+    }
+    if (plan.mode === "dag") {
+      for (const node of plan.nodes) for (const dep of node.dependsOn ?? []) {
+        if (!ids.has(dep)) throw new PhononError("errInvalidParams", `DAG dependency ${dep} does not exist`);
+      }
+      for (const edge of plan.edges ?? []) {
+        if (!ids.has(edge.from) || !ids.has(edge.to)) throw new PhononError("errInvalidParams", `DAG edge ${edge.from}->${edge.to} has an unknown endpoint`);
+      }
+      if (plan.finalNodeId && !ids.has(plan.finalNodeId)) throw new PhononError("errInvalidParams", `finalNodeId ${plan.finalNodeId} does not exist`);
+      return;
+    }
+    if (plan.mode === "discussion") {
+      if (!ids.has(plan.chairman)) throw new PhononError("errInvalidParams", `chairman ${plan.chairman} not in participants`);
+      return;
+    }
+    const executorId = plan.executor.nodeId;
+    const workerIds = new Set(plan.workers.map((w) => w.nodeId));
+    const edgeKeys = new Set<string>();
+    for (const edge of plan.communicationGraph.edges) {
+      const key = `${edge.from}->${edge.to}`;
+      if (edgeKeys.has(key)) throw new PhononError("errInvalidParams", `duplicate communication edge ${key}`);
+      edgeKeys.add(key);
+      if (edge.from !== executorId) throw new PhononError("errInvalidParams", `graph edge source must be executor ${executorId}: ${key}`);
+      if (!workerIds.has(edge.to)) throw new PhononError("errInvalidParams", `graph edge target is not a worker: ${key}`);
+      if (!plan.communicationGraph.allowSelfLoop && edge.from === edge.to) throw new PhononError("errInvalidParams", `self-loop is disabled: ${key}`);
+    }
+  }
+
+  private async executeWithTimeout(run: WorkflowRunState, executionEpoch: number): Promise<void> {
+    if (this.disposed) return;
+    if (run.policy.timeoutSeconds && run.checkpoint.deadlineAt === undefined) {
+      run.checkpoint.deadlineAt = Date.now() + run.policy.timeoutSeconds * 1000;
+      this.persist(run);
+    }
+    const timeoutMs = run.checkpoint.deadlineAt === undefined
+      ? undefined
+      : Math.max(0, run.checkpoint.deadlineAt - Date.now());
+    if (timeoutMs === 0) {
+      if (!this.disposed && run.checkpoint.controlEpoch === executionEpoch && ["queued", "running"].includes(run.status)) {
+        await this.finalizeTimeout(run);
+      }
+      return;
+    }
+    const exec = this.execute(run, executionEpoch);
+    if (timeoutMs === undefined) { await exec; return; }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
-    const winner = await Promise.race([exec.then(() => "done" as const), timeout]);
-    if (timer) clearTimeout(timer);
-    if (winner === "timeout") {
+    let winner: "done" | "timeout";
+    try {
+      winner = await Promise.race([exec.then(() => "done" as const), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (winner === "timeout" && !this.disposed && run.checkpoint.controlEpoch === executionEpoch && run.status === "running") {
+      await this.finalizeTimeout(run);
+    }
+  }
+
+  private async finalizeTimeout(run: WorkflowRunState): Promise<void> {
+    if (this.finalizing.has(run.workflowId)) return;
+    this.finalizing.add(run.workflowId);
+    try {
+      run.checkpoint.controlEpoch++;
       run.status = "timeout";
       run.completedAt = new Date().toISOString();
       run.updatedAt = run.completedAt;
       run.error = `workflow exceeded timeout ${run.policy.timeoutSeconds}s`;
-      this.persist(run);
-      this.emit(run, { type: "workflow.status", status: "timeout", payload: { error: run.error } });
+      const terminations: Promise<unknown>[] = [];
       for (const n of run.nodes) {
-        if (n.sessionId && ["running", "ready", "pending"].includes(n.status)) {
+        if (["running", "ready", "pending", "paused"].includes(n.status)) {
           n.status = "cancelled";
-          try { await this.opts.engine.terminate(this.opts.tenantId, n.sessionId); } catch {}
+          const attempt = n.attempts?.at(-1);
+          if (attempt?.status === "running") { attempt.status = "timeout"; attempt.completedAt = run.updatedAt; attempt.error = run.error; }
+          this.resolveNodeWaiter(n, "timeout");
+          if (n.sessionId) terminations.push(this.opts.engine.terminate(this.opts.tenantId, n.sessionId).catch(() => {}));
         }
       }
-      await this.cleanupPersistent(run);
-      const wtKept2 = await this.cleanupAutoWorktrees(run);
-      if (wtKept2.kept.length > 0) {
-        this.emit(run, { type: "workflow.status", status: "timeout", payload: { worktreesKept: wtKept2.kept } });
+      this.persist(run);
+      this.emit(run, { type: "workflow.status", status: "timeout", payload: { error: run.error } });
+      await settleWithin(terminations);
+      await this.cleanupPersistent(run, false);
+      const wtKept = await this.cleanupAutoWorktrees(run);
+      this.persist(run);
+      if (wtKept.kept.length > 0) {
+        this.emit(run, { type: "workflow.status", status: "timeout", payload: { worktreesKept: wtKept.kept } });
       }
+      this.opts.store?.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
+    } finally {
+      this.finalizing.delete(run.workflowId);
     }
   }
 
-  private async execute(run: WorkflowRunState): Promise<void> {
+  private async execute(run: WorkflowRunState, executionEpoch: number): Promise<void> {
+    if (this.disposed) return;
+    if (run.checkpoint.controlEpoch !== executionEpoch || run.status !== "queued") throw new StaleExecutionError();
     run.status = "running";
     run.updatedAt = new Date().toISOString();
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "running" });
-    if (run.plan.mode === "dag") await this.executeDag(run);
-    else if (run.plan.mode === "graph") await this.executeGraph(run);
-    else if (run.plan.mode === "discussion") await this.executeDiscussion(run);
+    if (run.plan.mode === "dag") await this.executeDag(run, executionEpoch);
+    else if (run.plan.mode === "graph") await this.executeGraph(run, executionEpoch);
+    else if (run.plan.mode === "discussion") await this.executeDiscussion(run, executionEpoch);
+    if (this.disposed) return;
+    this.assertCurrent(run, executionEpoch);
     if (!(["cancelled", "failed", "timeout"] as string[]).includes(run.status)) {
+      this.fillFinalText(run);
+      // Keep status=running while cleanup is in flight so lease renewal remains
+      // active and no successor can claim the pre-terminal checkpoint.
+      const wtKeptEx = await this.cleanupAutoWorktrees(run);
+      this.assertCurrent(run, executionEpoch);
       run.status = "completed";
       run.completedAt = new Date().toISOString();
       run.updatedAt = run.completedAt;
-      this.fillFinalText(run);
-      // DAG completed 路径：也要清理 auto worktree（持久 session 在 graph/discussion 内部已清）
-      const wtKeptEx = await this.cleanupAutoWorktrees(run);
       this.persist(run);
       this.emit(run, { type: "workflow.status", status: "completed", payload: { finalText: run.finalText, worktreesKept: wtKeptEx.kept } });
+      this.opts.store?.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
     }
   }
 
@@ -537,7 +923,7 @@ export class WorkflowEngine {
   // DAG
   // ---------------------------------------------------------------------------
 
-  private async executeDag(run: WorkflowRunState): Promise<void> {
+  private async executeDag(run: WorkflowRunState, executionEpoch: number): Promise<void> {
     if (run.plan.mode !== "dag") return;
     const plan = run.plan;
     const deps = new Map<string, Set<string>>();
@@ -552,9 +938,11 @@ export class WorkflowEngine {
     for (const node of run.nodes) {
       if (node.status === "completed") { settled.add(node.nodeId); succeeded.add(node.nodeId); }
       else if (node.status === "skipped") { settled.add(node.nodeId); skipped.add(node.nodeId); }
+      else if (node.status === "failed" && run.policy.onNodeFailure !== "fail_workflow") settled.add(node.nodeId);
     }
 
     while (settled.size < plan.nodes.length) {
+      this.assertCurrent(run, executionEpoch);
       if ((["cancelled", "failed", "timeout"] as string[]).includes(run.status)) return;
 
       const ready = plan.nodes.filter((n) => {
@@ -580,7 +968,8 @@ export class WorkflowEngine {
           skipped.add(n.nodeId);
         }
       }
-      const runnable = ready.filter((n) => !toSkip.includes(n));
+      // continue runs dependents once all prerequisites settle, even if some failed.
+      const runnable = run.policy.onNodeFailure === "continue" ? ready : ready.filter((n) => !toSkip.includes(n));
       if (runnable.length === 0 && toSkip.length > 0) continue;
 
       const batchSize = run.policy.maxParallel ?? runnable.length;
@@ -588,8 +977,9 @@ export class WorkflowEngine {
         const batch = runnable.slice(i, i + batchSize);
         const results = await Promise.allSettled(batch.map((n) =>
           this.executeNode(run, n.nodeId, n.agent, n.model, n.role, this.composeDagNodeInput(run, n, succeeded), n.agentConfig, n.systemPrompt, undefined,
-            { project: n.project, worktreeId: n.worktreeId, branch: n.branch })
+            { project: n.project, worktreeId: n.worktreeId, branch: n.branch }, executionEpoch)
         ));
+        this.assertCurrent(run, executionEpoch);
         for (let j = 0; j < batch.length; j++) {
           const n = batch[j]!;
           const r = results[j]!;
@@ -637,322 +1027,274 @@ export class WorkflowEngine {
   // Graph (executor + workers, v0.5 升级到 4-kind RoutingDirective)
   // ---------------------------------------------------------------------------
 
-  private async executeGraph(run: WorkflowRunState): Promise<void> {
+  private async executeGraph(run: WorkflowRunState, executionEpoch: number): Promise<void> {
     if (run.plan.mode !== "graph") return;
     const plan = run.plan;
     const allowedEdges = new Set<string>(plan.communicationGraph.edges.map((e) => `${e.from}->${e.to}`));
     const maxIterations = plan.communicationGraph.maxIterations ?? 12;
+    const cursor: GraphCursor = run.checkpoint.graph ?? {
+      iteration: 0,
+      phase: "executor",
+      currentDirectives: [],
+      handled: [],
+      workerResults: [],
+    };
+    run.checkpoint.graph = cursor;
 
     const executorPrompt = [
       "You are the EXECUTOR of a multi-agent workflow.",
       `Input: ${run.input ?? ""}`,
       `Workers available: ${JSON.stringify(plan.workers.map((w) => ({ nodeId: w.nodeId, role: w.role, agent: w.agent, model: w.model })))}`,
       `Communication graph (allowed routes): ${JSON.stringify(plan.communicationGraph)}`,
-      "",
-      "You may emit one of these fenced directives:",
-      "```phonon.workflow.route",
-      '{"to":"<workerNodeId>","message":"...","reason":"..."}',
-      "```",
-      "```phonon.workflow.feedback",
-      '{"to":"<workerNodeId>","message":"revise: ...","reason":"..."}',
-      "```",
-      "```phonon.workflow.reply",
-      '{"to":"<workerNodeId>","keystroke":"Y"}',
-      "```",
-      "```phonon.workflow.done",
-      '{"finalSummary":"...","reason":"..."}',
-      "```",
-      "Use `workflow.done` when you decide the workflow is complete.",
+      "", "Emit a fenced phonon.workflow.route/feedback/reply/done directive.",
+      "All targets must be workers connected by an explicit executor edge.",
+      "Use `workflow.done` when the workflow is complete.",
     ].join("\n");
-
-    // 启动 executor（persistKey = executor nodeId，后续轮复用同一 session）
     const execEnv = { project: plan.executor.project, worktreeId: plan.executor.worktreeId, branch: plan.executor.branch };
-    const executorResult = await this.executeNode(
-      run,
-      plan.executor.nodeId,
-      plan.executor.agent,
-      plan.executor.model,
-      "executor",
-      executorPrompt,
-      plan.executor.agentConfig,
-      plan.executor.systemPrompt,
-      plan.executor.nodeId,
-      execEnv,
-    );
+    let done = false;
 
-    let currentDirectives = parseRoutingDirectives(executorResult.text ?? "");
-    let lastExecutorText = executorResult.text ?? "";
-    let terminated = currentDirectives.some((d) => d.kind === "workflow.done");
-    let finalSummary: string | undefined;
-    for (const d of currentDirectives) {
-      if (d.kind === "workflow.done") finalSummary = d.finalSummary;
-    }
+    while (!done) {
+      this.assertCurrent(run, executionEpoch);
+      if (cursor.phase === "executor") {
+        const input = cursor.iteration === 0 && cursor.workerResults.length === 0
+          ? executorPrompt
+          : [
+              "Worker results from previous iteration:",
+              ...cursor.workerResults.map((w) => `[worker ${w.nodeId}]\n${w.text}`),
+              "", "Either emit the next routing directive or finalize with `workflow.done`.",
+            ].join("\n\n");
+        const result = await this.executeNode(
+          run, plan.executor.nodeId, plan.executor.agent, plan.executor.model, "executor", input,
+          plan.executor.agentConfig, plan.executor.systemPrompt, plan.executor.nodeId, execEnv, executionEpoch,
+        );
+        this.assertCurrent(run, executionEpoch);
+        cursor.lastExecutorText = result.text ?? cursor.lastExecutorText ?? "";
+        cursor.workerResults = [];
 
-    // 退出原因跟踪（修复问题 C）：executor 放弃/超 maxIterations 不是正常完成。
-    type GraphExit = "done" | "max_iterations" | "no_directive" | "no_valid_targets";
-    let exitReason: GraphExit | undefined;
+        const parsed = parseRoutingDirectives(cursor.lastExecutorText);
+        const seen = new Set<string>();
+        cursor.currentDirectives = parsed.filter((directive) => {
+          const key = directiveKey(directive);
+          if (seen.has(key)) return false; // duplicate blocks in one executor turn are idempotent
+          seen.add(key);
+          if (directive.kind === "workflow.done" || directive.kind === "workflow.human_review") return true;
+          const targets = Array.isArray(directive.to) ? directive.to : [directive.to];
+          // Strict: one bad endpoint invalidates the whole directive; never
+          // partially execute a broadcast that was not authorized as written.
+          return targets.length > 0 && targets.every((target) =>
+            plan.workers.some((w) => w.nodeId === target) && allowedEdges.has(`${plan.executor.nodeId}->${target}`));
+        });
+        cursor.phase = "directives";
+        this.persist(run);
 
-    // executor 首轮就没 emit 任何 directive：直接判定为 no_directive
-    if (currentDirectives.length === 0) {
-      exitReason = "no_directive";
-    }
+        const doneDirective = cursor.currentDirectives.find((d) => d.kind === "workflow.done");
+        if (doneDirective?.kind === "workflow.done") {
+          cursor.finalSummary = doneDirective.finalSummary;
+          done = true;
+          break;
+        }
+        if (cursor.currentDirectives.length === 0) {
+          throw new Error("graph executor terminated abnormally: no_valid_targets (no valid directive or authorized target)");
+        }
+      }
 
-    let iteration = 0;
-    while (currentDirectives.length > 0 && !terminated && iteration < maxIterations) {
-      if ((["cancelled", "failed", "timeout"] as string[]).includes(run.status)) return;
-      iteration++;
-      this.emit(run, { type: "round.started", payload: { iteration, mode: "graph" } });
+      if (cursor.phase !== "directives") continue;
+      if (cursor.iteration >= maxIterations) {
+        throw new Error(`graph executor terminated abnormally: max_iterations (reached maxIterations=${maxIterations})`);
+      }
+      const iteration = cursor.iteration + 1;
+      if (!cursor.roundStarted) {
+        this.emit(run, { type: "round.started", payload: { iteration, mode: "graph" } });
+        cursor.roundStarted = true;
+        this.persist(run);
+      }
 
-      const workerResults: { nodeId: string; text: string }[] = [];
-      let hadValidTarget = false;
-      for (const directive of currentDirectives) {
+      let produced = cursor.workerResults.length > 0;
+      for (const directive of cursor.currentDirectives) {
+        this.assertCurrent(run, executionEpoch);
+        const baseKey = `${cursor.iteration}:${directiveKey(directive)}`;
         if (directive.kind === "workflow.done") {
-          terminated = true;
-          finalSummary = directive.finalSummary;
-          exitReason = "done";
+          cursor.finalSummary = directive.finalSummary;
+          done = true;
           break;
         }
         if (directive.kind === "workflow.human_review") {
-          // v0.7: 暂停 workflow，反向问 server，等回复后决定 done 或继续
-          const reviewResult = await this.requestHumanReview(run, directive);
+          if (cursor.handled.includes(baseKey)) continue;
+          const reviewResult = await this.requestHumanReview(run, directive, `wf-review-${run.workflowId}-${baseKey}`);
+          this.assertCurrent(run, executionEpoch);
+          cursor.handled.push(baseKey);
           if (reviewResult.approved) {
-            terminated = true;
-            // v0.7 review fix: reviewer 不填 feedback 时，优先保留 executor 原始产出（不丢 LLM 输出），其次才是 directive.summary。
-            finalSummary = reviewResult.feedback ?? lastExecutorText ?? directive.summary;
-            exitReason = "done";
-            break;
+            cursor.finalSummary = reviewResult.feedback ?? cursor.lastExecutorText ?? directive.summary;
+            done = true;
+          } else {
+            cursor.workerResults.push({
+              nodeId: "__human_review__",
+              text: `[HUMAN REVIEW REJECTED]\nReviewer feedback: ${reviewResult.feedback ?? "(no feedback)"}\nReviewer: ${reviewResult.reviewer ?? "(unknown)"}`,
+            });
+            produced = true;
           }
-          // 拒绝 → 把 feedback 作为下一轮 executor 输入
-          hadValidTarget = true;
-          // 把 feedback 当成一个伪 worker 结果喂回 executor
-          workerResults.push({
-            nodeId: "__human_review__",
-            text: `[HUMAN REVIEW REJECTED]\nReviewer feedback: ${reviewResult.feedback ?? "(no feedback)"}\nReviewer: ${reviewResult.reviewer ?? "(unknown)"}`,
-          });
+          this.persist(run);
+          if (done) break;
           continue;
         }
-        // route / feedback / reply 都需要 target 在 allowedEdges 内
-        const targets = "to" in directive
-          ? (Array.isArray(directive.to) ? directive.to : [directive.to])
-          : [];
-        const validTargets = targets.filter((t) => allowedEdges.has(`${plan.executor.nodeId}->${t}`));
-        if (validTargets.length === 0) continue;
-        hadValidTarget = true;
 
-        for (const target of validTargets) {
-          const worker = plan.workers.find((w) => w.nodeId === target);
-          if (!worker) continue;
-
+        const targets = Array.isArray(directive.to) ? directive.to : [directive.to];
+        for (const target of targets) {
+          const targetKey = `${baseKey}:${target}`;
+          if (cursor.handled.includes(targetKey)) continue;
+          const worker = plan.workers.find((w) => w.nodeId === target)!;
           this.emit(run, {
-            type: "executor.decision",
-            nodeId: plan.executor.nodeId,
+            type: "executor.decision", nodeId: plan.executor.nodeId,
             payload: { kind: directive.kind, to: target, reason: ("reason" in directive ? directive.reason : undefined), iteration },
           });
-          this.emit(run, {
-            type: "edge.route",
-            payload: { from: plan.executor.nodeId, to: target, kind: directive.kind, iteration },
-          });
-
-          // 根据 kind 构造发给 worker 的输入
-          let workerInput: string;
-          if (directive.kind === "workflow.route") {
-            workerInput = directive.message;
-          } else if (directive.kind === "workflow.feedback") {
-            workerInput = `[FEEDBACK / REVISE]\n${directive.message}`;
-          } else if (directive.kind === "workflow.reply") {
-            workerInput = directive.keystroke;
-          } else {
-            continue;
-          }
-
-          const workerRes = await this.executeNode(
-            run,
-            worker.nodeId, // 修复问题 B：所有迭代复用同一 nodeId，iteration 走 payload，不再留空占位
-            worker.agent,
-            worker.model,
-            worker.role ?? "worker",
-            workerInput,
-            worker.agentConfig,
-            worker.systemPrompt,
-            worker.nodeId, // persistKey: 同一 worker 跨轮复用 session
-            { project: worker.project, worktreeId: worker.worktreeId, branch: worker.branch },
+          this.emit(run, { type: "edge.route", payload: { from: plan.executor.nodeId, to: target, kind: directive.kind, iteration } });
+          const workerInput = directive.kind === "workflow.route" ? directive.message
+            : directive.kind === "workflow.feedback" ? `[FEEDBACK / REVISE]\n${directive.message}`
+            : directive.keystroke;
+          const workerResult = await this.executeNode(
+            run, worker.nodeId, worker.agent, worker.model, worker.role ?? "worker", workerInput,
+            worker.agentConfig, worker.systemPrompt, worker.nodeId,
+            { project: worker.project, worktreeId: worker.worktreeId, branch: worker.branch }, executionEpoch,
           );
-          workerResults.push({ nodeId: target, text: workerRes.text ?? "" });
+          this.assertCurrent(run, executionEpoch);
+          cursor.workerResults.push({ nodeId: target, text: workerResult.text ?? "" });
+          cursor.handled.push(targetKey);
+          produced = true;
+          this.persist(run); // target-level boundary: recovery never repeats completed route
         }
       }
-      if (terminated) break;
-      if (!hadValidTarget) {
-        // 本轮中所有 directive 的 target 都被 graph 拒了 → executor 乱府或疑似问题
-        this.emit(run, { type: "round.completed", payload: { iteration, workerCount: 0 } });
-        exitReason = "no_valid_targets";
-        break;
-      }
-      if (workerResults.length === 0) {
-        this.emit(run, { type: "round.completed", payload: { iteration, workerCount: 0 } });
-        exitReason = "no_directive";
-        break;
-      }
-      this.emit(run, { type: "round.completed", payload: { iteration, workerCount: workerResults.length } });
-
-      // 把 worker 反馈喂回 executor
-      const followupPrompt = [
-        "Worker results from previous iteration:",
-        ...workerResults.map((w) => `[worker ${w.nodeId}]\n${w.text}`),
-        "",
-        "Either emit the next routing directive or finalize with `workflow.done`.",
-      ].join("\n\n");
-      const nextRes = await this.executeNode(
-        run,
-        plan.executor.nodeId, // 修复问题 B：executor 跨轮复用同一 nodeId
-        plan.executor.agent,
-        plan.executor.model,
-        "executor",
-        followupPrompt,
-        plan.executor.agentConfig,
-        plan.executor.systemPrompt,
-        plan.executor.nodeId, // persistKey
-        execEnv,
-      );
-      lastExecutorText = nextRes.text ?? lastExecutorText;
-      currentDirectives = parseRoutingDirectives(lastExecutorText);
-      for (const d of currentDirectives) {
-        if (d.kind === "workflow.done") {
-          terminated = true;
-          finalSummary = d.finalSummary;
-          exitReason = "done";
-        }
-      }
-      // executor 本轮输出不含任何 directive → 放弃了
-      if (currentDirectives.length === 0 && !terminated) {
-        exitReason = "no_directive";
-      }
-    }
-    if (!exitReason) {
-      // while 正常退出但未设 exitReason → 一定是超了 maxIterations
-      exitReason = terminated ? "done" : "max_iterations";
-    }
-
-    run.finalText = finalSummary ?? lastExecutorText;
-    // Graph 终态：清理 persistent session + worktree
-    await this.cleanupPersistent(run);
-    const wtKept3 = await this.cleanupAutoWorktrees(run);
-    if (wtKept3.kept.length > 0) {
-      this.emit(run, { type: "workflow.status", status: run.status, payload: { worktreesKept: wtKept3.kept } });
-    }
-
-    // 修复问题 C：非 done 退出都该标 failed，不是 completed
-    if (exitReason !== "done") {
-      run.status = "failed";
-      run.completedAt = new Date().toISOString();
-      run.updatedAt = run.completedAt;
-      run.error = `graph executor terminated abnormally: ${exitReason}` +
-        (exitReason === "no_directive" ? " (executor emitted no parseable directive)" :
-         exitReason === "no_valid_targets" ? " (all routing targets were rejected by communicationGraph)" :
-         exitReason === "max_iterations" ? ` (reached maxIterations=${maxIterations})` : "");
+      if (done) break;
+      if (!produced) throw new Error("graph executor terminated abnormally: no_directive");
+      this.emit(run, { type: "round.completed", payload: { iteration, workerCount: cursor.workerResults.length } });
+      cursor.iteration = iteration;
+      cursor.phase = "executor";
+      cursor.currentDirectives = [];
+      cursor.roundStarted = false;
       this.persist(run);
-      this.emit(run, {
-        type: "workflow.status",
-        status: "failed",
-        payload: { error: run.error, terminationReason: exitReason, finalText: run.finalText },
-      });
     }
+
+    run.finalText = cursor.finalSummary ?? cursor.lastExecutorText;
+    await this.cleanupPersistent(run);
+    const wtKept = await this.cleanupAutoWorktrees(run);
+    if (wtKept.kept.length > 0) this.emit(run, { type: "workflow.status", status: run.status, payload: { worktreesKept: wtKept.kept } });
   }
 
   // ---------------------------------------------------------------------------
   // Discussion (v0.5 新增；借鉴 Foreman _run_discuss_rounds)
   // ---------------------------------------------------------------------------
 
-  private async executeDiscussion(run: WorkflowRunState): Promise<void> {
+  private async executeDiscussion(run: WorkflowRunState, executionEpoch: number): Promise<void> {
     if (run.plan.mode !== "discussion") return;
     const plan = run.plan;
     const chairman = plan.participants.find((p) => p.nodeId === plan.chairman);
     if (!chairman) throw new PhononError("errInvalidParams", `chairman ${plan.chairman} not in participants`);
     const nonChair = plan.participants.filter((p) => p.nodeId !== plan.chairman);
-
-    const termination = plan.termination;
-    const chairmanSignal = termination?.chairmanSignal ?? "[DISCUSS_END]";
-    const maxRounds = termination?.maxRounds ?? 10;
-    const consensusSignal = termination?.consensusSignal;
-
+    const chairmanSignal = plan.termination?.chairmanSignal ?? "[DISCUSS_END]";
+    const maxRounds = plan.termination?.maxRounds ?? 10;
+    const consensusSignal = plan.termination?.consensusSignal;
+    const cursor: DiscussionCursor = run.checkpoint.discussion ?? {
+      round: 1, phase: "participants", outputs: {}, transcript: [],
+    };
+    run.checkpoint.discussion = cursor;
     let terminationReason: string | undefined;
-    let round = 0;
-    const transcript: { round: number; nodeId: string; role?: string; text: string }[] = [];
 
-    while (round < maxRounds) {
-      if ((["cancelled", "failed", "timeout"] as string[]).includes(run.status)) return;
-      round++;
-      this.emit(run, { type: "round.started", payload: { iteration: round, mode: "discussion", participants: nonChair.map((p) => p.nodeId) } });
-
-      // 阶段 A：非主席并行发言。复用各自持久 session（persistKey = p.nodeId）：agent
-      // 本身记得上轮说过什么、自己是谁，不需在 prompt 里复述全部历史（避免问题 E 复粘）。
-      const prompt = round === 1
-        ? `This is a multi-agent discussion. Topic: ${plan.topic}\n\nThis is round ${round}. State your position briefly. Stay strictly in character.`
-        : `This is round ${round} of the discussion. Building on what has already been said in earlier rounds (you remember your own prior turns), advance the discussion with NEW points. Do not repeat or summarize previous turns. Stay strictly in character.`;
-
-      const speakResults = await Promise.allSettled(
-        nonChair.map((p) =>
-          this.executeNode(run, p.nodeId, p.agent, p.model, p.role ?? "participant", prompt, p.agentConfig, p.systemPrompt, p.nodeId,
-            { project: p.project, worktreeId: p.worktreeId, branch: p.branch })
-            .then((r) => ({ nodeId: p.nodeId, role: p.role, text: r.text ?? "" })),
-        ),
-      );
-
-      let consensusHit = false;
-      for (const sr of speakResults) {
-        if (sr.status === "fulfilled") {
-          transcript.push({ round, nodeId: sr.value.nodeId, role: sr.value.role, text: sr.value.text });
-          if (consensusSignal && sr.value.text.includes(consensusSignal)) consensusHit = true;
-        }
+    while (!terminationReason && cursor.round <= maxRounds) {
+      this.assertCurrent(run, executionEpoch);
+      if (!cursor.roundStarted) {
+        this.emit(run, {
+          type: "round.started",
+          payload: { iteration: cursor.round, mode: "discussion", participants: nonChair.map((p) => p.nodeId) },
+        });
+        cursor.roundStarted = true;
+        this.persist(run);
       }
-      this.emit(run, { type: "round.completed", payload: { iteration: round, speakers: speakResults.length } });
 
+      if (cursor.phase === "participants") {
+        const missing = nonChair.filter((p) => !cursor.outputs[p.nodeId]);
+        const maxParallel = Math.max(1, run.policy.maxParallel ?? (missing.length || 1));
+        for (let i = 0; i < missing.length; i += maxParallel) {
+          const batch = missing.slice(i, i + maxParallel);
+          const results = await Promise.allSettled(batch.map(async (participant) => {
+            try {
+              const prompt = cursor.round === 1
+                ? `This is a multi-agent discussion. Topic: ${plan.topic}\n\nThis is round ${cursor.round}. State your position briefly. Stay strictly in character.`
+                : `This is round ${cursor.round} of the discussion. Advance the discussion with NEW points. Do not repeat earlier turns. Stay strictly in character.`;
+              const result = await this.executeNode(
+                run, participant.nodeId, participant.agent, participant.model, participant.role ?? "participant", prompt,
+                participant.agentConfig, participant.systemPrompt, participant.nodeId,
+                { project: participant.project, worktreeId: participant.worktreeId, branch: participant.branch }, executionEpoch,
+              );
+              this.assertCurrent(run, executionEpoch);
+              cursor.outputs[participant.nodeId] = { role: participant.role, text: result.text ?? "" };
+            } catch (err) {
+              if (run.policy.onNodeFailure !== "continue") throw err;
+              this.assertCurrent(run, executionEpoch);
+              cursor.outputs[participant.nodeId] = { role: participant.role, text: `[participant failed: ${String(err)}]` };
+            }
+            const output = cursor.outputs[participant.nodeId]!;
+            cursor.transcript.push({ round: cursor.round, nodeId: participant.nodeId, role: output.role, text: output.text });
+            // Participant-level checkpoint: a crash while another speaker in
+            // this batch is still running never repeats an already committed speech.
+            this.persist(run);
+          }));
+          this.assertCurrent(run, executionEpoch);
+          const failed = results.find((result) => result.status === "rejected");
+          if (failed?.status === "rejected") throw failed.reason;
+        }
+        if (nonChair.some((p) => !cursor.outputs[p.nodeId])) throw new Error("discussion participant barrier incomplete");
+        cursor.phase = "chairman";
+        this.persist(run);
+      }
+
+      const consensusHit = !!consensusSignal && nonChair.some((p) => cursor.outputs[p.nodeId]?.text.includes(consensusSignal));
       if (consensusHit) {
         terminationReason = `consensus signal "${consensusSignal}" detected`;
+        this.emit(run, { type: "round.completed", payload: { iteration: cursor.round, speakers: nonChair.length } });
         break;
       }
 
-      // 阶段 B：主席审视本轮。复用同一 chairman session（他也记得自己之前的总结）。
-      // prompt 只发本轮 contributions，避免复述全部历史。
-      const chairmanPrompt = [
-        `Round ${round} of the discussion just finished.`,
-        "",
-        "This round's contributions:",
-        ...speakResults.map((sr, i) => {
-          if (sr.status === "fulfilled") return `[${nonChair[i]!.nodeId} as ${nonChair[i]!.role ?? "participant"}]\n${sr.value.text}`;
-          return `[${nonChair[i]!.nodeId}] (failed: ${String(sr.reason)})`;
-        }),
-        "",
-        `As the chairman, decide whether the discussion has reached a useful conclusion.`,
-        `If yes, write your final summary AND include the literal token "${chairmanSignal}" somewhere in your reply (this signals the discussion to end).`,
-        "If no, summarize this round briefly and indicate what should be explored next.",
-      ].join("\n");
-
-      const chairmanRes = await this.executeNode(
-        run, chairman.nodeId, chairman.agent, chairman.model, chairman.role ?? "chairman",
-        chairmanPrompt, chairman.agentConfig, chairman.systemPrompt, chairman.nodeId,
-        { project: chairman.project, worktreeId: chairman.worktreeId, branch: chairman.branch },
-      );
-      transcript.push({ round, nodeId: chairman.nodeId, role: chairman.role ?? "chairman", text: chairmanRes.text ?? "" });
-
-      if ((chairmanRes.text ?? "").includes(chairmanSignal)) {
-        terminationReason = `chairman signal "${chairmanSignal}"`;
-        break;
+      if (cursor.phase === "chairman") {
+        const priorChair = cursor.outputs[chairman.nodeId];
+        let chairmanText = priorChair?.text;
+        if (chairmanText === undefined) {
+          const chairmanPrompt = [
+            `Round ${cursor.round} of the discussion just finished.`, "", "This round's contributions:",
+            ...nonChair.map((p) => `[${p.nodeId} as ${p.role ?? "participant"}]\n${cursor.outputs[p.nodeId]!.text}`),
+            "", "As the chairman, decide whether the discussion has reached a useful conclusion.",
+            `If yes, write your final summary AND include the literal token "${chairmanSignal}" somewhere in your reply.`,
+            "If no, summarize this round briefly and indicate what should be explored next.",
+          ].join("\n");
+          const result = await this.executeNode(
+            run, chairman.nodeId, chairman.agent, chairman.model, chairman.role ?? "chairman", chairmanPrompt,
+            chairman.agentConfig, chairman.systemPrompt, chairman.nodeId,
+            { project: chairman.project, worktreeId: chairman.worktreeId, branch: chairman.branch }, executionEpoch,
+          );
+          this.assertCurrent(run, executionEpoch);
+          chairmanText = result.text ?? "";
+          cursor.outputs[chairman.nodeId] = { role: chairman.role ?? "chairman", text: chairmanText };
+          cursor.transcript.push({ round: cursor.round, nodeId: chairman.nodeId, role: chairman.role ?? "chairman", text: chairmanText });
+          this.persist(run);
+        }
+        this.emit(run, { type: "round.completed", payload: { iteration: cursor.round, speakers: nonChair.length + 1 } });
+        if (chairmanText.includes(chairmanSignal)) terminationReason = `chairman signal "${chairmanSignal}"`;
+        else if (cursor.round >= maxRounds) terminationReason = `maxRounds (${maxRounds}) reached`;
+        else {
+          cursor.round++;
+          cursor.phase = "participants";
+          cursor.outputs = {};
+          cursor.roundStarted = false;
+          this.persist(run);
+        }
       }
     }
-    if (!terminationReason && round >= maxRounds) terminationReason = `maxRounds (${maxRounds}) reached`;
 
-    this.emit(run, { type: "discussion.terminated", payload: { rounds: round, reason: terminationReason ?? "unknown" } });
-
-    // Discussion 终态：清理 persistent session + worktree
+    if (!terminationReason) terminationReason = `maxRounds (${maxRounds}) reached`;
+    this.emit(run, { type: "discussion.terminated", payload: { rounds: Math.min(cursor.round, maxRounds), reason: terminationReason } });
+    const lastChairman = [...cursor.transcript].reverse().find((t) => t.nodeId === chairman.nodeId);
+    run.finalText = lastChairman?.text ?? cursor.transcript.at(-1)?.text;
     await this.cleanupPersistent(run);
-    const wtKept4 = await this.cleanupAutoWorktrees(run);
-    if (wtKept4.kept.length > 0) {
-      this.emit(run, { type: "workflow.status", status: run.status, payload: { worktreesKept: wtKept4.kept } });
-    }
-
-    // finalText = 最后一轮 chairman 输出，没有则最后一轮最后一个 participant
-    const lastChairman = [...transcript].reverse().find((t) => t.nodeId === chairman.nodeId);
-    run.finalText = lastChairman?.text ?? (transcript.length ? transcript[transcript.length - 1]!.text : undefined);
+    const wtKept = await this.cleanupAutoWorktrees(run);
+    if (wtKept.kept.length > 0) this.emit(run, { type: "workflow.status", status: run.status, payload: { worktreesKept: wtKept.kept } });
   }
 
   // ---------------------------------------------------------------------------
@@ -981,11 +1323,25 @@ export class WorkflowEngine {
     persistKey?: string,
     /** v0.6: 该节点的执行环境覆写（project/worktreeId/branch）。不传默认继承 workflow 级。 */
     nodeEnv?: { project?: string; worktreeId?: string; branch?: string },
+    executionEpoch = run.checkpoint.controlEpoch,
   ): Promise<WorkflowNodeResult> {
+    this.assertCurrent(run, executionEpoch);
     const node = run.nodes.find((n) => n.nodeId === nodeId) ?? this.addNode(run, { nodeId, agent, model, role });
     node.status = "running";
     node.startedAt = node.startedAt ?? new Date().toISOString();
+    // A persistent node may reuse its session for a new turn. Clear the prior
+    // turn id before send because adapters can emit synchronously before
+    // SessionEngine.send returns the new id; onStreamEvent must accept those
+    // early frames into turnResultCache.
+    node.turnId = undefined;
     node.iterations = (node.iterations ?? 0) + 1;
+    const attempt: NonNullable<WorkflowNodeState["attempts"]>[number] = {
+      attempt: (node.attempts?.at(-1)?.attempt ?? 0) + 1,
+      iteration: node.iterations,
+      status: "running",
+      startedAt: new Date().toISOString(),
+    };
+    (node.attempts ??= []).push(attempt);
     run.updatedAt = new Date().toISOString();
     this.emit(run, { type: "node.status", nodeId, agent, model, role, status: "running", payload: { iteration: node.iterations } });
 
@@ -997,6 +1353,7 @@ export class WorkflowEngine {
       const effectiveWorktreeId = exec.worktreeId;
       const systemPrompt = this.buildSystemPrompt(run, nodeSystemPrompt, cwd, role, effectiveProject, effectiveWorktreeId);
       const initialContext = systemPrompt ? [{ role: "system" as const, content: systemPrompt }] : undefined;
+      this.assertCurrent(run, executionEpoch);
 
       // ---- session 获取：persistent 复用 cache；burner 每次新建 ----
       const cacheKey = persistKey ? `${run.workflowId}::${persistKey}` : undefined;
@@ -1023,18 +1380,27 @@ export class WorkflowEngine {
         this.sessionToNode.set(sessionId, { workflowId: run.workflowId, nodeId });
       }
       node.sessionId = sessionId;
+      attempt.sessionId = sessionId;
+      this.persist(run);
+      this.assertCurrent(run, executionEpoch);
 
       const sent = await this.opts.engine.send(run.tenantId, sessionId, input, {
         environment: this.opts.env.resolveForExecution({ projectId: effectiveProject, agent }),
       });
       node.turnId = sent.turnId;
+      attempt.turnId = sent.turnId;
+      this.persist(run);
 
       const result = await this.awaitTurnResult(run, sessionId, sent.turnId);
+      this.assertCurrent(run, executionEpoch);
       node.result = result;
       node.status = result.status === "completed" ? "completed" : "failed";
       node.completedAt = new Date().toISOString();
       run.updatedAt = node.completedAt;
       if (node.status === "failed") node.error = result.text || `turn ended with status ${result.status}`;
+      attempt.status = result.status === "completed" ? "completed" : result.status === "timeout" ? "timeout" : "failed";
+      attempt.completedAt = node.completedAt;
+      if (node.error) attempt.error = node.error;
       this.persist(run);
       this.emit(run, {
         type: "node.status",
@@ -1051,9 +1417,13 @@ export class WorkflowEngine {
       if (node.status === "failed") throw new Error(node.error ?? "node failed");
       return result;
     } catch (err) {
+      if (err instanceof StaleExecutionError || run.checkpoint.controlEpoch !== executionEpoch || run.status !== "running") throw new StaleExecutionError();
       node.status = "failed";
       node.completedAt = new Date().toISOString();
       node.error = (err as Error)?.message ?? String(err);
+      attempt.status = "failed";
+      attempt.completedAt = node.completedAt;
+      attempt.error = node.error;
       run.updatedAt = node.completedAt;
       this.persist(run);
       this.emit(run, { type: "node.status", nodeId, agent, model, role, status: "failed", payload: { error: node.error } });
@@ -1062,15 +1432,26 @@ export class WorkflowEngine {
   }
 
   /** 清理某 workflow 的所有 persistent session（底层 best-effort）。 */
-  private async cleanupPersistent(run: WorkflowRunState): Promise<void> {
+  private async cleanupPersistent(run: WorkflowRunState, terminate = true): Promise<void> {
     const prefix = `${run.workflowId}::`;
     const toRemove: string[] = [];
+    const terminations: Promise<unknown>[] = [];
     for (const [k, sid] of this.persistentSessions.entries()) {
       if (!k.startsWith(prefix)) continue;
       toRemove.push(k);
-      try { await this.opts.engine.terminate(run.tenantId, sid); } catch {}
+      if (terminate) terminations.push(this.opts.engine.terminate(run.tenantId, sid).catch(() => {}));
     }
     for (const k of toRemove) this.persistentSessions.delete(k);
+    await settleWithin(terminations);
+  }
+
+  private resolveNodeWaiter(node: WorkflowNodeState, status: WorkflowNodeResult["status"]): void {
+    if (!node.sessionId || !node.turnId) return;
+    const key = `${node.sessionId}::${node.turnId}`;
+    const resolve = this.turnWaiters.get(key);
+    if (resolve) resolve({ status, text: "" });
+    this.pendingResultText.delete(key);
+    this.turnResultCache.delete(key);
   }
 
   // =============================================================================
@@ -1084,6 +1465,7 @@ export class WorkflowEngine {
   private async requestHumanReview(
     run: WorkflowRunState,
     directive: { kind: "workflow.human_review"; title: string; summary: string; artifacts?: Array<{ path: string; role: string }>; reason?: string; timeoutSeconds: number },
+    requestId: string,
   ): Promise<{ approved: boolean; feedback?: string; reviewer?: string }> {
     // emit requested 事件，server 端 UI 可以预先准备
     this.emit(run, {
@@ -1097,24 +1479,29 @@ export class WorkflowEngine {
       return result;
     }
     // 构造 interaction.request 表单
-    const interactionParams = {
-      reason: directive.reason ?? "Human review requested by workflow executor",
-      sessionId: run.workflowId, // 让 server 能按 workflowId 路由
+    const interactionParams = InteractionRequestParamsSchema.parse({
+      // Deterministic across checkpoint recovery: a server can de-duplicate a
+      // replayed review instead of showing a second form after device restart.
+      requestId,
+      blocking: true,
       timeoutSeconds: directive.timeoutSeconds,
+      at: new Date().toISOString(),
       form: {
         title: directive.title,
-        description: directive.summary,
-        metadata: {
-          workflowId: run.workflowId,
-          artifacts: directive.artifacts,
-        },
+        description: [
+          directive.summary,
+          `Workflow: ${run.workflowId}`,
+          directive.reason ? `Reason: ${directive.reason}` : undefined,
+          directive.artifacts?.length ? `Artifacts: ${directive.artifacts.map((a) => `${a.role}=${a.path}`).join(", ")}` : undefined,
+        ].filter(Boolean).join("\n\n"),
         fields: [
-          { name: "approved", label: "Approve?", type: "boolean", required: true },
-          { name: "feedback", label: "Feedback", type: "text", required: false },
-          { name: "reviewer", label: "Reviewer", type: "text", required: false },
+          { key: "approved", label: "Approve?", type: "boolean", required: true },
+          { key: "feedback", label: "Feedback", type: "text", required: false },
+          { key: "reviewer", label: "Reviewer", type: "text", required: false },
         ],
+        submitLabel: "Submit review",
       },
-    };
+    });
     let response: { approved?: boolean; feedback?: string; reviewer?: string; values?: Record<string, unknown> };
     // v0.7 补补丁：engine 本地 timeout race，防止 server 不 honor timeoutSeconds 或永远不回导致 workflow 永久挂死。
     // 策略：取 directive.timeoutSeconds + 5 秒宽限（留 server 优先回的机会），在 phonon 这边超时 → reject + emit resolved。
@@ -1200,12 +1587,17 @@ export class WorkflowEngine {
         projectId, baseBranch, newBranch: autoBranch,
       });
       this.autoWorktrees.set(autoKey, { projectId, worktreeId: wt.worktreeId, userKey: userWorktreeKey });
+      // Persist the resource identity before any node turn starts. This closes
+      // the common crash window that otherwise creates a second worktree on
+      // recovery (or leaves the first one orphaned).
+      this.persist(run);
       const cwd = this.opts.resolveCwd(projectId, wt.worktreeId);
       return { projectId, worktreeId: wt.worktreeId, cwd };
     }
 
     // ---- 情况 2: 不要 worktree 但要切 branch ----
-    if (branch) {
+    if (branch !== undefined) {
+      assertRefName(branch, "branch");
       const cacheKey = `${run.workflowId}::${projectId}`;
       const already = this.mainBranchCheckedOut.get(cacheKey);
       if (already !== branch) {
@@ -1218,6 +1610,7 @@ export class WorkflowEngine {
         try {
           await this.opts.projects.runGit(projectId, ["checkout", branch]);
           this.mainBranchCheckedOut.set(cacheKey, branch);
+          this.persist(run);
         } catch (e) {
           throw new PhononError("errInvalidParams", `git checkout ${branch} failed: ${(e as Error).message}`);
         }
@@ -1253,8 +1646,10 @@ export class WorkflowEngine {
     const toClear: string[] = [];
     for (const [k, entry] of this.autoWorktrees.entries()) {
       if (!k.startsWith(prefix)) continue;
-      toClear.push(k);
-      if (!this.opts.projects) continue;
+      if (!this.opts.projects) {
+        kept.push({ worktreeId: entry.worktreeId, userKey: entry.userKey, reason: "project manager unavailable" });
+        continue;
+      }
       try {
         // 检查 worktree dirty 状态
         let dirty = false;
@@ -1275,6 +1670,7 @@ export class WorkflowEngine {
           continue;
         }
         await this.opts.projects.worktreeRemove({ projectId: entry.projectId, worktreeId: entry.worktreeId });
+        toClear.push(k);
       } catch (err) {
         kept.push({ worktreeId: entry.worktreeId, userKey: entry.userKey, reason: `cleanup failed: ${(err as Error).message}` });
       }
@@ -1368,8 +1764,22 @@ export class WorkflowEngine {
   // ---------------------------------------------------------------------------
 
   private persist(run: WorkflowRunState): void {
-    if (!this.opts.store) return;
-    this.opts.store.upsertWorkflow({
+    if (this.disposed && !this.finalizing.has(run.workflowId)) return;
+    if (!this.persistDisposedRun(run)) {
+      run.checkpoint.controlEpoch++;
+      throw new StaleExecutionError();
+    }
+  }
+
+  /** Store helper used by dispose after the public runtime has been fenced. */
+  private persistDisposedRun(run: WorkflowRunState): boolean {
+    if (!this.opts.store) return true;
+    return this.opts.store.upsertWorkflow(this.storeRecord(run));
+  }
+
+  private storeRecord(run: WorkflowRunState): Parameters<PhononStore["upsertWorkflow"]>[0] {
+    this.captureCheckpointResources(run);
+    return {
       workflowId: run.workflowId,
       tenantId: run.tenantId,
       projectId: run.project,
@@ -1388,68 +1798,140 @@ export class WorkflowEngine {
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
       completedAt: run.completedAt,
-    });
+      checkpointJson: JSON.stringify(run.checkpoint),
+      ownerId: this.ownerId,
+      ownerEpoch: run.ownerEpoch,
+      leaseUntil: Date.now() + this.leaseMs,
+      metadataJson: run.metadata ? JSON.stringify(run.metadata) : undefined,
+    };
+  }
+
+  private captureCheckpointResources(run: WorkflowRunState): void {
+    const prefix = `${run.workflowId}::`;
+    run.checkpoint.persistentSessions = Object.fromEntries([...this.persistentSessions].filter(([key]) => key.startsWith(prefix)));
+    run.checkpoint.autoWorktrees = Object.fromEntries([...this.autoWorktrees].filter(([key]) => key.startsWith(prefix)));
+    run.checkpoint.mainBranchCheckedOut = Object.fromEntries([...this.mainBranchCheckedOut].filter(([key]) => key.startsWith(prefix)));
+  }
+
+  private hydrateCheckpoint(run: WorkflowRunState): void {
+    for (const [key, value] of Object.entries(run.checkpoint.persistentSessions ?? {})) this.persistentSessions.set(key, value);
+    for (const [key, value] of Object.entries(run.checkpoint.autoWorktrees ?? {})) this.autoWorktrees.set(key, value);
+    for (const [key, value] of Object.entries(run.checkpoint.mainBranchCheckedOut ?? {})) this.mainBranchCheckedOut.set(key, value);
+    for (const node of run.nodes) {
+      if (node.status === "running" || node.status === "ready" || node.status === "paused") node.status = "pending";
+    }
   }
 
   private restoreFromCheckpoint(rf: WorkflowResumeFrom): WorkflowRunState | undefined {
     if (!this.opts.store) return undefined;
+    if (this.finalizing.has(rf.workflowId)) {
+      throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} finalization is still in progress`);
+    }
     const row = this.opts.store.getWorkflow(rf.workflowId, this.opts.tenantId);
     if (!row) return undefined;
+    const priorStatus = row.status as string;
+    if (["queued", "running"].includes(priorStatus)) {
+      throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} is already active`);
+    }
+    if (!["paused", "failed", "timeout", "cancelled"].includes(priorStatus)) {
+      throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} is not resumable from ${priorStatus}`);
+    }
+    const knownNodeIds = new Set((JSON.parse(row.nodes_json as string) as WorkflowNodeState[]).map((node) => node.nodeId));
+    for (const nodeId of rf.rerunNodes ?? []) {
+      if (!knownNodeIds.has(nodeId)) throw new PhononError("errInvalidParams", `resume node ${nodeId} does not exist`);
+    }
+    if (rf.strategy.startsWith("node:") && !knownNodeIds.has(rf.strategy.slice(5))) {
+      throw new PhononError("errInvalidParams", `resume node ${rf.strategy.slice(5)} does not exist`);
+    }
+    const ownerEpoch = this.opts.store.claimWorkflow(rf.workflowId, this.opts.tenantId, this.ownerId, this.leaseMs);
+    if (ownerEpoch === undefined) throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} is owned by another executor`);
+    const run = this.restoreRow(row, ownerEpoch, false);
+    if (run.policy.timeoutSeconds && (priorStatus !== "paused" || rf.strategy !== "continue")) {
+      run.checkpoint.deadlineAt = Date.now() + run.policy.timeoutSeconds * 1000;
+    }
 
-    const plan = JSON.parse(row.plan_json as string) as WorkflowPlan;
-    const nodes = JSON.parse(row.nodes_json as string) as WorkflowNodeState[];
-    const policy = JSON.parse((row.policy_json as string) || '{"onNodeFailure":"fail_workflow"}');
-    const sharedContext = row.shared_json ? JSON.parse(row.shared_json as string) : undefined;
-
-    // 应用恢复策略：决定哪些节点要重置到 pending 重跑
     const rerun = new Set<string>(rf.rerunNodes ?? []);
-    if (rf.strategy === "failed_node") {
-      for (const n of nodes) if (n.status === "failed" || n.status === "cancelled" || n.status === "running") rerun.add(n.nodeId);
+    if (rf.strategy === "continue") {
+      for (const node of run.nodes) if (["paused", "running", "ready", "cancelled"].includes(node.status)) rerun.add(node.nodeId);
+    } else if (rf.strategy === "failed_node") {
+      for (const node of run.nodes) if (["failed", "cancelled", "running", "paused"].includes(node.status)) rerun.add(node.nodeId);
     } else if (rf.strategy === "last_success_dependents") {
-      // 把所有非 completed 节点 + 失败节点的依赖图下游都重置
-      for (const n of nodes) if (n.status !== "completed") rerun.add(n.nodeId);
+      for (const node of run.nodes) if (node.status !== "completed") rerun.add(node.nodeId);
     } else if (rf.strategy.startsWith("node:")) {
-      const fromId = rf.strategy.slice(5);
-      rerun.add(fromId);
-      // 简化：把所有非 completed 节点都加入（DAG runtime 自然只挑 ready 的）
-      for (const n of nodes) if (n.status !== "completed") rerun.add(n.nodeId);
+      rerun.add(rf.strategy.slice(5));
+      for (const node of run.nodes) if (node.status !== "completed") rerun.add(node.nodeId);
     }
-    for (const n of nodes) {
-      if (rerun.has(n.nodeId)) {
-        n.status = "pending";
-        delete n.result; delete n.error; delete n.startedAt; delete n.completedAt;
-        delete n.sessionId; delete n.turnId;
-      }
+    for (const node of run.nodes) {
+      if (!rerun.has(node.nodeId)) continue;
+      node.status = "pending";
+      delete node.result; delete node.error; delete node.startedAt; delete node.completedAt;
+      delete node.sessionId; delete node.turnId;
     }
-
-    const now = new Date().toISOString();
-    const run: WorkflowRunState = {
-      workflowId: rf.workflowId,
-      tenantId: row.tenant_id as string,
-      project: (row.project_id as string | null) ?? undefined,
-      worktreeId: (row.worktree_id as string | null) ?? undefined,
-      mode: row.mode as "dag" | "graph" | "discussion",
-      plan,
-      input: (row.input as string | null) ?? undefined,
-      policy,
-      sharedContext,
-      status: "queued",
-      nodes,
-      createdAt: row.created_at as string,
-      updatedAt: now,
-      seq: Number(row.seq ?? 0),
-      ackedSeq: Number(row.acked_seq ?? -1),
-      finalText: (row.final_text as string | null) ?? undefined,
-    };
+    // Explicit rollback strategies intentionally restart the mode cursor. A
+    // paused/automatic `continue` keeps the exact graph/discussion barrier.
+    if (rf.strategy !== "continue") {
+      delete run.checkpoint.graph;
+      delete run.checkpoint.discussion;
+    }
+    run.status = "queued";
+    run.error = undefined;
+    run.completedAt = undefined;
+    run.updatedAt = new Date().toISOString();
+    run.checkpoint.controlEpoch++;
+    this.hydrateCheckpoint(run);
     this.runs.set(rf.workflowId, run);
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "queued", payload: { resumed: true, strategy: rf.strategy } });
     return run;
   }
 
+  private restoreRow(row: Record<string, unknown>, ownerEpoch: number, automatic: boolean): WorkflowRunState {
+    const checkpoint = row.checkpoint_json
+      ? JSON.parse(row.checkpoint_json as string) as WorkflowCheckpoint
+      : { controlEpoch: 0, persistentSessions: {}, autoWorktrees: {}, mainBranchCheckedOut: {} };
+    checkpoint.controlEpoch = Number(checkpoint.controlEpoch ?? 0) + (automatic ? 1 : 0);
+    checkpoint.persistentSessions ??= {};
+    checkpoint.autoWorktrees ??= {};
+    checkpoint.mainBranchCheckedOut ??= {};
+    const run: WorkflowRunState = {
+      workflowId: row.workflow_id as string,
+      tenantId: row.tenant_id as string,
+      project: (row.project_id as string | null) ?? undefined,
+      worktreeId: (row.worktree_id as string | null) ?? undefined,
+      mode: row.mode as WorkflowRunState["mode"],
+      plan: JSON.parse(row.plan_json as string) as WorkflowPlan,
+      input: (row.input as string | null) ?? undefined,
+      policy: JSON.parse((row.policy_json as string) || '{"onNodeFailure":"fail_workflow"}'),
+      sharedContext: row.shared_json ? JSON.parse(row.shared_json as string) : undefined,
+      metadata: row.metadata_json ? JSON.parse(row.metadata_json as string) : undefined,
+      status: automatic ? "queued" : row.status as WorkflowRunState["status"],
+      nodes: JSON.parse(row.nodes_json as string) as WorkflowNodeState[],
+      createdAt: row.created_at as string,
+      updatedAt: new Date().toISOString(),
+      completedAt: automatic ? undefined : (row.completed_at as string | null) ?? undefined,
+      error: automatic ? undefined : (row.error as string | null) ?? undefined,
+      seq: Number(row.seq ?? 0),
+      ackedSeq: Number(row.acked_seq ?? -1),
+      finalText: (row.final_text as string | null) ?? undefined,
+      checkpoint,
+      ownerEpoch,
+    };
+    return run;
+  }
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  private assertCurrent(run: WorkflowRunState, executionEpoch: number): void {
+    const ownsLease = !this.opts.store || this.opts.store.renewWorkflowLease(
+      run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch, this.leaseMs,
+    );
+    if (this.disposed || !ownsLease || run.checkpoint.controlEpoch !== executionEpoch || run.status !== "running") {
+      if (!ownsLease) run.checkpoint.controlEpoch++;
+      throw new StaleExecutionError();
+    }
+  }
 
   private fillFinalText(run: WorkflowRunState): void {
     if (run.finalText) return;
@@ -1482,16 +1964,17 @@ export class WorkflowEngine {
   }
 
   private fail(run: WorkflowRunState, err: unknown): void {
-    if (run.status === "cancelled" || run.status === "timeout") return;
+    if (err instanceof StaleExecutionError || this.disposed || run.status === "paused" || run.status === "cancelled" || run.status === "timeout") return;
     run.status = "failed";
     run.error = (err as Error)?.message ?? String(err);
     run.completedAt = new Date().toISOString();
     run.updatedAt = run.completedAt;
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "failed", payload: { error: run.error } });
-    // 清理本 workflow 的所有 persistent session + worktree（不阻塞 fail 路径）
-    void this.cleanupPersistent(run).catch(() => {});
-    void this.cleanupAutoWorktrees(run).catch(() => {});
+    this.opts.store?.releaseWorkflow(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch);
+    // Failed workflows are explicitly resumable. Keep their durable session and
+    // worktree mappings intact; asynchronous cleanup after releasing ownership
+    // can otherwise race an immediate workflow.resume and delete its resources.
   }
 
   private toStatus(run: WorkflowRunState): WorkflowStatusResult {
@@ -1506,7 +1989,7 @@ export class WorkflowEngine {
       completedAt: run.completedAt,
       error: run.error,
       finalText: run.finalText,
-      resumable: !!this.opts.store && (run.status === "failed" || run.status === "timeout" || run.status === "cancelled"),
+      resumable: !!this.opts.store && ["paused", "failed", "timeout", "cancelled"].includes(run.status),
     } as WorkflowStatusResult;
   }
 
@@ -1522,16 +2005,42 @@ export class WorkflowEngine {
       completedAt: (row.completed_at as string | null) ?? undefined,
       error: (row.error as string | null) ?? undefined,
       finalText: (row.final_text as string | null) ?? undefined,
-      resumable: ["failed", "timeout", "cancelled"].includes(row.status as string),
+      resumable: ["paused", "failed", "timeout", "cancelled"].includes(row.status as string),
     } as WorkflowStatusResult;
   }
 
   private emit(run: WorkflowRunState, partial: Record<string, unknown>): void {
-    const ev = { workflowId: run.workflowId, seq: run.seq++, timestamp: new Date().toISOString(), ...partial } as unknown as WorkflowEvent;
-    const list = this.workflowEvents.get(run.workflowId) ?? [];
-    list.push(ev);
-    this.workflowEvents.set(run.workflowId, list);
-    this.persist(run);
-    this.opts.emit(ev);
+    if (this.disposed) return;
+    if (this.opts.store && !this.opts.store.isWorkflowOwner(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch)) {
+      run.checkpoint.controlEpoch++;
+      return;
+    }
+    const ev = {
+      workflowId: run.workflowId,
+      seq: run.seq++,
+      timestamp: new Date().toISOString(),
+      ...(run.metadata ? { metadata: run.metadata } : {}),
+      ...partial,
+    } as unknown as WorkflowEvent;
+    if (this.opts.store) {
+      const persisted = this.opts.store.appendWorkflowEvent(this.storeRecord(run), {
+        seq: ev.seq,
+        payload: JSON.stringify(ev),
+        createdAt: ev.timestamp,
+      });
+      if (!persisted) {
+        run.checkpoint.controlEpoch++;
+        return;
+      }
+    } else {
+      const list = this.workflowEvents.get(run.workflowId) ?? [];
+      list.push(ev);
+      this.workflowEvents.set(run.workflowId, list);
+    }
+    try {
+      this.opts.emit(ev);
+    } catch {
+      // Event/checkpoint are already durable; reconnect replay handles delivery.
+    }
   }
 }

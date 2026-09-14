@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "path": "acceptance/claude-gpt-compat-20260909-173426/REPORT.zh-CN.md",
+    "sha256": "e88695b2af3c137db02bc5dc1c40bed00b3b70dca511e000fd9c5e3a8d449367"
+  },
+  "scope": "Exact selected historical report lines, not raw wire/native evidence or a new acceptance. Omitted lines include host configuration, private artifacts and unrelated history; original source hash is provenance, not a claim that a fresh checkout can replay the original acceptance.",
+  "excerpts": [
+    {
+      "startLine": 7,
+      "endLine": 9,
+      "text": "**Claude→本地 GPT 的最终文本丢失问题已经在 agent-phonon 项目边界修复，并通过真实 Rescue 配置写入、原生 Claude 多步 Read 和最终文本验收。不是只写 env、不是模拟 Read、不是重复报告已知问题。**\n\n**重要状态：成功的独立 GPT settings 保留；验收 sidecar 已全部停止、24339 无监听。当前结果是可重现的 opt-in 入口，不是生产常驻部署。原默认 Claude、独立 Qwen、Hermes/OpenCode 成功配置均未改变。**\n"
+    },
+    {
+      "startLine": 13,
+      "endLine": 19,
+      "text": "本轮重新读取旧 wire、安装包源码及官方文档，再请求真实 local4000 `/v1/responses`。\n\n- 新原始 wire `original-live.sse` 再现：`response.created/in_progress/output_item.added/output_item.done/completed`，完整文字位于 message item 的 `content[].text`，**没有 `response.output_text.delta`**。\n- PyPI 实时检查最新发布仍是 **LiteLLM 1.100.0**。其 Anthropic Responses adapter 仅从 text delta 生成文字，item.done 只关 block，所以旧路线工具已执行但 finaltext 空。检查当前 main，新增的 refusal 等处理不等于 final output_text 回放修复。\n- 正式文档及安装版调用点没有发现适用的官方 buffering/nonstream-upstream→Messages-SSE 开关。原始 Responses deployment hook 每事件只返回一个替代事件，且吞异常，不能安全“多插一个 delta 并保留 done”；proxy iterator hook 已收到转换后的 Anthropic SSE，文字已经丢失。\n- 因此没有伪造参数、切换 OAuth、安装全局包或改 4000 服务。采用**固定版本 + 官方源文件 SHA 的进程局部 adapter 子类**。Messages↔Responses、模型路由、tool schema、参数转换、usage 仍由官方 LiteLLM 实现，不重造协议网关。\n\n"
+    },
+    {
+      "startLine": 32,
+      "endLine": 51,
+      "text": "`compat.install()` 校验的官方源码 SHA：\n\n- streaming_iterator.py：`75fcf0dfb4b458b2dc8d96dcbda4e9b2afd41ad2a1dc6761c870816793bb9a42`\n- handler.py：`1f604cf5910e53f9c90d5f6cd764a7564ba4a325d2c1ce27de1b94725e5fbd27`\n\n只替换**当前 launcher 进程中的类绑定**，没有向新旧 venv 或全局 site-packages 写补丁。版本/源字节不符启动拒绝；停止进程即卸除 shim。依赖锁和启动源码不依赖验收时的一次性 monkeypatch 文件或 GUI 状态。\n\n### 1.2 流语义、去重和错误边界\n\n1. 原标准 delta 立即原样交给官方处理；按 `(item_id, content_index)` 记已输出内容。\n2. 仅在 finalized message 到达、且该 content 从未有 delta 时，从 item 的真实文本补一次内部标准 text-delta，再关闭 block。不从 added 提前猜文字。\n3. 已有 delta 与 final 完全一致时不补；重复相同 done 不重复输出/关闭；不完整/冲突 delta、会重排内容的混合形态、缺失 final、空成功、未知/refusal/media final 内容保守报错。\n4. 保持 item/tool ID 和顺序，工具参数仍走官方转换；额外校验 tool call ID/name 和已转发 argument delta 拼接与 final tool 完全相同。缺失或冲突工具数据直接失败，不自行制造参数或结果。\n5. failed/incomplete、transport error、超时、提前 EOF 不变成 end_turn；发送 Anthropic SSE error 而非成功 message_stop。可识别 HTTP 状态保持相应错误类别，不反射任意原异常字符串中的 URL/头部内容。\n6. 每次模型流 deadline 45 秒，官方 upstream timeout 40 秒；等待工具结果发生在工具调用完成后、下一次模型请求前，没有提前伪造工具回复。取消和下游关闭会关闭官方 iterator 持有的 httpx.Response。\n7. completed usage 不改写；真实 native **最终 result.usage** 与各轮 upstream usage 的官方 Anthropic 投影逐项相等（含 cache read/write）。Claude 提前输出的 assistant snapshot usage 可为 0，不能拿它代替最终累计 usage。\n\n**如实命名：这是 final-item 文本补发兼容，不是恢复原上游逐 token 输出。** 本轮最终 7 次核心 native Responses 请求仍然是 stream:true；上游 text delta 总数 0，shim 只补了 3 个真实文字 item（短文本和两轮最终答案）。工具 argument deltas 原本存在，未补造。没有启用非流式上游来冒充 token streaming。\n\n证据：`official-preflight.json`、`official-release.json`、`hooks-doc.txt`、`current-streaming-iterator.py`、`original-live.sse`、`verified-converter-audit.jsonl`、`shim-tests-release-check.log`。\n"
+    },
+    {
+      "startLine": 94,
+      "endLine": 104,
+      "text": "### 1.4 最终代码的真实 Claude 验收\n\n核心 native 不传 `--model`、不传 endpoint override，而是读取上述 **Rescue 写入的真 settings**：`--bare --settings <真文件> --setting-sources '' --no-session-persistence --strict-mcp-config`。干净环境/独立 HOME 排除旧 token/OAuth/cache；工具只有本次明确授权的 Read，未跳过全部权限或修改全局审批。\n\n| 最终代码测试 | 真工具 | 最终 result 文本 | 结果 |\n| --- | --- | --- | --- |\n| 无工具短文本 | 0 | `GPT_TEXT_07b30631d14b2bc5` | exit 0，非空，非 error |\n| 新会话链 1 | 两次依赖 Read | `CLAUDE_GPT_CHAIN_1_68b1f678544083b4` | exit 0，精确等于第二个随机文件内容 |\n| 新会话链 2 | 两次依赖 Read | `CLAUDE_GPT_CHAIN_2_765966b71ad2c37e` | exit 0，不同 session/marker，精确相等 |\n\n多步链不是要求模型直接回显 prompt：prompt 不含 marker；第一次 Read 读取 first.txt，内容给出随机的第二文件名；第二次 Read 才能获得 marker。两个实际会话中全部工具结果按相同 callID、逐字相同内容进入下一次 `/v1/responses`；上游 tool name/arguments 与 native Read 输入也完全相同。\n"
+    },
+    {
+      "startLine": 109,
+      "endLine": 115,
+      "text": "- 链 2：`call_Y3ScLzucDIMMdhDQlqGluAWB` → `call_jg58KJJjzr8QbJpnCrnh6JjU`\n\n**模型映射与协议转换分开验证：**\n\n- 三个核心 native init.model 均为 `local-gpt-sol`，没有 CLI 模型覆盖；官方映射后每次上游请求为 gpt-5.6-sol，stream:true、store:false、路径 `/v1/responses`，native assistant.model 为 gpt-5.6-sol。\n- 另做独立的角色专项测试：分别显式 `--model opus/sonnet/haiku`（仅这些专项测试有 role override），三者 native init.model 均解析为 local-gpt-sol，分别返回 `ROLE_OPUS_OK`、`ROLE_SONNET_OK`、`ROLE_HAIKU_OK`。不是仅声称 env 字段已存在。\n- 服务日志实际接收 `/v1/messages?beta=true`；上游 guard/audit 记录的是 `/v1/responses`，且 Read tool results 已实际转换往返，不是只改别名。\n"
+    },
+    {
+      "startLine": 121,
+      "endLine": 124,
+      "text": "- **31/31 shim 回归通过**：final-item-only、completed-only、done 缺 added、标准 delta 不重复、与官方 adapter 逐事件等价、多 item/content 顺序、重复 done、部分/冲突文字拒绝、空/缺失 final 拒绝、失败/不完整/HTTP 错误分类、timeout、cancel、真实本地 HTTP socket 断开清理、usage、tool ID/arguments 原值和缺失/冲突拒绝等。\n- 最终代码做真实 sidecar 客户端断开：收到 message_start 后立即关闭客户端，`active-cancel/result.json` 显示对应 `msg_afcea4d6-7e57-484e-b0b2-6ca80047a915` 的 `stream_closed.completed=false`，关闭记录约在客户端断开后 1 毫秒。证明实际流未完成就关闭，不把取消算模型完成。\n- 如实保留一个取消检测非通过样本：`verified-role-cancel/result.json` 中短请求在断开被检测前已经正常完成，故 completed=true，不能证明 active cancel，测试为 false。三角色测试仍分别通过。随后用随机、较长但有界的一个本地请求重测 active cancel 成功；没有删掉竞态记录或修改上游。\n- timeout 是可控模拟/真实本地 transport 回归，不冒充故意拖挂实际 4000 服务；未改实际服务来注入故障。\n"
+    },
+    {
+      "startLine": 159,
+      "endLine": 165,
+      "text": "## 2. 剩余与明确限制\n\n1. **核心兼容目标没有功能 blocker：已真实成功。** 上游仍是 final-item-only，故文本不是 token 实时；这是已知并诚实披露的兼容行为，不是漏 finaltext 的旧失败。\n2. **未部署长期常驻服务。** 独立 GPT settings 现在依赖已停止的24339，不能只选文件就宣称立即可用。需先按项目支持方式前台启动 sidecar；默认 Qwen/Hermes/OpenCode不受影响。\n3. Claude 原默认 settings 和生产 Phonon override 仍旧、真实凭据原样保留。生产 Claude adapter 的独立 settings 选择/安全迁移是另一个部署范围；不能只改 endpoint 然后沿用旧 token。\n4. 此 wrapper 是固定版本、文本/已验证工具形态的保守兼容层；未知升级、缺失/矛盾事件、refusal/media 等不自动猜测恢复。无需 CC Switch GUI 或跨仓库权限即可完成当前目标。\n5. 快请求的取消观测竞态保留为非通过样本，另一个真正 active cancel 已通过；没有以“关闭 socket”替代确认 stream 未完成就关闭。\n"
+    }
+  ]
+}

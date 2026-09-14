@@ -130,7 +130,7 @@ async function main(): Promise<void> {
     case "rescue": {
       const sub = args[0];
       if (sub !== "configure") {
-        console.error("usage: agent-phonon rescue configure --base-url <url> --model <id> (--api-key <key>|--api-key-env <name>|--api-key-ref <file>)");
+        console.error("usage: agent-phonon rescue configure --base-url <url> --model <id> [--wire-api chat|responses|anthropic|gemini] (--api-key-env <name>|--api-key-ref <file>|--no-auth [loopback only])");
         process.exit(1);
       }
       const baseUrl = opt("base-url");
@@ -138,19 +138,25 @@ async function main(): Promise<void> {
       const apiKey = opt("api-key");
       const apiKeyEnv = opt("api-key-env");
       const apiKeyRef = opt("api-key-ref");
-      if (!baseUrl || !model || (!apiKey && !apiKeyEnv && !apiKeyRef)) {
-        console.error("usage: agent-phonon rescue configure --base-url <url> --model <id> (--api-key <key>|--api-key-env <name>|--api-key-ref <file>)");
+      const wireApi = opt("wire-api") ?? "chat";
+      if (wireApi !== "chat" && wireApi !== "responses" && wireApi !== "anthropic" && wireApi !== "gemini") {
+        console.error("rescue --wire-api must be chat, responses, anthropic or gemini");
         process.exit(1);
       }
-      const probe = await probeRescueEndpoint({ baseUrl, model, apiKey, apiKeyEnv, apiKeyRef });
+      const authMode = flag("no-auth") ? "none" as const : "api-key" as const;
+      if (!baseUrl || !model || (authMode !== "none" && !apiKey && !apiKeyEnv && !apiKeyRef)) {
+        console.error("usage: agent-phonon rescue configure --base-url <url> --model <id> [--wire-api chat|responses|anthropic|gemini] (--api-key-env <name>|--api-key-ref <file>|--no-auth [loopback only])");
+        process.exit(1);
+      }
+      const probe = await probeRescueEndpoint({ baseUrl, model, apiKey, apiKeyEnv, apiKeyRef, authMode, wireApi });
       if (!probe.ok) {
         console.error(`rescue endpoint probe failed${probe.status ? ` (HTTP ${probe.status})` : ""}: ${probe.error ?? "unknown error"}`);
-        console.error("configuration was not changed; endpoint must support OpenAI Chat Completions + tool calling");
+        console.error("configuration was not changed; endpoint must support the selected wire API + tool calling");
         process.exit(1);
       }
-      const cfg = configureRescueAgent(loadConfig(), { baseUrl, model, apiKey, apiKeyEnv, apiKeyRef });
+      const cfg = configureRescueAgent(loadConfig(), { baseUrl, model, apiKey, apiKeyEnv, apiKeyRef, authMode, wireApi });
       writeConfig(cfg);
-      console.log(`configured phonon-rescue (${model} @ ${baseUrl}); Chat Completions tool probe passed; restart the daemon to apply`);
+      console.log(`configured phonon-rescue (${model} @ ${baseUrl}); ${wireApi} tool probe passed; restart the daemon to apply`);
       break;
     }
     case "service": {
@@ -180,7 +186,7 @@ async function main(): Promise<void> {
       console.log("  doctor                        check agent availability / Gateway / plugin");
       console.log("  adapter add <type> [opts]     configure an adapter override (auto-detect covers common local agents)");
       console.log("  adapter list                  list configured + auto-detected adapters");
-      console.log("  rescue configure [opts]       configure built-in OpenAI-compatible rescue agent");
+      console.log("  rescue configure [opts]       configure rescue (--wire-api chat|responses|anthropic|gemini; --no-auth: loopback only)");
       console.log("  plugin install openclaw       install OpenClaw HITL plugin");
       console.log("  service install|start|status  manage autostart service (Linux systemd / macOS launchd / Windows nssm)");
       console.log("  server add <url> [--trust-local] [--device-key <k>]");

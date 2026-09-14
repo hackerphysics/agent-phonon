@@ -1,10 +1,12 @@
 import { spawn } from "node:child_process";
+import { spawnSupervised } from "./process-supervisor.js";
 import { mkdir, rm, readdir, stat, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve, basename, sep, relative, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { PhononError } from "./rpc.js";
 import { buildChildProcessEnvironment } from "./child-env.js";
+import { randomUUID } from "node:crypto";
 
 /**
  * 项目管理（design §8c / D23 + D25）。
@@ -86,7 +88,7 @@ function assertNotOption(value: string, label: string): string {
  * 允许：字母数字 . _ / - + ~ ^ : @ { } （覆盖 refspec / HEAD@{u} / a..b 等常见形式）。
  * 拒：空格、`..` 开头、控制符、`-` 开头、`--`。
  */
-function assertRefName(value: string, label: string): string {
+export function assertRefName(value: string, label: string): string {
   assertNotOption(value, label);
   if (value.length > 255) throw new PhononError("errInvalidParams", `${label} too long`);
   if (value.includes("--")) throw new PhononError("errInvalidParams", `${label} must not contain '--'`);
@@ -106,7 +108,6 @@ function assertRemote(value: string, label = "remote"): string {
 export class ProjectManager {
   private projects = new Map<string, ProjectRecord>();
   private worktrees = new Map<string, WorktreeRecord>();
-  private idSeq = 1;
   /** 查询某 project 是否有 active session（由 engine 注入）。 */
   private hasActiveSessions: (projectId: string) => string[];
   /** 查询某 worktree 是否有 active session（bug-bash#2 B8）。 */
@@ -160,7 +161,7 @@ export class ProjectManager {
   }
 
   async create(params: { name: string; path?: string; git?: boolean; remote?: string }): Promise<ProjectRecord> {
-    const projectId = `proj-${Date.now()}-${this.idSeq++}`;
+    const projectId = `proj-${Date.now()}-${randomUUID()}`;
     const root = this.workspaceRoot ?? defaultWorkspaceRoot();
     let path = params.path ? resolve(params.path) : join(root, params.name);
     // 路径校验（P0-1）：policy 执行越界拒绝（不再「记风险但放行」）
@@ -225,7 +226,7 @@ export class ProjectManager {
     // A1: 校验用户可控的 branch 名，拒选项注入
     assertRefName(params.baseBranch, "baseBranch");
     if (params.newBranch) assertRefName(params.newBranch, "newBranch");
-    const worktreeId = `wt-${Date.now()}-${this.idSeq++}`;
+    const worktreeId = `wt-${Date.now()}-${randomUUID()}`;
     const wtPath = params.path ? resolve(params.path) : join(proj.path, "..", `${proj.name}-${params.newBranch ?? params.baseBranch}`.replace(/\//g, "-"));
     // 自定义 worktree path 同样走 policy 路径校验（bug-bash#2 B8）
     if (params.path && this.assertProjectPath) this.assertProjectPath(wtPath);
@@ -506,14 +507,15 @@ export class ProjectManager {
     const max = params.maxOutputBytes ?? 1024 * 1024;
     const timeoutMs = params.timeoutMs ?? 120_000;
     return new Promise((resolveP, reject) => {
-      const child = spawn(params.command, params.args ?? [], { cwd, shell: false, env: buildChildProcessEnvironment(params.env) });
+      const supervisor = spawnSupervised(params.command, params.args ?? [], { cwd, shell: false, env: buildChildProcessEnvironment(params.env) });
+      const child = supervisor.child;
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0); let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0); let truncated = false;
       const append = (cur: Buffer<ArrayBufferLike>, d: Buffer): Buffer<ArrayBufferLike> => {
         const next = Buffer.concat([cur, d]);
         if (next.length > max) { truncated = true; return next.subarray(0, max); }
         return next;
       };
-      const timer = setTimeout(() => { child.kill("SIGTERM"); }, timeoutMs);
+      const timer = setTimeout(() => { void supervisor.terminate(); }, timeoutMs);
       child.stdout.on("data", (d: Buffer) => { stdout = append(stdout, d); });
       child.stderr.on("data", (d: Buffer) => { stderr = append(stderr, d); });
       child.on("error", (e) => { clearTimeout(timer); reject(new PhononError("errInternal", `exec spawn failed: ${e.message}`)); });

@@ -1,7 +1,6 @@
 # L4 Scheduling Protocol（定时任务 / Automation）
 
-Status: **设计获批 + v1 实现已完成（2026-06-30）**。调度内核（cron/webhook/manual 三种 trigger + run=session + consent 三档推送）已落地并通过全部测试。
-runKind=workflow 保留接口位，v1 暂拒（明确报 errCapabilityUnsupported，不停半成品语义）。
+Status: **设计获批 + Schedule→Workflow 闭环已实现（2026-08-16）**。调度内核支持 cron/webhook/manual、run=session/workflow、三档 consent 推送，以及 queue/retry/catch-up/cancel 的持久化生命周期。
 
 agent-phonon L4 在 L1 session / L2 tenant / L3 orchestration 之上，提供**设备自治的定时任务调度**。
 一个 schedule 到点（或被 webhook / 手动触发）后，会发起一次 **run**；每个 run 本质就是一次普通的
@@ -243,7 +242,7 @@ L4 几乎不新增执行原语，主要新增的是**调度器（device 本地 c
 
 ## 已知边界 / 留待实现细化
 
-- webhook body → target.prompt 的模板插值语法（变量白名单、防注入）。
+- webhook body 的高级模板插值语法（变量白名单、防注入）。当前字符串直接注入；对象以 JSON 注入 session prompt 或 workflow input。
 - cron 表达式库选型（需支持 tz、秒级可选）。
 - `maxConcurrentRuns` 设备级限流。
 - run 历史的本地保留策略（复用 sessions prune 思路：older-than / keep-n）。
@@ -277,8 +276,18 @@ Device 核心（`@agent-phonon/core`）
 - `e2e-scheduler.test.ts`（3）：真实 WS+SDK 跑通 create/trigger/run + p2s 推送 + full consent transcriptPath。
 - 全量回归：functional 125、e2e 29、protocol 50 全绿。
 
+## Schedule→Workflow 闭环（2026-08-16）
+
+- `runKind=workflow` 通过 tenant-scoped `WorkflowEngine.run` 启动，Run 持久化 `workflowId`；调度器订阅 `workflow.event`，把 workflow 终态映射为 run 的 `success/failed/timeout/cancelled`，并持久化 `resultText`。`consent.push=full` 时 workflow 元事件也可经 `run.event` 订阅。
+- `overlap=queue` 使用每 schedule FIFO；仅当前执行全部终态后启动队首一次。disable 或把 policy 改为非 queue 会取消排队项；delete 会收敛排队/运行记录。连接 dispose 时 session run 审计收敛，workflow run 则保持 active，并由替换连接重新绑定同一个 workflow。
+- `maxRetries=N` 明确定义总尝试上限为 `1+N`。仅 launch/runtime failure 重试；success/cancel/timeout 不重试。Run 暴露 `attempt/maxAttempts/retryHistory` 审计。触发 input 持久化，重连后的 retry 仍使用原输入。
+- 启动恢复时，`catchUp=true` 最多补一次最近错过的 cron 触发，`false` 只推进 `nextRunAt`；所有 cron 路径都先持久化下一触发点再 launch，避免重启风暴/重复触发。
+- scheduled workflow 的 `runId` 会写入 workflow metadata；即使崩溃发生在 workflow 已落盘而 run.workflowId 尚未写回的窗口，重启也能重新关联。每个 run 另有 owner lease + epoch，多个同 tenant 连接不能重复接管或用迟到 timer 覆盖终态。
+- 恢复时沿用原 run timeout 的剩余预算，不重置整段时限；`retry_wait` 的 phase/deadline/input 也持久化，断线后继续剩余 attempt，而不是吞掉重试。
+- `run.cancel` 同时覆盖 session interrupt 与 workflow cancel，并以终态持久化作为竞态 fence，迟到事件不能回写。
+- `schedule.trigger.input` 兼容既有 object API，并新增 string：session 追加到 prompt，workflow 注入 `workflow.run.input`；object 以 JSON 字符串注入。
+
 留待下一阶段
-- runKind=workflow（接 L3 WorkflowEngine）。
 - webhook server 端 HTTP 入口 `POST /hooks/<token>`（core 已有 `triggerByWebhook`，差 server SDK 暴露 HTTP）。
 - daemon 级 SchedulerEngine 生命周期（当前随 PhononConnection 建/销；跨 0 连接存活需提到 daemon 持有）。
 - webhook body → prompt 模板插值、`maxConcurrentRuns` 限流、run 历史保留策略。

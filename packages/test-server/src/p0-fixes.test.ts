@@ -133,16 +133,16 @@ test("P1 outbox: enqueue, ack prunes <= lastSeq, pending replays unacked", () =>
   // pending 返回未 ack 的，按 seq 排序
   const pend = ob.pending();
   assert.equal(pend.length, 2);
-  // resumeFrom: server 说 s1 收到 1，s2 收到 -1 → 只补 s1:2 + s2:0
-  const pend2 = ob.pending([{ sessionId: "s1", fromSeq: 1 }]);
-  assert.ok(pend2.every((e: unknown) => (e as { sessionId: string; seq: number }).seq > 1 || (e as { sessionId: string }).sessionId === "s2"));
+  // resumeFrom is inclusive: first locally pending seq for s1 is 2.
+  const pend2 = ob.pending([{ sessionId: "s1", fromSeq: 2 }]);
+  assert.ok(pend2.every((e: unknown) => (e as { sessionId: string; seq: number }).seq >= 2 || (e as { sessionId: string }).sessionId === "s2"));
 });
 
-test("P1 outbox: maxEvents drops oldest", () => {
+test("P1 outbox: maxEvents never silently drops an unacknowledged sequence", () => {
   const ob = new Outbox({ maxEvents: 3 });
   for (let i = 0; i < 5; i++) ob.enqueue({ type: "message", sessionId: "s", seq: i, turnId: "t", at: "now", text: "x" } as never);
-  assert.equal(ob.size, 3);
-  assert.equal(ob.dropped, 2);
+  assert.equal(ob.size, 5);
+  assert.equal(ob.dropped, 0);
 });
 
 test("P2 session.list pagination (limit + cursor)", async () => {

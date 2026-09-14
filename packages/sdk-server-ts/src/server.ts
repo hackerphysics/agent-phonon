@@ -199,6 +199,7 @@ export class PhononDevice extends EventEmitter {
     targets: () => this.peer.request("maintenance.targets", {}),
     diagnose: (targetId?: string) => this.peer.request("maintenance.diagnose", targetId ? { targetId } : {}),
     configGet: (targetId: string, configId: string) => this.peer.request("maintenance.config.get", { targetId, configId }),
+    configEdit: (p: { targetId: string; configId: string; expectedSha256: string; edits: Array<{ oldText: string; newText: string }>; reason?: string; clientRequestId?: string }) => this.peer.request("maintenance.config.edit", p),
     configPatch: (p: { targetId: string; configId: string; expectedSha256: string; patch: Record<string, unknown>; reason?: string; clientRequestId?: string }) => this.peer.request("maintenance.config.patch", p),
     rollback: (backupId: string, expectedCurrentSha256: string, opts?: { reason?: string; clientRequestId?: string }) => this.peer.request("maintenance.rollback", { backupId, expectedCurrentSha256, ...opts }),
     packageUpdate: (targetId: string, opts?: { version?: string; clientRequestId?: string }) => this.peer.request("maintenance.package.update", { targetId, ...opts }),
@@ -328,12 +329,14 @@ export class PhononDevice extends EventEmitter {
       this.peer.request("workflow.status", { workflowId }) as Promise<WorkflowStatusResult>,
     cancel: (workflowId: string, reason?: string) =>
       this.peer.request("workflow.cancel", { workflowId, reason }) as Promise<{ workflowId: string; status: "cancelled" }>,
+    pause: (workflowId: string, reason?: string) =>
+      this.peer.request("workflow.pause", { workflowId, reason }) as Promise<{ workflowId: string; status: "paused" }>,
     list: (filter?: WorkflowListParams) =>
       this.peer.request("workflow.list", filter ?? {}) as Promise<WorkflowListResult>,
     /** v0.7: 独立 resume 入口。推荐使用，比 run({resumeFrom}) 语义更明确。 */
     resume: (params: {
       workflowId: string;
-      strategy?: "last_success_dependents" | "failed_node" | `node:${string}`;
+      strategy?: "continue" | "last_success_dependents" | "failed_node" | `node:${string}`;
       rerunNodes?: string[];
       feedback?: string;
       sharedContextPatch?: WorkflowSharedContext;
@@ -399,7 +402,7 @@ export class PhononDevice extends EventEmitter {
     disable: (scheduleId: string, clientRequestId?: string) =>
       this.peer.request("schedule.disable", { scheduleId, clientRequestId }) as Promise<{ schedule: Schedule }>,
     /** 手动触发一次 run（manual / 测试 cron / 重放 webhook 都走它）。 */
-    trigger: (params: { scheduleId: string; source?: RunTriggerSource; input?: Record<string, unknown>; clientRequestId?: string }) =>
+    trigger: (params: { scheduleId: string; source?: RunTriggerSource; input?: string | Record<string, unknown>; clientRequestId?: string }) =>
       this.peer.request("schedule.trigger", params) as Promise<{ scheduleId: string; runId: string; status: RunStatus }>,
     runs: {
       list: (params: { scheduleId: string; status?: RunStatus; limit?: number }) =>
@@ -556,6 +559,7 @@ export class PhononDevice extends EventEmitter {
 // ---------------------------------------------------------------------------
 export interface PhononServerOptions {
   port?: number;
+  /** Bind address; omitted host binds to 127.0.0.1, never wildcard. */
   host?: string;
   /** 鉴权：返回 tenantId 表示通过，返回 null 拒绝。缺省仅在 loopback 放行（本地测试）。 */
   authenticate?: (deviceId: string, deviceKey: string | undefined) => { tenantId: string } | null | Promise<{ tenantId: string } | null>;
@@ -579,16 +583,16 @@ export class PhononServer extends EventEmitter {
 
   listen(): Promise<number> {
     // A5: 非 loopback 绑定 + 无 authenticate + 未显式 allowAnonymous → 拒绝启动
-    const host = this.opts.host;
-    const isLoopback = host === undefined || host === "127.0.0.1" || host === "::1" || host === "localhost";
-    if (!this.opts.authenticate && !this.opts.allowAnonymous && !isLoopback) {
+    const host = this.opts.host ?? "127.0.0.1";
+    const isLoopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
+    if (!this.opts.authenticate && this.opts.allowAnonymous !== true && !isLoopback) {
       throw new Error(
         `PhononServer refuses to listen on non-loopback host "${host}" without authenticate(); ` +
         `provide authenticate or set allowAnonymous=true (A5)`,
       );
     }
     return new Promise((resolve) => {
-      const wss = new WebSocketServer({ port: this.opts.port ?? 0, host: this.opts.host });
+      const wss = new WebSocketServer({ port: this.opts.port ?? 0, host });
       this.wss = wss;
       wss.on("connection", (ws: WebSocket) => this.onConnection(ws));
       wss.on("listening", () => {

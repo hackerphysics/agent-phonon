@@ -37,8 +37,21 @@ Three integration paths exist; phonon uses **Gateway WebSocket as primary** with
   - `onToolEvent` (tool event stream) — maps to `verbosity=tools`
 - Handshake: ws → receive `connect.challenge` event → send `connect` req
   (with token + scopes `operator.read/write/admin`).
-- ✅ **Full capability**: streaming, tool events, unsolicited-output subscription,
-  native compact/abort/inject — nearly 1:1 with phonon protocol primitives.
+- Map native `chat` delta/final/error/aborted events to one terminal turn; abort and
+  termination settle the local wait and clear its guard timer. Tool streams support
+  both `agent.stream=tool` and the current `agent.stream=item, data.kind=tool`
+  start/end events. Item-only payloads prove lifecycle/status, not raw tool I/O.
+- `chat.inject` is transcript/UI-only on current Gateways, so context injection is
+  queued into the next real `chat.send` input. It does not claim mid-turn injection.
+- Model discovery uses `models.list(view=default)`, respecting the Gateway allowlist.
+  Switching uses a separate read/write-only connection: no admin sticky-default
+  mutation authority. Native errors propagate; local model state changes only after
+  a response with a resolved model.
+- Native compaction requires `sessions.compact` to confirm `compacted=true`;
+  no-op/unsupported responses are not success. Custom dropToolIO supports only
+  resolvable legacy JSONL, not Gateway-owned SQLite transcripts without a public API.
+- Subscription capability is not proof of spontaneous output or installed hooks;
+  validate the native integration separately without changing host policy for a test.
 - ✅ Reuses the Gateway process; no per-turn spawn.
 - ❌ Requires a running Gateway + token; more complex than spawn.
 
@@ -97,36 +110,29 @@ Single-agent runtime; `discoverAgents` returns one `claude-code`.
 
 ### Invocation (each part matters)
 1. **CLI**: `claude -p --output-format stream-json --input-format stream-json
-   --verbose --permission-mode bypassPermissions --allowedTools <tools>
+   --verbose
    [--model X] [--session-id <uuid> | --resume <uuid>]`
 2. **Prompt goes on stdin** (not argv):
    `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}\n`
    — using `-p "prompt"` together with `--input-format stream-json` hangs waiting
    on stdin.
-3. **Strip outer env**: `env -u CLAUDECODE` (and `CLAUDECODE_*` / `CLAUDE_CODE_*`)
+3. **Strip outer env**: `env -u CLAUDECODE` (and `CLAUDECODE_*`; preserve native `CLAUDE_CODE_*` safety settings)
    to avoid a wrapping Claude Code's state leaking in.
-4. **Auth via `--settings`** injecting a complete env set:
-   ```json
-   {"env":{
-     "ANTHROPIC_BASE_URL":"<your-endpoint>",
-     "ANTHROPIC_AUTH_TOKEN":"<token>",
-     "ANTHROPIC_MODEL":"<model>",
-     "ANTHROPIC_DEFAULT_OPUS_MODEL":"<model>",
-     "ANTHROPIC_DEFAULT_SONNET_MODEL":"<model>",
-     "ANTHROPIC_DEFAULT_HAIKU_MODEL":"<model>",
-     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"
-   }}
-   ```
-   - Setting only BASE_URL + TOKEN is **not enough** — internal calls use the
-     default model names, so map all `DEFAULT_*_MODEL` to your endpoint's model or
-     they'll be rejected.
-   - `--settings` overrides the global `~/.claude/settings.json` **without**
-     polluting the user's global config.
-
-### Gotcha
-- If `~/.claude/settings.json` was rewritten by a proxy/switcher tool to point at
-  a non-running local proxy with a fake token, default Claude Code hangs. The
-  adapter sidesteps this entirely by supplying a clean config via `--settings`.
+4. **Native auth and approvals are preserved**. Keep HOME; do not auto-add bypass
+   flags. Explicit host-configured endpoint/auth overrides are passed only through
+   the child environment, never a temporary credential file or command argument.
+   A missing native provider, unavailable proxy or unapproved action must remain
+   an observable failure/blocker; do not rewrite native settings to make a test pass.
+5. **Independent settings (Claude 2.1.123)**: owner daemon adapter config may set
+   `claudeSettingsPath` to an absolute standalone JSON file. This is not a remote
+   session/agentConfig option. The adapter passes `--settings <path>` and
+   `--setting-sources ''`, without rewriting the file. Selected settings replace
+   legacy `claudeBaseUrl`/`claudeAuthToken` and discovery default-model overrides;
+   `session.create.model != default` remains an explicit native `--model` override.
+   Inherited Anthropic credentials/models/provider selectors are removed before
+   applying the selected `env`. A settings endpoint must carry its own auth or
+   apiKeyHelper, never borrow credentials from the old endpoint. Without
+   `claudeSettingsPath`, existing native/legacy override behavior is unchanged.
 
 ---
 
@@ -137,8 +143,7 @@ Single-agent runtime (`discoverAgents` returns one `codex`).
 ### Invocation
 1. **CLI**: `codex exec - --json -c model_provider=<id>
    -c model_providers.<id>.base_url=... -c model_providers.<id>.wire_api=responses
-   -c model_providers.<id>.env_key=OPENAI_API_KEY --model <m>
-   --dangerously-bypass-approvals-and-sandbox`
+   -c model_providers.<id>.env_key=OPENAI_API_KEY --model <m>`
    - Prompt on **stdin** (argv uses `-` as placeholder).
    - Resume: `codex exec resume <thread_id> - --json ...`
 2. **Provider override via `-c`** so you don't touch `~/.codex/config.toml`.
@@ -164,7 +169,7 @@ with the current official CLI command, **`copilot`**, not the retired
    the process list. The CLI is invoked with:
    ```text
    copilot --name=agent-phonon-<sessionId>
-     --output-format json --stream on --allow-all --no-ask-user
+     --output-format json --stream on --no-ask-user
      --no-remote --no-auto-update --no-color [--model <model>]
    ```
 2. Later turns use `--resume=agent-phonon-<sessionId>`. After a daemon restart,
@@ -176,8 +181,9 @@ with the current official CLI command, **`copilot`**, not the retired
    - `tool.execution_start` → `tool_call`
    - `tool.execution_complete` → `tool_result`
    - final `result.sessionId` → native Copilot session identity
-4. Available models are parsed from `copilot help config`; an explicit adapter
-   model list or configured/default model is used as fallback.
+4. `copilot help config` is only a static inventory; those model rows are marked
+   unavailable/unverified. Prefer the native `default` selection unless the host
+   explicitly configures a model/inventory. A help entry is not auth or availability proof.
 
 ### Verified gotcha
 
@@ -193,19 +199,45 @@ by that stable name; it does not rely on the inaccurate UUID behavior.
 **Multi-agent runtime** (like OpenClaw): a Hermes profile = an independent agent
 (its own config/.env/SOUL.md/skills). Composite agentId `hermes:<profile>`.
 
-- Enumerate: `hermes profile list`; select via `HERMES_PROFILE=<profile>` env.
-- Invoke: `hermes -z <prompt> -m <model> [--provider X] --continue <name>`
-- `-z`/`--oneshot`: plain-text single-shot output (non-streaming → final event).
-- Session: `--continue <name>` (creates on first turn, resumes after). The name
-  is stored as the session **title**, which is how the session is later located.
-- `--pass-session-id` is a flag, not a parameter.
-
----
+- Enumerate: `hermes profile list`; select via native `--profile <profile>` before
+  native modules load (the installed 0.16 CLI does not select by HERMES_PROFILE).
+- Invoke the installed Python console script's own interpreter with a bundled
+  narrow observer, then native `hermes --profile <profile> chat -Q -q <prompt>`.
+  The first turn creates a native session; subsequent turns `--resume` its observed
+  native id. `--continue <nonexistent-name>` does not create a session in 0.16.
+- Native `main` retains HOME/HERMES_HOME/profile/dotenv/config/provider/key-ref
+  loading. A configured named `model.provider` under `providers` is retained when
+  Phonon supplies a model; an explicit owner `hermesProvider` wins. There is no
+  separate JSON-settings loader, provider credential copy, or auth-cache reader.
+- The observer reads actual `AIAgent.run_conversation` result fields and new tool
+  messages, preserving model tool-call ids, arguments and full native tool output.
+  It does not reconstruct results from prose. Tool events are buffered until the
+  turn returns (`streaming:false`), not advertised as live token deltas.
+- 0.16 `-z` discards structured failures, and ACP can return `end_turn` after an
+  error. Neither is a safe success oracle. Completion requires exit 0, an explicit
+  `completed:true`, no failed/partial/error/interrupted flags, and nonempty final
+  text. No structured result is a failure; ordinary prose mentioning HTTP 404 is
+  not a failure. Windows/non-console-script Hermes launchers require a validated
+  structured integration; the adapter fails closed rather than falling back to
+  exit-code-only success.
+- Native tool approval policy is preserved; no automatic yolo/accept-hooks flags.
+  A failed **turn** emits error/status=failed, making workflow/run retry paths
+  fail. The reusable session lifecycle returns to `idle` by the existing protocol;
+  SessionStatus has no `failed` member. Timeout/cancel remain non-success terminals.
+- Custom `dropToolIO` uses the observed session id, retaining native SQLite backup
+  behavior. Native compression and mid-turn injection remain unsupported.
 
 ## OpenCode adapter
 
+- Native 1.14.48 `tool_use.part` is a ToolPart: `callID` identifies the actual
+  call and `state.input/output/error/status` carry its I/O and lifecycle. Normalize
+  completed-only snapshots into a same-id call/result pair; deduplicate repeated
+  pending/running/terminal phases within each turn. A part id or final assistant
+  text is not a substitute for a missing native tool id/output. Decode UTF-8 across
+  chunk boundaries and consume a final JSONL record even without a trailing LF.
+
 Single-agent runtime.
-`opencode run --format json --dangerously-skip-permissions --model <m>
+`opencode run --format json [--model <m>]
 [--session <ses_id>] <prompt>`
 
 - **Key gotcha**: Node's `spawn` defaults stdin to a pipe; OpenCode detects this

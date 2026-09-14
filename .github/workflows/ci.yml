@@ -23,7 +23,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run consistency
       - run: pnpm -r build
-      - run: pnpm -r test
+      - run: pnpm test
+      - run: pnpm test:e2e
 
   test-python:
     name: Python SDK e2e
@@ -53,9 +54,8 @@ jobs:
         working-directory: sdk-python
         run: pip install -e .
 
-      - name: Run e2e
-        working-directory: sdk-python
-        run: python3 test_e2e.py
+      - name: Run all local Python SDK scenarios and authentication behavior
+        run: pnpm test:python
 
   maintenance-cross-platform:
     name: Maintenance/rescue (${{ matrix.os }})

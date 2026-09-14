@@ -18,7 +18,7 @@ import {
   type PhononConnection,
   type AgentAdapter,
 } from "@agent-phonon/core";
-import { type DaemonConfig, readOpenClawGatewayToken } from "./config.js";
+import { type DaemonConfig, readOpenClawGatewayToken, validateServerConfigs } from "./config.js";
 import { autoDetectAdapters } from "./commands.js";
 import { ObsServer } from "./obs-server.js";
 
@@ -38,7 +38,8 @@ export interface PhononDaemonDeps {
 export class PhononDaemon {
   private cfg: DaemonConfig;
   private store: PhononStore;
-  private registry = new AdapterRegistry();
+  private registry: AdapterRegistry;
+  private releaseInventory?: () => void;
   private clients: PhononClient[] = [];
   private bridge?: HookBridge;
   private gatewayAdapters: OpenClawGatewayAdapter[] = [];
@@ -46,9 +47,14 @@ export class PhononDaemon {
   private metrics = new Metrics();
   private obsServer?: ObsServer;
   private startedAt = Date.now();
+  private stopped = false;
+  private startPromise?: Promise<void>;
+  private stopPromise?: Promise<void>;
 
   constructor(cfg: DaemonConfig, deps: PhononDaemonDeps = {}) {
+    validateServerConfigs(cfg.servers);
     this.cfg = cfg;
+    this.registry = new AdapterRegistry(cfg.discovery, this.obs);
     this.store = new PhononStore(cfg.dbPath);
     // 可观测堆栈：结构化日志 + 指标 + audit 落库，都从同一 ObsBus 消费
     new StructuredLogger({ level: cfg.logLevel ?? "info" }).attach(this.obs);
@@ -57,6 +63,8 @@ export class PhononDaemon {
     if (cfg.rescueAgent?.enabled !== false) {
       this.registry.register(new RescueAdapter({
         baseUrl: cfg.rescueAgent?.baseUrl,
+        wireApi: cfg.rescueAgent?.wireApi,
+        authMode: cfg.rescueAgent?.authMode,
         apiKey: cfg.rescueAgent?.apiKey,
         apiKeyEnv: cfg.rescueAgent?.apiKeyEnv,
         apiKeyRef: cfg.rescueAgent?.apiKeyRef,
@@ -87,7 +95,7 @@ export class PhononDaemon {
         this.gatewayAdapters.push(ad);
         this.registry.register(ad);
       } else if (a.type === "claude-code") {
-        this.registry.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
+        this.registry.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
       } else if (a.type === "codex") {
         this.registry.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
       } else if (a.type === "hermes") {
@@ -103,8 +111,17 @@ export class PhononDaemon {
   }
 
   /** 启动：起 HookBridge + 连所有 server（带自动重连）。 */
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error("daemon stopped"));
+    return this.startPromise ??= this.startRuntime();
+  }
+
+  private async startRuntime(): Promise<void> {
     this.obs.emitEvent({ category: "daemon", level: "info", event: "daemon.start", msg: `device=${this.cfg.deviceId}` });
+
+    this.releaseInventory ??= this.registry.inventory.acquire();
+    await this.registry.inventory.list();
+    if (this.stopped) return;
 
     // HookBridge：跨所有连接路由 sessionKey
     this.bridge = new HookBridge(
@@ -112,6 +129,7 @@ export class PhononDaemon {
       this.cfg.hookBridge?.token ? { token: this.cfg.hookBridge.token } : undefined,
     );
     const port = await this.bridge.listen(this.cfg.hookBridge?.port ?? 4318);
+    if (this.stopped) return;
     console.log(`[daemon] HookBridge on :${port}`);
 
     // 可观测 HTTP 服务（人/监控看状态）
@@ -125,6 +143,7 @@ export class PhononDaemon {
         sessions: () => this.allSessions(),
       });
       const obsPort = await this.obsServer.listen(this.cfg.obs?.port ?? 4319);
+      if (this.stopped) return;
       console.log(`[daemon] obs server on http://127.0.0.1:${obsPort} (/health /metrics /sessions /events /stream)`);
     }
 
@@ -141,6 +160,8 @@ export class PhononDaemon {
         trustLocal: s.trustLocal,
         workspaceRoot: this.cfg.workspaceRoot,
         deviceKey: s.deviceKey,
+        expectedTenantId: s.expectedTenantId,
+        allowInsecure: s.allowInsecure,
         policy: s.policy,
         maintenance: this.cfg.maintenance,
       });
@@ -186,7 +207,7 @@ export class PhononDaemon {
 
   /** HookBridge 路由：找到 owns 该 session 的连接。sessionKey 形如 agent:<sub>:phonon-<sessionId>。 */
   private routeHook(sessionKey: string): { conn: PhononConnection; sessionId: string } | undefined {
-    const m = sessionKey.match(/phonon-(s-\d+-\d+)$/);
+    const m = sessionKey.match(/phonon-(s-[A-Za-z0-9-]+)$/);
     const sessionId = m?.[1];
     if (!sessionId) return undefined;
     for (const c of this.clients) {
@@ -196,12 +217,22 @@ export class PhononDaemon {
     return undefined;
   }
 
-  async stop(): Promise<void> {
-    this.obs.emitEvent({ category: "daemon", level: "info", event: "daemon.stop" });
-    for (const c of this.clients) c.close();
-    for (const a of this.gatewayAdapters) a.close();
-    await this.bridge?.close();
-    await this.obsServer?.close();
-    this.store.close();
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopped = true;
+    this.stopPromise = (async () => {
+      this.obs.emitEvent({ category: "daemon", level: "info", event: "daemon.stop" });
+      this.releaseInventory?.();
+      await this.registry.inventory.dispose();
+      // A stop during the initial scan/listen must not publish new listeners
+      // or clients after teardown. Startup checks stopped after each await.
+      await this.startPromise?.catch(() => {});
+      await Promise.all(this.clients.map((c) => c.close()));
+      for (const a of this.gatewayAdapters) a.close();
+      await this.bridge?.close();
+      await this.obsServer?.close();
+      this.store.close();
+    })();
+    return this.stopPromise;
   }
 }

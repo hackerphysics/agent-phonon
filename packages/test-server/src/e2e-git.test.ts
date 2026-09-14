@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { AdapterRegistry, PhononClient } from "@agent-phonon/core";
 import { PhononServer } from "@agent-phonon/server-sdk";
 import type { PhononDevice } from "@agent-phonon/server-sdk";
@@ -25,6 +25,9 @@ async function setup(): Promise<{ device: PhononDevice; project: { projectId: st
   await client.connect();
   const device = await ready;
   const project = await device.project.create({ name: "git-test", git: true }) as { project: { projectId: string; path: string } };
+  // Fixture-local committer identity: later RPC commits must not depend on HOME/global Git config.
+  execFileSync("git", ["-C", project.project.path, "config", "--local", "user.name", "Phonon Test"]);
+  execFileSync("git", ["-C", project.project.path, "config", "--local", "user.email", "phonon-test@example.invalid"]);
   // 初始 commit（很多 git 操作都需要至少一个 commit）
   writeFileSync(join(project.project.path, "README.md"), "# init\n");
   execSync(`git -C ${project.project.path} -c user.email=t@x -c user.name=t add . && git -C ${project.project.path} -c user.email=t@x -c user.name=t commit -q -m init`);

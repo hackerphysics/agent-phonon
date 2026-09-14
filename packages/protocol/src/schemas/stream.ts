@@ -135,11 +135,11 @@ export const StreamErrorEvent = StreamEventBase.extend({
 
 // ---------------------------------------------------------------------------
 // stream.ack —— server → phonon，确认已收到 seq <= lastSeq（P0-4）
-// 让 phonon 能清理 outbox / 控制背压；可按 session 粒度或全局。
+// 让 phonon 能清理 outbox / 控制背压。seq 是 per-session，ACK 必须带 sessionId。
 // ---------------------------------------------------------------------------
 export const StreamAckParams = z.object({
-  /** 按 session 确认；缺省表示该连接全局。 */
-  sessionId: SessionId.optional(),
+  /** 必须按 session 确认；单一标量无法安全表达连接全局水位。 */
+  sessionId: SessionId,
   /** 已收到的最大连续 seq（含）；phonon 可清理 <= 此值的 outbox。 */
   lastSeq: z.number().int().nonnegative(),
 });

@@ -1,11 +1,13 @@
-import type { ChildProcess } from "node:child_process";
-import { spawnAgent } from "../proc.js";
+import { parse as parseYaml } from "yaml";
+import { HERMES_BRIDGE } from "./hermes-bridge.js";
+import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
+import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
-import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { join, dirname, delimiter, isAbsolute } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
 import type {
   AgentAdapter,
@@ -23,11 +25,11 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, Mode
  * 一个 Hermes 安装 = 一个 runtime，里面多个 profile = 多个 agent。
  * 复合 agentId：hermes:<profile>（如 hermes:default）。
  *
- * 调用：`HERMES_PROFILE=<profile> hermes -z <prompt> -m <model> --yolo --accept-hooks
- *   [--continue <name>]`。-z/--oneshot 纯文本输出（非流式）。
+ * 调用安装版 Python console script 的 native `--profile <profile> chat -Q -q`。
+ * 窄桥接读取 run_conversation 的结构化终态与实际工具消息；不使用有损 -z 文本。
  * 枚举 profile：`hermes profile list`。
  *
- * 方案 A：用 Hermes 现有 provider 配置（不强制网关）。全自动：--yolo + --accept-hooks。
+ * 使用 Hermes 现有 YAML/provider/key refs 与原生权限；不接管认证或全局策略。
  */
 
 const HERMES_PROVIDER_FALLBACK_MODELS: Record<string, string[]> = {
@@ -63,33 +65,47 @@ const CAPABILITIES: AgentCapabilities = {
   injectMidTurn: false,
   skillManagement: true, // hermes skills
   hooks: ["pre_command"],
-  streaming: false, // -z 是纯文本一次性输出，非流式 → 用 final 事件
+  streaming: false, // native result messages are delivered after the turn (not token streaming)
   workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4 },
 };
 
-function parseHermesConfig(configPath = join(homedir(), ".hermes", "config.yaml")): { defaultModel?: string; provider?: string; catalogUrl?: string } {
+/** Discovery only. Execution delegates config, dotenv and key refs to native Hermes. */
+export function parseHermesConfig(configPath = join(process.env.HERMES_HOME || join(homedir(), ".hermes"), "config.yaml")): { defaultModel?: string; provider?: string; catalogUrl?: string } {
   if (!existsSync(configPath)) return {};
-  const text = readFileSync(configPath, "utf8");
-  const modelBlock = text.match(/(?:^|\n)model:\n([\s\S]*?)(?:\n[A-Za-z_][A-Za-z0-9_-]*:|$)/)?.[1] ?? "";
-  const defaultModel = modelBlock.match(/^\s+default:\s*['"]?([^'"\n]+)['"]?/m)?.[1]?.trim();
-  const provider = modelBlock.match(/^\s+provider:\s*['"]?([^'"\n]+)['"]?/m)?.[1]?.trim();
-  const catalogBlock = text.match(/(?:^|\n)model_catalog:\n([\s\S]*?)(?:\n[A-Za-z_][A-Za-z0-9_-]*:|$)/)?.[1] ?? "";
-  const catalogUrl = catalogBlock.match(/^\s+url:\s*['"]?([^'"\n]+)['"]?/m)?.[1]?.trim();
-  return { defaultModel, provider, catalogUrl };
+  const cfg = parseYaml(readFileSync(configPath, "utf8")) ?? {};
+  const model = cfg.model;
+  const str = (v: unknown): string | undefined => typeof v === "string" && v.trim() ? v.trim() : undefined;
+  return { defaultModel: str(typeof model === "string" ? model : model?.default ?? model?.model), provider: str(model?.provider), catalogUrl: str(cfg.model_catalog?.url) };
 }
 
-function fetchHermesCatalogModels(url: string, provider?: string): Promise<ModelInfo[]> {
-  return new Promise((resolve) => {
+/** Use the installed console script's own interpreter; never another Python's packages. */
+function bridgeCommand(bin: string): { python: string; entry: string } {
+  const entry = isAbsolute(bin) ? bin : (process.env.PATH ?? "").split(delimiter).map(p => join(p, bin)).find(p => existsSync(p));
+  if (!entry) throw new Error("Hermes CLI not found on daemon PATH; configure hermesBinPath");
+  const real = realpathSync(entry);
+  const shebang = readFileSync(real, "utf8").split("\n", 1)[0]?.trim() ?? "";
+  const python = shebang.match(/^#!(\/[^\r\n]+\/python[\d.]*)$/)?.[1];
+  if (!python || !existsSync(python)) throw new Error("Hermes structured bridge requires an installed Python console script (configure hermesBinPath); refusing unstructured success fallback");
+  return { python, entry: real };
+}
+
+function fetchHermesCatalogModels(url: string, provider?: string, signal?: AbortSignal): Promise<ModelInfo[]> {
+  return new Promise((resolve, reject) => {
     const u = new URL(url);
     const reqMod = u.protocol === "http:" ? import("node:http") : import("node:https");
     reqMod.then((mod) => {
-      const req = mod.request(url, { method: "GET", timeout: 5000 }, (res) => {
+      const req = mod.request(url, { method: "GET", timeout: 5000, signal }, (res) => {
         let body = "";
         res.setEncoding("utf8");
-        res.on("data", (d) => (body += d));
+        res.on("error", reject);
+        res.on("data", (d) => {
+          body += d;
+          if (body.length > 2_000_000) res.destroy(new Error("inventory response too large"));
+        });
         res.on("end", () => {
           try {
+            if ((res.statusCode ?? 500) < 200 || (res.statusCode ?? 500) >= 300) throw new Error("catalog HTTP failure");
             const data = JSON.parse(body) as { providers?: Record<string, { models?: Array<{ id?: string; description?: string }> }> };
             const providers = data.providers ?? {};
             const rows = provider
@@ -101,13 +117,13 @@ function fetchHermesCatalogModels(url: string, provider?: string): Promise<Model
               seen.add(m.id);
               return [{ id: m.id, ...(m.description ? { displayName: m.description } : {}), available: true } satisfies ModelInfo];
             }));
-          } catch { resolve([]); }
+          } catch { reject(new Error("Hermes catalog scan failed")); }
         });
       });
       req.on("timeout", () => req.destroy());
-      req.on("error", () => resolve([]));
+      req.on("error", reject);
       req.end();
-    }, () => resolve([]));
+    }, reject);
   });
 }
 
@@ -128,10 +144,10 @@ class HermesSession implements AdapterSession {
   private cwd: string;
   private env: HermesEnv;
   private profile: string;
-  private hermesSessionId: string;
+  private hermesSessionId?: string;
   private convName: string;
   private started = false;
-  private current?: ChildProcess;
+  private current?: ProcessSupervisor;
   private pendingInject: string[] = [];
 
   constructor(sessionId: string, model: string, cwd: string, env: HermesEnv, profile: string, initialContext?: ContextItem[]) {
@@ -140,7 +156,6 @@ class HermesSession implements AdapterSession {
     this.cwd = cwd;
     this.env = env;
     this.profile = profile;
-    this.hermesSessionId = randomUUID();
     this.convName = `phonon-${sessionId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
     // contextInjection: 注入 initialContext（含 workflow systemPrompt）进首轮 message
     this.pendingInject.push(...formatInitialContextLines(initialContext));
@@ -157,15 +172,13 @@ class HermesSession implements AdapterSession {
       prompt = `[本轮请使用这些能力: ${opts.skills.join(", ")}]\n\n${prompt}`;
     }
 
-    const args = ["-z", prompt];
+    const args = ["--profile", this.profile, "chat", "-Q", "-q", prompt];
     if (this.model) args.push("-m", this.model);
     if (this.env.provider) args.push("--provider", this.env.provider);
     if (this.env.toolsets) args.push("-t", this.env.toolsets);
-    // 全自动模式：phonon 让 agent 自动跑，不等人授权
-    args.push("--yolo", "--accept-hooks");
-    // 持续会话：用 phonon sessionId 作为 Hermes 会话名，--continue <name> 恢复/创建
-    // （--continue 接会话名，首轮创建、后续恢复）
-    args.push("--continue", this.convName);
+    // Preserve native approval policy; do not auto-elevate tools.
+    // Native chat creates the first session; resume only its observed real id.
+    if (this.hermesSessionId) args.push("--resume", this.hermesSessionId);
     this.started = true;
 
     await this.run(args, turnId, emit, opts);
@@ -173,43 +186,96 @@ class HermesSession implements AdapterSession {
 
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "hermes", args, {
+      let command: ReturnType<typeof bridgeCommand>;
+      try { command = bridgeCommand(this.env.binPath ?? "hermes"); }
+      catch (e) {
+        emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: adapterDiagnostic(String(e)), status: "failed", final: true } as StreamEvent);
+        resolve(); return;
+      }
+      const supervisor = spawnSupervisedAgent(command.python, ["-c", HERMES_BRIDGE, command.entry, ...args], {
         cwd: this.cwd,
-        env: { ...buildChildProcessEnvironment(opts.environment), HERMES_PROFILE: this.profile },
+        env: buildChildProcessEnvironment(opts.environment),
       });
-      this.current = child;
+      // No interactive input is required by native chat -Q -q.
+      supervisor.child.stdin.end();
+      const child = supervisor.child;
+      this.current = supervisor;
+      const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
+      child.once("close", releaseCurrent);
+      child.once("error", releaseCurrent);
       let out = "";
       let err = "";
+      let buffer = "";
+      let outcome: Record<string, unknown> | undefined;
+      const calls = new Map<string, string>();
+      const results = new Set<string>();
       let settled = false;
+      const abort = (): void => { void supervisor.terminate(); finish("interrupted", out); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
-        this.current = undefined;
+        opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
           emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: message ?? "hermes failed", status: "failed", final: true } as StreamEvent);
         } else {
-          // -z 是一次性文本：作为一条 message + result 终态
+          // Native structured final text: one message and one terminal.
           if (text) emit({ type: "message", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), role: "assistant", text, delta: false } as StreamEvent);
           emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), text, status, final: true } as StreamEvent);
         }
         resolve();
       };
-      const guard = setTimeout(() => finish("timeout", out), 1800000);
-      opts.signal?.addEventListener("abort", () => { child.kill("SIGTERM"); finish("interrupted", out); }, { once: true });
+      const guard = setTimeout(() => { void supervisor.terminate(); finish("timeout", out); }, 1800000);
+      if (opts.signal?.aborted) abort();
+      else opts.signal?.addEventListener("abort", abort, { once: true });
 
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.stderr.on("data", (d) => (err += d.toString()));
+      const consume = (line: string): void => {
+        if (settled || !line.trim()) return;
+        let ev: Record<string, any>;
+        try { ev = JSON.parse(line); } catch { return; }
+        const base = { sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString() };
+        if (ev.type === "hermes_result") {
+          outcome = ev;
+          out = typeof ev.final_response === "string" ? ev.final_response : "";
+          if (typeof ev.session_id === "string") this.hermesSessionId = ev.session_id;
+        } else if (ev.type === "hermes_tool_call") {
+          const call = ev.call, id = call?.id, fn = call?.function;
+          if (typeof id !== "string" || typeof fn?.name !== "string" || calls.has(id)) return;
+          calls.set(id, fn.name);
+          let input = fn.arguments;
+          if (typeof input === "string") { try { input = JSON.parse(input); } catch { /* retain actual raw input */ } }
+          emit({ ...base, type: "tool_call", toolName: fn.name, toolCallId: id, args: input } as StreamEvent);
+        } else if (ev.type === "hermes_tool_result") {
+          const m = ev.message, id = m?.tool_call_id;
+          if (!calls.has(id) || results.has(id)) return;
+          results.add(id);
+          let payload: any;
+          try { payload = JSON.parse(m.content); } catch { /* native text result */ }
+          emit({ ...base, type: "tool_result", toolName: calls.get(id)!, toolCallId: id, ok: !(payload?.error || payload?.success === false || m.is_error), output: m.content } as StreamEvent);
+        }
+      };
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (d) => {
+        buffer += d;
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) >= 0) { consume(buffer.slice(0, nl)); buffer = buffer.slice(nl + 1); }
+      });
+      child.stderr.on("data", (d) => (err = (err + d).slice(-16000)));
       child.on("error", (e) => finish("failed", "", e.message));
       child.on("close", (code) => {
         if (settled) return;
-        finish(code === 0 ? "completed" : "failed", out.trim(), code !== 0 ? `hermes exited ${code}: ${err.slice(0, 300)}` : undefined);
+        consume(buffer);
+        if (outcome?.interrupted) { finish("interrupted", out.trim()); return; }
+        const success = code === 0 && outcome?.completed === true && !outcome.failed && !outcome.partial && !outcome.error && !!out.trim();
+        const detail = adapterDiagnostic(String(outcome?.error || err || "Native CLI returned no successful structured completion/output"));
+        finish(success ? "completed" : "failed", out.trim(), success ? undefined : `hermes exited ${code}: ${detail}`);
       });
     });
   }
 
   async interrupt(): Promise<void> {
-    if (this.current) { this.current.kill("SIGTERM"); this.current = undefined; }
+    if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
@@ -228,7 +294,7 @@ class HermesSession implements AdapterSession {
     if (!this.started) throw new Error("Hermes session not started yet (no turn run); nothing to compress");
     const dbPath = resolveHermesDbPath();
     if (!existsSync(dbPath)) throw new Error(`Hermes state.db not found: ${dbPath}`);
-    const dbSessionId = resolveHermesSessionByTitle(dbPath, this.convName);
+    const dbSessionId = this.hermesSessionId ?? resolveHermesSessionByTitle(dbPath, this.convName);
     if (!dbSessionId) throw new Error(`Hermes session not found for title ${this.convName}`);
     const r = await dropToolIORowsSqlite({
       dbPath,
@@ -290,14 +356,15 @@ export class HermesAdapter implements AgentAdapter {
   readonly capabilities = CAPABILITIES;
   private env: HermesEnv;
   private defaultProfile: string;
+  private modelCatalog?: { key: string; models: ModelInfo[] };
 
   constructor(opts: { env?: HermesEnv; defaultProfile?: string } = {}) {
     this.env = opts.env ?? {};
     this.defaultProfile = opts.defaultProfile ?? "default";
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
-    const version = await this.probeVersion();
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
+    const version = await this.probeVersion(signal);
     const available = version !== null;
     if (!available) {
       return [{
@@ -312,10 +379,23 @@ export class HermesAdapter implements AgentAdapter {
       }];
     }
     // 枚举所有 profile = 多个 agent（D32，同 OpenClaw）
-    const profiles = await this.listProfiles();
+    const profiles = await this.listProfiles(signal);
     const cfg = parseHermesConfig();
     const provider = this.env.provider ?? cfg.provider;
-    const catalogModels = cfg.catalogUrl ? await fetchHermesCatalogModels(cfg.catalogUrl, provider) : [];
+    let catalogModels: ModelInfo[] = [];
+    if (cfg.catalogUrl) {
+      const key = JSON.stringify([cfg.catalogUrl, provider]);
+      try {
+        catalogModels = await fetchHermesCatalogModels(cfg.catalogUrl, provider, signal);
+        this.modelCatalog = { key, models: catalogModels };
+      } catch {
+        signal?.throwIfAborted();
+        // Optional catalog failure is not native unavailability. Retain its
+        // last-good models, or native YAML defaults on the first scan.
+        catalogModels = this.modelCatalog?.key === key ? this.modelCatalog.models : [];
+        console.warn("[hermes] discovery.catalog_failed; retaining known/native-config models");
+      }
+    }
     const providerFallbackModels = provider ? (HERMES_PROVIDER_FALLBACK_MODELS[provider] ?? []).map((id) => ({ id, available: true })) : [];
     const now = new Date().toISOString();
     return profiles.map((p) => ({
@@ -348,34 +428,21 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   /** 枚举 Hermes profile（去 ANSI 色解析 profile list）。 */
-  private listProfiles(): Promise<Array<{ name: string; model?: string }>> {
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "hermes", ["profile", "list"], {});
-      let out = "";
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.on("error", () => resolve([{ name: this.defaultProfile }]));
-      child.on("close", () => {
-        const clean = out.replace(/\u001b\[[0-9;]*m/g, "");
-        const names: Array<{ name: string; model?: string }> = [];
-        for (const line of clean.split("\n")) {
-          const m = line.match(/^\s*[\u25c6\u25cf\s]*([a-z0-9][a-z0-9_-]*)\s+(\S.*)?$/i);
-          if (m && m[1] && !/^(Profile|Distribution|Model|Gateway|Alias)$/i.test(m[1])) {
-            const rest = (m[2] ?? "").trim().split(/\s{2,}/);
-            names.push({ name: m[1], model: rest[0] || undefined });
-          }
-        }
-        resolve(names.length > 0 ? names : [{ name: this.defaultProfile }]);
-      });
-    });
+  private async listProfiles(signal?: AbortSignal): Promise<Array<{ name: string; model?: string }>> {
+    const out = await discoveryProbe(this.env.binPath ?? "hermes", ["profile", "list"], signal) ?? "";
+    const clean = out.replace(/\u001b\[[0-9;]*m/g, "");
+    const names: Array<{ name: string; model?: string }> = [];
+    for (const line of clean.split("\n")) {
+      const m = line.match(/^\s*[\u25c6\u25cf\s]*([a-z0-9][a-z0-9_-]*)\s+(\S.*)?$/i);
+      if (m && m[1] && !/^(Profile|Distribution|Model|Gateway|Alias)$/i.test(m[1])) {
+        const rest = (m[2] ?? "").trim().split(/\s{2,}/);
+        names.push({ name: m[1], model: rest[0] || undefined });
+      }
+    }
+    return names.length > 0 ? names : [{ name: this.defaultProfile }];
   }
 
-  private probeVersion(): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "hermes", ["--version"], {});
-      let out = "";
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.on("error", () => resolve(null));
-      child.on("close", (code) => resolve(code === 0 ? out.trim().split("\n")[0] ?? "hermes" : null));
-    });
+  private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    return (await discoveryProbe(this.env.binPath ?? "hermes", ["--version"], signal))?.split("\n")[0] ?? null;
   }
 }

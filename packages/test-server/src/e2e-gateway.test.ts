@@ -41,7 +41,7 @@ test("e2e-gateway: streaming via OpenClaw Gateway WS", { timeout: 240000 }, asyn
   // create
   const project = (await device.peer.requestRaw("project.create", { name: "gateway-e2e", path: cwd, git: false })) as { project: { projectId: string } };
   const created = (await device.peer.requestRaw("session.create", {
-    project: project.project.projectId, agent: "openclaw:phonon", model: "github-copilot/claude-opus-4.8", verbosity: "messages",
+    project: project.project.projectId, agent: "openclaw:phonon", model: "phgeek-gw/gpt-5.6-sol", verbosity: "messages",
   })) as { sessionId: string };
 
   // send
@@ -61,7 +61,7 @@ test("e2e-gateway: streaming via OpenClaw Gateway WS", { timeout: 240000 }, asyn
   // terminate
   await device.peer.requestRaw("session.terminate", { sessionId: created.sessionId });
 
-  client.close();
+  await client.close();
   gwAdapter.close();
   await server.close();
 });

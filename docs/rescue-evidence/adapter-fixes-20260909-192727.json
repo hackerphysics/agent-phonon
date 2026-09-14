@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "path": "acceptance/adapter-fixes-20260909-192727/REPORT.zh-CN.md",
+    "sha256": "1a316b5e4765a18d9fbc2e1cf9d05375741bce293dada2c41a64120f52ad79b3"
+  },
+  "scope": "Exact selected historical report lines, not raw wire/native evidence or a new acceptance. Omitted lines include host configuration, private artifacts and unrelated history; original source hash is provenance, not a claim that a fresh checkout can replay the original acceptance.",
+  "excerpts": [
+    {
+      "startLine": 5,
+      "endLine": 5,
+      "text": "**前三项真实功能失败均已修复；Claude 独立 settings 选择也已实现并真实通过。生产未部署。**\n"
+    },
+    {
+      "startLine": 9,
+      "endLine": 12,
+      "text": "- 最终源码真实回归：**33 个语义检查，32 PASS / 1 NOT_SUPPORTED**。这是本轮有限范围，不是全量 192 场景通过，也没有继承旧 168 PASS。矩阵含启动、清理和默认 executable 查找等检查，不是 33 个独立产品功能。\n- 最终源码原始尝试：38 条，36 PASS / 1 FAIL / 1 NOT_SUPPORTED；其中 Discussion 首次主席提前结束，保留原 FAIL，用严格主席阶段指令的新真实两轮会话复测通过。重复启动/清理检查去重，Discussion 后验映射见 [scenario-matrix.json](scenario-matrix.json)。更早的开发/driver 失败另保留在根目录、`live-02`，不用于扩大最终 PASS。\n- 方法：当前源码构建的独立 `PhononDaemon` 进程 + localhost WS + TS/Python SDK；独立 Phonon DB、projects/workspace、端口。真实 OpenCode/Hermes/Claude native 请求现有本地模型，不用 MockAdapter、native 旁路或最终文本替代 API 工具回传。\n- **12 对工具调用/结果**通过后验：API 与 native 记录的 call ID、完整输入和输出逐项相等；final 为 prompt 中未出现的随机文件 marker。主回归 10 对、无 executable/provider/model override 的补测 2 对。见 [evidence-verification-v2.json](evidence-verification-v2.json)、[evidence-default-path.json](evidence-default-path.json)。\n"
+    },
+    {
+      "startLine": 16,
+      "endLine": 25,
+      "text": "**根因**：安装版 1.14.48 输出 `tool_use.part`，实际 ID 在 `part.callID`，参数/输出/状态在 `part.state.input/output/status/error`。旧代码只读 `part.input`，且只发 `tool_call`。\n\n**改动**：`packages/core/src/adapters/opencode.ts`。\n\n- 使用真实 callID，而非 part ID；完成态快照可一次归一化成 call/result。\n- 每轮按 ID 去重 pending/running/terminal；pending 参数不提前发出，error/cancel 保留 native 错误结果。\n- 保留完整 native output，不用 assistant final 伪装结果；UTF-8 分块解码、无末尾 LF 的 JSONL flush 均有测试。\n- 保留既有 native error/空输出失败判定和 process supervisor；没有开放 native permission bypass。\n\n证据：旧 [FAIL case](../full-live-reacceptance-20260909-184120/cases/1.agent.tool.opencode.json) → 新 [Read 1](live-03/cases/priority.opencode.read-1.json)、[Read 2](live-03/cases/priority.opencode.read-2.json)、[完全默认查找](live-05/cases/default-no-bin-no-provider-no-model.opencode.json)。原生 JSONL 在 `live-03/native-events.jsonl`；机器后验输出精确相等，不仅“包含 marker”。\n"
+    },
+    {
+      "startLine": 33,
+      "endLine": 40,
+      "text": "**改动**：`hermes.ts` + 新增内嵌 `hermes-bridge.ts`。\n\n- 由安装版 console script 自己的 Python 解释器运行 native `main`，先执行 `--profile`/HOME/HERMES_HOME/dotenv 原生加载，再进入 `chat -Q -q`。\n- 从 native `load_config()` 的 `model.provider` / `providers` 保持现有 named-provider 绑定；显式 owner `hermesProvider` 仍优先。执行路径不读取其它 JSON settings，不复制 key，也不操作 auth cache。\n- 测试 API **未传临时 provider/model override**；adapter 内部将已有 YAML 的 provider 传给 native CLI，是产品配置解析行为，不是测试绕过。\n- discovery 使用 YAML parser 代替脆弱正则，支持 quoted/inline mapping。\n- 首轮由 native 新建 session；以后用观察到的真实 native id `--resume`。0.16 的 `--continue <不存在的名字>` 不会新建，`-z` 也不是可靠的有状态会话路径。真实续接现已通过。\n- 移除旧 adapter 自动加入的 yolo/accept-hooks，使用 native 原权限，没有修改全局策略。\n"
+    },
+    {
+      "startLine": 46,
+      "endLine": 57,
+      "text": "**根因**：`-z` 最终只输出 `AIAgent.chat` 的字符串，丢失 `run_conversation` 的 `completed/failed/error`。旧 adapter 只按 exit code 判成功。安装版 ACP 也可能在失败后返回 `end_turn`，不能据此无条件更换传输。\n\n**改动**：窄桥接观察 native `run_conversation` 的真实结构化返回和新工具消息；仍由 native 执行模型、工具、持久化和认证，不是另写推理客户端。\n\n- 成功同时要求 exit 0、明确 `completed:true`、无 failed/partial/error/interrupted、非空 final。\n- 实际工具调用/返回来自 native messages 的同一模型 call id；并非推测 raw output。Hermes 工具事件在该轮结束后缓冲交付，`streaming:false`，不声称实时 token/tool streaming。\n- exit0 + 结构化失败、空输出、partial、取消有定向测试；真实 404、正常对话含 404、超时/取消另走真实 API。\n- **未修改 scheduler、session engine 或 workflow engine**。真实错误传播到了现有失败/重试链。\n\n证据：旧 [run 被误记 success](../full-live-reacceptance-20260909-184120/cases/6.run.real-agent-failure-bounded-retry.json) → 新 [失败 turn](live-03/cases/priority.hermes.real-404-session.json)、[失败 workflow](live-03/cases/priority.hermes.real-404-workflow.json)、[session 调度恰好两次](live-03/cases/priority.hermes.real-404-retry-session.json)、[workflow 调度恰好两次](live-03/cases/priority.hermes.real-404-retry-workflow.json)、[普通 404 文本仍完成](live-03/cases/priority.hermes.normal-404-prose.json)。两类 retryHistory 均有两条真实 HTTP404 诊断，而非 setup/path 错误或仅计数断言。\n\n**协议语义**：失败的是 session 的当前 turn，发出 `error/status=failed/final=true`。可复用 session 生命周期随后回到 `idle`；现有 SessionStatus 只有 idle/running/paused/terminated，没有 failed。本轮没有为了匹配用词增加新 schema。\n"
+    },
+    {
+      "startLine": 61,
+      "endLine": 67,
+      "text": "新增 owner daemon config 字段 `claudeSettingsPath`，贯通 `config.ts → daemon.ts/commands.ts → ClaudeCodeAdapter`；安装版 2.1.123 的 `--settings` / `--setting-sources` 已核实。\n\n- 只接受 owner 配置的绝对 standalone JSON 文件，不新增远程 session/agentConfig 选任意文件的入口。\n- 传 native `--settings <file> --setting-sources ''`，不改源文件。选中 settings 时不混入旧 `claudeBaseUrl/claudeAuthToken`、旧 Anthropic/OAuth/provider 环境和 discovery 默认模型；显式 session model 仍可覆盖 native 模型。\n- 选中 endpoint 必须自带认证或 apiKeyHelper，不能借旧 endpoint 凭据。无 settingsPath 时保留旧行为。\n- 真实 API 用原独立 Qwen/GPT settings，各两次 Read、同 ID 实际结果、精确 final。测试特意保留了无效 legacy endpoint/model 与非秘密 legacy token 标记，证明新选择优先，不会借用旧 token。\n- GPT 使用本项目已固定依赖/SHA 的 `scripts/claude-gpt-compat` 前台 sidecar；复用既有固定 venv，只本轮启动/停止。上游审计在 `live-03/claude-sidecar-audit.jsonl`，仍固定 local4000 Responses、gpt-5.6-sol、store:false；无依赖安装或 proxy 修改。\n"
+    },
+    {
+      "startLine": 82,
+      "endLine": 94,
+      "text": "## 2. 剩余功能、环境与暂缓\n\n| 类别 | 结论及必要边界 |\n|---|---|\n| D03 / D08 | **继续暂缓**：session/workflow status-only 内容泄露、敏感路径规则，共 3 个旧语义失败，仍是两个已知缺陷。本轮没有修复、放宽或改判 PASS。 |\n| discovery.changed | 本轮有真实隔离诱发：owner fixture 的 native OpenCode 从不存在变为真实 binary symlink，API discovery 从 unavailable 变为 available，但没有 changed 通知。当前只有 notify helper，没有生产调用/自动监测来源；这是实现缺口，不再笼统称“没有 fixture”。未伪造 p2s。见 `live-05/cases/remaining.discovery.changed.real-inventory-probe.json`。 |\n| native hook / proactive | 正常 Read 不等于 hook；普通 send 不等于主动事件。需要授权的隔离 Gateway/plugin/native trigger 接入；现有受限轮次未改真实 Gateway/plugins/scheduler，所以仍 BLOCKED，不虚构通过。 |\n| Codex bwrap | 旧证据的 RTM_NEWADDR/沙箱权限边界仍待 owner 的合规运行环境处理。本轮未改沙箱、未提权，也未向旧远端凭据 endpoint 重测。 |\n| Gemini native 404 | 旧 native endpoint 条件仍待本地服务 owner 提供可用 endpoint；本轮未修改 4000 proxy、未切 Chat 冒充 Gemini，也没有宣称本轮已重新验证其 404。 |\n| 通用 document/form/upload、内置 webhook | 缺 native adapter-origin producer / 上传实现或内置 HTTP listener，是更大的功能工作；已有 helper/RPC schema 不等于完整桥接。保留待办，不无限扩写。 |\n| 其它旧 NOT_SUPPORTED | OpenClaw SQLite custom 压缩、若干 adapter native/custom 压缩仍需官方能力；TOML/text 已有 exact edit，不为 merge patch 重写格式。跨 OS/跨设备/人工 UI 不在本轮证明范围。 |\n| Hermes launcher 版本边界 | 本轮验证 Linux Hermes 0.16.0 的 Python console script。Windows/非 Python launcher 需要另验结构化入口，目前明确失败而非降级成 exit0=成功。 |\n| Rescue 知识 | 本轮优先功能，保持 pack 2026.09.09.2 未更新。旧 pack 的历史 daemon/settings 能力描述不能冒充新源码能力；当前变更已写入 integration docs。未把 code patch 声称成 Rescue 可执行修复。 |\n"
+    }
+  ]
+}

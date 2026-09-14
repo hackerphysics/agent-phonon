@@ -1,13 +1,13 @@
 # agent-phonon 协议总览（一页速读）
 
 > 自动对照 `packages/protocol` 源码的人话版总览。字段级看 `src/schemas/*.ts`，决策看 `docs/design.md`。
-> 当前 89 个方法，协议版本 `0.1.0`。
+> 当前 90 个方法，协议版本 `0.1.0`。新增方法保持向后兼容。
 
 ## 一句话
 
 phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 JSON-RPC 2.0。服务端下发 session 操作，phonon 上推流式结果 / 自发输出 / hook 请求。
 
-## 89 个方法
+## 90 个方法
 
 | 方法 | 方向 | 类型 | 干啥 |
 |------|------|------|------|
@@ -17,9 +17,10 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `device.fs.roots` | server→phonon | request | 返回设备可浏览根：workspaceRoot/home，以及 Linux/macOS `/` 或 Windows 盘符 |
 | `device.fs.list` | server→phonon | request | 设备级目录浏览：按 root+相对路径或 absolutePath 列目录项元数据，不读取文件内容 |
 | `maintenance.targets` | server→phonon | request | 列设备本地预注册的维护 target/config/service 及当前权限 |
-| `maintenance.diagnose` | server→phonon | request | 确定性诊断 executable、JSON 配置和用户服务，不依赖 LLM/外部 Agent |
-| `maintenance.config.get` | server→phonon | request | 读取预注册 JSON 配置，secret 字段递归脱敏，并返回 SHA-256 乐观锁 |
+| `maintenance.diagnose` | server→phonon | request | 确定性诊断 executable、已注册文本配置和用户服务，不依赖 LLM/外部 Agent |
+| `maintenance.config.get` | server→phonon | request | 读取预注册 JSON/JSONC/YAML/TOML/text，secret 字段递归脱敏，并返回 SHA-256 乐观锁 |
 | `maintenance.config.patch` | server→phonon | request | RFC 7396 merge patch；本地 policy gate，自动备份、原子写，拒绝 raw path 和 `***` secret 占位符 |
+| `maintenance.config.edit` | server→phonon | request | expectedSha256 + 唯一非重叠 oldText/newText；显式 public 文本、写前格式校验、root allowlist、原始字节备份 |
 | `maintenance.rollback` | server→phonon | request | 按本地 backupId 校验 checksum 后回滚预注册配置 |
 | `maintenance.package.update` | server→phonon | request | 更新设备本地白名单中的用户态 npm/pnpm 包，协议不接受包名 |
 | `maintenance.service.status` | server→phonon | request | 查询设备本地白名单用户服务状态 |
@@ -30,7 +31,7 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `session.create` | server→phonon | request | 建会话，**必须绑 project + agent + model** |
 | `session.send` | server→phonon | request | 发任务＝对话；ack 回 turnId，内容走 stream；可传 `skills` 指定本轮技能 |
 | `session.inject` | server→phonon | request | 注入上下文 |
-| `session.compress` | server→phonon | request | 压缩，native \| custom 双模；custom 第一版支持 `dropToolIO`（删除结构化 tool 调用/结果，保留文本，默认保留最近 3 个 tool call，可 `keepRecentToolCalls` 配置） |
+| `session.compress` | server→phonon | request | 压缩，native \| custom 双模；custom `dropToolIO` 仅适用于 adapter 可安全操作的存储。OpenClaw SQLite Gateway 无对应自定义 API 时返回 `errCapabilityUnsupported`，不编辑其私有数据库；native 必须确认实际 compacted，不能吞错伪成功。 |
 | `session.switchModel` | server→phonon | request | 中途换模型（agent 不变） |
 | `session.interrupt` | server→phonon | request | **打断当前 turn，session 存活** |
 | `session.terminate` | server→phonon | request | 销毁整个 session |
@@ -69,6 +70,8 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `workflow.run` | server→phonon | request | L3 编排：提交 DAG 或 executor graph 执行计划；policy.timeout/maxParallel/onNodeFailure 可选 |
 | `workflow.status` | server→phonon | request | 查询 workflow 与各 node/session 状态；节点 result 带 text/status/usage；finalText 可选 |
 | `workflow.cancel` | server→phonon | request | 取消 workflow（幂等） |
+| `workflow.pause` | server→phonon | request | 暂停 workflow 并 fence 迟到事件 |
+| `workflow.resume` | server→phonon | request | 按持久化 checkpoint 和指定策略恢复 |
 | `workflow.list` | server→phonon | request | 列 workflow run（可按 status/projectId/since/until 筛） |
 | `workflow.event` | phonon→server | notify | L3 工作流级元事件：workflow.status / node.status / edge.route / executor.decision / artifact.written / node.diagnostic（session 输出走 stream.event） |
 | `workflow.ack` | server→phonon | notify | 确认 workflow.event seq≤lastSeq（与 stream.ack 平行） |
@@ -210,3 +213,53 @@ GPT 落了 0.3.0 的 L3 协议骨架后，万万对协议做了一次 review，�
 **v1 范围**：runKind=session 已实现；runKind=workflow 保留接口位（报 errCapabilityUnsupported）。webhook 的 server 端 HTTP 入口待 server SDK 暴露（core 已有 triggerByWebhook）。
 
 **实现状态**：协议 + SchedulerEngine + cron 解析器 + sqlite store（schedules/runs 两表）+ TS/Python SDK + tests 同步落地。fn-cron(9) + fn-scheduler(8) + e2e-scheduler(3) 全过；全量回归 functional 128 / e2e 29 / protocol 50 全绿；真实挂钟 cron + webhook 端到端实跑验证通过。
+
+
+## 多格式维护配置与文本编辑
+
+本地注册的 `format` 为 `json | jsonc | yaml | toml | text`，旧 `json` 注册及
+`maintenance.config.patch` 参数保持兼容。`get` 返回 format、原始字节 SHA、脱敏 value；
+`text` 只有本地所有者显式注册 `textVisibility: "public"` 且保守扫描无疑似秘密时才返回，
+否则省略 text 并返回 `textWithheld: true`。public 是该文件的所有者声明，不是自动秘密探测保证。
+普通 text 不返回结构化 value；必须同时显式 `writable: true`、`wholeFileWritable: true` 和
+`textVisibility: "public"` 才可编辑，仅授权这一条既有文件，不允许任意路径或整个 HOME。
+
+| format | get/diagnose | merge patch | exact edit |
+| --- | --- | --- | --- |
+| json | 严格 JSON；拒绝重复键 | RFC7396，jsonc-parser 局部节点修改 | public 文本；写前 parse |
+| jsonc | JSON + 注释/尾逗号；拒绝重复键 | 同上，保留未涉及的注释 | 同上 |
+| yaml | 单文档 core schema，string mapping keys | 仅 plain mapping root；安全 Document API | 同一安全 YAML 子集，public 文本 |
+| toml | smol-toml，保留本地 date/time/bigint 类型 | **不支持**，明确要求 edit，不 stringify | 精确替换并重新 parse，其他字节不动 |
+| text | 有界有效 UTF-8；不作领域语法校验 | 不支持 | public + whole-file 授权 |
+
+YAML 禁止显式 tag、自定义构造、merge key、多文档和别名（预算 0）；节点预算 20,000，
+深度 64。不支持的输入明确失败，不静默丢弃内容。YAML patch 保留注释，可能规范化引号、缩进及集合样式；
+尽量保留 BOM、CRLF 与末尾换行状态，**不承诺 patch 的未修改文本逐字节相同**。
+需要字节局部性时使用 public exact edit；带秘密文件的 text 始终保守隐藏，exact edit 拒绝，改用 server 原值 merge patch。
+JSON/JSONC patch 采用叶节点源文本编辑；新增/删除节点可能调整附近空白。数组整体替换，null 删除 mapping 键，
+不是 TOML null，也不是数组元素逐项删除。
+TOML 的日期/本地时间、大整数及非有限数在 value 中使用 `$tomlDate`/`$tomlInteger`/`$number` 诊断投影；
+该投影不是写入格式，不得 JSON 序列化后覆盖 TOML。
+
+`maintenance.config.edit` 参数：
+```json
+{"targetId":"fixture","configId":"main","expectedSha256":"<get 返回的 SHA>","edits":[{"oldText":"before","newText":"after"}],"reason":"authorized repair","clientRequestId":"unique-request-id"}
+```
+1–100 项替换始终匹配**同一原始版本**，每项 oldText 非空且只能出现一次，区间不重叠；
+匹配 0/多处、非法 Unicode、`***` 占位、语法错误、过期 SHA 都不写。不会把 redacted text 整篇写回。
+结构化 edit/patch 都对解析前后的根键及嵌套语义差异检查 `allowedRootKeys`，包括删除和新增；
+rollback 也重新检查当前注册的根键权限。不会借 exact edit 更改其他 root 或 Rescue 自身 policy/maintenance 授权。
+
+文件限制：最多 1 MiB，拒绝非普通文件、非法 UTF-8、NUL 和二进制控制字符；exact edit 只更改匹配区间，
+保留其他 UTF-8 字节、BOM、CRLF、换行。所有写入先完整 parse，再保存私有原始字节 backup，以同目录 temp+rename
+原子替换；不支持原子替换的平台报错，绝不退化为部分 copy-over。备份后再检查当前 SHA；同 broker 同路径串行。
+这不是对不受控外部写者的文件系统原子 CAS 保证。无变化返回 changed=false，不创建备份。
+写结果包含 format、previousSha256、sha256、changed，发生改变时附 backupId；回滚使用 current SHA，校验备份 checksum，
+恢复原始字节并建立可逆备份。
+
+TS：`device.maintenance.configEdit(params)`；Python：
+`device.maintenance_config_edit(target_id, config_id, expected_sha256, edits, **opts)`。
+Rescue 四协议均提供 `edit_config` array-of-objects schema；Gemini 原 patch 的 JSON 对象字符串转换保留，
+edit 没有任意 additionalProperties，使用正常 array schema，经相同本地 Zod 与 policy 校验。
+新默认注册 Hermes `~/.hermes/config.yaml` 和 Codex `~/.codex/config.toml` **只读、text hidden**。
+已有持久注册不会自动扩权，Agent/maintenance/policy 自身仍不可由 Rescue 重写。

@@ -39,11 +39,14 @@ const MUTATING_METHODS = new Set<string>([
   "env.set",
   "env.delete",
   "maintenance.config.patch",
+  "maintenance.config.edit",
   "maintenance.rollback",
   "maintenance.package.update",
   "maintenance.service.restart",
   "workflow.run",
+  "workflow.pause",
   "workflow.cancel",
+  "workflow.resume",
   "schedule.create",
   "schedule.update",
   "schedule.delete",
@@ -80,6 +83,9 @@ export class PhononConnection {
   private obs?: import("./observability.js").ObsBus;
   private workflows?: WorkflowEngine;
   private scheduler?: SchedulerEngine;
+  private disposed = false;
+  private disposePromise?: Promise<void>;
+  private releaseInventory: () => void;
   constructor(opts: {
     tenantId: string;
     transport: RpcTransport;
@@ -109,13 +115,11 @@ export class PhononConnection {
     this.engine = new SessionEngine(opts.registry, (event: StreamEvent) => {
       this.workflows?.onStreamEvent(event);
       this.scheduler?.onStreamEvent(event);
-      // 下行可靠投递（D29）：先入 outbox（含 sqlite）再发；server ack 后清理
-      this.outbox.enqueue(event);
-      this.peer.notifyRaw("stream.event", event);
+      this.sendStreamEvent(event);
     }, opts.obs, this.store, {
       maintenance: this.maintenance,
       assertAgentAllowed: (agentId) => this.policy.assertAgentAllowed(agentId),
-    });
+    }, opts.tenantId);
     this.obs = opts.obs;
 
     this.projects = new ProjectManager(
@@ -128,7 +132,7 @@ export class PhononConnection {
         hasActiveSessionsForWorktree: (wtId) => this.engine.activeSessionsForWorktree(wtId), // 精确查询（B8）
       },
     );
-    this.engine.resolveCwdForReattach = (projectId) => this.projects.resolveCwd(projectId);
+    this.engine.resolveCwdForReattach = (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId);
     this.skills = new SkillManager(
       opts.registry,
       (projectId) => {
@@ -144,6 +148,7 @@ export class PhononConnection {
     this.env = new EnvManager(this.tenantId, this.store, { allowReveal: () => this.policy.allowEnvReveal() });
 
     this.peer = new RpcPeer(opts.transport, (method, params) => this.dispatch(method, params));
+    this.releaseInventory = this.registry.inventory.acquire((event) => this.notifyDiscoveryChanged(event));
     this.workflows = new WorkflowEngine({
       tenantId: this.tenantId,
       engine: this.engine,
@@ -157,21 +162,37 @@ export class PhononConnection {
         getProjectPath: (projectId) => this.projects.get(projectId).path,
       },
       store: this.store,
-      emit: (event) => this.peer.notifyRaw("workflow.event", event),
-      requestInteraction: (params: unknown) => this.peer.requestRaw("interaction.request", params),
+      emit: (event) => {
+        this.scheduler?.onWorkflowEvent(event);
+        this.peer.notifyRaw("workflow.event", event);
+      },
+      requestInteraction: (params: unknown) => this.requestInteraction(params),
     });
 
-    // L4 调度器（device-authoritative）。生命周期独立于 WS：start() 在 daemon 装载，
-    // 这里建好实例并接线 emit；断连时 owner 可换 emit 为 no-op，靠 store push_state 补推。
+    // L4 调度器（device-authoritative）。当前由 PhononConnection 持有：重连会
+    // dispose 旧实例、由新实例从 store 重建 cron；在途 run 会明确落为 failed，
+    // 避免旧 connection 的 timers/runtime 与新实例并存。
     this.scheduler = new SchedulerEngine({
       tenantId: this.tenantId,
       engine: this.engine,
       store: this.store,
       resolveCwd: (projectId) => this.projects.resolveCwd(projectId),
+      workflows: () => this.workflows,
       emit: (method, params) => this.peer.notifyRaw(method, params),
-      assertRunAllowed: () => this.policy.assertMethodAllowed("session.create"),
+      assertRunAllowed: (schedule) => this.policy.assertMethodAllowed(schedule.target.runKind === "workflow" ? "workflow.run" : "session.create"),
     });
     this.scheduler.start();
+    this.scheduler.replayUnacked();
+    this.workflows.replayUnacked();
+    // Workflow ownership is tenant-scoped and persisted. Recovery runs only
+    // after scheduler/event wiring is complete so resumed events reach the
+    // current connection and no replaced connection keeps an executor alive.
+    void this.workflows.recover().catch((err) => {
+      this.obs?.emitEvent({
+        category: "error", level: "error", event: "workflow.recovery_failed",
+        tenantId: this.tenantId, msg: (err as Error)?.message ?? String(err),
+      });
+    });
   }
 
   /** 喂入收到的文本。 */
@@ -179,16 +200,71 @@ export class PhononConnection {
     return this.peer.handle(data);
   }
 
-  /** 连接断开：拒绝 pending RPC；outbox 保留供重连补发。 */
-  onClose(reason = "connection closed"): void {
-    this.peer.rejectAllPending(reason);
+  /** 连接断开时永久释放 connection-scoped runtime。 */
+  onClose(reason = "connection closed"): Promise<void> {
+    return this.dispose(reason);
   }
 
-  /** 重连后补发未 ack 的 stream.event（D29）。resumeFrom = server welcome.ackedSeqs 转换。 */
+  /**
+   * Idempotent permanent teardown. Because SessionEngine is currently owned by
+   * a connection, active turns/runs are interrupted and persisted as
+   * paused/failed before a reconnect builds the replacement runtime.
+   */
+  dispose(reason = "connection disposed"): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    this.disposed = true;
+    this.releaseInventory();
+    this.peer.dispose(reason);
+    this.scheduler?.dispose(reason);
+    this.disposePromise = (async () => {
+      await this.workflows?.dispose(reason);
+      await this.engine.dispose();
+    })();
+    return this.disposePromise;
+  }
+
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
+  /** 下行可靠投递：必须先落 outbox；transport 失败只延迟投递，不回滚事件。 */
+  private sendStreamEvent(event: StreamEvent): void {
+    this.outbox.enqueue(event);
+    try {
+      this.peer.notifyRaw("stream.event", event);
+    } catch (err) {
+      this.obs?.emitEvent({
+        category: "stream", level: "warn", event: "stream.send_deferred",
+        tenantId: this.tenantId, sessionId: (event as { sessionId?: string }).sessionId,
+        msg: (err as Error)?.message ?? "stream transport send failed",
+      });
+    }
+  }
+
+  /** 重连后补发未 ack 的 stream.event（D29）。参数保留旧的 exclusive-watermark 兼容语义。 */
   replayPending(resumeFrom?: Array<{ sessionId: string; fromSeq: number }>): number {
     const events = this.outbox.pending(resumeFrom);
-    for (const e of events) this.peer.notifyRaw("stream.event", e);
-    return events.length;
+    let sent = 0;
+    for (const e of events) {
+      try {
+        this.peer.notifyRaw("stream.event", e);
+        sent++;
+      } catch {
+        // 保留全部未 ACK 记录；同一失效 transport 上继续发送没有收益。
+        break;
+      }
+    }
+    return sent;
+  }
+
+  /** connect.hello 使用的“每 session 第一条未 ACK seq”。 */
+  resumeFrom(): Array<{ sessionId: string; fromSeq: number }> {
+    return this.outbox.resumeFrom();
+  }
+
+  /** welcome/stream.ack 的唯一入口：单调推进并同步 sqlite。 */
+  acknowledgeStream(sessionId: string, lastSeq: number): void {
+    this.outbox.ack(sessionId, lastSeq);
   }
 
   /** outbox 待投递事件数（监控用）。 */
@@ -203,24 +279,28 @@ export class PhononConnection {
 
   // ---- p2s 主动发起（phonon → server，平面③ + HITL）----
 
-  /** 发本地文档给 server（document.send，D20）。adapter 解析 directive 后调用。 */
+  /** document.send RPC helper (D20); generic native directive/read producer is not yet wired. */
   async sendDocument(params: unknown): Promise<unknown> {
     return this.peer.requestRaw("document.send", params);
   }
 
-  /** 请求大文件上传凭证（document.prepare_upload，P1-6）。 */
+  /** Upload-credential RPC helper (P1-6), not an HTTP file uploader. */
   async prepareUpload(params: unknown): Promise<unknown> {
     return this.peer.requestRaw("document.prepare_upload", params);
   }
 
   /** 主动通知 server：agent 可用性变化（discovery.changed，D14）。 */
   notifyDiscoveryChanged(params: unknown): void {
-    this.peer.notifyRaw("discovery.changed", params);
+    if (this.disposed) return;
+    const event = METHODS["discovery.changed"].params.parse(params);
+    try { this.policy.assertAgentAllowed(event.agentId); } catch { return; }
+    this.peer.notifyRaw("discovery.changed", event);
   }
 
   /** 发可交互表单给 server，阻塞等人填（interaction.request，D21/P1-5）。 */
   async requestInteraction(params: unknown): Promise<unknown> {
-    return this.peer.requestRaw("interaction.request", params);
+    const timeout = (params as { timeoutSeconds?: number })?.timeoutSeconds;
+    return this.peer.requestRaw("interaction.request", params, timeout ? timeout * 1000 + 5000 : 120000);
   }
 
   /** 报 hook 事件并阻塞等 server 裁决（hook.fired，design §8，HITL）。 */
@@ -313,7 +393,7 @@ export class PhononConnection {
   }
 
   private async dispatchInner(method: string, p: Record<string, unknown>): Promise<unknown> {
-    const maintenanceMutation = method === "maintenance.config.patch" || method === "maintenance.rollback" || method === "maintenance.package.update" || method === "maintenance.service.restart";
+    const maintenanceMutation = method === "maintenance.config.edit" || method === "maintenance.config.patch" || method === "maintenance.rollback" || method === "maintenance.package.update" || method === "maintenance.service.restart";
     if (maintenanceMutation) {
       this.obs?.emitEvent({
         category: "tool", level: "info", event: method, tenantId: this.tenantId,
@@ -345,6 +425,8 @@ export class PhononConnection {
         return this.maintenance.diagnose(p.targetId as string | undefined);
       case "maintenance.config.get":
         return this.maintenance.configGet(p.targetId as string, p.configId as string);
+      case "maintenance.config.edit":
+        return this.maintenance.configEdit(p as never);
       case "maintenance.config.patch":
         return this.maintenance.configPatch(p as never);
       case "maintenance.rollback":
@@ -356,15 +438,16 @@ export class PhononConnection {
       case "maintenance.service.restart":
         return this.maintenance.serviceRestart(p.targetId as string, p.serviceId as string);
       case "discovery.list": {
-        // 聚合所有 runtime 的 sub-agents（OpenClaw 多 agent / Codex 单 agent）
-        const nested = await Promise.all(this.registry.all().map((a) => a.discoverAgents()));
-        return { agents: nested.flat() };
+        const agents = await this.registry.inventory.list();
+        return { agents: agents.filter((agent) => {
+          try { this.policy.assertAgentAllowed(agent.agentId); } catch { return false; }
+          return !p.availableOnly || agent.available;
+        }) };
       }
       case "discovery.get": {
-        const adapter = this.registry.resolve(p.agentId as string);
-        if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${p.agentId} not found`);
-        const agents = await adapter.discoverAgents();
-        const found = agents.find((a) => a.agentId === p.agentId) ?? agents[0];
+        this.policy.assertAgentAllowed(p.agentId as string);
+        const found = (await this.registry.inventory.list()).find((a) => a.agentId === p.agentId);
+        if (!found) throw new PhononError("errAgentUnavailable", `agent ${p.agentId} not found`);
         return { agent: found };
       }
       case "session.create": {
@@ -540,6 +623,8 @@ export class PhononConnection {
         return this.workflows!.status(p.workflowId as string);
       case "workflow.cancel":
         return this.workflows!.cancel(p.workflowId as string, p.reason as string | undefined);
+      case "workflow.pause":
+        return this.workflows!.pause(p.workflowId as string, p.reason as string | undefined);
       case "workflow.list":
         return this.workflows!.list(p as { status?: string; projectId?: string; since?: string; until?: string; limit?: number });
       case "workflow.resume":
@@ -601,7 +686,7 @@ export class PhononConnection {
         return this.scheduler!.trigger({
           scheduleId: p.scheduleId as string,
           source: p.source as never,
-          input: p.input as Record<string, unknown> | undefined,
+          input: p.input as string | Record<string, unknown> | undefined,
         });
       case "schedule.runs.list":
         return this.scheduler!.runsList(p.scheduleId as string, { status: p.status as string | undefined, limit: p.limit as number | undefined });
@@ -621,18 +706,22 @@ export class PhononConnection {
       // ---- 连接/可靠性（s2p） ----
       case "stream.ack": {
         // server 确认已收 seq≤lastSeq → phonon 清 outbox（D29 / P0-4）。
-        this.outbox.ack(p.sessionId as string | undefined, p.lastSeq as number);
+        this.acknowledgeStream(p.sessionId as string, p.lastSeq as number);
         return null;
       }
       case "interaction.response": {
         // server 回填人机交互结果（P1-5）→ 路由回对应 session/turn。v0 记录即可。
-        this.engine.resolveInteraction?.(p.requestId as string, p as never);
+        if (!this.peer.resolveRequest("interaction.request", p.requestId as string, p)) {
+          this.engine.resolveInteraction(p.requestId as string, p);
+        }
         return null;
       }
       case "interaction.cancel": {
         // server 主动取消一个 pending 交互（P1-5）。
-        this.engine.resolveInteraction?.(p.requestId as string, { action: "cancel", requestId: p.requestId });
-        return { requestId: p.requestId, cancelled: true };
+        const response = { action: "cancel", requestId: p.requestId };
+        const cancelled = this.peer.resolveRequest("interaction.request", p.requestId as string, response)
+          || this.engine.resolveInteraction(p.requestId as string, response);
+        return { requestId: p.requestId, cancelled };
       }
       case "hook.resolve": {
         // server 主动下发裁决（异步路径；同步路径是 hook.fired 的 RPC 响应）。
@@ -645,6 +734,8 @@ export class PhononConnection {
 }
 
 export { SessionEngine, AdapterRegistry, RpcPeer, PhononError, PROTOCOL_VERSION };
+export { DiscoveryInventory, discoveryOptions } from "./discovery-inventory.js";
+export type { DiscoveryOptions } from "./discovery-inventory.js";
 export type { AgentAdapter, RpcTransport };
 export * from "./adapter.js";
 export { OpenClawAdapter } from "./adapters/openclaw.js";
@@ -668,6 +759,8 @@ export { SecretBox } from "./secret-box.js";
 export { FileManager } from "./file-manager.js";
 export { EnvManager } from "./env-manager.js";
 export { DANGEROUS_CHILD_ENV_NAMES, isDangerousChildEnvName, sanitizeRemoteEnvironment, buildChildProcessEnvironment } from "./child-env.js";
+export { ProcessSupervisor, spawnSupervised, spawnSupervisedAgent } from "./process-supervisor.js";
+export type { ProcessSupervisorOptions } from "./process-supervisor.js";
 export { dropToolIOFromJsonlFiles, dropToolIOFromValue, computeKeepToolBlocks } from "./custom-compress.js";
 export { dropToolIORowsSqlite } from "./sqlite-compress.js";
 export { resolveCodexSessionFile } from "./adapters/codex.js";
@@ -693,3 +786,8 @@ export { spawnAgent, spawnSyncAgent, quoteWinArg } from "./proc.js";
 export { TranscriptWriter } from "./transcript.js";
 export { MaintenanceManager, applyJsonMergePatch } from "./maintenance.js";
 export type { MaintenanceRuntime, MaintenanceManagerConfig, MaintenanceTargetConfig, MaintenanceConfigTarget, MaintenancePackageTarget, MaintenanceServiceTarget } from "./maintenance.js";
+
+export { validateRescueEndpoint, resolveRescueConnection } from "./rescue-config.js";
+export type { RescueConnectionOptions } from "./rescue-config.js";
+
+export { createRescueModel, rescueProviderOptions } from "./rescue-model.js";

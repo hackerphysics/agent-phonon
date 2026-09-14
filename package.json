@@ -13,9 +13,13 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "consistency": "node scripts/check-consistency.mjs",
+    "consistency": "node scripts/check-consistency.mjs && node scripts/generate-rescue-knowledge.mjs --check",
+    "knowledge:check": "node scripts/generate-rescue-knowledge.mjs --check",
     "release:guard": "node scripts/release-guard.mjs",
     "install-hooks": "node scripts/install-git-hooks.mjs",
-    "test": "pnpm run consistency && pnpm -r test"
+    "test": "node scripts/test-local.mjs default",
+    "test:e2e": "node scripts/test-local.mjs e2e",
+    "test:python": "node scripts/test-local.mjs python",
+    "test:python:compat": "node scripts/test-local.mjs compat"
   }
 }

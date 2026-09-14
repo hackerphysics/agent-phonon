@@ -1,5 +1,6 @@
-import type { ChildProcess } from "node:child_process";
-import { spawnAgent } from "../proc.js";
+import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
+import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -20,7 +21,6 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, Mode
  * 调用（详见 docs/agent-cli-integration.md）：
  *   codex exec - --json -c model_provider=<id> -c model_providers.<id>.base_url=...
  *     -c model_providers.<id>.wire_api=responses --model X
- *     --dangerously-bypass-approvals-and-sandbox
  *   prompt 走 stdin（argv 用 "-"）；resume：codex exec resume <thread_id> - --json ...
  *
  * 网关由调用方通过 CodexEnv 传入（baseUrl/apiKey/wireApi），adapter 不绑定任何特定网关；
@@ -89,6 +89,7 @@ function parseCodexConfig(configPath = join(homedir(), ".codex", "config.toml"))
 }
 
 function normalizeOpenAiModels(data: unknown): ModelInfo[] {
+  if (!Array.isArray(data) && (!data || !Array.isArray((data as { data?: unknown }).data))) throw new Error("invalid model inventory");
   const rows = Array.isArray((data as { data?: unknown }).data)
     ? (data as { data: unknown[] }).data
     : (Array.isArray(data) ? data as unknown[] : []);
@@ -104,14 +105,18 @@ function normalizeOpenAiModels(data: unknown): ModelInfo[] {
   return out;
 }
 
-function fetchJson(url: string, headers?: Record<string, string>): Promise<unknown> {
+function fetchJson(url: string, headers?: Record<string, string>, signal?: AbortSignal): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const req = (u.protocol === "http:" ? import("node:http") : import("node:https"))
-      .then((mod) => mod.request(url, { method: "GET", headers, timeout: 5000 }, (res) => {
+      .then((mod) => mod.request(url, { method: "GET", headers, timeout: 5000, signal }, (res) => {
         let body = "";
         res.setEncoding("utf8");
-        res.on("data", (d) => (body += d));
+        res.on("error", reject);
+        res.on("data", (d) => {
+          body += d;
+          if (body.length > 2_000_000) res.destroy(new Error("inventory response too large"));
+        });
         res.on("end", () => {
           if ((res.statusCode ?? 500) < 200 || (res.statusCode ?? 500) >= 300) {
             reject(new Error(`GET ${url} failed: ${res.statusCode}`));
@@ -153,7 +158,7 @@ class CodexSession implements AdapterSession {
   private cwd: string;
   private env: CodexEnv;
   private threadId?: string; // Codex thread_id（= 会话），从 thread.started 抓
-  private current?: ChildProcess;
+  private current?: ProcessSupervisor;
   private pendingInject: string[] = [];
 
   constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[]) {
@@ -190,27 +195,36 @@ class CodexSession implements AdapterSession {
     }
 
     const args = this.threadId
-      ? ["exec", "resume", this.threadId, "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : []), "--dangerously-bypass-approvals-and-sandbox"]
-      : ["exec", "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : []), "--dangerously-bypass-approvals-and-sandbox"];
+      ? ["exec", "resume", this.threadId, "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : [])]
+      : ["exec", "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : [])];
 
     await this.run(args, prompt, turnId, emit, opts);
   }
 
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "codex", args, {
+      const supervisor = spawnSupervisedAgent(this.env.binPath ?? "codex", args, {
         cwd: this.cwd,
         env: { ...buildChildProcessEnvironment(opts.environment), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) },
       });
-      this.current = child;
+      const child = supervisor.child;
+      this.current = supervisor;
+      const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
+      child.once("close", releaseCurrent);
+      child.once("error", releaseCurrent);
       let buf = "";
       let acc = "";
+      let stderr = "";
+      let nativeError = "";
+      let sawCompletion = false;
+      child.stderr.on("data", (d) => { stderr = (stderr + String(d)).slice(-16000); });
       let settled = false;
+      const abort = (): void => { void supervisor.terminate(); finish("interrupted", acc); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
-        this.current = undefined;
+        opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
           emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: message ?? "codex failed", status: "failed", final: true } as StreamEvent);
         } else {
@@ -218,25 +232,34 @@ class CodexSession implements AdapterSession {
         }
         resolve();
       };
-      const guard = setTimeout(() => finish("timeout", acc), 1800000);
-      opts.signal?.addEventListener("abort", () => { child.kill("SIGTERM"); finish("interrupted", acc); }, { once: true });
+      const guard = setTimeout(() => { void supervisor.terminate(); finish("timeout", acc); }, 1800000);
+      if (opts.signal?.aborted) abort();
+      else opts.signal?.addEventListener("abort", abort, { once: true });
 
+      const consume = (line: string): void => {
+        if (!line.trim()) return;
+        let ev: Record<string, unknown>;
+        try { ev = JSON.parse(line); } catch { return; }
+        if (ev.type === "turn.failed" || ev.type === "error") {
+          nativeError = String((ev.error as { message?: string } | undefined)?.message ?? ev.message ?? "Codex turn failed");
+        }
+        if (ev.type === "turn.completed") { sawCompletion = true; nativeError = ""; }
+        this.handleEvent(ev, turnId, emit, (t) => (acc += t));
+      };
       child.stdout.on("data", (d) => {
         buf += d.toString();
         let nl;
         while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-          let ev: Record<string, unknown>;
-          try { ev = JSON.parse(line); } catch { continue; }
-          this.handleEvent(ev, turnId, emit, (t) => (acc += t));
+          const line = buf.slice(0, nl); buf = buf.slice(nl + 1); consume(line);
         }
       });
       child.on("error", (e) => finish("failed", "", e.message));
       child.on("close", (code) => {
         if (settled) return;
-        finish(code === 0 ? "completed" : "failed", acc, code !== 0 ? `codex exited ${code}` : undefined);
+        consume(buf);
+        const failed = code !== 0 || !!nativeError || !sawCompletion || !acc.trim();
+        const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [this.env.apiKey]);
+        finish(failed ? "failed" : "completed", acc, failed ? `codex exited ${code}: ${detail}` : undefined);
       });
 
       child.stdin.write(stdin);
@@ -263,7 +286,7 @@ class CodexSession implements AdapterSession {
   }
 
   async interrupt(): Promise<void> {
-    if (this.current) { this.current.kill("SIGTERM"); this.current = undefined; }
+    if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
@@ -290,15 +313,16 @@ export class CodexAdapter implements AgentAdapter {
   readonly name = "codex";
   readonly capabilities = CAPABILITIES;
   private env: CodexEnv;
+  private modelCatalog?: { baseUrl: string; models: ModelInfo[] };
 
   constructor(opts: { env: CodexEnv }) {
     this.env = opts.env;
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
-    const version = await this.probeVersion();
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
+    const version = await this.probeVersion(signal);
     const available = version !== null;
-    const models = await this.discoverModels();
+    const models = await this.discoverModels(signal);
     return [{
       agentId: "codex" as AgentDescriptor["agentId"],
       displayName: "Codex",
@@ -316,16 +340,26 @@ export class CodexAdapter implements AgentAdapter {
     return new CodexSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
   }
 
-  private async discoverModels(): Promise<ModelInfo[]> {
+  private async discoverModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     if (this.env.models?.length) return this.env.models;
     const cfg = parseCodexConfig();
     const baseUrl = this.env.baseUrl ?? cfg.baseUrl;
     if (baseUrl) {
+      let models: ModelInfo[] = [];
       try {
-        const data = await fetchJson(`${baseUrl.replace(/\/$/, "")}/models`, this.env.apiKey ? { Authorization: `Bearer ${this.env.apiKey}` } : undefined);
-        const models = normalizeOpenAiModels(data);
-        if (models.length > 0) return models;
-      } catch { /* fall back below */ }
+        const data = await fetchJson(`${baseUrl.replace(/\/$/, "")}/models`, this.env.apiKey ? { Authorization: `Bearer ${this.env.apiKey}` } : undefined, signal);
+        models = normalizeOpenAiModels(data);
+        this.modelCatalog = { baseUrl, models };
+      } catch {
+        signal?.throwIfAborted();
+        models = this.modelCatalog?.baseUrl === baseUrl ? this.modelCatalog.models : [];
+        console.warn("[codex] discovery.catalog_failed; retaining known/native-config models");
+      }
+      if (models.length > 0) {
+        const configured = this.env.defaultModel !== "default" ? this.env.defaultModel : cfg.model;
+        const preferred = configured && models.find((model) => model.id === configured);
+        return preferred ? [preferred, ...models.filter((model) => model.id !== configured)] : models;
+      }
     }
     const configured = this.env.defaultModel !== "default" ? this.env.defaultModel : cfg.model;
     const base = configured ? [{ id: configured, available: true }] : [];
@@ -334,13 +368,7 @@ export class CodexAdapter implements AgentAdapter {
     return base.length > 0 ? base : CODEX_FALLBACK_MODELS;
   }
 
-  private probeVersion(): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "codex", ["--version"], {});
-      let out = "";
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.on("error", () => resolve(null));
-      child.on("close", (code) => resolve(code === 0 ? out.trim() : null));
-    });
+  private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    return (await discoveryProbe(this.env.binPath ?? "codex", ["--version"], signal));
   }
 }

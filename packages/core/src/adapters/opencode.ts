@@ -1,5 +1,6 @@
-import type { ChildProcess } from "node:child_process";
-import { spawnAgent } from "../proc.js";
+import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
+import { discoveryProbe } from "../discovery-probe.js";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -68,7 +69,7 @@ class OpenCodeSession implements AdapterSession {
   private cwd: string;
   private bin: string;
   private ocSessionId?: string; // OpenCode ses_ id（从事件抓，供 -s resume）
-  private current?: ChildProcess;
+  private current?: ProcessSupervisor;
   private pendingInject: string[] = [];
 
   constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[]) {
@@ -91,7 +92,7 @@ class OpenCodeSession implements AdapterSession {
       message = `[本轮请使用这些能力: ${opts.skills.join(", ")}]\n\n${message}`;
     }
 
-    const args = ["run", "--format", "json", "--dangerously-skip-permissions"];
+    const args = ["run", "--format", "json"];
     if (this.model) args.push("--model", this.model);
     if (this.ocSessionId) args.push("--session", this.ocSessionId); // 持续会话
     args.push(message); // prompt 作为位置参数放最后
@@ -103,16 +104,26 @@ class OpenCodeSession implements AdapterSession {
     return new Promise((resolve) => {
       // 关键：stdin 设 ignore(=DEVNULL)，否则 OpenCode 检测到 stdin pipe 会等交互输入卡死
       // shell:win32 — bin 回退为 PATH 上的 `opencode`（.cmd shim），Node 22 不带 shell spawn .cmd 会抛 EINVAL（与其它 adapter 一致）。
-      const child = spawnAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: buildChildProcessEnvironment(opts.environment) });
-      this.current = child;
+      const supervisor = spawnSupervisedAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: buildChildProcessEnvironment(opts.environment) });
+      const child = supervisor.child;
+      this.current = supervisor;
+      const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
+      child.once("close", releaseCurrent);
+      child.once("error", releaseCurrent);
       let buf = "";
       let acc = "";
+      let stderr = "";
+      let nativeError = "";
+      let sawCompletion = false;
+      const tools = new Map<string, { called: boolean; finished: boolean }>();
+      child.stderr.on("data", (d) => { stderr = (stderr + String(d)).slice(-16000); });
       let settled = false;
+      const abort = (): void => { void supervisor.terminate(); finish("interrupted", acc); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
-        this.current = undefined;
+        opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
           emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: message ?? "opencode failed", status: "failed", final: true } as StreamEvent);
         } else {
@@ -120,31 +131,43 @@ class OpenCodeSession implements AdapterSession {
         }
         resolve();
       };
-      const guard = setTimeout(() => finish("timeout", acc), 1800000);
-      opts.signal?.addEventListener("abort", () => { child.kill("SIGTERM"); finish("interrupted", acc); }, { once: true });
+      const guard = setTimeout(() => { void supervisor.terminate(); finish("timeout", acc); }, 1800000);
+      if (opts.signal?.aborted) abort();
+      else opts.signal?.addEventListener("abort", abort, { once: true });
 
+      const consume = (line: string): void => {
+        if (settled || !line.trim()) return;
+        let ev: Record<string, unknown>;
+        try { ev = JSON.parse(line); } catch { return; }
+        if (ev.type === "error") {
+          const error = ev.error as { data?: { message?: string }; message?: string; name?: string } | undefined;
+          nativeError = String(error?.data?.message ?? error?.message ?? error?.name ?? "OpenCode error");
+          return;
+        }
+        if (ev.type === "step_finish") sawCompletion = true;
+        this.handleEvent(ev, turnId, emit, (t) => (acc += t), tools);
+      };
+      child.stdout.setEncoding("utf8");
       child.stdout.on("data", (d) => {
         buf += d.toString();
         let nl;
         while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-          let ev: Record<string, unknown>;
-          try { ev = JSON.parse(line); } catch { continue; }
-          this.handleEvent(ev, turnId, emit, (t) => (acc += t));
+          const line = buf.slice(0, nl); buf = buf.slice(nl + 1); consume(line);
         }
       });
       child.on("error", (e) => finish("failed", "", e.message));
       child.on("close", (code) => {
         if (settled) return;
-        finish(code === 0 ? "completed" : "failed", acc, code !== 0 ? `opencode exited ${code}` : undefined);
+        consume(buf);
+        const failed = code !== 0 || !!nativeError || !sawCompletion || !acc.trim();
+        const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", []);
+        finish(failed ? "failed" : "completed", acc, failed ? `opencode exited ${code}: ${detail}` : undefined);
       });
     });
   }
 
   /** 解析 OpenCode JSON 事件 → phonon StreamEvent。 */
-  private handleEvent(ev: Record<string, unknown>, turnId: string, emit: (e: StreamEvent) => void, addText: (t: string) => void): void {
+  private handleEvent(ev: Record<string, unknown>, turnId: string, emit: (e: StreamEvent) => void, addText: (t: string) => void, tools: Map<string, { called: boolean; finished: boolean }>): void {
     const now = new Date().toISOString();
     const type = ev.type as string;
     // 记录 OpenCode session id（首次出现）供 resume
@@ -156,7 +179,24 @@ class OpenCodeSession implements AdapterSession {
       addText(part.text);
       emit({ type: "message", sessionId: this.sessionId, turnId, seq: 0, at: now, role: "assistant", text: part.text, delta: true } as StreamEvent);
     } else if (type === "tool" || type === "tool_use") {
-      emit({ type: "tool_call", sessionId: this.sessionId, turnId, seq: 0, at: now, toolName: String(part?.tool ?? part?.name ?? "?"), args: part?.input } as StreamEvent);
+      // Native 1.14 tool_use contains a complete ToolPart; pending/running/
+      // completed snapshots can repeat. Never substitute the part id for callID.
+      const id = part?.callID;
+      const state = part?.state as Record<string, unknown> | undefined;
+      if (typeof id !== "string" || !id || !state) return;
+      const seen = tools.get(id) ?? { called: false, finished: false };
+      tools.set(id, seen);
+      const toolName = String(part?.tool ?? part?.name ?? "?");
+      const terminal = ["completed", "error", "cancelled", "canceled"].includes(String(state.status));
+      // Pending input may still be a partial buffer. Wait for running or final.
+      if (!seen.called && (state.status === "running" || terminal)) {
+        seen.called = true;
+        emit({ type: "tool_call", sessionId: this.sessionId, turnId, seq: 0, at: now, toolName, toolCallId: id, args: state.input } as StreamEvent);
+      }
+      if (!seen.finished && terminal) {
+        seen.finished = true;
+        emit({ type: "tool_result", sessionId: this.sessionId, turnId, seq: 0, at: now, toolName, toolCallId: id, ok: state.status === "completed", output: state.status === "completed" ? state.output : state.error } as StreamEvent);
+      }
     } else if (type === "error") {
       const err = ev.error as { data?: { message?: string }; name?: string } | undefined;
       const msg = err?.data?.message ?? err?.name ?? "opencode error";
@@ -167,7 +207,7 @@ class OpenCodeSession implements AdapterSession {
   }
 
   async interrupt(): Promise<void> {
-    if (this.current) { this.current.kill("SIGTERM"); this.current = undefined; }
+    if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
@@ -214,8 +254,8 @@ export class OpenCodeAdapter implements AgentAdapter {
     this.defaultModel = opts.env?.defaultModel;
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
-    const version = await this.probeVersion();
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
+    const version = await this.probeVersion(signal);
     const available = version !== null;
     return [{
       agentId: "opencode" as AgentDescriptor["agentId"],
@@ -237,13 +277,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     return new OpenCodeSession(params.sessionId, model, params.cwd, this.bin, params.initialContext);
   }
 
-  private probeVersion(): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.bin, ["--version"], {});
-      let out = "";
-      child.stdout.on("data", (d) => (out += d.toString()));
-      child.on("error", () => resolve(null));
-      child.on("close", (code) => resolve(code === 0 ? out.trim() : null));
-    });
+  private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    return (await discoveryProbe(this.bin, ["--version"], signal));
   }
 }

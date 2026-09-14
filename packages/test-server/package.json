@@ -24,8 +24,10 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build && node --test dist/fn-*.test.js dist/p0-fixes.test.js dist/sdk-e2e.test.js",
-    "test:e2e": "pnpm build && node --test dist/e2e.test.js dist/e2e-full.test.js dist/e2e-gateway.test.js dist/e2e-hitl.test.js dist/e2e-workflow.test.js dist/e2e-git.test.js",
-    "test:all": "pnpm build && node --test dist/**/*.test.js"
+    "test:e2e": "pnpm test:e2e:local",
+    "test:e2e:local": "pnpm build && node --test dist/e2e-workflow.test.js dist/e2e-git.test.js dist/e2e-scheduler.test.js",
+    "test:live": "pnpm build && node ../../scripts/run-live-tests.mjs dist/e2e.test.js dist/e2e-full.test.js dist/e2e-gateway.test.js dist/e2e-hitl.test.js",
+    "test:all": "pnpm test && pnpm test:e2e:local"
   },
   "dependencies": {
     "@agent-phonon/protocol": "workspace:*",

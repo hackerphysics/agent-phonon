@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "path": "acceptance/rescue-agent-model-repair-20260909-163743/REPORT.zh-CN.md",
+    "sha256": "5a7c2bae6607a53daf87774a717a9eb154c3aaa1ff92045a1fcad2e31eee439c"
+  },
+  "scope": "Exact selected historical report lines, not raw wire/native evidence or a new acceptance. Omitted lines include host configuration, private artifacts and unrelated history; original source hash is provenance, not a claim that a fresh checkout can replay the original acceptance.",
+  "excerpts": [
+    {
+      "startLine": 7,
+      "endLine": 16,
+      "text": "证据目录：`acceptance/rescue-agent-model-repair-20260909-163743/`。既有证据均未覆盖。\n\n### 实际完成情况\n\n| Agent / 路线 | Rescue 实际配置操作 | 原生后验 | 最终保留状态 |\n|---|---|---|---|\n| OpenCode 1.14.48 | 真 `~/.config/opencode/opencode.json` 新增 `provider.phonon-local4000`，修改 `model`、新增 `small_model` | 原生 OpenCode 实际 `read` → 工具结果 → 最终 `OPENCODE_NATIVE_TOOL_OK_6e24`，exit 0 | **保留新的默认模型/provider** |\n| Claude Code 2.1.123 / Qwen | 真独立 `~/.claude/providers/phonon-local4000.json` 的 `env` 由 Rescue 填入 | 原生 Claude 实际 `Read` → `tool_result` → 最终 `CLAUDE_NATIVE_TOOL_OK_28b5`，exit 0 | **保留可用独立 settings；必须显式选择，不冒充默认入口已修复** |\n| Claude / GPT Responses | Rescue 将上述独立 settings 临时改为本地转换器 endpoint + role aliases | 原生 Claude 实际 Read，结果以相同 call ID 到达上游 Responses；但最终 result 为空 | **失败后 Rescue rollback，字节级恢复 Qwen**；转换器已停止 |\n| Hermes | 未改 | 未做原生模型后验 | **未修复**；当前 broker 只支持 JSON，本轮未扩展 YAML |\n"
+    }
+  ]
+}

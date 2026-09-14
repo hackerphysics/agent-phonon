@@ -1,8 +1,8 @@
-import type { ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawnAgent } from "../proc.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
+import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import type {
   AgentAdapter,
@@ -25,7 +25,7 @@ import type {
  * Current official CLI entrypoint: `copilot` (not the retired `gh copilot`
  * extension). Programmatic turns use piped stdin plus JSONL streaming:
  *
- *   copilot --name=<name> --output-format json --stream on --allow-all
+ *   copilot --name=<name> --output-format json --stream on
  *   copilot --resume=<name> ...
  *
  * The prompt is deliberately sent over stdin rather than `-p` so task content
@@ -140,7 +140,7 @@ class CopilotSession implements AdapterSession {
   private readonly env: CopilotEnv;
   private readonly nativeName: string;
   private started: boolean;
-  private current?: ChildProcess;
+  private current?: ProcessSupervisor;
   private pendingInject: string[] = [];
   private nativeSessionId?: string;
 
@@ -177,7 +177,6 @@ class CopilotSession implements AdapterSession {
       this.started ? `--resume=${this.nativeName}` : `--name=${this.nativeName}`,
       "--output-format", "json",
       "--stream", "on",
-      "--allow-all",
       "--no-ask-user",
       "--no-remote",
       "--no-auto-update",
@@ -190,11 +189,15 @@ class CopilotSession implements AdapterSession {
   private run(args: string[], stdin: string, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
       const { turnId, emit } = opts;
-      const child = spawnAgent(this.env.binPath ?? "copilot", args, {
+      const supervisor = spawnSupervisedAgent(this.env.binPath ?? "copilot", args, {
         cwd: this.cwd,
         env: buildChildProcessEnvironment(opts.environment),
       });
-      this.current = child;
+      const child = supervisor.child;
+      this.current = supervisor;
+      const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
+      child.once("close", releaseCurrent);
+      child.once("error", releaseCurrent);
       let stdoutBuf = "";
       let stderr = "";
       let acc = "";
@@ -205,7 +208,7 @@ class CopilotSession implements AdapterSession {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
-        this.current = undefined;
+        opts.signal?.removeEventListener("abort", abort);
         if (status === "completed") this.started = true;
         const now = new Date().toISOString();
         if (status === "failed") {
@@ -223,11 +226,11 @@ class CopilotSession implements AdapterSession {
       };
 
       const guard = setTimeout(() => {
-        child.kill("SIGTERM");
+        void supervisor.terminate();
         finish("timeout", "copilot turn timed out");
       }, 1800000);
       const abort = (): void => {
-        child.kill("SIGTERM");
+        void supervisor.terminate();
         finish("interrupted");
       };
       if (opts.signal?.aborted) abort();
@@ -292,8 +295,9 @@ class CopilotSession implements AdapterSession {
 
   async interrupt(): Promise<void> {
     if (this.current) {
-      this.current.kill("SIGTERM");
+      const current = this.current;
       this.current = undefined;
+      await current.terminate();
     }
   }
 
@@ -320,10 +324,10 @@ export class CopilotAdapter implements AgentAdapter {
     this.env = opts.env ?? {};
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
-    const version = await this.probeVersion();
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
+    const version = await this.probeVersion(signal);
     const available = version !== null;
-    const models = available ? await this.discoverModels() : this.fallbackModels();
+    const models = available ? await this.discoverModels(signal) : this.fallbackModels();
     return [{
       agentId: "copilot" as AgentDescriptor["agentId"],
       displayName: "GitHub Copilot CLI",
@@ -352,33 +356,22 @@ export class CopilotAdapter implements AgentAdapter {
   }
 
   private fallbackModels(): ModelInfo[] {
-    const model = this.env.defaultModel ?? configuredModel() ?? "default";
-    return [{ id: model, available: true }];
+    const model = this.env.defaultModel ?? "default";
+    return [{ id: model, displayName: model === "default" ? "Native CLI default selection" : model, available: true }];
   }
 
-  private discoverModels(): Promise<ModelInfo[]> {
-    if (this.env.models?.length) return Promise.resolve(this.env.models);
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "copilot", ["help", "config"], {});
-      let out = "";
-      child.stdout.on("data", (chunk) => { out += chunk.toString(); });
-      child.on("error", () => resolve(this.fallbackModels()));
-      child.on("close", (code) => {
-        const parsed = code === 0 ? parseCopilotModelsHelp(out) : [];
-        const configured = this.env.defaultModel ?? configuredModel();
-        if (configured && !parsed.some((m) => m.id === configured)) parsed.unshift({ id: configured, available: true });
-        resolve(parsed.length ? parsed : this.fallbackModels());
-      });
-    });
+  private async discoverModels(signal?: AbortSignal): Promise<ModelInfo[]> {
+    if (this.env.models?.length) return this.env.models;
+    const out = await discoveryProbe(this.env.binPath ?? "copilot", ["help", "config"], signal);
+    // Static help is not the authenticated user's model availability.
+    const parsed = parseCopilotModelsHelp(out ?? "").map((model) => ({ ...model, available: false }));
+    const configured = configuredModel();
+    if (configured && !parsed.some((m) => m.id === configured)) parsed.push({ id: configured, available: false });
+    const preferred = this.fallbackModels();
+    return [...preferred, ...parsed.filter((m) => !preferred.some((p) => p.id === m.id))];
   }
 
-  private probeVersion(): Promise<string | null> {
-    return new Promise((resolve) => {
-      const child = spawnAgent(this.env.binPath ?? "copilot", ["--version"], {});
-      let out = "";
-      child.stdout.on("data", (chunk) => { out += chunk.toString(); });
-      child.on("error", () => resolve(null));
-      child.on("close", (code) => resolve(code === 0 ? out.trim().split(/\r?\n/)[0] ?? null : null));
-    });
+  private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    return (await discoveryProbe(this.env.binPath ?? "copilot", ["--version"], signal))?.split(/\r?\n/)[0] ?? null;
   }
 }

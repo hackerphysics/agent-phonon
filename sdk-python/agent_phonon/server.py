@@ -130,6 +130,9 @@ class PhononDevice:
     async def maintenance_config_get(self, target_id: str, config_id: str) -> dict:
         return await self._peer.request("maintenance.config.get", {"targetId": target_id, "configId": config_id})
 
+    async def maintenance_config_edit(self, target_id: str, config_id: str, expected_sha256: str, edits: list[dict[str, str]], **opts: Any) -> dict:
+        return await self._peer.request("maintenance.config.edit", {"targetId": target_id, "configId": config_id, "expectedSha256": expected_sha256, "edits": edits, **opts})
+
     async def maintenance_config_patch(self, target_id: str, config_id: str, expected_sha256: str, patch: dict, **opts: Any) -> dict:
         return await self._peer.request("maintenance.config.patch", {"targetId": target_id, "configId": config_id, "expectedSha256": expected_sha256, "patch": patch, **opts})
 
@@ -297,6 +300,10 @@ class PhononDevice:
     async def workflow_cancel(self, workflow_id: str, reason: str | None = None) -> dict:
         return await self._peer.request("workflow.cancel", {"workflowId": workflow_id, "reason": reason})
 
+    async def workflow_pause(self, workflow_id: str, reason: str | None = None) -> dict:
+        """Pause at the current node/round boundary; resume with strategy='continue'."""
+        return await self._peer.request("workflow.pause", {"workflowId": workflow_id, "reason": reason})
+
     async def workflow_list(
         self,
         *,
@@ -380,7 +387,7 @@ class PhononDevice:
     async def schedule_disable(self, schedule_id: str) -> dict:
         return await self._peer.request("schedule.disable", {"scheduleId": schedule_id})
 
-    async def schedule_trigger(self, schedule_id: str, source: str | None = None, input: dict | None = None) -> dict:
+    async def schedule_trigger(self, schedule_id: str, source: str | None = None, input: str | dict | None = None) -> dict:
         """Manually trigger one run (manual / test cron / replay webhook)."""
         params: dict = {"scheduleId": schedule_id}
         if source is not None: params["source"] = source
@@ -539,10 +546,13 @@ class PhononDevice:
 class PhononServer:
     """监听 ws，管理多设备。"""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0, authenticate: Optional[Authenticate] = None) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 0, authenticate: Optional[Authenticate] = None, *, allow_anonymous: bool = False) -> None:
+        if authenticate is not None and not callable(authenticate):
+            raise TypeError("authenticate must be callable or None")
         self._host = host
         self._port = port
         self._authenticate = authenticate
+        self._allow_anonymous = allow_anonymous
         self._devices: dict[str, PhononDevice] = {}
         self._on_device: Optional[Callable[[PhononDevice], Awaitable[None]]] = None
         self._server: Any = None
@@ -560,6 +570,13 @@ class PhononServer:
         return self._devices.get(device_id)
 
     async def listen(self) -> int:
+        if self._authenticate is not None and not callable(self._authenticate):
+            raise TypeError("authenticate must be callable or None")
+        if self._authenticate is None and self._allow_anonymous is not True and self._host not in ("127.0.0.1", "::1", "localhost"):
+            raise ValueError(
+                "PhononServer refuses to listen on non-loopback host without authenticate(); "
+                "provide authenticate or set allow_anonymous=True (A5)"
+            )
         self._server = await websockets.serve(self._on_connection, self._host, self._port)
         sock = list(self._server.sockets)[0]
         self.port = sock.getsockname()[1]
@@ -577,7 +594,7 @@ class PhononServer:
                 p = params or {}
                 device_id = p.get("deviceId")
                 device_key = (p.get("auth") or {}).get("deviceKey")
-                if self._authenticate:
+                if self._authenticate is not None:
                     tenant = await self._authenticate(device_id, device_key)
                 else:
                     tenant = f"tenant-{device_id}"

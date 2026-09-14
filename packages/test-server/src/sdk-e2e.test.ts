@@ -89,7 +89,7 @@ test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, a
   assert.equal(st.status, "idle");
   await session.terminate();
 
-  client.close();
+  await client.close();
   await server.close();
 });
 
@@ -110,7 +110,7 @@ test("server-sdk: HITL decision via device.setHookDecider", { timeout: 20000 }, 
   assert.equal(dangerous.action, "abort");
   const safe = (await conn.fireHook({ sessionId: "s1", hookId: "h2", hookType: "pre_command", payload: { command: "ls" }, at: new Date().toISOString() })) as { action: string };
   assert.equal(safe.action, "continue");
-  client.close();
+  await client.close();
   await server.close();
 });
 
@@ -198,6 +198,6 @@ test("server-sdk: v0.7 HITL via device.setInteractionHandler + workflow.human_re
     `unexpected error from workflow.resume: ${resumeErrMsg}`,
   );
 
-  client.close();
+  await client.close();
   await server.close();
 });

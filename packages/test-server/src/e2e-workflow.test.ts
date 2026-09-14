@@ -592,16 +592,19 @@ test("e2e v0.6: per-node project 覆写 — 同一 workflow 不同 node 跑在�
 test("e2e v0.6: workflow 无 project + node 也无 project → 报错", { timeout: 15000 }, async () => {
   const fx = await makeFixture();
   try {
-    const run = await fx.device.workflow.run({
-      plan: {
-        mode: "dag",
-        nodes: [{ nodeId: "a", agent: "mock:a", model: "m1", input: "x" }],
+    await assert.rejects(
+      () => fx.device.workflow.run({
+        plan: {
+          mode: "dag",
+          nodes: [{ nodeId: "a", agent: "mock:a", model: "m1", input: "x" }],
+        },
+      }),
+      (err: unknown) => {
+        const value = err as { message?: string; data?: unknown };
+        const text = `${value.message ?? ""} ${JSON.stringify(value.data ?? err)}`;
+        return /no project/.test(text);
       },
-    }) as { workflowId: string };
-
-    const st = await waitWorkflow(fx.device, run.workflowId) as { status: string; error?: string };
-    assert.equal(st.status, "failed");
-    assert.match(st.error ?? "", /no project/);
+    );
   } finally { await fx.cleanup(); }
 });
 
@@ -702,3 +705,34 @@ test("e2e v0.6: per-node branch — 不传 worktreeId 时 git checkout 切主目
     assert.equal(cur, "feature-x");
   } finally { await fx.cleanup(); }
 });
+
+for (const source of ["workflow", "node"] as const) {
+  test(`A1 workflow checkout: ${source} branch rejects options/control characters before execution`, { timeout: 30000 }, async () => {
+    let turns = 0;
+    const fx = await makeFixture(() => { turns++; return "unexpected turn"; });
+    const { execFileSync } = await import("node:child_process");
+    try {
+      const { project } = await fx.device.project.create({ name: `branch-guard-${source}`, git: true });
+      const git = (...args: string[]) => execFileSync("git", ["-C", project.path, ...args], { encoding: "utf8" }).trim();
+      git("config", "--local", "user.name", "Phonon Test");
+      git("config", "--local", "user.email", "phonon-test@example.invalid");
+      writeFileSync(join(project.path, "README.md"), "fixture\n");
+      git("add", "."); git("commit", "-m", "fixture");
+      const before = git("symbolic-ref", "HEAD");
+      for (const branch of ["--detach", "--orphan=injected", "bad\nref", "bad\rref", "bad\tref", "bad\0ref", "bad\x1bref", ""]) {
+        const run = await fx.device.workflow.run({
+          project: project.projectId,
+          ...(source === "workflow" ? { branch } : {}),
+          plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "mock:a", model: "m1", input: "guard",
+            ...(source === "node" ? { branch } : {}) }] },
+        }) as { workflowId: string };
+        const st = await waitWorkflow(fx.device, run.workflowId) as { status: string; nodes: { error?: string }[] };
+        assert.equal(st.status, "failed");
+        assert.match(st.nodes[0]?.error ?? "", /branch (must|contains)/);
+        assert.doesNotMatch(st.nodes[0]?.error ?? "", /git checkout/);
+        assert.equal(git("symbolic-ref", "HEAD"), before, "must not detach or switch the main directory");
+        assert.equal(turns, 0, "invalid branch must not start the adapter");
+      }
+    } finally { await fx.cleanup(); }
+  });
+}

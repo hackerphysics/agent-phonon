@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "path": "acceptance/rescue-text-config-20260909-170156/REPORT.zh-CN.md",
+    "sha256": "404b2b0c52e5e1ebbd07eba70abb5603000a59a3e739f6ad2c546220a29846f9"
+  },
+  "scope": "Exact selected historical report lines, not raw wire/native evidence or a new acceptance. Omitted lines include host configuration, private artifacts and unrelated history; original source hash is provenance, not a claim that a fresh checkout can replay the original acceptance.",
+  "excerpts": [
+    {
+      "startLine": 7,
+      "endLine": 17,
+      "text": "**已实现并真实验证 JSON、JSONC、YAML、TOML、普通 UTF-8 文本的受限编辑/原字节回滚。Hermes 已由真实 Rescue 修改原生 YAML，随后原生 Hermes 实际执行 Read 并返回正确最终标记；成功配置保留。不是只读诊断，也不是宿主代写配置。**\n\n### 1.1 格式支持矩阵\n\n| 格式 | 读取/校验 | `config.patch` | `config.edit` | 真实 Rescue 写入/回滚 |\n| --- | --- | --- | --- | --- |\n| JSON | 严格解析，重复键拒绝，脱敏 value | RFC7396，叶节点局部修改 | 显式 public 文本，唯一非重叠替换 | PASS |\n| JSONC | 注释/尾逗号，重复键拒绝 | RFC7396，使用 jsonc-parser，保留未涉及注释 | 同上 | PASS |\n| YAML | 单文档 core schema，安全 Document API | plain mapping root；null 删除、数组整体替换 | 同一安全子集；显式 public | PASS；另有真实 Hermes patch |\n| TOML | smol-toml，原生日期/时间/大整数语义 | **不支持，明确返回改用 edit** | 局部替换后 parse；不 stringify | PASS |\n| text | 有界有效 UTF-8 | 不支持 | 该文件显式 public + wholeFileWritable | PASS |\n"
+    },
+    {
+      "startLine": 29,
+      "endLine": 44,
+      "text": "### 1.2 权限、秘密与字节保证\n\n新增方法 `maintenance.config.edit` 已贯通：\n\n`methods registry/schema → core dispatch + 幂等 mutation → MaintenanceRuntime/文件 helper → TS/Python SDK → Rescue 四协议 tools`。\n\n参数仅为本地 `targetId/configId`、`expectedSha256` 和 1–100 项 `oldText/newText`，没有任意路径、shell、HOME 注册或新的 exec/file 工具。每项 oldText 非空、对原文恰好匹配一次，全部区间互不重叠；0/多次匹配、重叠、过期 SHA、非法 Unicode、`***` 占位和语法错误均不写。\n\n- 默认 `textVisibility: hidden`；owner 必须对**这一文件**显式声明 public 才能得到 text/使用 exact edit。额外保守检测发现疑似秘密时仍隐藏并拒绝编辑。\n- 普通 text 可写还必须 `wholeFileWritable: true`，不能假借 root-key 过滤授予整文件写权。\n- 带秘密的结构化配置通过服务器原值 merge patch，模型只见脱敏 value；不把脱敏整篇覆盖真实文件，不复制旧 token 给新 provider。\n- 对结构化前后根键及嵌套语义差异检查 `allowedRootKeys`，新增/删除也检查；rollback 重新检查当前 root 授权，不能借 edit/rollback 绕过权限缩减。\n- 最多 1 MiB；拒绝非法 UTF-8、NUL、二进制控制字符；对读取的文件类型进行检查。exact edit 保留匹配范围以外的 UTF-8 字节、BOM、CRLF、换行状态，包括无末尾换行和中文/emoji。\n- 写前完整 parse、私有原始字节 backup、备份后 SHA 复查、同 broker 同路径串行、同目录 temp+rename 原子替换。删除了 Windows 失败后 copy-over 的非原子退化路径；不能原子替换时明确失败。\n- 无变化不创建备份；rollback 校验当前 SHA 和备份 checksum，原字节恢复并保存可逆备份。未宣称能对不受控外部写者提供文件系统原子 CAS。\n- 默认新增 Hermes YAML 与 Codex TOML 注册均为**只读、text hidden**；没有给所有 Agent 自动写权，也没有允许 Rescue 修改自身 policy/maintenance 注册。\n"
+    },
+    {
+      "startLine": 54,
+      "endLine": 66,
+      "text": "每种格式宿主只建立无秘密空配置骨架/空文本和原始字节对照。**模型**逐一完成：\n\n`list_targets → get_config（获取 SHA）→ edit_config → get_config（验证）→ rollback_config（使用当前 SHA）→ get_config（恢复验证）`。\n\n| 格式 | 实际工具调用/结果 | HTTP 200 | 原字节恢复 | 模型最终标记 |\n| --- | ---: | ---: | --- | --- |\n| JSON | 6 / 6 | 7 | PASS | JSON_REAL_ROLLBACK_OK |\n| JSONC | 6 / 6 | 7 | PASS | JSONC_REAL_ROLLBACK_OK |\n| YAML | 6 / 6 | 7 | PASS | YAML_REAL_ROLLBACK_OK |\n| TOML | 6 / 6 | 7 | PASS | TOML_REAL_ROLLBACK_OK |\n| text | 6 / 6 | 7 | PASS | TEXT_REAL_ROLLBACK_OK |\n\n合计 **30 次实际工具调用、30 次结果按真实 ID 回传、35 次 HTTP 200**。不仅比较最终文件：也读取 rollback 创建的可逆 backup，独立验证中间确有修改、其 SHA 等于 edit 结果，再比对原始 backup/最终文件的全部字节。没有宿主 write 帮助恢复。\n"
+    },
+    {
+      "startLine": 96,
+      "endLine": 98,
+      "text": "这是 merge patch 的增量示意，**不是整份文件**。原 model 的其他属性、原 `phgeek-gw` provider 及其凭据、所有其他 root 均逐项语义保持；未删除原 token、未复制到 local，也未将 `***` 写回。原文不进入本验收目录。\n\n首次真实操作发现 YAML Document 对新嵌套 mapping 需要 AST `createNode`：工具明确拒绝，原 SHA 不变、无 backup，无需 rollback；模型没有冒充成功。修正该现成 API 用法并加 JSON/JSONC/YAML 三格式深嵌套 provider 回归后，第二次真实 Rescue `list→get→patch→get` 全部通过。\n"
+    },
+    {
+      "startLine": 105,
+      "endLine": 107,
+      "text": "**原生后验不是 mock**：验收脚本调用安装版 `hermes_cli.main.main`，使用与 `hermes -z ... -t acceptance-read` 相同入口，继续执行真实 oneshot→AIAgent→官方客户端→本机 `file_tools.read_file_tool`。\n\n为了不读认证缓存/旧环境，只给这一次 native 进程临时 HOME/HERMES_HOME，把 `config.yaml` 临时引用到**真实修复后的文件**；没有 model/provider/endpoint 覆盖。使用原生公开 custom toolset API 只注册 Read，并把 Read 额外限于一个测试 marker 文件。验收包装层只做拒绝/观察，原样返回原生 Read 结果，不修改模型协议、不制造工具输出。无文件写、终端或服务工具；native 模式自身的一次性 approval 行为不成为全局权限更改。\n"
+    },
+    {
+      "startLine": 111,
+      "endLine": 120,
+      "text": "- native 默认解析：`qwen3.8-flash`、`phonon-local4000`、`chat_completions`。\n- 两次真实流式 HTTP 200，endpoint 均为 `http://127.0.0.1:4000/v1/chat/completions`；认证仅 native 内置非秘密占位，未携带原有 token。\n- 实际 Read 1 次；后续 tool message 的 ID 与 assistant tool call 一致，工具内容和本机 Read 实际返回值逐字相同。\n- 最终输出：**`HERMES_NATIVE_READ_OK_a713`**；native **exit 0**，未超时。\n- native 运行前后真实 YAML SHA 完全相同，说明它读取的是 Rescue 的结果，而非 native 启动后代写。\n- 成功配置保留，没有回滚；失败的首次 patch 没写入，不存在待恢复目标。\n\n诚实边界：native 启动有 **4 次非 loopback TCP 连接尝试被验收 guard 拒绝**，另有 **8 次本地 metadata 路径被拒绝**；不声称它完全不会发起辅助发现请求，也不声称审计了系统 DNS。实际模型调用仅上述本地 Chat 两次。未调用旧远端模型、未读取/复制原认证 cache。临时 config symlink 在后验后已删除，避免收集证据时跟随到私有文件。\n\n证据：`hermes-repair/`（保留原失败）、`hermes-repair-fixed/`、`hermes-native/native-evidence.jsonl`、`hermes-native/stdout.txt`、`hermes-native/run-result.json`、`verify-final.py`。生产 Phonon 的 Hermes adapter 没有显式 model/provider override，但**本轮没有启动生产服务或另行执行 Phonon 外部 Hermes adapter**，不冒充生产加载验收。\n"
+    },
+    {
+      "startLine": 158,
+      "endLine": 164,
+      "text": "## 2. 剩余与明确限制\n\n1. **当前已授权目标没有待解决 blocker：Hermes native 已实际修好。** 没有把格式限制继续作为停止理由。\n2. TOML merge patch 不支持；以 exact edit 提供安全修改，避免日期类型/注释/布局被 serializer 重排。带秘密或未被 owner 明确声明 public 的 TOML/text，exact edit 保守拒绝；不能把这一版本说成可任意编辑所有带秘密文本。\n3. YAML 仅安全单文档 core 子集，拒绝 tags/aliases/multidoc；不是完整 YAML 任意语法编辑器。YAML patch 不保证未修改区域每个字节相同，rollback 才是完整原字节恢复。\n4. Gemini 原生模型 endpoint 本轮未新增真实验收；新增 edit schema 经官方 SDK 模拟通过。真实五格式完整模型链是 Responses/gpt-5.6-sol；没有把模拟算成其他三协议真实写回通过。\n5. Claude→GPT 转换、D03/D08、生产部署/服务启动、Codex 真配置改动都不在本轮继续范围。此前报告的未通过项仍不改写成 PASS。\n"
+    }
+  ]
+}

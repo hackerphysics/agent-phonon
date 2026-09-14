@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
+import { PhononError } from "../rpc.js";
 
 /**
  * OpenClaw adapter（Gateway WS 版，design D10）。
@@ -50,7 +51,7 @@ class GatewaySession implements AdapterSession {
   private sessionKey: string;
   private openclawAgent: string;
   /** 当前活动 turn 的 emit/runId 跟踪。 */
-  private activeTurn?: { turnId: string; emit: (e: StreamEvent) => void; verbosity: string; done: () => void; acc: string };
+  private activeTurn?: { turnId: string; emit: (e: StreamEvent) => void; verbosity: string; done: () => void; acc: string; runId: string; seenTools: Set<string> };
   /** 自发输出水槽（无 active turn 时用，D16 unsolicited）。 */
   private unsolicitedSink?: (event: StreamEvent) => void;
   private unsolicitedSeq = 0;
@@ -81,7 +82,21 @@ class GatewaySession implements AdapterSession {
     const turn = this.activeTurn;
     const now = new Date().toISOString();
 
+    if (turn && (event === "agent" || event === "session.tool") && (payload.stream === "tool" || (payload.stream === "item" && (payload.data as { kind?: string })?.kind === "tool"))) {
+      const data = (payload.data ?? {}) as Record<string, unknown>;
+      if (!["tools", "trace"].includes(turn.verbosity)) return;
+      const phase = data.phase === "end" ? "result" : data.phase;
+      const toolCallId = String(data.toolCallId ?? data.id ?? "");
+      const key = `${payload.runId}:${toolCallId}:${phase}`;
+      if (turn.seenTools.has(key)) return;
+      turn.seenTools.add(key);
+      const base = { sessionId: this.sessionId, turnId: turn.turnId, seq: 0, at: now, toolName: String(data.name ?? data.toolName ?? "?"), toolCallId };
+      if (phase === "start") turn.emit({ ...base, type: "tool_call", args: data.args } as StreamEvent);
+      else if (phase === "result") turn.emit({ ...base, type: "tool_result", ok: data.isError !== true && data.status !== "failed" && data.status !== "error", output: data.result } as StreamEvent);
+      return;
+    }
     if (event !== "chat") return;
+    if (turn && payload.runId && payload.runId !== turn.runId) return;
     const state = payload.state as string;
 
     // 无 active turn 的 chat 输出 = 自发（D16 unsolicited）：OpenClaw cron/定时/心跳（修 P0#7）
@@ -107,7 +122,13 @@ class GatewaySession implements AdapterSession {
       return;
     }
 
-    if (state === "delta") {
+    if (state === "error" || state === "aborted") {
+      turn.emit({ type: "result", sessionId: this.sessionId, turnId: turn.turnId, seq: 0, at: now,
+        text: state === "error" ? String(payload.errorMessage ?? "OpenClaw run failed") : turn.acc,
+        status: state === "error" ? "failed" : "aborted", final: true } as StreamEvent);
+      this.activeTurn = undefined;
+      turn.done();
+    } else if (state === "delta") {
         const deltaText = payload.deltaText as string | undefined;
         if (deltaText) {
           turn.acc += deltaText;
@@ -147,69 +168,73 @@ class GatewaySession implements AdapterSession {
 
     await new Promise<void>((resolve) => {
       let settled = false;
+      let guard: ReturnType<typeof setTimeout> | undefined;
+      const runId = randomUUID();
       const finish = () => {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
+        opts.signal?.removeEventListener("abort", abort);
+        if (this.activeTurn?.turnId === turnId) this.activeTurn = undefined;
         resolve();
       };
-      this.activeTurn = { turnId, emit, verbosity: opts.verbosity, done: finish, acc: "" };
-      this.gw
-        .rpc("chat.send", {
-          sessionKey: this.sessionKey,
-          message,
-          deliver: false,
-          idempotencyKey: randomUUID(),
-        }, 1800000)
-        .catch((err) => {
-          emit({
-            type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(),
-            message: (err as Error)?.message ?? "chat.send failed", status: "failed", final: true,
-          } as StreamEvent);
-          this.activeTurn = undefined;
-          finish();
-        });
-      // 兜底超时：30 分钟没 final 就强制收尾
-      const guard = setTimeout(() => {
-        if (this.activeTurn?.turnId === turnId) {
-          emit({
-            type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(),
-            text: "", status: "timeout", final: true,
-          } as StreamEvent);
-          this.activeTurn = undefined;
-          finish();
-        }
+      const abort = () => {
+        emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), text: "", status: "interrupted", final: true } as StreamEvent);
+        finish();
+      };
+      this.activeTurn = { turnId, emit, verbosity: opts.verbosity, done: finish, acc: "", runId, seenTools: new Set() };
+      guard = setTimeout(() => {
+        if (settled) return;
+        emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), text: "", status: "timeout", final: true } as StreamEvent);
+        finish();
+        void this.gw.rpc("chat.abort", { sessionKey: this.sessionKey }, 5000).catch(() => {});
       }, 1800000);
+      if (opts.signal?.aborted) { abort(); return; }
+      opts.signal?.addEventListener("abort", abort, { once: true });
+      this.gw.rpc("chat.send", {
+        sessionKey: this.sessionKey, message, deliver: false, idempotencyKey: runId,
+      }, 1800000).catch((err) => {
+        if (settled) return;
+        emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(),
+          message: (err as Error)?.message ?? "chat.send failed", status: "failed", final: true } as StreamEvent);
+        finish();
+      });
     });
   }
 
   async interrupt(): Promise<void> {
-    await this.gw.rpc("chat.abort", { sessionKey: this.sessionKey }, 5000).catch(() => {});
+    const turn = this.activeTurn;
+    try { await this.gw.rpc("chat.abort", { sessionKey: this.sessionKey }, 5000); }
+    finally { turn?.done(); }
   }
 
   async switchModel(model: string): Promise<{ warnings?: string[] }> {
-    this.model = model;
-    await this.gw.rpc("sessions.patch", { key: this.sessionKey, model }, 10000).catch(() => {});
+    const response = await this.gw.patchSessionModel(this.sessionKey, model);
+    const resolved = response.resolved as { model?: string; modelProvider?: string; provider?: string } | undefined;
+    if (!resolved?.model) throw new Error("OpenClaw sessions.patch did not return a resolved model");
+    this.model = [resolved.modelProvider ?? resolved.provider, resolved.model].filter(Boolean).join("/");
     return {};
   }
 
   async inject(context: ContextItem[]): Promise<void> {
     if (context.length === 0) return;
-    const message = context.map((c) => `[${c.role}] ${c.content}`).join("\n");
-    await this.gw.rpc("chat.inject", { sessionKey: this.sessionKey, message }, 10000).catch(() => {});
+    // chat.inject is UI/transcript-only in current Gateways; queue actual model input.
+    this.pendingInject.push(...context.map((c) => `[${c.role}] ${c.content}`));
   }
 
   async compressCustom(strategy = "dropToolIO", options?: { keepRecentToolCalls?: number }): Promise<{ summary?: string; filesChanged?: number; recordsChanged?: number; blocksRemoved?: number; bytesBefore?: number; bytesAfter?: number; backups?: string[] }> {
     if (strategy !== "dropToolIO") throw new Error(`unsupported custom compression strategy: ${strategy}`);
     const file = this.resolveSessionFile();
-    if (!file) throw new Error(`OpenClaw session file not found for ${this.sessionKey}`);
+    if (!file) throw new PhononError("errCapabilityUnsupported", "OpenClaw custom dropToolIO requires a legacy JSONL transcript; current Gateway owns SQLite transcripts and exposes no custom dropToolIO API");
     const r = await dropToolIOFromJsonlFiles([file], options);
     return { summary: `dropToolIO removed ${r.blocksRemoved} tool blocks from ${r.filesChanged} files`, ...r };
   }
 
   async compressNative(): Promise<{ summary?: string }> {
-    await this.gw.rpc("sessions.compact", { key: this.sessionKey }, 600000).catch(() => {});
-    return { summary: "compacted via sessions.compact" };
+    const result = await this.gw.rpc("sessions.compact", { key: this.sessionKey }, 120000);
+    if (result.ok === false) throw new Error(`OpenClaw compaction failed: ${String(result.reason ?? "unknown")}`);
+    if (result.compacted !== true) throw new PhononError("errCapabilityUnsupported", `OpenClaw did not compact: ${String(result.reason ?? "no verified change")}`);
+    return { summary: "OpenClaw sessions.compact confirmed compacted=true" };
   }
 
   private resolveSessionFile(): string | undefined {
@@ -270,7 +295,8 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     });
   }
 
-  async discoverAgents(): Promise<AgentDescriptor[]> {
+  async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
+    signal?.throwIfAborted();
     let connected = false;
     try {
       await this.gw.connect();
@@ -278,6 +304,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     } catch {
       connected = false;
     }
+    signal?.throwIfAborted();
     if (!connected) {
       return [
         {
@@ -295,16 +322,15 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
 
     // 枚举该 Gateway 下所有 OpenClaw agent（按 workspace 分）
     let subAgents: Array<{ id: string; workspace?: string; model?: { primary?: string } | string }> = [];
-    try {
-      const r = await this.gw.rpc("agents.list", {}, 8000);
-      subAgents = (r.agents as typeof subAgents) ?? [];
-    } catch {
-      subAgents = [{ id: this.defaultAgent }];
-    }
+    const r = await this.gw.rpc("agents.list", {}, 8000);
+    signal?.throwIfAborted();
+    if (!Array.isArray(r.agents)) throw new Error("invalid Gateway agent inventory");
+    subAgents = r.agents as typeof subAgents;
     if (subAgents.length === 0) subAgents = [{ id: this.defaultAgent }];
 
     const now = new Date().toISOString();
     const gatewayModels = await this.listGatewayModels();
+    signal?.throwIfAborted();
     return subAgents.map((a) => {
       if (a.workspace) this.workspaceCache.set(`openclaw:${a.id}`, a.workspace);
       const primaryModel =
@@ -326,12 +352,16 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
 
   private async listGatewayModels(): Promise<ModelInfo[]> {
     try {
-      const r = await this.gw.rpc("models.list", { view: "all" }, 8000);
-      const rows = Array.isArray(r.models) ? r.models as Array<Record<string, unknown>> : [];
+      const r = await this.gw.rpc("models.list", { view: "default" }, 8000);
+      if (!Array.isArray(r.models)) throw new Error("invalid Gateway model inventory");
+      const rows = r.models as Array<Record<string, unknown>>;
       const models: ModelInfo[] = [];
       const seen = new Set<string>();
       for (const row of rows) {
-        const id = typeof row.key === "string" ? row.key : (typeof row.id === "string" ? row.id : undefined);
+        const nativeId = typeof row.id === "string" ? row.id : undefined;
+        const provider = typeof row.provider === "string" ? row.provider : undefined;
+        const id = typeof row.key === "string" ? row.key
+          : nativeId && provider && !nativeId.startsWith(`${provider}/`) ? `${provider}/${nativeId}` : nativeId;
         if (!id || seen.has(id)) continue;
         if (row.available === false || row.missing === true) continue;
         seen.add(id);
@@ -347,7 +377,8 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
       }
       return models;
     } catch {
-      return [];
+      // Preserve the shared inventory instead of manufacturing model removals.
+      throw new Error("Gateway model inventory scan failed");
     }
   }
 

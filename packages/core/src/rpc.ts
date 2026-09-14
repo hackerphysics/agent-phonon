@@ -25,6 +25,8 @@ export interface RpcTransport {
 export type RpcHandler = (method: string, params: unknown) => Promise<unknown> | unknown;
 
 interface Pending {
+  method?: string;
+  requestId?: string;
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
@@ -35,6 +37,7 @@ export class RpcPeer extends EventEmitter {
   private handler: RpcHandler;
   private pending = new Map<string | number, Pending>();
   private nextId = 1;
+  private disposed = false;
 
   constructor(transport: RpcTransport, handler: RpcHandler) {
     super();
@@ -50,6 +53,7 @@ export class RpcPeer extends EventEmitter {
   /** 发一个请求（弱类型，内部用）。 */
   /** 发一个请求（弱类型，内部用）。timeoutMs 缺省 120s，0=不超时。 */
   requestRaw(method: string, params: unknown, timeoutMs = 120000): Promise<unknown> {
+    if (this.disposed) return Promise.reject(new Error("RPC peer disposed"));
     const id = this.nextId++;
     const msg = { jsonrpc: "2.0", id, method, params };
     return new Promise((resolve, reject) => {
@@ -60,9 +64,23 @@ export class RpcPeer extends EventEmitter {
               reject(new PhononError("errInternal", `RPC timeout: ${method}`));
             }, timeoutMs)
           : undefined;
-      this.pending.set(id, { resolve, reject, timer });
-      this.transport.send(JSON.stringify(msg));
+      const requestId = (params as { requestId?: string } | undefined)?.requestId;
+      this.pending.set(id, { resolve, reject, timer, method, requestId });
+      try { this.transport.send(JSON.stringify(msg)); }
+      catch (err) { if (timer) clearTimeout(timer); this.pending.delete(id); reject(err); }
     });
+  }
+
+  /** Resolve the same pending RPC via its application-level correlation id. */
+  resolveRequest(method: string, requestId: string, value: unknown): boolean {
+    for (const [id, pending] of this.pending) {
+      if (pending.method !== method || pending.requestId !== requestId) continue;
+      this.pending.delete(id);
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.resolve(value);
+      return true;
+    }
+    return false;
   }
 
   /** 发一个通知（不需要响应）。 */
@@ -71,11 +89,13 @@ export class RpcPeer extends EventEmitter {
   }
 
   notifyRaw(method: string, params: unknown): void {
+    if (this.disposed) return;
     this.transport.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
   }
 
   /** 喂入一条收到的文本。 */
   async handle(data: string): Promise<void> {
+    if (this.disposed) return;
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(data);
@@ -140,6 +160,14 @@ export class RpcPeer extends EventEmitter {
       p.reject(new Error(reason));
     }
     this.pending.clear();
+  }
+
+  /** Permanently release pending timers and EventEmitter listeners. */
+  dispose(reason = "RPC peer disposed"): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.rejectAllPending(reason);
+    this.removeAllListeners();
   }
 }
 
