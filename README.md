@@ -5,7 +5,7 @@
 > Orchestrate many agents as one — run them on your device, command them from anywhere.
 
 **agent-phonon** is a device-side daemon that discovers local AI coding agents
-(Claude Code, Codex, GitHub Copilot CLI, OpenCode, OpenClaw, Hermes, and more) and exposes them to a
+(Claude Code, Codex, GitHub Copilot CLI, Herdr multi-agent, OpenCode, OpenClaw, Hermes, and more) and exposes them to a
 server through one uniform WebSocket/JSON protocol.
 
 The name comes from the **phonon** in condensed-matter physics: a collective
@@ -68,6 +68,7 @@ for development and integration testing.
   - Claude Code: `claude`
   - Codex CLI: `codex`
   - GitHub Copilot CLI: `copilot`
+  - Herdr (multi-agent runtime): `herdr` — delegates to whichever kind you select (`herdr:codex`, `herdr:claude`, …)
   - OpenCode: `opencode`
   - Hermes: `hermes`
   - OpenClaw Gateway/plugin for OpenClaw integration
@@ -197,6 +198,11 @@ Adapter auto-detection is conservative:
   (`GET <base_url>/models`) when available, with safe fallback models.
 - GitHub Copilot CLI models are parsed from `copilot help config`; the adapter
   uses JSONL streaming and native named-session resume.
+- Herdr is delegated through the CLI (`herdr workspace create` + `herdr agent start --kind <kind>`),
+  polling lifecycle state and reading recent pane output. Structured tool events are not
+  available; the adapter honestly declares `streaming:false` / `hooks:[]` and is meant for
+  OS-consistent agent control and reuse of Herdr's pane/state detection rather than for
+  deep telemetry.
 - Hermes models are discovered from Hermes profile/config/catalog information
   with provider fallbacks when the catalog is incomplete.
 - No user-specific provider names, endpoints, or local machine paths are

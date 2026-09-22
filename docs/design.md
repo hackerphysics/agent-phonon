@@ -34,7 +34,7 @@ L2  统一协议 + 双向连接层            ← Phase 1 核心；**tenant 在�
         ↑
 L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等公民；**不感知 tenant**
         ↓ adapter 层
-   OpenClaw / Claude Code / Codex / GitHub Copilot CLI / OpenCode / Hermes
+   OpenClaw / Claude Code / Codex / GitHub Copilot CLI / Herdr / OpenCode / Hermes
 ```
 
 - **L1**：与单个 agent 通信，做会话管理 + 上下文管理。**发任务＝在 session 里对话。**只认 sessionId，**不感知 tenant**。
@@ -59,7 +59,7 @@ L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等�
 | D7 | **压缩双模：native + custom** | native＝透传 agent 原生压缩；custom＝phonon 自有压缩引擎，便于统一自定义上下文管理。第一版 custom 策略为 `dropToolIO`：删除结构化 tool_use/tool_result/tool_call（含 Codex `function_call`/`function_call_output`）内容和返回结果，保留纯文本；默认保留最近 3 个 tool call 及其 result，可用 `keepRecentToolCalls` 配置，因为最近工具上下文通常更重要。保留计数按「tool call 锚点」位置算（非按 id），所以没有 id 的最近 tool 块也能正确保留。已接入：OpenClaw spawn/Gateway + Claude Code（编辑 session JSONL）、Codex（rollout JSONL，按 thread_id 定位）、OpenCode（`opencode.db` 的 `part` 表，删 tool part 行）、Hermes（`state.db`，按 title 定位 session：删 `role=tool` 行、清 assistant 行的 tool_calls 列以保留推理）。sqlite 改动前用 `VACUUM INTO` 一致性备份（正确处理 WAL）、IMMEDIATE 事务、FTS 触发器自动同步。 |
 | D8 | **Adapter 声明能力，core 补齐缺口** | 各 agent 厚薄不一：对外协议恒统一，对内 adapter 按 `capabilities` 声明原生支持，core 缺啥补啥。OpenClaw adapter 极薄，CLI adapter 较厚。 |
 | D9 | **单设备，不感知其他设备** | 多设备互联由上层服务管理；phonon 装到多台，各管各的。不做设备发现/互联。 |
-| D10 | **agent 支持顺序（✅ OpenClaw ✅ Claude Code ✅ Codex ✅ GitHub Copilot CLI ✅ OpenCode ✅ Hermes）** | 核心 adapter 均已完成；新增 runtime 必须继续声明真实能力并提供可验证的非交互/会话/流式映射。 |
+| D10 | **agent 支持顺序（✅ OpenClaw ✅ Claude Code ✅ Codex ✅ GitHub Copilot CLI ✅ Herdr ✅ OpenCode ✅ Hermes）** | 核心 adapter 均已完成；新增 runtime 必须继续声明真实能力并提供可验证的非交互/会话/流式映射。Herdr 是特殊的 meta runtime：它不直接 spawn CLI，而是委派给 Herdr 的 workspace/pane/agent 生命周期（screen-scrape 获输出，lifecycle polling 获状态），故 `streaming:false` / `hooks:[]` —— 保留能力/可信，但不假装结构化事件。 |
 | D11 | **phonon 是独立的底层能力** | phonon 是通用的设备侧 agent 调度底层，其上可延伸更多项目。与其他任何项目无绑定关系。 |
 | D12 | **部署＝CLI + systemd 类守护（Linux/Mac）** | Docker 太重且不便调度本机 agent。Windows 无 systemd，后续单独想办法（NSSM / Windows Service / 计划任务，待定）。 |
 | D13 | **多服务端 / 多租户，底层硬隔离，配置驱动 + CLI 管理** | phonon 同时维护 N 条到不同服务端的拨出连接，每条一把 device key，构成一个 tenant；session 及所有资源按 tenant 严格隔离（server A 不可见/不可控 server B 的 session）；隔离在 RPC 分发层强制。隔离单元＝「一条服务端连接」。 |

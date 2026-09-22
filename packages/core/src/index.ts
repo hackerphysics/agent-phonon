@@ -780,6 +780,8 @@ export { OpenCodeAdapter } from "./adapters/opencode.js";
 export type { OpenCodeEnv } from "./adapters/opencode.js";
 export { CopilotAdapter, parseCopilotEvent, parseCopilotModelsHelp } from "./adapters/copilot.js";
 export type { CopilotEnv, ParsedCopilotEvent } from "./adapters/copilot.js";
+export { HerdrAdapter, parseHerdrKind, parseHerdrVersion, probeHerdrSync, HERDR_KINDS } from "./adapters/herdr.js";
+export type { HerdrEnv, HerdrKind } from "./adapters/herdr.js";
 export { RescueAdapter } from "./adapters/rescue.js";
 export type { RescueAdapterOptions } from "./adapters/rescue.js";
 export { spawnAgent, spawnSyncAgent, quoteWinArg } from "./proc.js";

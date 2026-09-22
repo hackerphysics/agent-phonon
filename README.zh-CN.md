@@ -5,7 +5,7 @@
 > 把多种本地 Agent 编排成一个系统——在你的设备上运行，从任何地方调度。
 
 **agent-phonon** 是一个设备侧 daemon。它会发现本机已安装的 AI Coding Agent
-（Claude Code、Codex、GitHub Copilot CLI、OpenCode、OpenClaw、Hermes 等），并通过统一的
+（Claude Code、Codex、GitHub Copilot CLI、Herdr 多代理运行时、OpenCode、OpenClaw、Hermes 等），并通过统一的
 WebSocket/JSON 协议暴露给服务端。
 
 名字来自凝聚态物理里的 **phonon（声子）**：大量原子共同振动时涌现出的集体准粒子。
@@ -62,6 +62,7 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
   - Claude Code：`claude`
   - Codex CLI：`codex`
   - GitHub Copilot CLI：`copilot`
+  - Herdr 多代理运行时：`herdr` — 委托给所选 kind（如 `herdr:codex`、`herdr:claude` …）
   - OpenCode：`opencode`
   - Hermes：`hermes`
   - OpenClaw Gateway / plugin
@@ -178,6 +179,10 @@ agent-phonon discover
 自动发现策略：
 
 - 通过执行 CLI 的 version 命令判断是否可用；
+- Herdr 委派给其 CLI（`herdr workspace create` + `herdr agent start --kind <kind>`），
+  轮询 lifecycle 状态并读取 pane 最近输出；不提供结构化 tool 事件，adapter
+  诚实声明 `streaming:false` / `hooks:[]`，用于跨 OS 一致性与复用 Herdr 的 pane / 状态
+  检测能力，不用于深度遥测；
 - 尽量解析成绝对路径，避免 systemd/launchd 的 PATH 和交互 shell 不一致；
 - Codex 会读取用户自己的 `~/.codex/config.toml`，从 provider endpoint 请求 `GET <base_url>/models`；失败时使用安全 fallback；
 - GitHub Copilot CLI 会从 `copilot help config` 解析模型清单，并使用 JSONL 真流式输出和原生命名会话续接；
