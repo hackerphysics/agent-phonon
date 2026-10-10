@@ -22,3 +22,7 @@ device.key
 *.bak-*
 dist-test/
 tmp-realtest/
+
+# local acceptance/verification material (credentials, venvs, logs, databases,
+# retained report snapshots) — never committed, per ed1d1cc convention
+acceptance/
