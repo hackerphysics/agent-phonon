@@ -106,7 +106,7 @@ export class SchedulerEngine {
         this.renewRunLeases();
         this.reconcileOrphanedRuns();
       } catch {
-        // Store shutdown/replacement is handled by the owning connection.
+        this.reportBackgroundFailure();
       }
     }, Math.max(500, Math.floor(this.leaseMs / 3)));
     this.leaseTimer.unref?.();
@@ -243,7 +243,9 @@ export class SchedulerEngine {
     this.persist(updated, webhookToken);
 
     const overlap = updated.policy?.overlap ?? "skip";
-    if (!enabled) this.cancelQueued(updated.id, "schedule disabled");
+    if (!enabled) {
+      this.cancelQueued(updated.id, "schedule disabled");
+    }
     else if (overlap !== "queue") this.cancelQueued(updated.id, `overlap policy changed to ${overlap}`);
 
     if (enabled && trigger.kind === "cron") this.armCron(updated);
@@ -430,14 +432,15 @@ export class SchedulerEngine {
   // launch / queue / retry
   // -------------------------------------------------------------------------
 
-  private async launchRun(schedule: Schedule, source: RunTriggerSource, input?: TriggerInput): Promise<string> {
+  private async launchRun(schedule: Schedule, source: RunTriggerSource, input?: TriggerInput, cronNextRunAt?: string): Promise<string> {
     if (this.disposed) throw new Error("scheduler disposed");
+    this.opts.store.delivery.assertNewWork();
     this.opts.assertRunAllowed?.(schedule, source);
     const overlap = schedule.policy?.overlap ?? "skip";
     const active = this.hasActive(schedule.id);
-    if (active && overlap === "skip") return this.persistSkipped(schedule, source);
+    if (active && overlap === "skip") return this.persistSkipped(schedule, source, cronNextRunAt);
 
-    const rt = this.createRuntime(schedule, source, input, active && overlap === "queue" ? "queued" : "launching");
+    const rt = this.createRuntime(schedule, source, input, active && overlap === "queue" ? "queued" : "launching", cronNextRunAt);
     if (rt.phase === "queued") {
       const queue = this.queues.get(schedule.id) ?? [];
       queue.push(rt.runId);
@@ -448,7 +451,7 @@ export class SchedulerEngine {
     return rt.runId;
   }
 
-  private createRuntime(schedule: Schedule, source: RunTriggerSource, input: TriggerInput | undefined, phase: RuntimePhase): RunRuntime {
+  private createRuntime(schedule: Schedule, source: RunTriggerSource, input: TriggerInput | undefined, phase: RuntimePhase, cronNextRunAt?: string): RunRuntime {
     const runId = `run-${this.now()}-${randomUUID()}`;
     const createdAt = this.now();
     const rt: RunRuntime = {
@@ -469,10 +472,21 @@ export class SchedulerEngine {
       retryHistory: [],
       ownerEpoch: 0,
     };
+    if (cronNextRunAt !== undefined) this.opts.store.acceptCronRun(this.runtimeRecord(rt), cronNextRunAt);
+    else {
+      this.persistRuntime(rt);
+      this.touchLastRun(schedule.id, new Date(createdAt).toISOString());
+    }
     this.runtimes.set(runId, rt);
-    this.persistRuntime(rt);
-    this.touchLastRun(schedule.id, new Date(createdAt).toISOString());
     return rt;
+  }
+
+  private reportBackgroundFailure(): void {
+    if (!this.disposed) this.opts.store.delivery.backgroundFailed("scheduler");
+  }
+
+  private startAttempt(rt: RunRuntime): void {
+    void this.launchAttempt(rt).catch(() => this.reportBackgroundFailure());
   }
 
   private async launchAttempt(rt: RunRuntime, initialSchedule?: Schedule): Promise<void> {
@@ -513,7 +527,7 @@ export class SchedulerEngine {
           input: this.mapInput(undefined, rt.input),
           policy: schedule.policy?.timeoutMs ? { timeoutSeconds: Math.max(1, Math.ceil(schedule.policy.timeoutMs / 1000)) } : undefined,
           metadata: launchMetadata,
-        });
+        }, true);
         if (this.disposed || !this.runtimes.has(rt.runId) || TERMINAL.has(rt.status)) {
           await workflows.cancel(launched.workflowId, "scheduler no longer owns run").catch(() => {});
           return;
@@ -583,7 +597,7 @@ export class SchedulerEngine {
       const retryTimer = setTimeout(() => {
         rt.timeoutTimer = undefined;
         if (this.disposed || !this.runtimes.has(rt.runId) || rt.phase !== "retry_wait") return;
-        void this.launchAttempt(rt);
+        this.startAttempt(rt);
       }, retryDelayMs);
       retryTimer.unref?.();
       rt.timeoutTimer = retryTimer;
@@ -655,7 +669,7 @@ export class SchedulerEngine {
       const rt = this.runtimes.get(runId);
       if (!rt || rt.phase !== "queued") continue;
       if (queue.length === 0) this.queues.delete(scheduleId);
-      void this.launchAttempt(rt);
+      this.startAttempt(rt);
       return;
     }
     this.queues.delete(scheduleId);
@@ -674,7 +688,7 @@ export class SchedulerEngine {
     return [...this.runtimes.values()].some((rt) => rt.scheduleId === scheduleId && rt.phase !== "queued" && !TERMINAL.has(rt.status));
   }
 
-  private persistSkipped(schedule: Schedule, source: RunTriggerSource): string {
+  private persistSkipped(schedule: Schedule, source: RunTriggerSource, cronNextRunAt?: string): string {
     const runId = `run-${this.now()}-${randomUUID()}`;
     const nowIso = new Date(this.now()).toISOString();
     const run = {
@@ -689,7 +703,7 @@ export class SchedulerEngine {
       maxAttempts: 1 + (schedule.policy?.maxRetries ?? 0),
       retryHistory: [],
     } as unknown as Run;
-    this.opts.store.upsertRun({
+    const record: Parameters<PhononStore["upsertRun"]>[0] = {
       id: runId,
       scheduleId: schedule.id,
       tenantId: this.opts.tenantId,
@@ -702,7 +716,9 @@ export class SchedulerEngine {
       attempt: 0,
       maxAttempts: 1 + (schedule.policy?.maxRetries ?? 0),
       retryHistoryJson: "[]",
-    });
+    };
+    if (cronNextRunAt !== undefined) this.opts.store.acceptCronRun(record, cronNextRunAt);
+    else this.opts.store.upsertRun(record);
     this.safeEmit("run.finished", { run: this.shapeRunForPush(run, schedule.consent.push), push: schedule.consent.push });
     return runId;
   }
@@ -714,9 +730,11 @@ export class SchedulerEngine {
   private armRunTimeout(rt: RunRuntime, timeoutMs?: number): void {
     if (!timeoutMs || timeoutMs <= 0) return;
     rt.timeoutTimer = setTimeout(() => {
-      if (this.disposed || !this.runtimes.has(rt.runId) || TERMINAL.has(rt.status) || !this.assertRunOwner(rt)) return;
-      this.finishRun(rt, "timeout", `exceeded timeout ${timeoutMs}ms`);
-      void this.cancelExecution(rt, "timeout");
+      try {
+        if (this.disposed || !this.runtimes.has(rt.runId) || TERMINAL.has(rt.status) || !this.assertRunOwner(rt)) return;
+        this.finishRun(rt, "timeout", `exceeded timeout ${timeoutMs}ms`);
+        void this.cancelExecution(rt, "timeout").catch(() => this.reportBackgroundFailure());
+      } catch { this.reportBackgroundFailure(); }
     }, timeoutMs);
     (rt.timeoutTimer as { unref?: () => void }).unref?.();
   }
@@ -774,13 +792,16 @@ export class SchedulerEngine {
     if (schedule.trigger.kind !== "cron") return;
     const missed = schedule.nextRunAt !== undefined && Date.parse(schedule.nextRunAt) <= this.now();
     if (missed) {
+      if (schedule.policy?.catchUp) {
+        void this.onCronFire(schedule.id).catch(() => this.reportBackgroundFailure());
+        return;
+      }
       // Advance durably before any catch-up launch. One startup produces at most
       // one catch-up run regardless of how many occurrences were missed.
       const updated = { ...schedule, nextRunAt: this.computeNextRun(schedule.trigger) };
       this.persist(updated);
       this.safeEmit("schedule.changed", { schedule: this.maskSchedule(updated) });
       this.armCron(updated);
-      if (schedule.policy?.catchUp) void this.launchRun(updated, "cron").catch(() => {});
       return;
     }
     if (!schedule.nextRunAt) {
@@ -800,7 +821,7 @@ export class SchedulerEngine {
     const delay = Math.max(0, Date.parse(nextIso) - this.now());
     const timer = setTimeout(() => {
       this.timers.delete(schedule.id);
-      void this.onCronFire(schedule.id);
+      void this.onCronFire(schedule.id).catch(() => this.reportBackgroundFailure());
     }, Math.min(delay, 2 ** 31 - 1));
     (timer as { unref?: () => void }).unref?.();
     this.timers.set(schedule.id, timer);
@@ -816,19 +837,22 @@ export class SchedulerEngine {
       this.armCron(schedule);
       return;
     }
-    const updated: Schedule = {
-      ...schedule,
-      nextRunAt: this.computeNextRun(schedule.trigger),
-      lastRunAt: new Date(this.now()).toISOString(),
-    };
-    this.persist(updated);
-    this.safeEmit("schedule.changed", { schedule: this.maskSchedule(updated) });
+    const nextRunAt = this.computeNextRun(schedule.trigger);
+    if (!nextRunAt) return;
     try {
-      await this.launchRun(updated, "cron");
-    } catch {
-      // launchRun persists execution failures. Policy rejection intentionally has no run.
+      // Run receipt + next occurrence are committed together before execution.
+      await this.launchRun(schedule, "cron", undefined, nextRunAt);
+    } catch (error) {
+      // Capacity pressure never rejects/defers. A true persistence/read failure
+      // is not accepted and must not advance the due cursor or fake a result.
+      if (!(error instanceof PhononError) || error.appCode !== "errPolicyDenied") throw error;
+      this.persist({ ...schedule, nextRunAt });
     }
     if (!this.started || this.disposed) return;
+    const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
+    if (!current) return;
+    const updated = this.rowToSchedule(current);
+    this.safeEmit("schedule.changed", { schedule: this.maskSchedule(updated) });
     this.armCron(updated);
   }
 
@@ -862,13 +886,14 @@ export class SchedulerEngine {
 
   ack(runId: string, opts?: { lastSeq?: number; finished?: boolean }): void {
     const rt = this.runtimes.get(runId);
+    // Commit before changing runtime state, including on a failed receipt write.
+    this.opts.store.ackRun(runId, this.opts.tenantId, opts);
     if (rt && opts?.lastSeq !== undefined) {
       rt.ackedSeq = Math.max(rt.ackedSeq, Math.min(opts.lastSeq, rt.seq - 1));
     }
     // Receipt ACK is tenant-authoritative and independent from execution owner.
     // Only finished=true acknowledges run.finished; a pure event ACK must not
     // suppress terminal replay.
-    this.opts.store.ackRun(runId, this.opts.tenantId, opts);
   }
 
   private persistRuntime(rt: RunRuntime, exitReason?: string, error?: string): boolean {
@@ -1029,7 +1054,7 @@ export class SchedulerEngine {
           const timer = setTimeout(() => {
             rt.timeoutTimer = undefined;
             if (this.disposed || !this.runtimes.has(runId) || rt.phase !== "retry_wait") return;
-            void this.launchAttempt(rt);
+            this.startAttempt(rt);
           }, delay);
           timer.unref?.();
           rt.timeoutTimer = timer;

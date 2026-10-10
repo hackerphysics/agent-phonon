@@ -352,8 +352,14 @@ export class SessionEngine {
     rec.lastActiveAt = new Date().toISOString();
     this.emit2("turn", "info", "turn.start", rec, { turnId, msg: `turn ${turnId} started`, data: { input: input.slice(0, 200) } });
     this.persist(rec);
-    void this.runTurn(rec, input, turnId, verbosity, opts.skills, opts.environment);
+    void this.runTurn(rec, input, turnId, verbosity, opts.skills, opts.environment).catch(() => this.reportDeliveryFailure(rec));
     return { turnId, disposition: "started" };
+  }
+
+  private reportDeliveryFailure(rec: SessionRecord): void {
+    this.store?.delivery.failed();
+    // Do not include storage errors/payloads/credentials in public telemetry.
+    this.emit2("error", "error", "stream.persistence_failed", rec, { msg: "background turn delivery failed; inspect local storage" });
   }
 
   private async runTurn(
@@ -419,7 +425,7 @@ export class SessionEngine {
           rec.status = "running";
           rec.currentTurnId = n.turnId;
           rec.lastActiveAt = new Date().toISOString();
-          void this.runTurn(rec, n.input, n.turnId, n.verbosity, n.skills, n.environment);
+          void this.runTurn(rec, n.input, n.turnId, n.verbosity, n.skills, n.environment).catch(() => this.reportDeliveryFailure(rec));
         }
       }
     }
@@ -472,7 +478,7 @@ export class SessionEngine {
           rec.status = "running";
           rec.currentTurnId = n.turnId;
           rec.lastActiveAt = new Date().toISOString();
-          void this.runTurn(rec, n.input, n.turnId, n.verbosity, n.skills, n.environment);
+          void this.runTurn(rec, n.input, n.turnId, n.verbosity, n.skills, n.environment).catch(() => this.reportDeliveryFailure(rec));
         }
       }
     }

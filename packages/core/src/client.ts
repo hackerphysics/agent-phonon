@@ -73,6 +73,7 @@ export class PhononClient {
     /** sqlite 文件路径（多连接可共享同一 store）。 */
     dbPath?: string;
     store?: import("./store.js").PhononStore;
+    delivery?: Partial<import("./delivery-capacity.js").DeliveryConfig>;
     /** 可选：policy 覆盖。 */
     policy?: Partial<import("@agent-phonon/protocol").TenantPolicy>;
     /** 可观测事件总线。 */
@@ -94,6 +95,7 @@ export class PhononClient {
     this.workspaceRoot = opts.workspaceRoot;
     this.ownsStore = !opts.store;
     this.store = opts.store ?? new PhononStore(opts.dbPath ?? ":memory:");
+    this.store.delivery.configure(opts.delivery, opts.obs);
     this.policy = opts.policy;
     this.obs = opts.obs;
     this.maintenance = opts.maintenance;

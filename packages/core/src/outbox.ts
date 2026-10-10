@@ -52,7 +52,7 @@ export class Outbox {
     }
   }
 
-  /** 记录一个待投递事件（已带 seq）。返回是否触发超限丢弃。 */
+  /** 记录一个待投递事件（已带 seq）。绝不因容量压力丢弃。 */
   enqueue(event: StreamEvent): void {
     const sessionId = (event as { sessionId: string }).sessionId;
     const seq = (event as { seq: number }).seq;
@@ -73,9 +73,11 @@ export class Outbox {
     if (sessionItems.length === 0) return;
     // ACK 只能推进到本地确实发出/持久化过的边界，恶意或错误的超大 ACK
     // 不能毒化水位并吞掉未来事件。
-    const maxKnown = Math.max(...sessionItems.map((b) => b.seq));
+    const maxKnown = sessionItems.reduce((max, item) => Math.max(max, item.seq), -1);
     const effective = Math.min(lastSeq, maxKnown);
     if (effective <= prev) return;
+    // Commit first: a failed SQLite ACK must not forget the replay promise.
+    this.store?.outboxAck(this.tenantId ?? "", sessionId, effective);
     this.acked.set(sessionId, effective);
     const kept: Buffered[] = [];
     for (const item of this.buffer) {
@@ -83,7 +85,6 @@ export class Outbox {
       else kept.push(item);
     }
     this.buffer = kept;
-    this.store?.outboxAck(this.tenantId ?? "", sessionId, effective);
   }
 
   private key(sessionId: string, seq: number): string {

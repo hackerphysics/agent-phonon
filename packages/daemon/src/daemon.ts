@@ -20,7 +20,7 @@ import {
 } from "@agent-phonon/core";
 import { type DaemonConfig, readOpenClawGatewayToken, validateServerConfigs } from "./config.js";
 import { autoDetectAdapters } from "./commands.js";
-import { ObsServer } from "./obs-server.js";
+import { ObsServer, unavailableDeliveryMeasurement } from "./obs-server.js";
 
 /**
  * PhononDaemon（bug-bash B4）：设备侧常驻服务。
@@ -55,11 +55,12 @@ export class PhononDaemon {
     validateServerConfigs(cfg.servers);
     this.cfg = cfg;
     this.registry = new AdapterRegistry(cfg.discovery, this.obs);
-    this.store = new PhononStore(cfg.dbPath);
+    this.store = new PhononStore(cfg.dbPath, { delivery: cfg.delivery });
     // 可观测堆栈：结构化日志 + 指标 + audit 落库，都从同一 ObsBus 消费
     new StructuredLogger({ level: cfg.logLevel ?? "info" }).attach(this.obs);
     this.metrics.attach(this.obs);
     new AuditSink(this.store).attach(this.obs);
+    this.store.delivery.configure(undefined, this.obs, this.metrics);
     if (cfg.rescueAgent?.enabled !== false) {
       this.registry.register(new RescueAdapter({
         baseUrl: cfg.rescueAgent?.baseUrl,
@@ -180,8 +181,14 @@ export class PhononDaemon {
       outboxSize: c.connection?.outboxSize ?? 0,
     }));
     const anyDown = connections.some((c) => !c.connected) && this.cfg.servers.length > 0;
+    let delivery: import("@agent-phonon/core").DeliverySnapshot;
+    try { delivery = this.store.delivery.snapshot(); } catch {
+      return { ok: false, delivery: unavailableDeliveryMeasurement() };
+    }
     return {
-      ok: !anyDown,
+      ok: !anyDown && !delivery.admissionBlocked,
+      degraded: delivery.state !== "normal",
+      delivery,
       deviceId: this.cfg.deviceId,
       uptimeSeconds: Math.floor((Date.now() - this.startedAt) / 1000),
       adapters: this.registry.all().map((a) => a.name),

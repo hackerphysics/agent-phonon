@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { deliveryOptions, DeliveryCapacity, type DeliveryConfig, type DeliveryChannel, type DeliveryPending } from "./delivery-capacity.js";
 import { SecretBox } from "./secret-box.js";
 
 /**
@@ -18,7 +19,10 @@ export class PhononStore {
   /** env 变量值 at-rest 加密(AES-256-GCM)。密钥文件与库同目录、0600。 */
   private secrets: SecretBox;
 
-  constructor(dbPath: string) {
+  readonly delivery: DeliveryCapacity;
+
+  constructor(dbPath: string, opts?: { delivery?: Partial<DeliveryConfig> }) {
+    const delivery = deliveryOptions(opts?.delivery);
     this.dbPath = dbPath;
     if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
@@ -27,6 +31,9 @@ export class PhononStore {
     // 设备密钥：内存库用进程内随机密钥；落盘库用同目录 device.key(0600)。
     this.secrets = SecretBox.fromKeyFile(dbPath === ":memory:" ? undefined : join(dirname(dbPath), "device.key"));
     this.migrate();
+    this.migrateDeliveryAccounting();
+    this.delivery = new DeliveryCapacity(() => this.deliveryPending(), delivery);
+    this.delivery.snapshot();
   }
 
   /**
@@ -224,6 +231,14 @@ export class PhononStore {
     // 用 PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN。
     // sessions.transcript_path：phonon 自存的会话快照 JSONL 路径（可观测/审计）。
     this.ensureColumn("sessions", "transcript_path", "TEXT");
+    // Keep fingerprints out of the unrestricted request-key namespace. Legacy
+    // results/ambiguous old sidecar rows are retained without guessing a hash.
+    this.ensureColumn("idempotency", "request_hash", "TEXT");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS workflow_resume_dispatches (
+      tenant_id TEXT NOT NULL, request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
+      workflow_id TEXT NOT NULL, result_json TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,request_key)
+    )`);
     // stream_seq 保存“下一条 stream.event 的 seq”。旧库从 outbox 最大值兜底恢复；
     // 新事件在发送前推进此值，确保全部 ACK 后重启也不会从 0 碰撞。
     this.ensureColumn("sessions", "stream_seq", "INTEGER NOT NULL DEFAULT 0");
@@ -269,6 +284,85 @@ export class PhononStore {
       CREATE INDEX idx_env_scope ON env_vars(tenant_id, scope, project_id, agent_id, skill_name);
       CREATE UNIQUE INDEX idx_env_unique ON env_vars(tenant_id, scope, IFNULL(project_id,''), IFNULL(agent_id,''), IFNULL(skill_name,''), name);
     `);
+  }
+
+  /** Reconcile once on open. Incremental triggers keep accounting in the same
+   * transaction as source events and ACKs, with no payload scan per token. */
+  private migrateDeliveryAccounting(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS delivery_totals (
+          channel TEXT PRIMARY KEY, pending_count INTEGER NOT NULL, pending_bytes INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO delivery_totals VALUES ('stream',0,0),('workflow',0,0),('run',0,0);
+        CREATE TABLE IF NOT EXISTS delivery_pending (
+          channel TEXT NOT NULL, tenant_id TEXT NOT NULL, entity_id TEXT NOT NULL,
+          seq INTEGER NOT NULL, bytes INTEGER NOT NULL,
+          PRIMARY KEY(channel,tenant_id,entity_id,seq)
+        );
+        CREATE TRIGGER IF NOT EXISTS delivery_counter_insert AFTER INSERT ON delivery_pending BEGIN
+          UPDATE delivery_totals SET pending_count=pending_count+1,pending_bytes=pending_bytes+NEW.bytes WHERE channel=NEW.channel;
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_counter_delete AFTER DELETE ON delivery_pending BEGIN
+          UPDATE delivery_totals SET pending_count=pending_count-1,pending_bytes=pending_bytes-OLD.bytes WHERE channel=OLD.channel;
+        END;
+      `);
+      const channels = [
+        ["stream", "outbox_events", "session_id", "outbox_acks", "session_id", "last_seq"],
+        ["workflow", "workflow_events", "workflow_id", "workflows", "workflow_id", "acked_seq"],
+        ["run", "run_events", "run_id", "runs", "id", "acked_seq"],
+      ];
+      for (const [channel, table, id, parent, parentId, watermark] of channels) {
+        this.db.exec(`
+          CREATE TRIGGER IF NOT EXISTS delivery_${channel}_insert AFTER INSERT ON ${table}
+          WHEN NEW.seq>COALESCE((SELECT ${watermark} FROM ${parent} WHERE ${parentId}=NEW.${id} AND tenant_id=NEW.tenant_id),-1) BEGIN
+            INSERT OR IGNORE INTO delivery_pending VALUES ('${channel}',NEW.tenant_id,NEW.${id},NEW.seq,length(CAST(NEW.payload AS BLOB)));
+          END;
+          CREATE TRIGGER IF NOT EXISTS delivery_${channel}_delete AFTER DELETE ON ${table} BEGIN
+            DELETE FROM delivery_pending WHERE channel='${channel}' AND tenant_id=OLD.tenant_id AND entity_id=OLD.${id} AND seq=OLD.seq;
+          END;
+          CREATE TRIGGER IF NOT EXISTS delivery_${channel}_ack_insert AFTER INSERT ON ${parent} BEGIN
+            DELETE FROM delivery_pending WHERE channel='${channel}' AND tenant_id=NEW.tenant_id AND entity_id=NEW.${parentId} AND seq<=NEW.${watermark};
+          END;
+          CREATE TRIGGER IF NOT EXISTS delivery_${channel}_ack_update AFTER UPDATE OF ${watermark} ON ${parent} BEGIN
+            DELETE FROM delivery_pending WHERE channel='${channel}' AND tenant_id=NEW.tenant_id AND entity_id=NEW.${parentId} AND seq<=NEW.${watermark};
+          END;
+        `);
+      }
+      this.db.exec("DELETE FROM delivery_pending; UPDATE delivery_totals SET pending_count=0,pending_bytes=0;");
+      for (const [channel, table, id, parent, parentId, watermark] of channels) {
+        // Orphan legacy events are conservatively counted, never discarded.
+        this.db.exec(`INSERT INTO delivery_pending
+          SELECT '${channel}',e.tenant_id,e.${id},e.seq,length(CAST(e.payload AS BLOB))
+          FROM ${table} e LEFT JOIN ${parent} p ON p.${parentId}=e.${id} AND p.tenant_id=e.tenant_id
+          WHERE e.seq>COALESCE(p.${watermark},-1)`);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  private deliveryPending(): Record<DeliveryChannel, DeliveryPending> {
+    const result = {} as Record<DeliveryChannel, DeliveryPending>;
+    for (const row of this.db.prepare("SELECT * FROM delivery_totals").all() as Array<{ channel: DeliveryChannel; pending_count: number; pending_bytes: number }>) {
+      result[row.channel] = { count: row.pending_count, bytes: row.pending_bytes };
+    }
+    return result;
+  }
+
+  /** Failure stays observable even when SQLite cannot store an audit row. */
+  private deliveryWrite<T>(fn: () => T, refresh = true): T {
+    try {
+      const result = fn();
+      if (refresh) this.delivery.snapshot();
+      return result;
+    } catch (error) {
+      this.delivery.failed();
+      throw error;
+    }
   }
 
   /** 幂等加列：列不存在才 ALTER TABLE ADD COLUMN。 */
@@ -386,35 +480,52 @@ export class PhononStore {
 
   // ---- outbox ----
   outboxAdd(tenantId: string, sessionId: string, seq: number, payload: string, createdAt: string): boolean {
-    // Event durability and sequence advancement are one transaction. Advancing
-    // sessions.stream_seq first would leave a permanent protocol gap if the
-    // process crashed before the outbox row was inserted.
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const result = this.db.prepare("INSERT OR IGNORE INTO outbox_events(tenant_id,session_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
-        .run(tenantId, sessionId, seq, payload, createdAt);
-      this.db.prepare("UPDATE sessions SET stream_seq=MAX(stream_seq, ?) WHERE session_id=? AND tenant_id=?")
-        .run(seq + 1, sessionId, tenantId);
-      this.db.exec("COMMIT");
-      return Number(result.changes) > 0;
-    } catch (err) {
-      try { this.db.exec("ROLLBACK"); } catch { /* preserve the original failure */ }
-      throw err;
-    }
+    return this.deliveryWrite(() => {
+      // Event durability and sequence advancement are one transaction. Advancing
+      // sessions.stream_seq first would leave a permanent protocol gap if the
+      // process crashed before the outbox row was inserted.
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = this.db.prepare("INSERT OR IGNORE INTO outbox_events(tenant_id,session_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
+          .run(tenantId, sessionId, seq, payload, createdAt);
+        this.db.prepare("UPDATE sessions SET stream_seq=MAX(stream_seq, ?) WHERE session_id=? AND tenant_id=?")
+          .run(seq + 1, sessionId, tenantId);
+        this.db.exec("COMMIT");
+        return Number(result.changes) > 0;
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* preserve the original failure */ }
+        throw err;
+      }
+    });
   }
   outboxDelete(tenantId: string, sessionId: string, seq: number): void {
-    this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq=?")
-      .run(tenantId, sessionId, seq);
+    return this.deliveryWrite(() => {
+      this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq=?")
+        .run(tenantId, sessionId, seq);
+    });
   }
   outboxMarkFinalized(tenantId: string, sessionId: string, lastSeq: number): void {
-    this.db.prepare(
-      `INSERT INTO outbox_acks(tenant_id,session_id,last_seq) VALUES(?,?,?)
-       ON CONFLICT(tenant_id,session_id) DO UPDATE SET last_seq=MAX(last_seq, excluded.last_seq)`,
-    ).run(tenantId, sessionId, lastSeq);
+    return this.deliveryWrite(() => {
+      this.db.prepare(
+        `INSERT INTO outbox_acks(tenant_id,session_id,last_seq) VALUES(?,?,?)
+         ON CONFLICT(tenant_id,session_id) DO UPDATE SET last_seq=MAX(last_seq, excluded.last_seq)`,
+      ).run(tenantId, sessionId, lastSeq);
+    });
   }
   outboxAck(tenantId: string, sessionId: string, lastSeq: number): void {
-    this.outboxMarkFinalized(tenantId, sessionId, lastSeq);
-    this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq<=?").run(tenantId, sessionId, lastSeq);
+    this.deliveryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.prepare(`INSERT INTO outbox_acks(tenant_id,session_id,last_seq) VALUES(?,?,?)
+          ON CONFLICT(tenant_id,session_id) DO UPDATE SET last_seq=MAX(last_seq,excluded.last_seq)`)
+          .run(tenantId, sessionId, lastSeq);
+        this.db.prepare("DELETE FROM outbox_events WHERE tenant_id=? AND session_id=? AND seq<=?").run(tenantId, sessionId, lastSeq);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        throw error;
+      }
+    });
   }
   outboxLoad(tenantId: string): Array<{ sessionId: string; seq: number; payload: string }> {
     return (this.db.prepare("SELECT session_id,seq,payload FROM outbox_events WHERE tenant_id=? ORDER BY id").all(tenantId) as Record<string, unknown>[]).map((r) => ({
@@ -527,12 +638,31 @@ export class PhononStore {
     const row = this.db.prepare("SELECT result FROM idempotency WHERE k=?").get(key) as { result?: string } | undefined;
     return row?.result;
   }
-  idempotencyPut(key: string, result: string): void {
-    this.db.prepare("INSERT INTO idempotency(k,result,created_at) VALUES(?,?,?) ON CONFLICT(k) DO NOTHING").run(key, result, Date.now());
+  idempotencyFingerprint(key: string): string | undefined {
+    const row = this.db.prepare("SELECT request_hash FROM idempotency WHERE k=?").get(key) as { request_hash: string | null } | undefined;
+    return row?.request_hash ?? undefined;
+  }
+
+  idempotencyPut(key: string, result: string, fingerprint?: string): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO idempotency(k,result,created_at,request_hash) VALUES(?,?,?,?) ON CONFLICT(k) DO NOTHING")
+        .run(key, result, Date.now(), fingerprint ?? null);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      this.delivery.failed();
+      throw error;
+    }
   }
 
   findWorkflowDispatch(tenantId:string,key:string):Record<string,unknown>|undefined {
     return this.db.prepare(`SELECT * FROM workflows WHERE tenant_id=? AND json_extract(metadata_json,'$._phononDispatch.key')=? LIMIT 1`).get(tenantId,key) as Record<string,unknown>|undefined;
+  }
+
+  workflowResumeDispatch(tenantId: string, key: string): { requestHash: string; resultJson: string } | undefined {
+    return this.db.prepare("SELECT request_hash AS requestHash,result_json AS resultJson FROM workflow_resume_dispatches WHERE tenant_id=? AND request_key=?")
+      .get(tenantId, key) as { requestHash: string; resultJson: string } | undefined;
   }
 
   // ---- workflows (L3 checkpoint) ----
@@ -543,56 +673,66 @@ export class PhononStore {
     seq: number; ackedSeq: number; createdAt: string; updatedAt: string; completedAt?: string;
     checkpointJson?: string; ownerId?: string; ownerEpoch?: number; leaseUntil?: number; metadataJson?: string;
   }): boolean {
-    const result = this.db
-      .prepare(
-        `INSERT INTO workflows(workflow_id,tenant_id,project_id,worktree_id,mode,plan_json,input,policy_json,shared_json,status,final_text,error,nodes_json,seq,acked_seq,created_at,updated_at,completed_at,checkpoint_json,owner_id,owner_epoch,lease_until,metadata_json)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(workflow_id) DO UPDATE SET
-           status=excluded.status,
-           final_text=excluded.final_text,
-           error=excluded.error,
-           shared_json=excluded.shared_json,
-           nodes_json=excluded.nodes_json,
-           seq=excluded.seq,
-           acked_seq=MAX(workflows.acked_seq, excluded.acked_seq),
-           updated_at=excluded.updated_at,
-           completed_at=excluded.completed_at,
-           checkpoint_json=excluded.checkpoint_json,
-           lease_until=excluded.lease_until,
-           metadata_json=excluded.metadata_json
-         WHERE workflows.tenant_id=excluded.tenant_id AND workflows.owner_id=excluded.owner_id AND workflows.owner_epoch=excluded.owner_epoch`,
-      )
-      .run(
-        w.workflowId, w.tenantId, w.projectId ?? null, w.worktreeId ?? null, w.mode, w.planJson,
-        w.input ?? null, w.policyJson ?? null, w.sharedJson ?? null,
-        w.status, w.finalText ?? null, w.error ?? null, w.nodesJson,
-        w.seq, w.ackedSeq, w.createdAt, w.updatedAt, w.completedAt ?? null,
-        w.checkpointJson ?? null, w.ownerId ?? null, w.ownerEpoch ?? 0, w.leaseUntil ?? null, w.metadataJson ?? null,
-      );
-    return Number(result.changes) === 1;
+    // May run inside append/accept transaction: publish gauges only after commit.
+    return this.deliveryWrite(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO workflows(workflow_id,tenant_id,project_id,worktree_id,mode,plan_json,input,policy_json,shared_json,status,final_text,error,nodes_json,seq,acked_seq,created_at,updated_at,completed_at,checkpoint_json,owner_id,owner_epoch,lease_until,metadata_json)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(workflow_id) DO UPDATE SET
+             status=excluded.status,
+             final_text=excluded.final_text,
+             error=excluded.error,
+             shared_json=excluded.shared_json,
+             nodes_json=excluded.nodes_json,
+             seq=excluded.seq,
+             acked_seq=MAX(workflows.acked_seq, excluded.acked_seq),
+             updated_at=excluded.updated_at,
+             completed_at=excluded.completed_at,
+             checkpoint_json=excluded.checkpoint_json,
+             lease_until=excluded.lease_until,
+             metadata_json=excluded.metadata_json
+           WHERE workflows.tenant_id=excluded.tenant_id AND workflows.owner_id=excluded.owner_id AND workflows.owner_epoch=excluded.owner_epoch`,
+        )
+        .run(
+          w.workflowId, w.tenantId, w.projectId ?? null, w.worktreeId ?? null, w.mode, w.planJson,
+          w.input ?? null, w.policyJson ?? null, w.sharedJson ?? null,
+          w.status, w.finalText ?? null, w.error ?? null, w.nodesJson,
+          w.seq, w.ackedSeq, w.createdAt, w.updatedAt, w.completedAt ?? null,
+          w.checkpointJson ?? null, w.ownerId ?? null, w.ownerEpoch ?? 0, w.leaseUntil ?? null, w.metadataJson ?? null,
+        );
+      return Number(result.changes) === 1;
+    }, false);
   }
 
   /** Atomically persist the workflow checkpoint/seq and its emitted event. */
   appendWorkflowEvent(
     w: Parameters<PhononStore["upsertWorkflow"]>[0],
     event: { seq: number; payload: string; createdAt: string },
+    resumeDispatch?: { key: string; hash: string; resultJson: string },
   ): boolean {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const persisted = this.upsertWorkflow(w);
-      if (!persisted) {
-        this.db.exec("ROLLBACK");
-        return false;
+    return this.deliveryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const persisted = this.upsertWorkflow(w);
+        if (!persisted) {
+          this.db.exec("ROLLBACK");
+          return false;
+        }
+        this.db.prepare(
+          "INSERT OR IGNORE INTO workflow_events(workflow_id,tenant_id,seq,payload,created_at) VALUES(?,?,?,?,?)",
+        ).run(w.workflowId, w.tenantId, event.seq, event.payload, event.createdAt);
+        if (resumeDispatch) {
+          this.db.prepare("INSERT INTO workflow_resume_dispatches(tenant_id,request_key,request_hash,workflow_id,result_json) VALUES(?,?,?,?,?)")
+            .run(w.tenantId, resumeDispatch.key, resumeDispatch.hash, w.workflowId, resumeDispatch.resultJson);
+        }
+        this.db.exec("COMMIT");
+        return true;
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        throw err;
       }
-      this.db.prepare(
-        "INSERT OR IGNORE INTO workflow_events(workflow_id,tenant_id,seq,payload,created_at) VALUES(?,?,?,?,?)",
-      ).run(w.workflowId, w.tenantId, event.seq, event.payload, event.createdAt);
-      this.db.exec("COMMIT");
-      return true;
-    } catch (err) {
-      try { this.db.exec("ROLLBACK"); } catch {}
-      throw err;
-    }
+    });
   }
 
   workflowEvents(workflowId: string, tenantId: string, afterSeq = -1, limit = 200): Array<{ seq: number; payload: string }> {
@@ -673,11 +813,13 @@ export class PhononStore {
   }
 
   ackWorkflow(workflowId: string, lastSeq: number, tenantId?: string): void {
-    if (tenantId !== undefined) {
-      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, MIN(?, seq-1)) WHERE workflow_id=? AND tenant_id=?").run(lastSeq, workflowId, tenantId);
-    } else {
-      this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, MIN(?, seq-1)) WHERE workflow_id=?").run(lastSeq, workflowId);
-    }
+    return this.deliveryWrite(() => {
+      if (tenantId !== undefined) {
+        this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, MIN(?, seq-1)) WHERE workflow_id=? AND tenant_id=?").run(lastSeq, workflowId, tenantId);
+      } else {
+        this.db.prepare("UPDATE workflows SET acked_seq=MAX(acked_seq, MIN(?, seq-1)) WHERE workflow_id=?").run(lastSeq, workflowId);
+      }
+    });
   }
 
   // ---- schedules (L4 定时任务定义；device 为真相源) ----
@@ -719,7 +861,25 @@ export class PhononStore {
   }
   deleteSchedule(id: string): void {
     this.db.prepare("DELETE FROM schedules WHERE id=?").run(id);
-    this.db.prepare("DELETE FROM runs WHERE schedule_id=?").run(id);
+    // Preserve run history/receipts for replay and ACK after schedule deletion.
+  }
+
+  /** Accept one cron run receipt and consume its due cursor atomically before
+   * any provider call. A storage failure cannot advance the cursor alone. */
+  acceptCronRun(run: Parameters<PhononStore["upsertRun"]>[0], nextRunAt: string): void {
+    this.deliveryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!this.upsertRun(run)) throw new Error("cron run acceptance failed");
+        const updated = this.db.prepare("UPDATE schedules SET next_run_at=?,last_run_at=? WHERE id=? AND tenant_id=?")
+          .run(nextRunAt, run.createdAt, run.scheduleId, run.tenantId);
+        if (Number(updated.changes) !== 1) throw new Error("cron schedule disappeared during acceptance");
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        throw error;
+      }
+    });
   }
 
   // ---- runs (L4 每次执行记录) ----
@@ -731,55 +891,60 @@ export class PhononStore {
     attempt?: number; maxAttempts?: number; retryHistoryJson?: string; inputJson?: string;
     phase?: string; retryAt?: number; ownerId?: string; ownerEpoch?: number; leaseUntil?: number; eventSeq?: number;
   }): boolean {
-    const result = this.db
-      .prepare(
-        `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at,attempt,max_attempts,retry_history_json,input_json,phase,retry_at,owner_id,owner_epoch,lease_until,event_seq)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET
-           status=excluded.status, session_id=excluded.session_id, workflow_id=excluded.workflow_id,
-           started_at=excluded.started_at, finished_at=excluded.finished_at,
-           exit_reason=excluded.exit_reason, error=excluded.error,
-           transcript_path=excluded.transcript_path, result_text=excluded.result_text,
-           usage_json=excluded.usage_json,
-           push_state=CASE WHEN runs.push_state='acked' THEN 'acked' ELSE excluded.push_state END,
-           acked_seq=MAX(runs.acked_seq, excluded.acked_seq),
-           attempt=excluded.attempt, max_attempts=excluded.max_attempts,
-           retry_history_json=excluded.retry_history_json, input_json=excluded.input_json,
-           phase=excluded.phase, retry_at=excluded.retry_at, lease_until=excluded.lease_until,
-           event_seq=MAX(runs.event_seq, excluded.event_seq)
-         WHERE runs.tenant_id=excluded.tenant_id AND
-               ((runs.owner_id IS NULL AND excluded.owner_id IS NULL) OR
-                (runs.owner_id=excluded.owner_id AND runs.owner_epoch=excluded.owner_epoch))`,
-      )
-      .run(
-        r.id, r.scheduleId, r.tenantId, r.triggerSource, r.status,
-        r.sessionId ?? null, r.workflowId ?? null, r.startedAt ?? null, r.finishedAt ?? null,
-        r.exitReason ?? null, r.error ?? null, r.transcriptPath ?? null, r.resultText ?? null,
-        r.usageJson ?? null, r.pushState ?? "pending", r.ackedSeq ?? -1, r.createdAt,
-        r.attempt ?? 0, r.maxAttempts ?? 1, r.retryHistoryJson ?? "[]", r.inputJson ?? null,
-        r.phase ?? null, r.retryAt ?? null, r.ownerId ?? null, r.ownerEpoch ?? 0, r.leaseUntil ?? null, r.eventSeq ?? 0,
-      );
-    return Number(result.changes) === 1;
+    // May run inside append/accept transaction: publish gauges only after commit.
+    return this.deliveryWrite(() => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at,attempt,max_attempts,retry_history_json,input_json,phase,retry_at,owner_id,owner_epoch,lease_until,event_seq)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET
+             status=excluded.status, session_id=excluded.session_id, workflow_id=excluded.workflow_id,
+             started_at=excluded.started_at, finished_at=excluded.finished_at,
+             exit_reason=excluded.exit_reason, error=excluded.error,
+             transcript_path=excluded.transcript_path, result_text=excluded.result_text,
+             usage_json=excluded.usage_json,
+             push_state=CASE WHEN runs.push_state='acked' THEN 'acked' ELSE excluded.push_state END,
+             acked_seq=MAX(runs.acked_seq, excluded.acked_seq),
+             attempt=excluded.attempt, max_attempts=excluded.max_attempts,
+             retry_history_json=excluded.retry_history_json, input_json=excluded.input_json,
+             phase=excluded.phase, retry_at=excluded.retry_at, lease_until=excluded.lease_until,
+             event_seq=MAX(runs.event_seq, excluded.event_seq)
+           WHERE runs.tenant_id=excluded.tenant_id AND
+                 ((runs.owner_id IS NULL AND excluded.owner_id IS NULL) OR
+                  (runs.owner_id=excluded.owner_id AND runs.owner_epoch=excluded.owner_epoch))`,
+        )
+        .run(
+          r.id, r.scheduleId, r.tenantId, r.triggerSource, r.status,
+          r.sessionId ?? null, r.workflowId ?? null, r.startedAt ?? null, r.finishedAt ?? null,
+          r.exitReason ?? null, r.error ?? null, r.transcriptPath ?? null, r.resultText ?? null,
+          r.usageJson ?? null, r.pushState ?? "pending", r.ackedSeq ?? -1, r.createdAt,
+          r.attempt ?? 0, r.maxAttempts ?? 1, r.retryHistoryJson ?? "[]", r.inputJson ?? null,
+          r.phase ?? null, r.retryAt ?? null, r.ownerId ?? null, r.ownerEpoch ?? 0, r.leaseUntil ?? null, r.eventSeq ?? 0,
+        );
+      return Number(result.changes) === 1;
+    }, false);
   }
   appendRunEvent(
     run: Parameters<PhononStore["upsertRun"]>[0],
     event: { seq: number; payload: string; createdAt: string },
   ): boolean {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const persisted = this.upsertRun(run);
-      if (!persisted) {
-        this.db.exec("ROLLBACK");
-        return false;
+    return this.deliveryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const persisted = this.upsertRun(run);
+        if (!persisted) {
+          this.db.exec("ROLLBACK");
+          return false;
+        }
+        this.db.prepare("INSERT OR IGNORE INTO run_events(run_id,tenant_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
+          .run(run.id, run.tenantId, event.seq, event.payload, event.createdAt);
+        this.db.exec("COMMIT");
+        return true;
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        throw err;
       }
-      this.db.prepare("INSERT OR IGNORE INTO run_events(run_id,tenant_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
-        .run(run.id, run.tenantId, event.seq, event.payload, event.createdAt);
-      this.db.exec("COMMIT");
-      return true;
-    } catch (err) {
-      try { this.db.exec("ROLLBACK"); } catch {}
-      throw err;
-    }
+    });
   }
 
   unackedRunEvents(tenantId: string): Array<{ runId: string; seq: number; payload: string }> {
@@ -792,16 +957,18 @@ export class PhononStore {
   }
 
   ackRun(runId: string, tenantId: string, opts?: { lastSeq?: number; finished?: boolean }): boolean {
-    const row = this.db.prepare("SELECT acked_seq,event_seq,push_state FROM runs WHERE id=? AND tenant_id=?")
-      .get(runId, tenantId) as { acked_seq: number; event_seq: number; push_state: string } | undefined;
-    if (!row) return false;
-    const ackedSeq = opts?.lastSeq === undefined
-      ? row.acked_seq
-      : Math.max(row.acked_seq, Math.min(opts.lastSeq, row.event_seq - 1));
-    const pushState = opts?.finished === true ? "acked" : row.push_state;
-    const result = this.db.prepare("UPDATE runs SET acked_seq=?,push_state=? WHERE id=? AND tenant_id=?")
-      .run(ackedSeq, pushState, runId, tenantId);
-    return Number(result.changes) === 1;
+    return this.deliveryWrite(() => {
+      const row = this.db.prepare("SELECT acked_seq,event_seq,push_state FROM runs WHERE id=? AND tenant_id=?")
+        .get(runId, tenantId) as { acked_seq: number; event_seq: number; push_state: string } | undefined;
+      if (!row) return false;
+      const ackedSeq = opts?.lastSeq === undefined
+        ? row.acked_seq
+        : Math.max(row.acked_seq, Math.min(opts.lastSeq, row.event_seq - 1));
+      const pushState = opts?.finished === true ? "acked" : row.push_state;
+      const result = this.db.prepare("UPDATE runs SET acked_seq=?,push_state=? WHERE id=? AND tenant_id=?")
+        .run(ackedSeq, pushState, runId, tenantId);
+      return Number(result.changes) === 1;
+    });
   }
 
   claimRun(runId: string, tenantId: string, ownerId: string, leaseMs = 30_000): number | undefined {

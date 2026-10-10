@@ -2,7 +2,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from "n
 import { generateText, tool } from "ai";
 import { z } from "zod";
 import type { ModelInfo, TenantPolicy } from "@agent-phonon/protocol";
-import { discoveryOptions, type DiscoveryOptions, createRescueModel, rescueProviderOptions, validateRescueEndpoint, type RescueConnectionOptions, type MaintenanceManagerConfig } from "@agent-phonon/core";
+import { deliveryOptions, type DeliveryConfig, discoveryOptions, type DiscoveryOptions, createRescueModel, rescueProviderOptions, validateRescueEndpoint, type RescueConnectionOptions, type MaintenanceManagerConfig } from "@agent-phonon/core";
 import { homedir, hostname } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -88,6 +88,8 @@ export interface DaemonConfig {
   logLevel?: "debug" | "info" | "warn" | "error";
   /** Shared discovery inventory; owner-only polling and per-adapter deadline. */
   discovery?: DiscoveryOptions;
+  /** Device-wide durable unACKed payload warning/critical threshold, not a write/admission cap. */
+  delivery?: Partial<DeliveryConfig>;
   hookBridge?: { port?: number; token?: string };
   /** 可观测 HTTP 服务。 */
   obs?: { enabled?: boolean; port?: number; token?: string };
@@ -143,6 +145,7 @@ export function defaultConfig(): DaemonConfig {
     dbPath: join(DEFAULT_DIR, "phonon.db"),
     workspaceRoot: join(homedir(), "phonon-projects"),
     discovery: discoveryOptions(),
+    delivery: deliveryOptions(),
     hookBridge: { port: 4318 },
     obs: { enabled: true, port: 4319 },
     maintenance: defaultMaintenance(),
@@ -164,6 +167,7 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): DaemonConfig {
     dbPath: raw.dbPath ?? d.dbPath,
     workspaceRoot: raw.workspaceRoot ?? d.workspaceRoot,
     discovery: discoveryOptions(raw.discovery),
+    delivery: deliveryOptions(raw.delivery),
     hookBridge: { ...d.hookBridge, ...raw.hookBridge },
     obs: { ...d.obs, ...raw.obs },
     logLevel: raw.logLevel ?? d.logLevel,

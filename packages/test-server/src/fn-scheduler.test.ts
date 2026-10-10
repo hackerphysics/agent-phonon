@@ -183,7 +183,7 @@ test("L4: schedules persist across store restart", async () => {
   store2.close();
 });
 
-test("L4: delete schedule removes it and its runs", async () => {
+test("L4: delete schedule removes definition and retains run receipts", async () => {
   const { tc, store } = setup();
   const project = await mkProject(tc);
   const created = (await tc.call("schedule.create", {
@@ -291,8 +291,8 @@ test("L4: overlap=queue launches FIFO exactly once and disable cancels queued it
   const eighth = (await tc.call("schedule.trigger", { scheduleId: created.schedule.id, input: "eight" })) as { runId: string };
   await tc.call("schedule.delete", { scheduleId: created.schedule.id });
   await new Promise((resolve) => setTimeout(resolve, 120));
-  assert.equal(store.getRun(seventh.runId, "tenant-test"), undefined);
-  assert.equal(store.getRun(eighth.runId, "tenant-test"), undefined);
+  assert.equal(store.getRun(seventh.runId, "tenant-test")?.status, "cancelled", "retain active run receipt for ACK/replay");
+  assert.equal(store.getRun(eighth.runId, "tenant-test")?.status, "cancelled", "retain queued intent cancellation receipt");
   store.close();
 });
 

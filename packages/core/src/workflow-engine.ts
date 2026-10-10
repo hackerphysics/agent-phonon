@@ -282,9 +282,9 @@ export class WorkflowEngine {
         // A real process crash cannot release its lease. Periodic scanning means
         // the successor claims the checkpoint immediately after lease expiry
         // instead of depending on a one-shot startup race.
-        void this.recover().catch(() => {});
+        void this.recover().catch(() => this.reportBackgroundFailure());
       } catch {
-        // Store shutdown/replacement is handled by the owning connection.
+        this.reportBackgroundFailure();
       }
     }, Math.max(500, Math.floor(this.leaseMs / 3)));
     this.leaseTimer.unref?.();
@@ -316,7 +316,7 @@ export class WorkflowEngine {
           this.hydrateCheckpoint(run);
           this.runs.set(workflowId, run);
           this.persist(run);
-          void this.executeWithTimeout(run, run.checkpoint.controlEpoch).catch((err) => this.fail(run, err));
+          this.startExecution(run);
           recovered++;
         } catch (err) {
           // One corrupt/stale checkpoint must not starve every later workflow.
@@ -428,13 +428,18 @@ export class WorkflowEngine {
     sharedContext?: WorkflowSharedContext;
     resumeFrom?: WorkflowResumeFrom;
     metadata?: Record<string, unknown>;
-  }): Promise<WorkflowRunResult> {
+  }, acceptedExecution = false): Promise<WorkflowRunResult> {
     if (this.disposed) throw new Error("workflow engine disposed");
     // Acceptance key/hash is checkpointed before any execution. Retrying after
     // a lost response or process restart returns the original workflow identity.
     const requestHash = params.clientRequestId ? createHash("sha256").update(stableDispatchJson(params)).digest("hex") : undefined;
     if (params.metadata&&Object.prototype.hasOwnProperty.call(params.metadata,"_phononDispatch")) throw new PhononError("errInvalidParams","reserved workflow metadata");
     if (params.clientRequestId) {
+      const resumed = this.opts.store?.workflowResumeDispatch(this.opts.tenantId, params.clientRequestId);
+      if (resumed) {
+        if (resumed.requestHash !== requestHash) throw new PhononError("errInvalidParams", "workflow dispatch idempotency mismatch");
+        return JSON.parse(resumed.resultJson) as WorkflowRunResult;
+      }
       const existing = this.opts.store?.findWorkflowDispatch(this.opts.tenantId,params.clientRequestId);
       if(!existing&&this.opts.store?.idempotencyGet(`${this.opts.tenantId}\u0000workflow.run\u0000${params.clientRequestId}`)!==undefined)throw new PhononError("errInvalidParams","unverifiable legacy dispatch identity; inspect original workflow instead of redispatching");
       if (existing) {
@@ -443,14 +448,14 @@ export class WorkflowEngine {
         return {workflowId:existing.workflow_id as string,status:existing.status as WorkflowRunResult["status"],createdAt:existing.created_at as string,resumed:false};
       }
     }
+    if (!acceptedExecution) this.opts.store?.delivery.assertNewWork();
     // 1. 恢复路径
     if (params.resumeFrom) {
-      const restored = this.restoreFromCheckpoint(params.resumeFrom);
+      const restored = this.restoreFromCheckpoint(params.resumeFrom, params.clientRequestId ? { key: params.clientRequestId, hash: requestHash! } : undefined);
       if (restored) {
-        this.validateExecutionTargets(restored.project, restored.plan);
-        this.validatePlan(restored.plan);
-        void this.executeWithTimeout(restored, restored.checkpoint.controlEpoch).catch((err) => this.fail(restored, err));
-        return { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
+        const result: WorkflowRunResult = { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
+        this.startExecution(restored);
+        return result;
       }
       // 找不到 checkpoint → 错误（不静默 fallback）
       throw new PhononError("errInvalidParams", `workflow ${params.resumeFrom.workflowId} has no resumable checkpoint`);
@@ -499,7 +504,7 @@ export class WorkflowEngine {
     this.runs.set(workflowId, run);
     this.persist(run);
     this.emit(run, { type: "workflow.status", status: "queued" });
-    void this.executeWithTimeout(run, run.checkpoint.controlEpoch).catch((err) => this.fail(run, err));
+    this.startExecution(run);
     return { workflowId, status: run.status, createdAt: run.createdAt, resumed: false };
   }
 
@@ -514,6 +519,7 @@ export class WorkflowEngine {
     feedback?: string;
     sharedContextPatch?: WorkflowSharedContext;
   }): Promise<WorkflowRunResult> {
+    this.opts.store?.delivery.assertNewWork();
     const restored = this.restoreFromCheckpoint({
       workflowId: params.workflowId,
       strategy: params.strategy,
@@ -540,7 +546,7 @@ export class WorkflowEngine {
       restored.sharedContext = merged;
       this.persist(restored);
     }
-    void this.executeWithTimeout(restored, restored.checkpoint.controlEpoch).catch((err) => this.fail(restored, err));
+    this.startExecution(restored);
     return { workflowId: restored.workflowId, status: restored.status, createdAt: restored.createdAt, resumed: true };
   }
 
@@ -662,8 +668,8 @@ export class WorkflowEngine {
     if (run) {
       const bounded = Math.min(lastSeq, run.seq - 1);
       if (bounded > run.ackedSeq) {
-        run.ackedSeq = bounded;
         this.opts.store?.ackWorkflow(workflowId, bounded, this.opts.tenantId);
+        run.ackedSeq = bounded;
       }
     } else {
       this.opts.store?.ackWorkflow(workflowId, lastSeq, this.opts.tenantId);
@@ -1852,7 +1858,7 @@ export class WorkflowEngine {
     }
   }
 
-  private restoreFromCheckpoint(rf: WorkflowResumeFrom): WorkflowRunState | undefined {
+  private restoreFromCheckpoint(rf: WorkflowResumeFrom, dispatch?: { key: string; hash: string }): WorkflowRunState | undefined {
     if (!this.opts.store) return undefined;
     if (this.finalizing.has(rf.workflowId)) {
       throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} finalization is still in progress`);
@@ -1876,6 +1882,8 @@ export class WorkflowEngine {
     const ownerEpoch = this.opts.store.claimWorkflow(rf.workflowId, this.opts.tenantId, this.ownerId, this.leaseMs);
     if (ownerEpoch === undefined) throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} is owned by another executor`);
     const run = this.restoreRow(row, ownerEpoch, false);
+    this.validateExecutionTargets(run.project, run.plan);
+    this.validatePlan(run.plan);
     if (run.policy.timeoutSeconds && (priorStatus !== "paused" || rf.strategy !== "continue")) {
       run.checkpoint.deadlineAt = Date.now() + run.policy.timeoutSeconds * 1000;
     }
@@ -1910,8 +1918,25 @@ export class WorkflowEngine {
     run.checkpoint.controlEpoch++;
     this.hydrateCheckpoint(run);
     this.runs.set(rf.workflowId, run);
-    this.persist(run);
-    this.emit(run, { type: "workflow.status", status: "queued", payload: { resumed: true, strategy: rf.strategy } });
+    // The queued checkpoint, event and independent resume key are one commit.
+    // Never replace the original _phononDispatch key or start an executor first.
+    try {
+      if (!dispatch) this.persist(run);
+      this.emit(run, { type: "workflow.status", status: "queued", payload: { resumed: true, strategy: rf.strategy } }, dispatch ? {
+        ...dispatch,
+        resultJson: JSON.stringify({ workflowId: run.workflowId, status: run.status, createdAt: run.createdAt, resumed: true }),
+      } : undefined);
+    } catch (error) {
+      if (dispatch) {
+        // Do not let later disposal persist a phantom queued resume after the
+        // acceptance transaction rolled back. Keep the claimed lease tracked
+        // against the original checkpoint so normal teardown can release it.
+        const previous = this.restoreRow(row, ownerEpoch, false);
+        this.runs.set(rf.workflowId, previous);
+        this.hydrateCheckpoint(previous);
+      }
+      throw error;
+    }
     return run;
   }
 
@@ -1993,6 +2018,16 @@ export class WorkflowEngine {
     return node;
   }
 
+  private reportBackgroundFailure(): void {
+    if (!this.disposed) this.opts.store?.delivery.backgroundFailed("workflow");
+  }
+
+  private startExecution(run: WorkflowRunState): void {
+    void this.executeWithTimeout(run, run.checkpoint.controlEpoch).catch((error) => {
+      try { this.fail(run, error); } catch { this.reportBackgroundFailure(); }
+    });
+  }
+
   private fail(run: WorkflowRunState, err: unknown): void {
     if (err instanceof StaleExecutionError || this.disposed || run.status === "paused" || run.status === "cancelled" || run.status === "timeout") return;
     run.status = "failed";
@@ -2041,10 +2076,11 @@ export class WorkflowEngine {
     } as WorkflowStatusResult;
   }
 
-  private emit(run: WorkflowRunState, partial: Record<string, unknown>): void {
+  private emit(run: WorkflowRunState, partial: Record<string, unknown>, resumeDispatch?: { key: string; hash: string; resultJson: string }): void {
     if (this.disposed) return;
     if (this.opts.store && !this.opts.store.isWorkflowOwner(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch)) {
       run.checkpoint.controlEpoch++;
+      if (resumeDispatch) throw new StaleExecutionError();
       return;
     }
     const ev = {
@@ -2059,9 +2095,10 @@ export class WorkflowEngine {
         seq: ev.seq,
         payload: JSON.stringify(ev),
         createdAt: ev.timestamp,
-      });
+      }, resumeDispatch);
       if (!persisted) {
         run.checkpoint.controlEpoch++;
+        if (resumeDispatch) throw new StaleExecutionError();
         return;
       }
     } else {

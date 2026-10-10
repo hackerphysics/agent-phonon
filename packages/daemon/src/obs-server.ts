@@ -26,6 +26,18 @@ export interface ObsServerDeps {
   token?: string;
 }
 
+/** Unknown measurements are omitted, never substituted with an empty backlog.
+ * Do not copy a SQLite error/stack/path into a local HTTP response. */
+export function unavailableDeliveryMeasurement() {
+  return {
+    state: "unavailable" as const,
+    measurementAvailable: false,
+    persistenceHealthy: false,
+    admissionBlocked: true,
+    error: "delivery_accounting_unavailable",
+  };
+}
+
 export class ObsServer {
   private server?: Server;
   private deps: ObsServerDeps;
@@ -66,10 +78,20 @@ export class ObsServer {
     }
 
     if (path === "/health") {
-      const h = this.deps.health();
+      let h: Record<string, unknown>;
+      try { h = this.deps.health(); } catch {
+        this.measurementUnavailable(res);
+        return;
+      }
       const ok = h.ok !== false;
       res.writeHead(ok ? 200 : 503, { "content-type": "application/json" }).end(JSON.stringify(h, null, 2));
       return;
+    }
+    if (path === "/metrics" || path === "/metrics.json") {
+      try { this.deps.store.delivery.snapshot(); } catch {
+        this.measurementUnavailable(res);
+        return;
+      }
     }
     if (path === "/metrics") {
       res.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(this.deps.metrics.prometheus());
@@ -110,6 +132,12 @@ export class ObsServer {
       return;
     }
     res.writeHead(404).end("not found");
+  }
+
+  private measurementUnavailable(res: import("node:http").ServerResponse): void {
+    res.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify({
+      ok: false, delivery: unavailableDeliveryMeasurement(),
+    }));
   }
 
   private broadcast(e: ObsEvent): void {

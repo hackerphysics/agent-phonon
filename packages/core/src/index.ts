@@ -101,21 +101,24 @@ export class PhononConnection {
     obs?: import("./observability.js").ObsBus;
     /** 设备本地预注册的确定性维护目标。 */
     maintenance?: MaintenanceManagerConfig;
+    delivery?: Partial<import("./delivery-capacity.js").DeliveryConfig>;
   }) {
     this.tenantId = opts.tenantId;
     this.registry = opts.registry;
     this.policy = new PolicyEnforcer({ policy: opts.policy, trustLocal: opts.trustLocal, workspaceRoot: opts.workspaceRoot });
     // 持久化（D6）：projects/skills/worktrees/outbox 落 sqlite；dbPath 缺省内存库
     this.store = opts.store ?? new PhononStore(opts.dbPath ?? ":memory:");
+    this.store.delivery.configure(opts.delivery, opts.obs);
     this.idempotency = new IdempotencyStore({ store: this.store });
     this.maintenance = new MaintenanceManager(this.policy, opts.maintenance);
 
     // 先建 engine（ProjectManager 要用它查 active session）
     this.outbox = new Outbox({ store: this.store, tenantId: opts.tenantId });
     this.engine = new SessionEngine(opts.registry, (event: StreamEvent) => {
+      // The original stream promise must be durable even if a derived channel fails.
+      this.sendStreamEvent(event);
       this.workflows?.onStreamEvent(event);
       this.scheduler?.onStreamEvent(event);
-      this.sendStreamEvent(event);
     }, opts.obs, this.store, {
       maintenance: this.maintenance,
       assertAgentAllowed: (agentId) => this.policy.assertAgentAllowed(agentId),
@@ -188,12 +191,7 @@ export class PhononConnection {
     // Workflow ownership is tenant-scoped and persisted. Recovery runs only
     // after scheduler/event wiring is complete so resumed events reach the
     // current connection and no replaced connection keeps an executor alive.
-    void this.workflows.recover().catch((err) => {
-      this.obs?.emitEvent({
-        category: "error", level: "error", event: "workflow.recovery_failed",
-        tenantId: this.tenantId, msg: (err as Error)?.message ?? String(err),
-      });
-    });
+    void this.workflows.recover().catch(() => this.store.delivery.backgroundFailed("workflow"));
   }
 
   /** 喂入收到的文本。 */
@@ -266,6 +264,11 @@ export class PhononConnection {
   /** welcome/stream.ack 的唯一入口：单调推进并同步 sqlite。 */
   acknowledgeStream(sessionId: string, lastSeq: number): void {
     this.outbox.ack(sessionId, lastSeq);
+  }
+
+  /** Device-wide durable backlog, including disconnected tenants. */
+  deliveryStatus(): import("./delivery-capacity.js").DeliverySnapshot {
+    return this.store.delivery.snapshot();
   }
 
   /** outbox 待投递事件数（监控用）。 */
@@ -348,7 +351,8 @@ export class PhononConnection {
     // 幂等：改状态请求带 clientRequestId 则去重（D28 / P0#2）
     const crid = p.clientRequestId as string | undefined;
     if (crid && method!=="workflow.run" && MUTATING_METHODS.has(method)) {
-      return this.idempotency.run(this.tenantId, method, crid, () => this.dispatchInner(method, p));
+      return this.idempotency.run(this.tenantId, method, crid, () => this.dispatchInner(method, p),
+        ["session.create", "session.send", "schedule.trigger", "workflow.resume"].includes(method) ? p : undefined);
     }
     return this.dispatchInner(method, p);
   }
@@ -452,6 +456,7 @@ export class PhononConnection {
         return { agent: found };
       }
       case "session.create": {
+        this.store.delivery.assertNewWork();
         this.policy.assertAgentAllowed(p.agent as string);
         // ProjectManager is the sole project/worktree resolver. Unregistered
         // IDs must never be interpreted as filesystem paths.
@@ -470,6 +475,7 @@ export class PhononConnection {
         return { sessionId: r.sessionId, project: p.project, agent: p.agent, model: p.model, status: r.status, createdAt: r.createdAt };
       }
       case "session.send": {
+        this.store.delivery.assertNewWork();
         const meta = await this.engine.status(this.tenantId, p.sessionId as string);
         const r = await this.engine.send(this.tenantId, p.sessionId as string, p.input as string, {
           verbosity: p.verbosity as never,
@@ -795,3 +801,5 @@ export { validateRescueEndpoint, resolveRescueConnection } from "./rescue-config
 export type { RescueConnectionOptions } from "./rescue-config.js";
 
 export { createRescueModel, rescueProviderOptions } from "./rescue-model.js";
+
+export { DeliveryCapacity, deliveryOptions, DEFAULT_MAX_PENDING_BYTES, type DeliveryConfig, type DeliverySnapshot } from "./delivery-capacity.js";

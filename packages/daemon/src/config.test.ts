@@ -212,3 +212,163 @@ test("daemon: stop during initial pending inventory cannot reopen listeners or c
   assert.equal(calls, 1);
   await assert.rejects(daemon.start(), /daemon stopped/);
 });
+
+test("config: delivery capacity defaults to 1 GiB and rejects coercion or invalid limits", async () => {
+  const { loadConfig } = await import("./config.js");
+  const path = join(mkdtempSync(join(tmpdir(), "phonon-delivery-cfg-")), "config.json");
+  const cfg = defaultConfig();
+  assert.equal(cfg.delivery?.maxPendingBytes, 1073741824);
+  cfg.delivery = undefined;
+  writeConfig(cfg, path);
+  assert.equal(loadConfig(path).delivery?.maxPendingBytes, 1073741824);
+  cfg.delivery = { maxPendingBytes: 1234 };
+  writeConfig(cfg, path);
+  assert.equal(loadConfig(path).delivery?.maxPendingBytes, 1234);
+  for (const value of [0, -1, 1.5, "100", null, Number.MAX_SAFE_INTEGER + 1]) {
+    cfg.delivery = { maxPendingBytes: value } as never;
+    writeConfig(cfg, path);
+    assert.throws(() => loadConfig(path), /delivery.maxPendingBytes/);
+  }
+  for (const value of [null, [], "100"]) {
+    cfg.delivery = value as never;
+    writeConfig(cfg, path);
+    assert.throws(() => loadConfig(path), /delivery must be an object/);
+  }
+});
+
+test("daemon: health and metrics expose device-wide disconnected backlog before any connection", async () => {
+  const { PhononDaemon } = await import("./daemon.js");
+  const cfg = defaultConfig(); cfg.dbPath = join(mkdtempSync(join(tmpdir(), "phonon-delivery-health-")), "state.sqlite");
+  cfg.servers = []; cfg.adapters = []; cfg.rescueAgent = { enabled: false }; cfg.delivery = { maxPendingBytes: 3 }; cfg.logLevel = "error";
+  const daemon = new PhononDaemon(cfg);
+  const access = daemon as unknown as { store: import("@agent-phonon/core").PhononStore; health: () => { ok: boolean; delivery: { pendingBytes: number; admissionBlocked: boolean } }; metrics: import("@agent-phonon/core").Metrics };
+  access.store.outboxAdd("disconnected", "s", 0, "汉", new Date(0).toISOString());
+  assert.equal(access.health().ok, true, "byte pressure alone does not stop the daemon or new work");
+  assert.equal(access.health().delivery.pendingBytes, 3);
+  assert.equal(access.health().delivery.admissionBlocked, false);
+  assert.match(access.metrics.prometheus(), /phonon_delivery_pending_bytes 3/);
+  access.store.outboxAck("disconnected", "s", 0);
+  assert.equal(access.health().ok, true);
+  access.store.close();
+  const restarted = new PhononDaemon(cfg);
+  const access2 = restarted as unknown as typeof access;
+  assert.equal(access2.health().delivery.pendingBytes, 0);
+  access2.store.close();
+});
+
+test("obs: accounting read failures return sanitized 503s on all three HTTP endpoints and keep daemon controls alive", { timeout: 20000 }, async () => {
+  const { PhononDaemon } = await import("./daemon.js");
+  const { DatabaseSync } = await import("node:sqlite");
+  const { MockAdapter, PhononTestServer } = await import("@agent-phonon/test-server");
+  const server = new PhononTestServer({ assignTenant: () => "obs-read-tenant" });
+  const port = await server.listen();
+  const root = mkdtempSync(join(tmpdir(), "phonon-obs-read-failure-"));
+  const dbPath = join(root, "state.sqlite");
+  const daemon = new PhononDaemon({
+    deviceId: "obs-read-failure", dbPath, workspaceRoot: root,
+    adapters: [], servers: [{ url: `ws://127.0.0.1:${port}`, trustLocal: true }],
+    rescueAgent: { enabled: false }, hookBridge: { port: 0 }, obs: { enabled: true, port: 0 }, logLevel: "error",
+  }, { adapters: [new MockAdapter()] });
+  const access = daemon as unknown as {
+    store: import("@agent-phonon/core").PhononStore;
+    clients: Array<{ connection?: import("@agent-phonon/core").PhononConnection }>;
+    health: () => Record<string, unknown>;
+  };
+  let db: InstanceType<typeof DatabaseSync> | undefined;
+  const reads = access.store.delivery as unknown as { readPending: () => unknown };
+  const originalRead = reads.readPending;
+  const internalPath = join(root, "private-location-must-not-leak");
+  const sensitivePayload = "private-generated-payload-must-not-leak";
+  const fetchEndpoint = (endpoint: string) => fetch(`http://127.0.0.1:${daemon.obsPort}${endpoint}`, { signal: AbortSignal.timeout(2000) });
+  const restoreCounter = () => db!.exec(`
+    CREATE TABLE IF NOT EXISTS delivery_totals (channel TEXT PRIMARY KEY,pending_count INTEGER NOT NULL,pending_bytes INTEGER NOT NULL);
+    INSERT OR REPLACE INTO delivery_totals SELECT channel,COUNT(*),SUM(bytes) FROM delivery_pending GROUP BY channel;
+    INSERT OR IGNORE INTO delivery_totals VALUES ('stream',0,0),('workflow',0,0),('run',0,0);
+  `);
+  try {
+    await daemon.start();
+    const device = await server.firstDevice(3000);
+    const project = await device.peer.requestRaw("project.create", { name: "p", git: false }) as { project: { projectId: string } };
+    const session = await device.peer.requestRaw("session.create", { project: project.project.projectId, agent: "mock:default", model: "m1" }) as { sessionId: string };
+    access.store.outboxAdd("offline", "pending", 0, sensitivePayload, new Date(0).toISOString());
+    const actualBytes = Buffer.byteLength(sensitivePayload);
+    access.store.delivery.configure({ maxPendingBytes: actualBytes });
+    const pressure = await fetchEndpoint("/health");
+    assert.equal(pressure.status, 200);
+    const known = await pressure.json() as { ok: boolean; degraded: boolean; delivery: { state: string; pendingBytes: number; pressureCritical: boolean; admissionBlocked: boolean } };
+    assert.equal(known.delivery.state, "critical", "ordinary pressure is not a failed measurement");
+    assert.equal(known.delivery.pendingBytes, actualBytes);
+    assert.equal(known.ok, true); assert.equal(known.degraded, true);
+    assert.equal(known.delivery.pressureCritical, true); assert.equal(known.delivery.admissionBlocked, false);
+    assert.equal((await fetchEndpoint("/metrics")).status, 200);
+    assert.equal((await fetchEndpoint("/metrics.json")).status, 200);
+    db = new DatabaseSync(dbPath);
+    for (const injection of ["throw", "drop-table"]) {
+      if (injection === "throw") reads.readPending = () => { throw new Error(`${internalPath}: ${sensitivePayload}`); };
+      else db.exec("DROP TABLE delivery_totals");
+      const direct = access.health() as { ok: boolean; delivery: Record<string, unknown> };
+      assert.equal(direct.ok, false);
+      assert.equal(direct.delivery.state, "unavailable");
+      for (const endpoint of ["/health", "/metrics", "/metrics.json"]) {
+        const response = await fetchEndpoint(endpoint);
+        assert.equal(response.status, 503, `${injection}: ${endpoint}`);
+        const body = await response.text();
+        assert.ok(!body.includes(root) && !body.includes(internalPath) && !body.includes(sensitivePayload));
+        assert.ok(!body.includes("delivery_totals") && !body.includes("Error:") && !body.includes("stack"));
+        const status = JSON.parse(body) as { ok: boolean; delivery: Record<string, unknown> };
+        assert.equal(status.ok, false);
+        assert.equal(status.delivery.state, "unavailable");
+        assert.equal(status.delivery.measurementAvailable, false);
+        assert.equal(status.delivery.persistenceHealthy, false);
+        assert.equal(status.delivery.admissionBlocked, true);
+        assert.equal("pendingBytes" in status.delivery, false, "unknown is not fabricated zero bytes");
+        assert.equal("pendingCount" in status.delivery, false);
+        assert.equal("channels" in status.delivery, false);
+      }
+      for (const endpoint of ["/", "/sessions", "/events"]) assert.equal((await fetchEndpoint(endpoint)).status, 200);
+      // Actual WebSocket SDK calls still complete while HTTP measurement is unavailable.
+      await device.peer.requestRaw("session.status", { sessionId: session.sessionId });
+      await device.peer.requestRaw("session.interrupt", { sessionId: session.sessionId });
+      assert.doesNotThrow(() => access.clients[0]!.connection!.replayPending());
+      assert.throws(() => access.store.delivery.assertNewWork(), injection === "throw" ? /private-location/ : /delivery_totals/, "Core admission still fails closed on read errors");
+      reads.readPending = originalRead;
+      if (injection === "drop-table") restoreCounter();
+      assert.equal(access.store.delivery.snapshot().pendingBytes, actualBytes);
+      assert.equal(access.store.delivery.snapshot().persistenceHealthy, false, "HTTP fallback never clears the sticky failure latch");
+      const recoveredRead = await fetchEndpoint("/metrics.json");
+      assert.equal(recoveredRead.status, 200);
+      const metrics = await recoveredRead.json() as { gauges: Record<string, number> };
+      assert.equal(metrics.gauges.delivery_pending_bytes, actualBytes);
+      assert.equal(metrics.gauges.delivery_persistence_healthy, 0);
+      const after = await (await fetchEndpoint("/health")).json() as { delivery: { state: string } };
+      assert.equal(after.delivery.state, "critical", "read restored: no longer the unavailable-measurement state");
+    }
+    // ACK remains usable once storage reads are restored despite the sticky failed latch.
+    access.store.outboxAck("offline", "pending", 0);
+    assert.equal(access.store.delivery.snapshot().pendingBytes, 0);
+    assert.throws(() => access.store.delivery.assertNewWork(), /unhealthy/);
+  } finally {
+    reads.readPending = originalRead;
+    if (db) { restoreCounter(); db.close(); }
+    await daemon.stop();
+    await server.close();
+  }
+});
+
+test("obs: independent health provider read exception is contained by the HTTP boundary", async () => {
+  const { ObsServer } = await import("./obs-server.js");
+  const { ObsBus, Metrics, PhononStore } = await import("@agent-phonon/core");
+  const store = new PhononStore(":memory:");
+  const obs = new ObsServer({ bus: new ObsBus(), metrics: new Metrics(), store,
+    health: () => { throw new Error("private-health-provider-path-and-payload"); }, sessions: () => [],
+  });
+  try {
+    const port = await obs.listen(0);
+    const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
+    assert.equal(response.status, 503);
+    const body = await response.text();
+    assert.ok(!body.includes("private-health-provider"));
+    assert.equal(JSON.parse(body).delivery.measurementAvailable, false);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/sessions`)).status, 200);
+  } finally { await obs.close(); store.close(); }
+});

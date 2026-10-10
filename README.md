@@ -453,3 +453,16 @@ Session transcript files are retained by default for all sessions, including Dev
 Users may explicitly delete history using the existing `agent-phonon sessions prune --older-than <days>` or `--keep <n>` command. It previews candidates unless `--yes` is supplied; review them before deletion. This is an owner-invoked operation, not a scheduled retention policy or a general reference-safe garbage collector. Deletion cannot recover already-lost historical content.
 
 The unacknowledged-event outbox is separate from history: it stores events still needing server delivery, and removes acknowledged entries after a receipt. ACK does **not** delete session transcript files. Automatic retention policy is deferred; files can grow while users retain them. Transcript writing remains best-effort and is not a guarantee against disk-full or I/O failure.
+
+
+### Unacknowledged delivery warning threshold
+
+`delivery.maxPendingBytes` defaults to **1 GiB (1073741824)** and accepts only a positive safe integer:
+
+```json
+{ "delivery": { "maxPendingBytes": 1073741824 } }
+```
+
+Despite the compatibility field name, this is a **warning threshold, not an admission/write cap**. Device-wide serialized UTF-8 payload bytes of stream/workflow/run unACKed events (all tenants, including disconnected tenants) warn at 80% and become critical at 100%. Byte pressure alone never rejects, defers, cancels or deletes new tasks, input messages, workflows or scheduled executions. Events/results still persist and replay; ACK drains the actual backlog. `/health.delivery` and metrics expose counts, bytes, pressure and persistence health without payloads; pressure makes health degraded, not stopped.
+
+There is **no new end-to-end durable inbound task/input queue**; a rejected request must not be described as saved. Actual storage/read failure still explicitly fails new work closed and marks unhealthy, rather than pretending to accept it. ACKed histories and Session JSONL remain retained. This threshold does **not** bound disk or RAM: SQLite/WAL/history overhead is separate and the existing Outbox still mirrors payloads in memory. See [delivery measurement, reliability and limits](docs/DELIVERY_CAPACITY.md).
