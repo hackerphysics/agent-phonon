@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AdapterRegistry, PhononClient } from "@agent-phonon/core";
-import { PhononServer } from "@agent-phonon/server-sdk";
+import { PhononServer, PhononDevice } from "@agent-phonon/server-sdk";
 import { MockAdapter } from "./harness.js";
 
 /**
@@ -221,4 +221,16 @@ test("SDK stream consumer persists before ACK and leaves failed consumers unackn
  let commit=false;device.setStreamEventHandler(async()=>{await new Promise(r=>setTimeout(r,10));commit=true;return true;});
  const pending=device._handleInbound("stream.event",{sessionId:"s",seq:0,type:"message",text:"bounded"});assert.equal(messages.length,0);await pending;assert.equal(commit,true);assert.equal(JSON.parse(messages[0]!).method,"stream.ack");
  device.setStreamEventHandler(()=>{throw new Error("durability failure");});await assert.rejects(()=>device._handleInbound("stream.event",{sessionId:"s",seq:1}));assert.equal(messages.length,1);
+});
+
+// ACK is cumulative: the application supplies its persisted prefix cursor.
+test("server-sdk: explicit persisted stream ACK cursor may cover a filled gap", async()=>{
+  const acks:unknown[]=[];const device=new PhononDevice("owned","tenant",{notify:(...args:unknown[])=>acks.push(args)} as never);
+  device.setStreamEventHandler(()=>({ackSeq:1}));await device._handleInbound("stream.event",{sessionId:"s",seq:0});
+  assert.deepEqual(acks,[["stream.ack",{sessionId:"s",lastSeq:1}]]);
+});
+test("server-sdk: invalid cumulative cursor never produces an ACK", async()=>{
+  const acks:unknown[]=[];const device=new PhononDevice("owned","tenant",{notify:(...args:unknown[])=>acks.push(args)} as never);
+  for(const ackSeq of [-1,0,1.5,Number.NaN]){device.setStreamEventHandler(()=>({ackSeq}));await assert.rejects(device._handleInbound("stream.event",{sessionId:"s",seq:1}),/invalid cumulative/);}
+  assert.deepEqual(acks,[]);
 });

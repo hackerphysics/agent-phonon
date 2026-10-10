@@ -179,7 +179,7 @@ export class PhononDevice extends EventEmitter {
   private interactionHandler?: (params: unknown) => Promise<unknown> | unknown;
   private documentHandler?: (params: unknown) => Promise<unknown> | unknown;
   private prepareUploadHandler?: (params: unknown) => Promise<unknown> | unknown;
-  private streamEventHandler?: (ev: StreamEvent) => Promise<boolean> | boolean;
+  private streamEventHandler?: (ev: StreamEvent) => Promise<boolean | {ackSeq:number}> | boolean | {ackSeq:number};
   private workflowEventHandler?: (ev: WorkflowEvent) => Promise<unknown> | unknown;
   private runFinishedHandler?: (params: { run: Run; push: SchedulePushConsent }) => Promise<unknown> | unknown;
   /** 自发输出（无对应 session 时）回调。 */
@@ -472,8 +472,11 @@ export class PhononDevice extends EventEmitter {
   setPrepareUploadHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
     this.prepareUploadHandler = fn;
   }
-  /** Returning true means durably consumed; ACK is sent only after the awaited handler commits. False retains ordinary SDK routing. */
-  setStreamEventHandler(fn: (ev: StreamEvent) => Promise<boolean> | boolean): void { this.streamEventHandler=fn; }
+  /** Consumer must prove the whole cumulative prefix, not just this frame.
+   * Return {ackSeq} from a durable contiguous cursor (possibly beyond ev.seq
+   * after filling a gap), or true only when the prefix through ev.seq is safe.
+   * False retains ordinary SDK routing; rejection sends no ACK. */
+  setStreamEventHandler(fn: (ev: StreamEvent) => Promise<boolean | {ackSeq:number}> | boolean | {ackSeq:number}): void { this.streamEventHandler=fn; }
   /** 设置自发输出回调。 */
   setUnsolicitedHandler(fn: (ev: StreamEvent) => void): void {
     this.onUnsolicited = fn;
@@ -486,8 +489,13 @@ export class PhononDevice extends EventEmitter {
   async _handleInbound(method: string, params: unknown): Promise<unknown> {
     if (method === "stream.event") {
       const ev = params as StreamEvent;
-      if(this.streamEventHandler && await this.streamEventHandler(ev)===true){
-        this.peer.notify("stream.ack",{sessionId:ev.sessionId,lastSeq:ev.seq});return null;
+      if(this.streamEventHandler){
+        const consumed=await this.streamEventHandler(ev);
+        if(consumed===true||(consumed&&typeof consumed==="object")){
+          const ackSeq=consumed===true?ev.seq:consumed.ackSeq;
+          if(!Number.isSafeInteger(ackSeq)||ackSeq<ev.seq)throw new Error("invalid cumulative stream ACK cursor");
+          this.peer.notify("stream.ack",{sessionId:ev.sessionId,lastSeq:ackSeq});return null;
+        }
       }
       const s = this.sessions.get((ev as { sessionId: string }).sessionId);
       if (s) {
