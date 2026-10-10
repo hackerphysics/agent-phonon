@@ -70,7 +70,13 @@ Phase 1 目标 = **验证「拨出→discovery→建项目→create→send→流
 
 - **触发条件**：进入 Phase 2 开发中央大脑时启动。先定义 Persona Schema + Registry + Compiler + Eval，再精选导入 The Agency 角色；不要先复制全部角色。
 
-### N1c. Group / ChatRoom 抽象：多 agent 交叉会话的协议层容器（Phase 2 协议前置依赖）
+### N1c. 自由讨论（无控场者的多 agent 群聊）— Group / ChatRoom 抽象（Phase 2 协议前置依赖）
+
+> **状态：仅记录，尚未开发。** 2026-10-10 Stephen 确认「自由讨论先写入 backlog，后面再开发」。
+> 检索词：`自由讨论` / `free discussion` / `群聊` / `chatroom` / `group`。
+> 能力名 = **自由讨论**（用户视角：几个 agent 在一个群里自己聊，没人拍板）；
+> 机制名 = **Group / ChatRoom 抽象**（实现视角：一个 groupId 持有多个 session + 共享时间轴）。
+> 两者是同一件事的两种视角，不是两个需求。
 
 > 来源：2026-09-23 Stephen 在 AgentSphere 上看到「AgentFunction 星型被动编排」问题后，明确提出「多 agent 能不能不走 A2A，直接在 phonon 内部通信」的需求。2026-09-24 明确容器形态：**Group / ChatRoom**，不是 shared session。
 >
@@ -168,7 +174,7 @@ group.create({ title: "讨论架构" })
 agent-to-agent 「看到」通过 **group timeline** 实现，不是 A2A；成员退出通过 `group.remove`；强边界 = tenant + policy + audit 都按现有规则走。
 
 **不变的部分**：
-- session 子树不变（89 个方法不动；sessionId ↔ agent 1:1 保持）
+- session 子树不变（当前 90 个方法不动；sessionId ↔ agent 1:1 保持）
 - 不新增协议依赖（不用 A2A/MCP/ACP）
 - 不改 model/workflow/schedule/maintenance；中枢大脑另起项目（N1）
 
