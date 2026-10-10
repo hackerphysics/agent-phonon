@@ -444,3 +444,12 @@ controls acceptance even when anonymous opt-in is set.
 For isolated default/local E2E/Python tests and separately gated live tests, see
 [Local testing](docs/LOCAL_TESTING.md). RPC method presence checks alone do not
 prove authentication or bind-address parity.
+
+
+## Local session history
+
+Session transcript files are retained by default for all sessions, including Dev workflows. Completing or terminating a session, acknowledging delivery, restarting the daemon, or writing another session does not rotate, truncate or expire that history. Existing transcript files and earlier `.jsonl.1` archives are left untouched.
+
+Users may explicitly delete history using the existing `agent-phonon sessions prune --older-than <days>` or `--keep <n>` command. It previews candidates unless `--yes` is supplied; review them before deletion. This is an owner-invoked operation, not a scheduled retention policy or a general reference-safe garbage collector. Deletion cannot recover already-lost historical content.
+
+The unacknowledged-event outbox is separate from history: it stores events still needing server delivery, and removes acknowledged entries after a receipt. ACK does **not** delete session transcript files. Automatic retention policy is deferred; files can grow while users retain them. Transcript writing remains best-effort and is not a guarantee against disk-full or I/O failure.

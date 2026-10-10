@@ -400,3 +400,12 @@ E2E 明确包含 workflow、Git、scheduler、obs。Python 包含三个场景脚
 Node 跨语言回归。真实 CLI/Gateway/模型保留独立显式 opt-in，compat 固定依赖
 为可选独立入口。详见 [本地测试说明](docs/LOCAL_TESTING.md)；RPC 方法字符串
 parity 不能证明构造参数、监听地址或鉴权行为一致。
+
+
+## 本地 Session 历史保留
+
+所有 Session 轨迹文件默认保留，包括 Dev Workflow 会话。执行结束/终止、投递 ACK、daemon 重启或其它会话写入，都不会自动轮转、截断或按年龄删除历史。已有文件和旧 `.jsonl.1` 归档保持原样。
+
+允许用户通过现有 `agent-phonon sessions prune --older-than <天数>` 或 `--keep <数量>` 主动删除：不加 `--yes` 时只预览候选，确认后才删除。它不是定时留存策略，也不是通用的引用安全 GC；删除前需检查候选。留存策略后期再设计，不承诺已被旧策略删除或截断的内容可恢复。
+
+未 ACK 队列是另外的数据：保存尚待服务端确认的投递事件，收到回执后清理待投递项，**不会因此删除 Session 历史文件**。默认保留意味着文件可能持续增长；轨迹写入仍是 best-effort，磁盘满或 I/O 失败不保证成功保存。
