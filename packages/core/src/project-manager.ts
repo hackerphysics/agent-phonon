@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { spawnSupervised } from "./process-supervisor.js";
 import { mkdir, rm, readdir, stat, realpath } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, basename, sep, relative, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { PhononError } from "./rpc.js";
@@ -18,6 +18,7 @@ import { randomUUID } from "node:crypto";
 
 export interface ProjectRecord {
   projectId: string;
+  namespace?: string;
   name: string;
   path: string;
   git: boolean;
@@ -115,12 +116,14 @@ export class ProjectManager {
   /** 可选 policy 校验回调（bug-bash P0-1）。 */
   private assertProjectPath?: (path: string) => void;
   private assertDeleteFiles?: () => void;
+  private namespace?: string;
 
   constructor(
     hasActiveSessions: (projectId: string) => string[] = () => [],
-    hooks?: { assertProjectPath?: (path: string) => void; assertDeleteFiles?: () => void; store?: import("./store.js").PhononStore; workspaceRoot?: string; hasActiveSessionsForWorktree?: (worktreeId: string) => string[] },
+    hooks?: { namespace?: string; assertProjectPath?: (path: string) => void; assertDeleteFiles?: () => void; store?: import("./store.js").PhononStore; workspaceRoot?: string; hasActiveSessionsForWorktree?: (worktreeId: string) => string[] },
   ) {
     this.hasActiveSessions = hasActiveSessions;
+    this.namespace = hooks?.namespace;
     this.hasActiveSessionsForWorktree = hooks?.hasActiveSessionsForWorktree ?? (() => []);
     this.assertProjectPath = hooks?.assertProjectPath;
     this.assertDeleteFiles = hooks?.assertDeleteFiles;
@@ -180,7 +183,7 @@ export class ProjectManager {
       await runGit(path, ["init"]);
       if (params.remote) { assertRemote(params.remote); await runGit(path, ["remote", "add", "origin", "--", params.remote]).catch(() => {}); }
     }
-    const rec: ProjectRecord = { projectId, name: params.name, path, git, createdAt: new Date().toISOString() };
+    const rec: ProjectRecord = { projectId, namespace: this.namespace, name: params.name, path, git, createdAt: new Date().toISOString() };
     this.projects.set(projectId, rec);
     this.store?.upsertProject(rec);
     return rec;
@@ -188,13 +191,16 @@ export class ProjectManager {
 
   list(): ProjectRecord[] {
     this.refreshFromStore();
-    return [...this.projects.values()];
+    return [...this.projects.values()].filter(p => !p.namespace || p.namespace===this.namespace).filter(p=>{ try { this.assertProjectPath?.(p.path); return true; } catch { return false; } });
   }
 
-  get(projectId: string): ProjectRecord {
+  get(projectId: string,options?: {readonly?:boolean}): ProjectRecord {
     this.refreshFromStore();
     const rec = this.projects.get(projectId);
-    if (!rec) throw new PhononError("errProjectNotFound", `project ${projectId} not found`);
+    if (!rec || (this.namespace && rec.namespace!==this.namespace && !(options?.readonly && !rec.namespace))) throw new PhononError("errProjectNotFound", `project ${projectId} not found`);
+    const canonical=realpathSync(rec.path);
+    if (rec.namespace && canonical!==rec.path) throw new PhononError("errPolicyDenied","registered project root identity changed");
+    this.assertProjectPath?.(canonical);
     return rec;
   }
 

@@ -15,7 +15,7 @@ function reg() {
 }
 
 // ============ tenant 隔离 ============
-test("D23: registered projects are shared across tenant connections on one device", async () => {
+test("registered project namespace prevents cross-connection access, legacy unscoped records remain preserved", async () => {
   const sharedRegistry = reg();
   const sharedStore = new PhononStore(":memory:");
   const root = mkdtempSync(join(tmpdir(), "phonon-shared-project-"));
@@ -23,9 +23,13 @@ test("D23: registered projects are shared across tenant connections on one devic
   const b = new TestConn({ registry: sharedRegistry, tenantId: "B", workspaceRoot: root, trustLocal: true, store: sharedStore });
 
   const created = (await a.call("project.create", { name: "shared", git: false })) as { project: { projectId: string; path: string } };
-  const seen = (await b.call("project.get", { projectId: created.project.projectId })) as { project: { path: string } };
-  assert.equal(seen.project.path, created.project.path);
-  await b.call("session.create", { project: created.project.projectId, agent: "mock:default", model: "m1", verbosity: "messages" });
+  await assert.rejects(()=>b.call("project.get",{projectId:created.project.projectId}), (e:any)=>e.data?.appCode==="errProjectNotFound");
+  await assert.rejects(()=>b.call("session.create",{project:created.project.projectId,agent:"mock:default",model:"m1"}), (e:any)=>e.data?.appCode==="errProjectNotFound");
+  const visible=await b.call("project.list",{}) as {projects:unknown[]};assert.equal(visible.projects.length,0);
+  const legacy={projectId:"legacy-unmapped",name:"Legacy",path:created.project.path,git:false,createdAt:new Date().toISOString()};
+  sharedStore.upsertProject(legacy);
+  const preserved=await b.call("project.get",{projectId:legacy.projectId}) as {project:{path:string;namespace?:string}};
+  assert.equal(preserved.project.path,legacy.path);assert.equal(preserved.project.namespace,undefined);
 
   sharedStore.close();
 });

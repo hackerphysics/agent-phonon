@@ -70,6 +70,122 @@ Phase 1 目标 = **验证「拨出→discovery→建项目→create→send→流
 
 - **触发条件**：进入 Phase 2 开发中央大脑时启动。先定义 Persona Schema + Registry + Compiler + Eval，再精选导入 The Agency 角色；不要先复制全部角色。
 
+### N1c. Group / ChatRoom 抽象：多 agent 交叉会话的协议层容器（Phase 2 协议前置依赖）
+
+> 来源：2026-09-23 Stephen 在 AgentSphere 上看到「AgentFunction 星型被动编排」问题后，明确提出「多 agent 能不能不走 A2A，直接在 phonon 内部通信」的需求。2026-09-24 明确容器形态：**Group / ChatRoom**，不是 shared session。
+>
+> **2026-09-24 补**：Stephen 提醒 phonon 早就有「一起聊」的能力（v0.5）。具体是 **`WorkflowDiscussionPlan`**（`packages/protocol/src/schemas/workflow.ts:122`）—— N 个 participant 平等多轮发言 + chairman 控场 + barrier 同步 + checkpoint resume + consensusSignal / chairmanSignal 终止。本条目是 **Discussion 之后的下一跳**，不是从零起。详见下方「已存在的能力」段。
+
+**为什么不走 shared sessionId**（决策记录，避免反复讨论）：
+- session 是「一个 agent 的一次连续对话」——这个不变量不能动；动了 `terminat / compressNative / compressCustom / interrupt / switchModel / switch session 身份` 全部歧义。
+- adapter 的 native session（claude-code `--resume` / hermes session_id / codex thread / herdr agent name）也只属于单个 agent。
+- 「同一个 sessionId 上挂多 agent」会把这个 1:1 不变量打碎，调试/续接/audit 全部变难。
+
+**为什么不是 A2A**（同样决策记录）：
+- A2A 每个 agent-to-agent 调用是 HTTP/JSON-RPC round-trip；同信任域内是纯 overhead。
+- A2A 引入跨进程 trace 与 OAuth；现有 tenant/policy/audit 体系足够。
+- 跨组织场景：让 **N1 大脑层接 A2A**，不放在 daemon 层（daemon 是控制面，不是协作面）。
+
+**正确抽象：Group / ChatRoom**（类比 Slack channel、Matrix room、微信群）：
+
+### 已存在的能力（v0.5 Discussion plan mode，不要重复造）
+
+> 2026-09-24 Stephen 提醒后核实：phonon 已有「多 agent 一起聊」。**别把它当空白需求重做。**
+
+- **协议层**：`WorkflowPlan = WorkflowDagPlan | WorkflowGraphPlan | **WorkflowDiscussionPlan**`（`packages/protocol/src/schemas/workflow.ts:144`）
+- **Discussion plan 字段**：`topic` / `participants[].nodeId+agent+model+role`（≥2 个，无主从）/ `chairman`（必须是 participants 之一）/ `termination = { chairmanSignal: "[DISCUSS_END]", maxRounds: 10, consensusSignal? }`
+- **执行机制**（`packages/core/src/workflow-engine.ts:1186 executeDiscussion`）：
+  - 每轮 participants **并行发言**（`Promise.allSettled` + `maxParallel` 控制并发）
+  - **barrier 同步**：本轮全员发完才进 chairman
+  - chairman 看完本轮所有发言，决定续/停；输出含 `chairmanSignal` 则终止
+  - 任一 participant 输出含 `consensusSignal` 也可自然终止
+  - 状态落 sqlite（`workflows` 表），崩溃后能 resume 上一轮
+  - 事件：`round.started` / `round.completed` / `discussion.terminated` 三种新事件
+- **测试**：`packages/test-server/src/fn-workflow.test.ts:273` 「workflow.run discussion: chairman signal terminates after N rounds」—— 验证多 round + chairman 决定 + event 流
+- **使用位置**：在 `workflow.run` RPC 里选 `mode: "discussion"` 即用
+- **示例**（实测代码）：3 个 participant (alice supporter / bob supporter / chair chairman) + 5 轮上限 + `[DISCUSS_END]` 终止
+
+### Discussion 缺什么、不够什么（明确差距）
+
+#### 三种已实现模式对照（以免跟现有能力混了）
+
+| 模式 | 控场者 | 结构 | 适用场景 |
+|---|---|---|---|
+| **dag** | 编译期拓扑 | `nodes + edges + finalNodeId` | 确定性流水线 |
+| **graph** | **executor（一个 agent）**发 RoutingDirective 调度 workers | 主从循环，executor 决策 + worker 执行，maxIterations 兑底 | 主从型委托（A 调 B、C） |
+| **discussion** | **固定 chairman**控场，N participant 并行发言 | 评审 / 多视角讨论，barrier + maxRounds + chairmanSignal / consensusSignal | 需拍板的评审、决策类 |
+
+**都「有控场者」**——无论是编译期拓扑、executor 还是 chairman。**没有完全自由讨论 / 无控场者的多 agent 模式**——那是 N1c 要补的。
+
+下面是 Discussion **作为「多 agent 群聊」还缺的部分**（不要重新造 Discussion，补足缺口）：
+
+1. **运行时上下文连贯性**：Discussion 里 chairman prompt 里才看见本轮发言，上一轮发言只在 chairman 的 systemPrompt 里。**没有跨轮 stream 订阅**——participant 看不见别人上一轮说了什么，只能看到「同一 round 的其他 participant」。AgentSphere 需要的是 Slack channel 语义（任何人看到所有历史）。
+2. **动态加成员**：Discussion 在 `workflow.run` 时定好 participants。**中途加一个 agent 进群**要新建 workflow。
+3. **长生命周期**：Discussion 在 `workflow.run` 里跑，结束即释放。**群里 agent 可以留几天**继续讨论——这不是 workflow 语义。
+4. **session 是 1:1 adapter**这个不变量保持：Discussion 是每次发言调 `executeNode` → 创建临时 session，结束释放；**不是 group 中驻留的 agent**。这两者不同——group 里的 agent 是「在场成员」，Discussion 的 agent 是「每轮临时调起」。
+5. **agent 间主动互问**（A 问 B 「帮我算 X」）—— Discussion 里只能 chairman 控场，没有 agent-to-agent 直接说。
+
+### 真正还要做的（基于已存在能力往上加，不是从零起）
+
+> 下面三个新增是 **Discussion 没覆盖的场景**，跟 N1c 原描述一脉相承。
+
+**正确抽象：Group / ChatRoom**（类比 Slack channel、Matrix room、微信群）：
+- 一个 **group** 拥有自己的 `groupId`（也可叫 `chatId`）。
+- group = 一组 **member**（`sessionId` 列表）；每个 member session 仍然 1:1 绑定到单个 agent，与今天完全一样。
+- group 拥有**共享事件时间轴**：每个 member session 发出的 stream.event 都会 fan-in 到 group timeline。
+- member 可以 `group.subscribe(filter)` 看其他人事件；可以 `group.publish(event)` 往时间轴上推事件。
+- member 可以动态 `group.add({ sessionId })` / `group.remove({ sessionId })`；一个 agent 退出不影响其他 member。
+- session 本身的 lifecycle 不变：terminate 那个 session 只清自己的 native state，group timeline 仍记得他发过什么。
+
+**协议改动面**（一个全新子树，不动 session 子树）：
+
+| 方法 | 方向 | 干啥 |
+|---|---|---|
+| `group.create` | server→phonon | 建空 group，拿 groupId |
+| `group.add` | server→phonon | 把已存在的 sessionId 加入 group（不创建新 session） |
+| `group.remove` | server→phonon | 把 sessionId 移除 group；session 本身不受影响 |
+| `group.list` | server→phonon | 列 group + 当前 members + 状态 |
+| `group.subscribe` | server→phonon | 返回 group timeline 的事件流（可过滤 member / event kind） |
+| `group.publish` | server→phonon | 往 group timeline 推一个事件（fromSessionId 必须是 group member） |
+| `group.close` | server→phonon | 关 group（不关任何 member session） |
+| `group.event` | phonon→server | group timeline 上的新事件（stream 同 `stream.event` 走相同可靠投递） |
+
+成员 session 发出的 stream.event 自动 fan-in 到 group timeline（**不需要每 agent 主动 publish**——这是 daemon 在 stream 分发层做的）。
+
+**典型场景（AgentFunction 摆脱星型编排）**：
+```
+group.create({ title: "讨论架构" })
+  → session.create({ agent: "codex" }) → sessionId=ssn_a
+  → session.create({ agent: "claude" }) → sessionId=ssn_b
+  → group.add({ groupId, sessionId: ssn_a })
+  → group.add({ groupId, sessionId: ssn_b })
+  → server 给 ssn_a 发 seed prompt（"帮我分析 X 选型"）
+  → ssn_a 跑完一轮后，stream.event 自动进 group timeline
+  → ssn_b 能从 group.subscribe 看到 ssn_a 的所有中间事件（thinking/tool_call/result）
+  → 编排器只需监听 group.event + 收尾
+```
+
+agent-to-agent 「看到」通过 **group timeline** 实现，不是 A2A；成员退出通过 `group.remove`；强边界 = tenant + policy + audit 都按现有规则走。
+
+**不变的部分**：
+- session 子树不变（89 个方法不动；sessionId ↔ agent 1:1 保持）
+- 不新增协议依赖（不用 A2A/MCP/ACP）
+- 不改 model/workflow/schedule/maintenance；中枢大脑另起项目（N1）
+
+**明确不做**：
+- 同一个 sessionId 挂多 adapter（违反不变量，明确拒绝）
+- daemon 层接 A2A server（重复造轮，且混控制面与协作面）
+- agent-to-agent 远程调用 HTTP 化（违反 phonon 是 daemon-控制面原则）
+- 跨 daemon 集群的 group（Phase 3+；group 默认是 daemon-local）
+
+**触发条件**：
+- N1 中央大脑项目启动后、或 AgentSphere 需要多 agent 在同一群里相互讨论
+- 先 PR：`group.create/add/remove/list` + group timeline fan-in（最小可用）
+- 再 PR：`group.subscribe/publish/event`（让 server / agent 能消费 group timeline）
+- 最后由 AgentSphere / 大脑层使用；不在 daemon 控制面暴露 agent-to-agent 高级 API
+
+**实现预估**：协议 < 250 行（schema + dispatch + outbox 复用）；stream fan-in < 80 行（PhononConnection 层加 hook）；测试 < 250 行。**不需要另立包，在现有 protocol/core 增量上即可。**
+
 ### N2. 长期任务 / 计划任务（Phase 2）
 - **内容**：支持 long-running job、定时任务、周期任务、延迟任务；任务状态可查询，结果走 stream/notification 回传。
 - **定位**：下一阶段做。当前先通过服务端侧调度或 OpenClaw 自身 cron 兜底。

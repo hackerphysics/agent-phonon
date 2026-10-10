@@ -54,6 +54,7 @@ export interface WorkflowNodeInput {
   role?: string;
   input?: string;
   systemPrompt?: string;
+  sessionId?: string;
   dependsOn?: string[];
   agentConfig?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
@@ -178,6 +179,7 @@ export class PhononDevice extends EventEmitter {
   private interactionHandler?: (params: unknown) => Promise<unknown> | unknown;
   private documentHandler?: (params: unknown) => Promise<unknown> | unknown;
   private prepareUploadHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private streamEventHandler?: (ev: StreamEvent) => Promise<boolean> | boolean;
   private workflowEventHandler?: (ev: WorkflowEvent) => Promise<unknown> | unknown;
   private runFinishedHandler?: (params: { run: Run; push: SchedulePushConsent }) => Promise<unknown> | unknown;
   /** 自发输出（无对应 session 时）回调。 */
@@ -331,7 +333,7 @@ export class PhononDevice extends EventEmitter {
       this.peer.request("workflow.cancel", { workflowId, reason }) as Promise<{ workflowId: string; status: "cancelled" }>,
     pause: (workflowId: string, reason?: string) =>
       this.peer.request("workflow.pause", { workflowId, reason }) as Promise<{ workflowId: string; status: "paused" }>,
-    list: (filter?: WorkflowListParams) =>
+    list: (filter?: WorkflowListParams & {dispatchKey?:string}) =>
       this.peer.request("workflow.list", filter ?? {}) as Promise<WorkflowListResult>,
     /** v0.7: 独立 resume 入口。推荐使用，比 run({resumeFrom}) 语义更明确。 */
     resume: (params: {
@@ -470,15 +472,23 @@ export class PhononDevice extends EventEmitter {
   setPrepareUploadHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
     this.prepareUploadHandler = fn;
   }
+  /** Returning true means durably consumed; ACK is sent only after the awaited handler commits. False retains ordinary SDK routing. */
+  setStreamEventHandler(fn: (ev: StreamEvent) => Promise<boolean> | boolean): void { this.streamEventHandler=fn; }
   /** 设置自发输出回调。 */
   setUnsolicitedHandler(fn: (ev: StreamEvent) => void): void {
     this.onUnsolicited = fn;
   }
 
+  /** Close this device's owned transport and reject outstanding requests. */
+  disconnect():void { this.peer.disconnect(); }
+
   /** 内部：处理 phonon → server 的请求/通知。 */
   async _handleInbound(method: string, params: unknown): Promise<unknown> {
     if (method === "stream.event") {
       const ev = params as StreamEvent;
+      if(this.streamEventHandler && await this.streamEventHandler(ev)===true){
+        this.peer.notify("stream.ack",{sessionId:ev.sessionId,lastSeq:ev.seq});return null;
+      }
       const s = this.sessions.get((ev as { sessionId: string }).sessionId);
       if (s) {
         s._onStream(ev);
@@ -575,6 +585,7 @@ export class PhononServer extends EventEmitter {
   private opts: PhononServerOptions;
   private devices = new Map<string, PhononDevice>();
   private actualPort = 0;
+  private closing?: Promise<void>;
 
   constructor(opts: PhononServerOptions = {}) {
     super();
@@ -620,6 +631,8 @@ export class PhononServer extends EventEmitter {
           ? await this.opts.authenticate(p.deviceId, p.auth?.deviceKey)
           : { tenantId: `tenant-${p.deviceId}` };
         if (!auth) throw new Error("unauthorized");
+        // Authentication may complete after shutdown or peer disconnect.
+        if (this.closing || ws.readyState !== ws.OPEN) throw new Error("connection closed");
         device = new PhononDevice(p.deviceId, auth.tenantId, peer);
         this.devices.set(p.deviceId, device);
         this.emit("device", device); // 用户监听这个
@@ -631,14 +644,30 @@ export class PhononServer extends EventEmitter {
 
     ws.on("message", (raw: Buffer) => peer.handle(raw.toString()));
     ws.on("close", () => {
-      if (device) { this.devices.delete(device.deviceId); device._onClose(); }
+      if (device) {
+        if (this.devices.get(device.deviceId) === device) this.devices.delete(device.deviceId);
+        device._onClose();
+      }
     });
   }
 
   close(): Promise<void> {
-    return new Promise((resolve) => {
-      if (!this.wss) return resolve();
-      this.wss.close(() => resolve());
+    if (this.closing) return this.closing;
+    if (!this.wss) return Promise.resolve();
+    const wss = this.wss;
+    // WebSocketServer's close callback can precede each socket's close handler.
+    // Wait for those handlers too, so no device remains visible after shutdown.
+    this.closing = Promise.resolve().then(async () => {
+      const socketsClosed = [...wss.clients].map(client => new Promise<void>(resolve => {
+        if (client.readyState === client.CLOSED) { resolve(); return; }
+        client.once("close", () => resolve());
+        client.terminate();
+      }));
+      const serverClosed = new Promise<void>(resolve => wss.close(() => resolve()));
+      await Promise.all([...socketsClosed, serverClosed]);
+      this.devices.clear();
+      this.wss = undefined;
     });
+    return this.closing;
   }
 }

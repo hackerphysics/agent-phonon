@@ -237,7 +237,11 @@ export class PhononStore {
     this.ensureColumn("workflows", "owner_id", "TEXT");
     this.ensureColumn("workflows", "owner_epoch", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("workflows", "lease_until", "INTEGER");
+    // Nullable legacy namespace is deliberately not guessed/backfilled.
+    this.ensureColumn("projects", "namespace", "TEXT");
     this.ensureColumn("workflows", "metadata_json", "TEXT");
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_dispatch_identity ON workflows(tenant_id,json_extract(metadata_json,'$._phononDispatch.key')) WHERE json_extract(metadata_json,'$._phononDispatch.key') IS NOT NULL`);
+
     this.ensureColumn("runs", "input_json", "TEXT");
     this.ensureColumn("runs", "phase", "TEXT");
     this.ensureColumn("runs", "retry_at", "INTEGER");
@@ -276,20 +280,20 @@ export class PhononStore {
   }
 
   // ---- projects ----
-  upsertProject(r: { projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string }): void {
+  upsertProject(r: { projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string; namespace?: string }): void {
     this.db
       .prepare(
-        `INSERT INTO projects(project_id,name,path,git,remote,created_at)
-         VALUES(?,?,?,?,?,?)
+        `INSERT INTO projects(project_id,name,path,git,remote,created_at,namespace)
+         VALUES(?,?,?,?,?,?,?)
          ON CONFLICT(project_id) DO UPDATE SET name=excluded.name, path=excluded.path, git=excluded.git, remote=excluded.remote`,
       )
-      .run(r.projectId, r.name, r.path, r.git ? 1 : 0, r.remote ?? null, r.createdAt);
+      .run(r.projectId, r.name, r.path, r.git ? 1 : 0, r.remote ?? null, r.createdAt, r.namespace ?? null);
   }
   deleteProject(projectId: string): void {
     this.db.prepare("DELETE FROM projects WHERE project_id=?").run(projectId);
     this.db.prepare("DELETE FROM worktrees WHERE project_id=?").run(projectId);
   }
-  loadProjects(): Array<{ projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string }> {
+  loadProjects(): Array<{ projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string; namespace?: string }> {
     return (this.db.prepare("SELECT * FROM projects").all() as Record<string, unknown>[]).map((row) => ({
       projectId: row.project_id as string,
       name: row.name as string,
@@ -297,6 +301,7 @@ export class PhononStore {
       git: (row.git as number) === 1,
       remote: (row.remote as string) ?? undefined,
       createdAt: row.created_at as string,
+      namespace: (row.namespace as string) ?? undefined,
     }));
   }
 
@@ -524,6 +529,10 @@ export class PhononStore {
   }
   idempotencyPut(key: string, result: string): void {
     this.db.prepare("INSERT INTO idempotency(k,result,created_at) VALUES(?,?,?) ON CONFLICT(k) DO NOTHING").run(key, result, Date.now());
+  }
+
+  findWorkflowDispatch(tenantId:string,key:string):Record<string,unknown>|undefined {
+    return this.db.prepare(`SELECT * FROM workflows WHERE tenant_id=? AND json_extract(metadata_json,'$._phononDispatch.key')=? LIMIT 1`).get(tenantId,key) as Record<string,unknown>|undefined;
   }
 
   // ---- workflows (L3 checkpoint) ----

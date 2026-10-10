@@ -303,6 +303,14 @@ export class WorkflowEngine {
         if (ownerEpoch === undefined) continue;
         const run = this.restoreRow(row, ownerEpoch, true);
         try {
+          if(run.metadata?.dev_run_id){
+            // A hard crash leaves uncertainty about the original model turn.
+            // Claim its checkpoint but never silently execute another attempt.
+            run.status="paused";run.error="process restarted; explicit checkpoint reconciliation required";
+            for(const node of run.nodes)if(node.status==="running")node.status="paused";
+            this.runs.set(workflowId,run);this.persist(run);this.emit(run,{type:"workflow.status",status:"paused",payload:{recovery:"needs_reconciliation"}});
+            this.opts.store.releaseWorkflow(run.workflowId,run.tenantId,this.ownerId,run.ownerEpoch);recovered++;continue;
+          }
           this.validateExecutionTargets(run.project, run.plan);
           this.validatePlan(run.plan);
           this.hydrateCheckpoint(run);
@@ -369,8 +377,10 @@ export class WorkflowEngine {
         // executor and checkpoint the current boundary as queued for the next
         // connection instead of converting a recoverable run into failure.
         run.checkpoint.controlEpoch++;
-        run.status = "queued";
-        run.error = undefined;
+        // Dev explicitly chooses manual continuation after an interrupted turn.
+        // Transport recovery must not silently pay for/repeat a model attempt.
+        run.status = run.metadata?.dev_run_id ? "paused" : "queued";
+        run.error = run.metadata?.dev_run_id ? "transport interrupted; explicit Dev resume required" : undefined;
         run.completedAt = undefined;
         run.updatedAt = new Date().toISOString();
         for (const node of run.nodes) {
@@ -408,6 +418,7 @@ export class WorkflowEngine {
   }
 
   async run(params: {
+    clientRequestId?: string;
     project?: string;
     worktreeId?: string;
     branch?: string;
@@ -419,6 +430,19 @@ export class WorkflowEngine {
     metadata?: Record<string, unknown>;
   }): Promise<WorkflowRunResult> {
     if (this.disposed) throw new Error("workflow engine disposed");
+    // Acceptance key/hash is checkpointed before any execution. Retrying after
+    // a lost response or process restart returns the original workflow identity.
+    const requestHash = params.clientRequestId ? createHash("sha256").update(stableDispatchJson(params)).digest("hex") : undefined;
+    if (params.metadata&&Object.prototype.hasOwnProperty.call(params.metadata,"_phononDispatch")) throw new PhononError("errInvalidParams","reserved workflow metadata");
+    if (params.clientRequestId) {
+      const existing = this.opts.store?.findWorkflowDispatch(this.opts.tenantId,params.clientRequestId);
+      if(!existing&&this.opts.store?.idempotencyGet(`${this.opts.tenantId}\u0000workflow.run\u0000${params.clientRequestId}`)!==undefined)throw new PhononError("errInvalidParams","unverifiable legacy dispatch identity; inspect original workflow instead of redispatching");
+      if (existing) {
+        const m = JSON.parse(existing.metadata_json as string);
+        if (m._phononDispatch.hash!==requestHash) throw new PhononError("errInvalidParams","workflow dispatch idempotency mismatch");
+        return {workflowId:existing.workflow_id as string,status:existing.status as WorkflowRunResult["status"],createdAt:existing.created_at as string,resumed:false};
+      }
+    }
     // 1. 恢复路径
     if (params.resumeFrom) {
       const restored = this.restoreFromCheckpoint(params.resumeFrom);
@@ -456,7 +480,7 @@ export class WorkflowEngine {
       input: params.input,
       policy,
       sharedContext: params.sharedContext,
-      metadata: params.metadata,
+      metadata: {...params.metadata,...(params.clientRequestId?{_phononDispatch:{key:params.clientRequestId,hash:requestHash}}:{})},
       status: "queued",
       nodes,
       createdAt: now,
@@ -531,7 +555,7 @@ export class WorkflowEngine {
     throw new PhononError("errInvalidParams", `workflow ${workflowId} not found`);
   }
 
-  list(filter?: { status?: string; projectId?: string; since?: string; until?: string; limit?: number }): { workflows: WorkflowStatusResult[] } {
+  list(filter?: { dispatchKey?:string; status?: string; projectId?: string; since?: string; until?: string; limit?: number }): { workflows: WorkflowStatusResult[] } {
     const limit = filter?.limit ?? 50;
     // 内存优先，store 补
     const mem = [...this.runs.values()];
@@ -544,7 +568,7 @@ export class WorkflowEngine {
       }
     }
     const filtered = all
-      .filter((w) => (!filter?.status || w.status === filter.status)
+      .filter((w) => (!filter?.dispatchKey || w.dispatchKey===filter.dispatchKey) && (!filter?.status || w.status === filter.status)
         && (!filter?.projectId || w.project === filter.projectId)
         && (!filter?.since || w.createdAt >= filter.since)
         && (!filter?.until || w.createdAt < filter.until))
@@ -977,7 +1001,7 @@ export class WorkflowEngine {
         const batch = runnable.slice(i, i + batchSize);
         const results = await Promise.allSettled(batch.map((n) =>
           this.executeNode(run, n.nodeId, n.agent, n.model, n.role, this.composeDagNodeInput(run, n, succeeded), n.agentConfig, n.systemPrompt, undefined,
-            { project: n.project, worktreeId: n.worktreeId, branch: n.branch }, executionEpoch)
+            { project: n.project, worktreeId: n.worktreeId, branch: n.branch, sessionId:n.sessionId }, executionEpoch)
         ));
         this.assertCurrent(run, executionEpoch);
         for (let j = 0; j < batch.length; j++) {
@@ -1322,7 +1346,7 @@ export class WorkflowEngine {
     nodeSystemPrompt?: string,
     persistKey?: string,
     /** v0.6: 该节点的执行环境覆写（project/worktreeId/branch）。不传默认继承 workflow 级。 */
-    nodeEnv?: { project?: string; worktreeId?: string; branch?: string },
+    nodeEnv?: { project?: string; worktreeId?: string; branch?: string; sessionId?: string },
     executionEpoch = run.checkpoint.controlEpoch,
   ): Promise<WorkflowNodeResult> {
     this.assertCurrent(run, executionEpoch);
@@ -1357,7 +1381,12 @@ export class WorkflowEngine {
 
       // ---- session 获取：persistent 复用 cache；burner 每次新建 ----
       const cacheKey = persistKey ? `${run.workflowId}::${persistKey}` : undefined;
-      let sessionId = cacheKey ? this.persistentSessions.get(cacheKey) : undefined;
+      let sessionId = cacheKey ? this.persistentSessions.get(cacheKey) : nodeEnv?.sessionId;
+      if(sessionId){
+        const existing=this.opts.engine.assertTenant(sessionId,run.tenantId);
+        if(existing.project!==effectiveProject||existing.worktreeId!==effectiveWorktreeId||existing.agent!==agent||existing.model!==model||existing.status==="terminated"||existing.status==="running")throw new PhononError("errInvalidParams","native session execution binding mismatch");
+        existing.workflowAttr={workflowId:run.workflowId,nodeId,role,devTrace:!!run.metadata?.dev_run_id};
+      }
       const isNewSession = !sessionId;
       if (!sessionId) {
         const created = await this.opts.engine.create({
@@ -1370,7 +1399,7 @@ export class WorkflowEngine {
           verbosity: "messages",
           agentConfig,
           initialContext,
-          workflowAttr: { workflowId: run.workflowId, nodeId, role },
+          workflowAttr: { workflowId: run.workflowId, nodeId, role,devTrace:!!run.metadata?.dev_run_id },
         });
         sessionId = created.sessionId;
         this.sessionToNode.set(sessionId, { workflowId: run.workflowId, nodeId });
@@ -1410,7 +1439,7 @@ export class WorkflowEngine {
 
       // burner 模式：跑完立刻纸连 session。
       // persistent 模式：保留 session，下轮复用；由 cleanupPersistent() 统一清理。
-      if (!cacheKey) {
+      if (!cacheKey && !run.metadata?.dev_chat) {
         try { await this.opts.engine.terminate(run.tenantId, sessionId); } catch {}
       }
       void isNewSession;
@@ -1483,6 +1512,7 @@ export class WorkflowEngine {
       // Deterministic across checkpoint recovery: a server can de-duplicate a
       // replayed review instead of showing a second form after device restart.
       requestId,
+      workflowId: run.workflowId,
       blocking: true,
       timeoutSeconds: directive.timeoutSeconds,
       at: new Date().toISOString(),
@@ -1553,7 +1583,7 @@ export class WorkflowEngine {
    */
   private async resolveExecution(
     run: WorkflowRunState,
-    nodeEnv?: { project?: string; worktreeId?: string; branch?: string },
+    nodeEnv?: { project?: string; worktreeId?: string; branch?: string; sessionId?: string },
   ): Promise<{ projectId: string; worktreeId?: string; cwd: string }> {
     const projectId = nodeEnv?.project ?? run.project;
     if (!projectId) {
@@ -1979,6 +2009,7 @@ export class WorkflowEngine {
 
   private toStatus(run: WorkflowRunState): WorkflowStatusResult {
     return {
+      dispatchKey: (run.metadata?._phononDispatch as {key?:string}|undefined)?.key,
       workflowId: run.workflowId,
       status: run.status,
       project: run.project,
@@ -1995,6 +2026,7 @@ export class WorkflowEngine {
 
   private rowToStatus(row: Record<string, unknown>): WorkflowStatusResult {
     return {
+      dispatchKey: row.metadata_json?JSON.parse(row.metadata_json as string)._phononDispatch?.key:undefined,
       workflowId: row.workflow_id as string,
       status: row.status as WorkflowStatusResult["status"],
       project: (row.project_id as string | null) ?? undefined,
@@ -2043,4 +2075,12 @@ export class WorkflowEngine {
       // Event/checkpoint are already durable; reconnect replay handles delivery.
     }
   }
+}
+
+function stableDispatchJson(value: unknown): string {
+  if (value===undefined) return "null";
+  if (value===null || typeof value!=="object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableDispatchJson).join(",")}]`;
+  const row=value as Record<string,unknown>;
+  return `{${Object.keys(row).filter(k=>row[k]!==undefined).sort().map(k=>`${JSON.stringify(k)}:${stableDispatchJson(row[k])}`).join(",")}}`;
 }

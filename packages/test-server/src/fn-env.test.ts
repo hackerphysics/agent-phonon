@@ -167,7 +167,8 @@ test("tenant A cannot list, reveal, delete, or inject tenant B env", async () =>
   assert.equal(aVisible.variables.find((v) => v.name === "TENANT_SECRET")?.value, "a-only");
 
   const project = await a.tc.call("project.create", { name: "tenant-project", git: false }) as { project: { projectId: string } };
-  const bSession = await b.tc.call("session.create", { project: project.project.projectId, agent: "mock:default", model: "m1" }) as { sessionId: string };
+  const bProject=await b.tc.call("project.create",{name:"tenant-b-project",git:false}) as {project:{projectId:string}};
+  const bSession = await b.tc.call("session.create", { project: bProject.project.projectId, agent: "mock:default", model: "m1" }) as { sessionId: string };
   const bTurn = await b.tc.call("session.send", { sessionId: bSession.sessionId, input: "hi" }) as { turnId: string };
   await b.tc.waitTurnEnd(bTurn.turnId);
   assert.equal(b.adapter.lastSession?.lastEnvironment?.TENANT_SECRET, undefined);

@@ -201,3 +201,24 @@ test("server-sdk: v0.7 HITL via device.setInteractionHandler + workflow.human_re
   await client.close();
   await server.close();
 });
+
+
+test("SDK close shuts down its owned live authenticated sockets",{timeout:5000},async()=>{
+ const server=new PhononServer({host:"127.0.0.1",port:0,authenticate:()=>({tenantId:"shutdown-test"})});const port=await server.listen();const client=dialPhonon(`ws://127.0.0.1:${port}`,"shutdown-device");
+ try{
+  await client.connect();
+  const devices=server.listDevices();assert.equal(devices.length,1);
+  let disconnected=0;devices[0]!.on('disconnect',()=>{disconnected++;});
+  await Promise.all([server.close(),server.close()]);
+  assert.equal(server.listDevices().length,0);assert.equal(disconnected,1);
+  await server.close();assert.equal(disconnected,1);
+ }finally{await client.close();await server.close();}
+});
+
+test("SDK stream consumer persists before ACK and leaves failed consumers unacknowledged",async()=>{
+ const {PhononDevice}=await import("@agent-phonon/server-sdk");const {RpcPeer}=await import("../../sdk-server-ts/dist/rpc.js");const messages:string[]=[];
+ const peer=new RpcPeer({send:s=>messages.push(s),close:()=>{}},()=>null);const device=new PhononDevice("d","tenant",peer);
+ let commit=false;device.setStreamEventHandler(async()=>{await new Promise(r=>setTimeout(r,10));commit=true;return true;});
+ const pending=device._handleInbound("stream.event",{sessionId:"s",seq:0,type:"message",text:"bounded"});assert.equal(messages.length,0);await pending;assert.equal(commit,true);assert.equal(JSON.parse(messages[0]!).method,"stream.ack");
+ device.setStreamEventHandler(()=>{throw new Error("durability failure");});await assert.rejects(()=>device._handleInbound("stream.event",{sessionId:"s",seq:1}));assert.equal(messages.length,1);
+});

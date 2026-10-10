@@ -692,3 +692,22 @@ test("D01: continue runs dependents after failed upstream without spinning", asy
     assert.equal(fx.control.calls.filter((input) => input === "dependent").length, 1);
   } finally { await tc.conn.dispose(); fx.store.close(); }
 });
+
+
+test("Dev dispatch identity survives lost response/reconnect and rejects changed input",async()=>{
+ const fx=setup(input=>({text:"once:"+input}));let tc=fx.conn();
+ try{const p=await project(tc,"dispatch-identity");const input={project:p,clientRequestId:"durable-key",plan:{mode:"dag",nodes:[{nodeId:"a",agent:"controlled:a",model:"m1",input:"exactly-once"}]}};
+ const first=await tc.call("workflow.run",input) as {workflowId:string};await waitFor(tc,first.workflowId,s=>s.status==="completed");
+ await tc.conn.dispose();tc=fx.conn();const repeated=await tc.call("workflow.run",input) as {workflowId:string};assert.equal(repeated.workflowId,first.workflowId);assert.equal(fx.control.calls.length,1);
+ await assert.rejects(()=>tc.call("workflow.run",{...input,input:"different"}), (e:any)=>e.data?.appCode==="errInvalidParams");
+ }finally{await tc.conn.dispose();fx.store.close();}
+});
+
+test("Dev interrupted transport pauses until explicit resume, not automatic repeated model work",async()=>{
+ const fx=setup(input=>({text:"resumed:"+input,delay:200}));let tc=fx.conn();
+ try{const p=await project(tc,"dev-pause");const first=await tc.call("workflow.run",{project:p,clientRequestId:"pause-key",metadata:{dev_run_id:"central-run"},plan:{mode:"dag",nodes:[{nodeId:"a",agent:"controlled:a",model:"m1",input:"pause-input"}]}}) as {workflowId:string};
+ await waitFor(tc,first.workflowId,s=>s.nodes[0].status==="running");await tc.conn.dispose();const count=fx.control.calls.length;tc=fx.conn();await new Promise(r=>setTimeout(r,300));
+ const paused=await tc.call("workflow.status",{workflowId:first.workflowId}) as {status:string};assert.equal(paused.status,"paused");assert.equal(fx.control.calls.length,count);
+ await tc.call("workflow.resume",{workflowId:first.workflowId,strategy:"last_success_dependents"});await waitFor(tc,first.workflowId,s=>s.status==="completed");assert.equal(fx.control.calls.length,count+1);
+ }finally{await tc.conn.dispose();fx.store.close();}
+});

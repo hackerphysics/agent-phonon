@@ -343,6 +343,7 @@ export const WorkflowStatusParams = z.object({ workflowId: WorkflowId });
 export type WorkflowStatusParams = z.infer<typeof WorkflowStatusParams>;
 
 export const WorkflowStatusResult = z.object({
+  dispatchKey: z.string().optional(),
   workflowId: WorkflowId,
   status: WorkflowStatus,
   /** workflow 默认 project；v0.6 起可选。 */
@@ -370,6 +371,7 @@ export const WorkflowPauseResult = z.object({ workflowId: WorkflowId, status: z.
 export type WorkflowPauseResult = z.infer<typeof WorkflowPauseResult>;
 
 export const WorkflowListParams = z.object({
+  dispatchKey: z.string().optional(),
   status: WorkflowStatus.optional(),
   projectId: ProjectId.optional(),
   since: Timestamp.optional(),

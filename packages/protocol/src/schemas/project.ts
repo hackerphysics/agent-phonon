@@ -12,6 +12,8 @@ import { ProjectId, Timestamp } from "./common.js";
 /** 项目描述。 */
 export const ProjectDescriptor = z.object({
   projectId: ProjectId,
+  /** Creator connection namespace. Missing means an unmapped legacy record, not implicit ownership. */
+  namespace: z.string().optional(),
   /** 展示名。 */
   name: z.string().min(1),
   /** 项目目录的绝对路径（设备本地）。 */

@@ -1,9 +1,12 @@
-import { mkdir, readFile, readdir, lstat, realpath, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import {constants} from "node:fs";
+import type {FileHandle} from "node:fs/promises";
+import { mkdir, open, readdir, lstat, realpath } from "node:fs/promises";
+import { basename, dirname, join, resolve, sep,relative } from "node:path";
 import { PhononError } from "./rpc.js";
 
 export interface FileScopeResolver {
   resolveCwd(projectId: string, worktreeId?: string): string;
+  assertPath?: (absolutePath: string, projectRoot: string) => void;
 }
 
 type StatEntry = { path: string; type: "file" | "directory" | "symlink" | "other"; sizeBytes: number; modifiedAt: string };
@@ -62,63 +65,93 @@ export class FileManager {
     if (real !== root && !real.startsWith(root + sep)) {
       throw new PhononError("errPolicyDenied", `file path escapes project/worktree via symlink: ${rel}`);
     }
-    return abs;
+    this.resolver.assertPath?.(abs,root);
+    this.resolver.assertPath?.(real,root);
+    return followFinal ? real : abs;
+  }
+
+  /** Standard Node APIs with Linux /proc fd anchors. Each component is opened
+   * no-follow relative to an already-open directory, not re-resolved by name.
+   * Other platforms fail explicitly until an equally strong OS adapter exists.
+   */
+  private async anchored(projectId:string,worktreeId:string|undefined,rel:string,flags:number,createDirs=false):Promise<FileHandle>{
+    if(process.platform!=="linux")throw new PhononError("errPolicyDenied","secure file broker unsupported on this platform");
+    const abs=await this.resolvePath(projectId,worktreeId,rel);
+    const root=await this.realpathBoundary(resolve(this.resolver.resolveCwd(projectId,worktreeId)));
+    const parts=relative(root,abs).split(sep).filter(Boolean);
+    if(parts.some(p=>p==='..')||parts.length>256)throw new PhononError("errPolicyDenied","invalid anchored path");
+    const handles:FileHandle[]=[];let result:FileHandle|undefined;
+    try{
+      let current=await open(root,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);handles.push(current);
+      if(await realpath(`/proc/self/fd/${current.fd}`)!==root)throw new PhononError("errPolicyDenied","opened root identity changed");
+      for(let i=0;i<parts.length;i++){
+        const path=`/proc/self/fd/${current.fd}/${parts[i]}`;const final=i===parts.length-1;
+        if(createDirs&&(!final||!!(flags&constants.O_DIRECTORY))){try{await mkdir(path);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}}
+        current=await open(path,(final?flags:constants.O_RDONLY|constants.O_DIRECTORY)|constants.O_NOFOLLOW);handles.push(current);
+      }
+      result=current;return current;
+    }catch(error){if((error as NodeJS.ErrnoException).code==="ELOOP"||(error as NodeJS.ErrnoException).code==="ENOTDIR")throw new PhononError("errPolicyDenied","symlink or directory identity changed during file operation");throw error;}
+    finally{for(const h of handles)if(h!==result)await h.close();}
   }
 
   async read(params: { projectId: string; worktreeId?: string; path: string; encoding?: "utf8" | "base64"; maxBytes?: number }) {
-    const abs = await this.resolvePath(params.projectId, params.worktreeId, params.path);
-    const buf = await readFile(abs);
-    const max = params.maxBytes;
-    const out = max && buf.length > max ? buf.subarray(0, max) : buf;
+    const file=await this.anchored(params.projectId,params.worktreeId,params.path,constants.O_RDONLY);
+    let out: Buffer,sizeBytes: number;
+    try {
+      const stat=await file.stat();if(!stat.isFile())throw new PhononError("errInvalidParams","file.read requires a regular file");sizeBytes=stat.size;
+      const limit=Math.min(sizeBytes,params.maxBytes??sizeBytes);
+      out=Buffer.alloc(limit);const read=await file.read(out,0,limit,0);out=out.subarray(0,read.bytesRead);
+    } finally {await file.close();}
+    const max=params.maxBytes;
     const encoding = params.encoding ?? "utf8";
     return {
       path: params.path,
       encoding,
       data: encoding === "base64" ? out.toString("base64") : out.toString("utf8"),
-      sizeBytes: buf.length,
-      truncated: !!max && buf.length > max,
+      sizeBytes,
+      truncated: !!max && sizeBytes > max,
     };
   }
 
   async write(params: { projectId: string; worktreeId?: string; path: string; encoding?: "utf8" | "base64"; data: string; overwrite?: boolean; createDirs?: boolean }) {
-    const abs = await this.resolvePath(params.projectId, params.worktreeId, params.path);
-    if (params.createDirs ?? true) await mkdir(dirname(abs), { recursive: true });
     const content = params.encoding === "base64" ? Buffer.from(params.data, "base64") : Buffer.from(params.data, "utf8");
-    await writeFile(abs, content, { flag: params.overwrite === false ? "wx" : "w" });
+    const flags=constants.O_WRONLY|constants.O_CREAT|(params.overwrite===false?constants.O_EXCL:constants.O_TRUNC);
+    const file=await this.anchored(params.projectId,params.worktreeId,params.path,flags,params.createDirs??true);
+    try{await file.writeFile(content);}finally{await file.close();}
     return { path: params.path, sizeBytes: content.length, written: true as const };
   }
 
   async mkdir(params: { projectId: string; worktreeId?: string; path: string; recursive?: boolean }) {
-    const abs = await this.resolvePath(params.projectId, params.worktreeId, params.path);
-    await mkdir(abs, { recursive: params.recursive ?? true });
+    await this.resolvePath(params.projectId,params.worktreeId,params.path);
+    const parent=await this.anchored(params.projectId,params.worktreeId,dirname(params.path),constants.O_RDONLY|constants.O_DIRECTORY,params.recursive??true);
+    try{try{await mkdir(`/proc/self/fd/${parent.fd}/${basename(params.path)}`);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST"||params.recursive===false)throw e;}}finally{await parent.close();}
     return { path: params.path, created: true as const };
   }
 
   async stat(params: { projectId: string; worktreeId?: string; path: string }) {
-    const abs = await this.resolvePath(params.projectId, params.worktreeId, params.path, false);
-    return { stat: await this.lstatOne(abs, params.path) };
+    await this.resolvePath(params.projectId,params.worktreeId,params.path,false);
+    const parent=await this.anchored(params.projectId,params.worktreeId,dirname(params.path),constants.O_RDONLY|constants.O_DIRECTORY);
+    try{return {stat:await this.lstatOne(`/proc/self/fd/${parent.fd}/${basename(params.path)}`,params.path)};}finally{await parent.close();}
   }
 
   async list(params: { projectId: string; worktreeId?: string; path?: string; recursive?: boolean; limit?: number }) {
     const baseRel = params.path ?? ".";
     const limit = params.limit ?? 500;
-    const baseAbs = await this.resolvePath(params.projectId, params.worktreeId, baseRel);
-    const entries: StatEntry[] = [];
-    const walk = async (absDir: string, relDir: string): Promise<void> => {
-      if (entries.length >= limit) return;
-      const names = await readdir(absDir);
-      for (const name of names) {
-        if (entries.length >= limit) return;
-        const childRel = relDir === "." ? name : `${relDir}/${name}`;
-        const childAbs = join(absDir, name);
-        const s = await this.lstatOne(childAbs, childRel);
-        entries.push(s);
-        // Only descend into REAL directories. lstat reports symlinks as "symlink",
-        // so symlinked dirs are never followed (also avoids symlink-cycle loops).
-        if (params.recursive && s.type === "directory") await walk(childAbs, childRel);
+    const base=await this.anchored(params.projectId,params.worktreeId,baseRel,constants.O_RDONLY|constants.O_DIRECTORY);
+    const entries:StatEntry[]=[];
+    const root=this.resolver.resolveCwd(params.projectId,params.worktreeId);
+    const walk=async(handle:FileHandle,relDir:string):Promise<void>=>{
+      if(entries.length>=limit)return;
+      for(const name of await readdir(`/proc/self/fd/${handle.fd}`)){
+        if(entries.length>=limit)break;const childRel=relDir==='.'?name:`${relDir}/${name}`;
+        try{this.resolver.assertPath?.(resolve(root,childRel),root);}catch{continue;}
+        const path=`/proc/self/fd/${handle.fd}/${name}`;const stat=await this.lstatOne(path,childRel);entries.push(stat);
+        if(params.recursive&&stat.type==='directory'){
+          let next:FileHandle|undefined;try{next=await open(path,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);await walk(next,childRel);}catch(e){if((e as NodeJS.ErrnoException).code!=='ELOOP'&&(e as NodeJS.ErrnoException).code!=='ENOTDIR')throw e;}finally{await next?.close();}
+        }
       }
     };
-    await walk(baseAbs, baseRel);
+    try{await walk(base,baseRel);}finally{await base.close();}
     return { path: baseRel, entries, truncated: entries.length >= limit };
   }
 

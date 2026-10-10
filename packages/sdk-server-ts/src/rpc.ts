@@ -74,6 +74,8 @@ export class RpcPeer {
     }
   }
 
+  disconnect():void { this.rejectAll("device disconnected");this.transport.close(); }
+
   rejectAll(reason: string): void {
     for (const [, p] of this.pending) { if (p.timer) clearTimeout(p.timer); p.reject(new Error(reason)); }
     this.pending.clear();

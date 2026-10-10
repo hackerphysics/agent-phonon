@@ -86,7 +86,7 @@ interface SessionRecord {
    * 该 session 所有 stream.event 会被 decorate 为携带 workflowId/nodeId/role，
    * 服务端能直接从 stream.event 区分哪个节点的输出。
    */
-  workflowAttr?: { workflowId: string; nodeId: string; role?: string };
+  workflowAttr?: { workflowId: string; nodeId: string; role?: string; devTrace?:boolean };
 }
 
 /** 流式事件订阅回调（core 用它转发给对应 tenant 连接）。 */
@@ -215,7 +215,7 @@ export class SessionEngine {
     agentConfig?: Record<string, unknown>;
     initialContext?: ContextItem[];
     /** L3 归属（workflow node 创建 session 时传入）。 */
-    workflowAttr?: { workflowId: string; nodeId: string; role?: string };
+    workflowAttr?: { workflowId: string; nodeId: string; role?: string; devTrace?:boolean };
   }): Promise<{ sessionId: string; status: string; createdAt: string }> {
     if (this.disposed) throw new Error("session engine disposed");
     this.runtimeContext?.assertAgentAllowed?.(params.agent);

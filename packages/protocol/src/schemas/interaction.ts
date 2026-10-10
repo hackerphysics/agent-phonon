@@ -80,6 +80,8 @@ export type InteractionDirective = z.infer<typeof InteractionDirective>;
 export const InteractionRequestParams = z.object({
   /** 本次交互唯一 id，response 用它配对。 */
   requestId: z.string().min(1),
+  /** Trusted workflow attribution supplied by the device controller, not parsed from form prose. */
+  workflowId: z.string().optional(),
   sessionId: SessionId.optional(),
   turnId: z.string().optional(),
   form: InteractionForm,

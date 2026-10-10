@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import websockets
@@ -67,10 +68,11 @@ class PhononSession:
 class PhononDevice:
     """一台连入的设备。"""
 
-    def __init__(self, device_id: str, tenant_id: str, peer: RpcPeer) -> None:
+    def __init__(self, device_id: str, tenant_id: str, peer: RpcPeer, close_transport=None) -> None:
         self.device_id = device_id
         self.tenant_id = tenant_id
         self._peer = peer
+        self._close_transport = close_transport
         self._sessions: dict[str, PhononSession] = {}
         self._hook_decider: Optional[HookDecider] = None
         self._unsolicited: Optional[Callable[[dict], None]] = None
@@ -78,6 +80,7 @@ class PhononDevice:
         self._document_handler: Optional[Callable[[dict], None]] = None
         self._prepare_upload_handler: Optional[Callable[[dict], dict]] = None
         self._interaction_handler: Optional[Callable[[dict], dict]] = None
+        self._stream_event_handler: Optional[Callable[[dict], Awaitable[bool] | bool]] = None
         self._workflow_event_handler: Optional[Callable[[dict], Awaitable[None] | None]] = None
         self._schedule_changed_handler: Optional[Callable[[dict], None]] = None
         self._run_started_handler: Optional[Callable[[dict], None]] = None
@@ -307,6 +310,7 @@ class PhononDevice:
     async def workflow_list(
         self,
         *,
+        dispatch_key: str | None = None,
         status: str | None = None,
         project_id: str | None = None,
         since: str | None = None,
@@ -315,6 +319,7 @@ class PhononDevice:
         cursor: str | None = None,
     ) -> dict:
         params: dict = {}
+        if dispatch_key is not None: params["dispatchKey"] = dispatch_key
         if status is not None: params["status"] = status
         if project_id is not None: params["projectId"] = project_id
         if since is not None: params["since"] = since
@@ -439,6 +444,10 @@ class PhononDevice:
     def set_interaction_handler(self, fn: Callable[[dict], dict]) -> None:
         self._interaction_handler = fn
 
+    def set_stream_event_handler(self, fn: Callable[[dict], Awaitable[bool] | bool]) -> None:
+        """True acknowledges only after durable consumption; False retains normal routing."""
+        self._stream_event_handler = fn
+
     def set_workflow_event_handler(self, fn: Callable[[dict], Awaitable[None] | None]) -> None:
         self._workflow_event_handler = fn
 
@@ -454,9 +463,23 @@ class PhononDevice:
     def set_run_finished_handler(self, fn: Callable[[dict], Awaitable[None] | None]) -> None:
         self._run_finished_handler = fn
 
+    async def disconnect(self) -> None:
+        self._peer.reject_all("device disconnected")
+        if self._close_transport:
+            result = self._close_transport()
+            if inspect.isawaitable(result):
+                await result
+
     async def _handle_inbound(self, method: str, params: Any) -> Any:
         if method == "stream.event":
             ev = params or {}
+            if self._stream_event_handler:
+                consumed = self._stream_event_handler(ev)
+                if inspect.isawaitable(consumed):
+                    consumed = await consumed
+                if consumed is True:
+                    await self._peer.notify("stream.ack", {"sessionId": ev.get("sessionId"), "lastSeq": ev.get("seq")})
+                    return None
             s = self._sessions.get(ev.get("sessionId"))
             if s is not None:
                 s._on_stream(ev)
@@ -600,7 +623,7 @@ class PhononServer:
                     tenant = f"tenant-{device_id}"
                 if tenant is None:
                     raise PermissionError("unauthorized")
-                device = PhononDevice(device_id, tenant, peer)
+                device = PhononDevice(device_id, tenant, peer, ws.close)
                 self._devices[device_id] = device
                 if self._on_device:
                     asyncio.create_task(self._on_device(device))

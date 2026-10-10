@@ -27,7 +27,8 @@ export async function collectDeviceInfo() {
 }
 
 async function inferCapabilities(): Promise<string[]> {
-  const caps = new Set<string>();
+  const caps = new Set<string>(["project_namespace_v1","durable_workflow_dispatch_v1","manual_dev_recovery_v1","dev_dispatch_identity_v1"]);
+  if(platform()==="linux")caps.add("secure_file_broker_linux_v1");
   const p = platform();
   if (p === "darwin") {
     caps.add("macos");

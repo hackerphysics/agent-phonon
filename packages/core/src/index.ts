@@ -125,6 +125,7 @@ export class PhononConnection {
     this.projects = new ProjectManager(
       (projectId) => this.engine.activeSessionsForProject(projectId), // 真实 active 查询（修 P0#8）
       {
+        namespace: this.tenantId,
         assertProjectPath: (p) => this.policy.assertProjectPath(p),
         assertDeleteFiles: () => this.policy.assertDeleteFiles(),
         store: this.store,
@@ -144,7 +145,7 @@ export class PhononConnection {
       },
       this.store,
     );
-    this.files = new FileManager({ resolveCwd: (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId) });
+    this.files = new FileManager({ resolveCwd: (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId), assertPath:(absolutePath,projectRoot)=>this.policy.assertDocumentPath(absolutePath,projectRoot) });
     this.env = new EnvManager(this.tenantId, this.store, { allowReveal: () => this.policy.allowEnvReveal() });
 
     this.peer = new RpcPeer(opts.transport, (method, params) => this.dispatch(method, params));
@@ -346,7 +347,7 @@ export class PhononConnection {
     this.policy.assertMethodAllowed(method);
     // 幂等：改状态请求带 clientRequestId 则去重（D28 / P0#2）
     const crid = p.clientRequestId as string | undefined;
-    if (crid && MUTATING_METHODS.has(method)) {
+    if (crid && method!=="workflow.run" && MUTATING_METHODS.has(method)) {
       return this.idempotency.run(this.tenantId, method, crid, () => this.dispatchInner(method, p));
     }
     return this.dispatchInner(method, p);
@@ -508,13 +509,13 @@ export class PhononConnection {
       // ---- project (D23/D25) ----
       case "project.create": {
         const r = await this.projects.create({ name: p.name as string, path: p.path as string | undefined, git: p.git as boolean | undefined, remote: p.remote as string | undefined });
-        return { project: { projectId: r.projectId, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt } };
+        return { project: { projectId: r.projectId, namespace: r.namespace, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt } };
       }
       case "project.list":
-        return { projects: this.projects.list().map((r) => ({ projectId: r.projectId, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt })) };
+        return { projects: this.projects.list().map((r) => ({ projectId: r.projectId, namespace: r.namespace, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt })) };
       case "project.get": {
-        const r = this.projects.get(p.projectId as string);
-        return { project: { projectId: r.projectId, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt } };
+        const r = this.projects.get(p.projectId as string,{readonly:true});
+        return { project: { projectId: r.projectId, namespace: r.namespace, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt } };
       }
       case "project.remove": {
         const r = await this.projects.remove(p.projectId as string, { deleteFiles: p.deleteFiles as boolean, whenActiveSessions: p.whenActiveSessions as "reject" | "cascade" });
@@ -609,6 +610,7 @@ export class PhononConnection {
           this.projects.resolveCwd(p.project as string);
         }
         return this.workflows!.run({
+          clientRequestId: p.clientRequestId as string | undefined,
           project: p.project as string,
           worktreeId: p.worktreeId as string | undefined,
           branch: p.branch as string | undefined,
