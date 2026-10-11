@@ -790,6 +790,8 @@ export { CopilotAdapter, parseCopilotEvent, parseCopilotModelsHelp } from "./ada
 export type { CopilotEnv, ParsedCopilotEvent } from "./adapters/copilot.js";
 export { HerdrAdapter, parseHerdrKind, parseHerdrVersion, probeHerdrSync, HERDR_KINDS } from "./adapters/herdr.js";
 export type { HerdrEnv, HerdrKind } from "./adapters/herdr.js";
+export { PiAdapter, parsePiEvent, parsePiModels, parsePiVersion, toPiSessionId } from "./adapters/pi.js";
+export type { PiEnv, ParsedPiEvent } from "./adapters/pi.js";
 export { RescueAdapter } from "./adapters/rescue.js";
 export type { RescueAdapterOptions } from "./adapters/rescue.js";
 export { spawnAgent, spawnSyncAgent, quoteWinArg } from "./proc.js";

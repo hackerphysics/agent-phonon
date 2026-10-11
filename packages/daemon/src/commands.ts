@@ -4,7 +4,7 @@ import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chm
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, HerdrAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, HerdrAdapter, PiAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
 import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
 
 /**
@@ -15,7 +15,11 @@ function probe(bin: string, args: string[] = ["--version"]): { ok: boolean; out:
   // spawnSyncAgent：win32 下给含空格的全路径（如 C:\Program Files\nodejs\claude.cmd）加引号，
   // 否则 cmd.exe 在空格处截断 → probe 误判为不可用 → autoDetect 不加 adapter → discover=0。
   const r = spawnSyncAgent(bin, args, { timeout: 8000 });
-  return { ok: r.status === 0, out: (r.stdout?.toString() ?? "").trim().split("\n")[0] ?? "" };
+  // 有些 CLI（实测 pi）把 version 写到 stderr；ok 仍只看退出码，这里只补展示用的文本。
+  const out = (r.stdout?.toString() ?? "").trim().split("\n")[0]
+    ?? (r.stderr?.toString() ?? "").trim().split("\n")[0]
+    ?? "";
+  return { ok: r.status === 0, out: out || (r.stderr?.toString() ?? "").trim().split("\n")[0] || "" };
 }
 
 function executableNames(bin: string): string[] {
@@ -114,12 +118,18 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
     if (herdrPath && probe(herdrPath).ok) out.push({ type: "herdr", herdrBinPath: herdrPath });
   }
 
+  if (!has("pi")) {
+    const piPath = commandPath("pi");
+    if (piPath && probe(piPath).ok) out.push({ type: "pi", piBinPath: piPath });
+  }
+
   for (const a of out) {
     if (a.type === "hermes" && !a.hermesBinPath) a.hermesBinPath = commandPath("hermes");
     if (a.type === "claude-code" && !a.claudeBinPath) a.claudeBinPath = commandPath("claude");
     if (a.type === "codex" && !a.codexBinPath) a.codexBinPath = commandPath("codex");
     if (a.type === "copilot" && !a.copilotBinPath) a.copilotBinPath = commandPath("copilot");
     if (a.type === "herdr" && !a.herdrBinPath) a.herdrBinPath = commandPath("herdr");
+    if (a.type === "pi" && !a.piBinPath) a.piBinPath = commandPath("pi");
   }
 
   if (!has("claude-code")) {
@@ -147,7 +157,7 @@ export async function cmdDoctor(): Promise<void> {
   console.log(`OpenClaw HITL plugin: ${existsSync(pluginDir) ? "✓ installed" : "✗ not installed (run: agent-phonon plugin install openclaw)"}`);
   // CLI agents
   console.log("\nCLI agents:");
-  for (const [name, bin] of [["Claude Code", "claude"], ["Codex", "codex"], ["GitHub Copilot CLI", "copilot"], ["Herdr", "herdr"], ["Hermes", "hermes"]] as const) {
+  for (const [name, bin] of [["Claude Code", "claude"], ["Codex", "codex"], ["GitHub Copilot CLI", "copilot"], ["Herdr", "herdr"], ["Hermes", "hermes"], ["Pi", "pi"]] as const) {
     const p = probe(bin);
     console.log(`  ${name} (${bin}): ${p.ok ? "✓ " + p.out : "✗ not found"}`);
   }
@@ -211,6 +221,8 @@ export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["
       reg.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels } }));
     } else if (a.type === "herdr") {
       reg.register(new HerdrAdapter({ env: { binPath: a.herdrBinPath, defaultModel: a.herdrModel, defaultKind: a.herdrDefaultKind, turnTimeoutSeconds: a.herdrTurnTimeoutSeconds, pollIntervalMs: a.herdrPollIntervalMs } }));
+    } else if (a.type === "pi") {
+      reg.register(new PiAdapter({ env: { binPath: a.piBinPath, defaultModel: a.piModel, models: a.piModels, appendSystemPrompt: a.piAppendSystemPrompt } }));
     }
   }
   return reg;
@@ -243,8 +255,11 @@ export function cmdAdapterAdd(type: string, opts: Record<string, string | undefi
     case "herdr":
       a = { type: "herdr", herdrBinPath: opts.bin, herdrModel: opts.model };
       break;
+    case "pi":
+      a = { type: "pi", piBinPath: opts.bin, piModel: opts.model };
+      break;
     default:
-      return fail(`unknown adapter type: ${type} (openclaw|claude-code|codex|copilot|herdr|hermes|opencode)`);
+      return fail(`unknown adapter type: ${type} (openclaw|claude-code|codex|copilot|herdr|pi|hermes|opencode)`);
   }
   // 去重：同 type 覆盖
   cfg.adapters = cfg.adapters.filter((x) => x.type !== a.type);

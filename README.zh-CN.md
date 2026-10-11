@@ -5,7 +5,7 @@
 > 把多种本地 Agent 编排成一个系统——在你的设备上运行，从任何地方调度。
 
 **agent-phonon** 是一个设备侧 daemon。它会发现本机已安装的 AI Coding Agent
-（Claude Code、Codex、GitHub Copilot CLI、Herdr 多代理运行时、OpenCode、OpenClaw、Hermes 等），并通过统一的
+（Claude Code、Codex、GitHub Copilot CLI、Pi、Herdr 多代理运行时、OpenCode、OpenClaw、Hermes 等），并通过统一的
 WebSocket/JSON 协议暴露给服务端。
 
 名字来自凝聚态物理里的 **phonon（声子）**：大量原子共同振动时涌现出的集体准粒子。
@@ -39,7 +39,8 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
    └────────────────┘                   │   ├─ adapter: Codex         │
                                         │   ├─ adapter: Copilot CLI   │
                                         │   ├─ adapter: OpenCode      │
-                                        │   └─ adapter: Hermes        │
+                                        │   ├─ adapter: Hermes        │
+                                        │   └─ adapter: Pi            │
                                         └────────────────────────────┘
 ```
 
@@ -65,6 +66,7 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
   - Herdr 多代理运行时：`herdr` — 委托给所选 kind（如 `herdr:codex`、`herdr:claude` …）
   - OpenCode：`opencode`
   - Hermes：`hermes`
+  - Pi：`pi` — 安装：`curl -fsSL https://pi.dev/install.sh | sh`
   - OpenClaw Gateway / plugin
 
 Linux 服务管理目前支持 **systemd --user**。macOS launchd 和 Windows service 后续单独支持。

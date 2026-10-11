@@ -29,7 +29,7 @@ export interface ServerConfig {
 
 export interface AdapterConfig {
   /** adapter 类型：openclaw-gateway | openclaw-cli。 */
-  type: "openclaw-gateway" | "openclaw-cli" | "claude-code" | "codex" | "hermes" | "opencode" | "copilot" | "herdr";
+  type: "openclaw-gateway" | "openclaw-cli" | "claude-code" | "codex" | "hermes" | "opencode" | "copilot" | "herdr" | "pi";
   /** OpenClaw Gateway WS URL（openclaw-gateway 用）。 */
   gatewayUrl?: string;
   /** Gateway token（openclaw-gateway 用；缺省从 ~/.openclaw/openclaw.json 读）。 */
@@ -68,6 +68,11 @@ export interface AdapterConfig {
   herdrDefaultKind?: import("@agent-phonon/core").HerdrKind;
   herdrTurnTimeoutSeconds?: number;
   herdrPollIntervalMs?: number;
+  /** Pi coding agent：binary 路径/默认模型/模型清单/追加 system prompt。 */
+  piBinPath?: string;
+  piModel?: string;
+  piModels?: ModelInfo[];
+  piAppendSystemPrompt?: string;
 }
 
 export interface RescueAgentConfig extends RescueConnectionOptions {

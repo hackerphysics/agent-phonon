@@ -203,6 +203,7 @@ async function main(): Promise<void> {
       console.log("  agent-phonon adapter add codex --base-url https://gw/v1 --api-key <k> --model gpt-5.5");
       console.log("  agent-phonon adapter add copilot --model gpt-5.4");
       console.log("  agent-phonon adapter add herdr --model gpt-5.4");
+      console.log("  agent-phonon adapter add pi --model anthropic/claude-sonnet-4-6");
       console.log("  agent-phonon adapter add hermes");
       break;
   }
