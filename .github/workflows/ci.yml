@@ -74,6 +74,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @agent-phonon/protocol build
       - run: pnpm --filter @agent-phonon/core build
+      - run: pnpm --filter @agent-phonon/server-sdk build
       - run: pnpm --filter @agent-phonon/test-server build
       - name: Run maintenance/rescue tests
         run: node --test packages/test-server/dist/fn-maintenance.test.js packages/test-server/dist/fn-maintenance-rpc.test.js packages/test-server/dist/fn-rescue-adapter.test.js
