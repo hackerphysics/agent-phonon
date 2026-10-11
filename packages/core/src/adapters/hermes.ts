@@ -65,7 +65,10 @@ const CAPABILITIES: AgentCapabilities = {
   injectMidTurn: false,
   skillManagement: true, // hermes skills
   hooks: ["pre_command"],
-  streaming: false, // native result messages are delivered after the turn (not token streaming)
+  // Hermes' run_conversation takes a native stream_callback invoked per text
+  // delta; the bridge chains onto the CLI's own callback so deltas reach us
+  // without disturbing Hermes' own TTS text queue.
+  streaming: true,
   workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4 },
 };
@@ -210,6 +213,8 @@ class HermesSession implements AdapterSession {
       const calls = new Map<string, string>();
       const results = new Set<string>();
       let settled = false;
+      /** True once at least one text delta was streamed, so finish() must not re-emit the full text. */
+      let streamed = false;
       const abort = (): void => { void supervisor.terminate(); finish("interrupted", out); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
@@ -220,7 +225,9 @@ class HermesSession implements AdapterSession {
           emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: message ?? "hermes failed", status: "failed", final: true } as StreamEvent);
         } else {
           // Native structured final text: one message and one terminal.
-          if (text) emit({ type: "message", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), role: "assistant", text, delta: false } as StreamEvent);
+          // When deltas were already streamed, skip the full-text message — the
+          // consumer has the same content and re-emitting would duplicate it.
+          if (text && !streamed) emit({ type: "message", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), role: "assistant", text, delta: false } as StreamEvent);
           emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), text, status, final: true } as StreamEvent);
         }
         resolve();
@@ -238,6 +245,11 @@ class HermesSession implements AdapterSession {
           outcome = ev;
           out = typeof ev.final_response === "string" ? ev.final_response : "";
           if (typeof ev.session_id === "string") this.hermesSessionId = ev.session_id;
+        } else if (ev.type === "hermes_text_delta") {
+          // Hermes' native stream_callback delta (chained in hermes-bridge).
+          if (typeof ev.text !== "string" || !ev.text) return;
+          streamed = true;
+          emit({ ...base, type: "message", role: "assistant", text: ev.text, delta: true } as StreamEvent);
         } else if (ev.type === "hermes_tool_call") {
           const call = ev.call, id = call?.id, fn = call?.function;
           if (typeof id !== "string" || typeof fn?.name !== "string" || calls.has(id)) return;

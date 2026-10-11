@@ -164,13 +164,13 @@ test("SIMULATED official Responses SDK carries knowledge ID/revision result by s
 });
 
 
-test("knowledge pack 2026.09.14.1 preserves native version, old npm, and unreleased daemon implementation boundaries", () => {
+test("knowledge pack 2026.10.11.1 preserves native version, old npm, and unreleased daemon implementation boundaries", () => {
   for (const [id, agent, version, protocol] of [
     ["claude-native-messages", "claude-code", "2.1.123", "anthropic"],
     ["hermes-named-provider", "hermes", "0.16.0", "chat"],
   ] as const) {
     const q = queryRescueKnowledge({ action: "get", id, agent, version, platform: "linux", protocol });
-    assert.equal(q.packVersion, "2026.09.14.1");
+    assert.equal(q.packVersion, "2026.10.11.1");
     const body = (q.entries[0] as { body?: string }).body!;
     assert.match(body, /adapter-fixes-20260909-192727/);
     assert.match(body, /0\.9\.1 alone/);
@@ -178,7 +178,7 @@ test("knowledge pack 2026.09.14.1 preserves native version, old npm, and unrelea
     if (agent === "claude-code") {
       assert.match(body, /claudeSettingsPath/); assert.match(body, /Pre-patch lacks/); assert.match(body, /legacy endpoint\/auth/);
     } else {
-      assert.match(body, /hermes-bridge/); assert.match(body, /streaming:false/); assert.match(body, /HTTP404 fails turn\/workflow\/run/);
+      assert.match(body, /hermes-bridge/); assert.match(body, /text deltas stream via native stream_callback/); assert.match(body, /tool messages remain buffered until completion/); assert.match(body, /HTTP404 fails turn\/workflow\/run/);
       assert.match(body, /idle after failed turn/); assert.match(body, /do not rewrite working YAML/);
     }
   }

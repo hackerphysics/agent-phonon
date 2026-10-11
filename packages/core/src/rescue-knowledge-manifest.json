@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "packVersion": "2026.09.14.1",
+  "packVersion": "2026.10.11.1",
   "authoring": {
     "tool": "skill_workshop",
     "proposalId": "phonon-rescue-repairs-20260909-c7f535f960",
     "proposalVersion": "v4",
     "publication": "pending OpenClaw proposal, NOT applied or installed; user-authorized product resource import only",
     "source": "packages/core/src/rescue-knowledge-source.md",
-    "sourceSha256": "7816d3fc2f6d85854969e03a1980e7c44e14b8b3c034c2ebcdf5cc440f04390b"
+    "sourceSha256": "f922068ac96772d244351d606398e71c418926fb0428b05d09aa696072056228"
   },
   "entries": [
     {

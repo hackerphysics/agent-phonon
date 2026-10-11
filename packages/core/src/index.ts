@@ -783,6 +783,7 @@ export type { ClaudeCodeEnv } from "./adapters/claude-code.js";
 export { CodexAdapter } from "./adapters/codex.js";
 export type { CodexEnv } from "./adapters/codex.js";
 export { HermesAdapter } from "./adapters/hermes.js";
+export { HERMES_BRIDGE } from "./adapters/hermes-bridge.js";
 export type { HermesEnv } from "./adapters/hermes.js";
 export { OpenCodeAdapter } from "./adapters/opencode.js";
 export type { OpenCodeEnv } from "./adapters/opencode.js";

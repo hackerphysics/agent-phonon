@@ -42,6 +42,29 @@ def observe(self, *args, **kwargs):
     root_agent = self
     history = kwargs.get("conversation_history") or (args[2] if len(args) > 2 else []) or []
     old_ids = {c.get("id") for m in history if isinstance(m, dict) for c in (m.get("tool_calls") or [])}
+    # Hermes already streams: run_conversation takes stream_callback invoked with
+    # each text delta (see cli.py / chat_completion_helpers). The CLI passes its own
+    # callback (TTS text_queue), so chain onto it rather than replacing it.
+    existing = kwargs.get("stream_callback")
+    if existing is None and len(args) >= 5:
+        existing = args[4]
+    def chained(delta):
+        try:
+            emit({"type": "hermes_text_delta", "text": delta})
+        except Exception:
+            pass
+        if callable(existing):
+            existing(delta)
+    if "stream_callback" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["stream_callback"] = chained
+    elif len(args) >= 5:
+        args = list(args)
+        args[4] = chained
+        args = tuple(args)
+    else:
+        kwargs = dict(kwargs)
+        kwargs["stream_callback"] = chained
     result = native_run(self, *args, **kwargs)
     if not isinstance(result, dict):
         emit({"type": "hermes_result", "completed": False, "error": "Native structured result unavailable"})
