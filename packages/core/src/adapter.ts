@@ -75,11 +75,25 @@ export interface SendOptions {
 }
 
 /** adapter 创建 session 的参数。 */
+/** Device-local HITL gate an adapter may enforce in-process, when the harness supports blocking hooks. */
+export interface AdapterHitlContext {
+  /** hook-bridge base URL, e.g. http://127.0.0.1:4318 */
+  bridgeUrl: string;
+  /** Optional bearer token for the bridge. */
+  token?: string;
+  /** How long to wait for a human decision. */
+  timeoutMs?: number;
+  /** Behaviour when the bridge is configured but unreachable. Defaults to closed. */
+  failMode?: "open" | "closed";
+}
+
 export interface AdapterRuntimeContext {
   /** Tenant-bound, policy-enforced deterministic host-maintenance broker. */
   maintenance?: MaintenanceRuntime;
   /** Device policy re-check for internal/scheduled session creation. */
   assertAgentAllowed?: (agentId: string) => void;
+  /** Device-local human-in-the-loop gate; absent means the harness declares no HITL. */
+  hitl?: AdapterHitlContext;
 }
 
 export interface CreateSessionParams {

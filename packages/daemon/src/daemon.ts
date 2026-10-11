@@ -111,6 +111,19 @@ export class PhononDaemon {
     }
   }
 
+  /** Give harnesses with a real in-process tool hook access to the local HITL bridge. */
+  private attachHitlGate(bridgePort: number): void {
+    const hitl = {
+      bridgeUrl: `http://127.0.0.1:${bridgePort}`,
+      ...(this.cfg.hookBridge?.token ? { token: this.cfg.hookBridge.token } : {}),
+    };
+    // Duck-typed on purpose: avoids instanceof across duplicated module instances.
+    for (const adapter of this.registry.all()) {
+      const gate = adapter as unknown as { setHitl?: (h: typeof hitl) => void };
+      if (typeof gate.setHitl === "function") gate.setHitl(hitl);
+    }
+  }
+
   /** 启动：起 HookBridge + 连所有 server（带自动重连）。 */
   start(): Promise<void> {
     if (this.stopped) return Promise.reject(new Error("daemon stopped"));
@@ -132,6 +145,11 @@ export class PhononDaemon {
     const port = await this.bridge.listen(this.cfg.hookBridge?.port ?? 4318);
     if (this.stopped) return;
     console.log(`[daemon] HookBridge on :${port}`);
+
+    // Adapters that can gate tools in-process need the bridge's *real* port, which
+    // is only known now (it can be dynamically assigned). Attach the gate here so
+    // Pi declares pre_tool HITL only when a human can actually answer.
+    this.attachHitlGate(port);
 
     // 可观测 HTTP 服务（人/监控看状态）
     if (this.cfg.obs?.enabled !== false) {

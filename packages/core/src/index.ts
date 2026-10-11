@@ -792,6 +792,7 @@ export { HerdrAdapter, parseHerdrKind, parseHerdrVersion, probeHerdrSync, HERDR_
 export type { HerdrEnv, HerdrKind } from "./adapters/herdr.js";
 export { PiAdapter, parsePiEvent, parsePiModels, parsePiVersion, toPiSessionId } from "./adapters/pi.js";
 export type { PiEnv, ParsedPiEvent } from "./adapters/pi.js";
+export { PI_HITL_EXTENSION_SOURCE, materializePiHitlExtension, piHitlExtensionHash, piHitlExtensionPath, piHitlStateDir } from "./pi-hitl-extension.js";
 export { RescueAdapter } from "./adapters/rescue.js";
 export type { RescueAdapterOptions } from "./adapters/rescue.js";
 export { spawnAgent, spawnSyncAgent, quoteWinArg } from "./proc.js";

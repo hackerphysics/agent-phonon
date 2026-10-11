@@ -38,7 +38,11 @@ const CAPABILITIES: AgentCapabilities = {
   skillManagement: false,
   hooks: ["pre_command"],
   streaming: true, // --format json 事件流
-  workflowRoles: ["worker"],
+  // Executor routing is parsed from the assistant's text output
+  // (parseRoutingDirectives), so any adapter that returns text can drive a graph.
+  // The previous ["worker"] declaration was advisory-only metadata that misled
+  // orchestrators into excluding opencode from executor roles.
+  workflowRoles: ["executor", "worker"],
   limits: { maxConcurrentSessions: 4 },
 };
 

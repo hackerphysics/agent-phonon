@@ -606,3 +606,47 @@ test("workflow: node systemPrompt is delivered to adapter via initialContext (da
   assert.match(resultText, /# Target Workspace/, "target workspace block should reach adapter input");
   assert.match(resultText, new RegExp(project.project.projectId), "target workspace should include project id");
 });
+
+test("workflowRoles is advisory metadata, not a gate: a worker-only adapter can still execute a graph", async () => {
+  // Regression guard for the 2026-10-11 capability pass. codex and opencode used to
+  // declare workflowRoles: ["worker"], which misled orchestrators into excluding them
+  // from executor roles. The engine never enforced the field: executor routing is
+  // parsed from assistant text (parseRoutingDirectives) and executeNode has no
+  // capability gate. Same graph shape as the routing test above, but the adapter
+  // deliberately declares worker-only roles.
+  const reg = new AdapterRegistry();
+  reg.register(new MockAdapter({
+    name: "mock",
+    agentIds: ["mock:executor", "mock:a"],
+    models: ["m1"],
+    caps: { workflowRoles: ["worker"] },
+    reply: (input) => {
+      if (input.includes("EXECUTOR of a multi-agent workflow")) {
+        return ["```phonon.workflow.route", JSON.stringify({ to: "worker", message: "do the review" }), "```"].join("\n");
+      }
+      // The follow-up executor turn carries worker results, not the EXECUTOR banner.
+      if (input.includes("Worker results from previous iteration")) {
+        return ["```phonon.workflow.done", JSON.stringify({ finalSummary: "Final answer text." }), "```"].join("\n");
+      }
+      return `worker output for: ${input}`;
+    },
+  }));
+  const tc = new TestConn({ registry: reg, workspaceRoot: mkdtempSync(join(tmpdir(), "phonon-wf-roles-")) });
+  const project = await tc.call("project.create", { name: "wf-roles" }) as { project: { projectId: string } };
+
+  const run = await tc.call("workflow.run", {
+    project: project.project.projectId,
+    input: "review this",
+    plan: {
+      mode: "graph",
+      executor: { nodeId: "exec", agent: "mock:executor", model: "m1" },
+      workers: [{ nodeId: "worker", agent: "mock:a", model: "m1" }],
+      communicationGraph: { edges: [{ from: "exec", to: "worker" }], maxIterations: 3 },
+    },
+  }) as { workflowId: string };
+
+  const status = await waitWorkflow(tc, run.workflowId) as { status: string; error?: string; nodes: Array<{ nodeId: string; status: string }> };
+  assert.equal(status.error, undefined, `workflow failed: ${status.error ?? "?"}`);
+  assert.equal(status.status, "completed");
+  assert.equal(status.nodes.find((n) => n.nodeId === "worker")?.status, "completed", "worker-only-declared executor must still drive the worker");
+});

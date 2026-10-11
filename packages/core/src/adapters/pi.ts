@@ -8,10 +8,12 @@ import { adapterDiagnostic } from "../adapter-diagnostic.js";
 import type {
   AgentAdapter,
   AdapterSession,
+  AdapterHitlContext,
   CreateSessionParams,
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
+import { materializePiHitlExtension, piHitlStateDir } from "../pi-hitl-extension.js";
 import type {
   AgentCapabilities,
   AgentDescriptor,
@@ -38,7 +40,7 @@ import type {
  */
 
 /** Pi 不暴露「按需触发压缩」的 CLI flag（它只在自己超阈值时自动 compact），故不谎报 nativeCompression。 */
-const CAPABILITIES: AgentCapabilities = {
+const BASE_CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // --session-id <id>，确定性续接
   nativeCompression: false, // Pi 内部会自动 compact，但没有可主动调用的 flag
   contextInjection: true, // --append-system-prompt / 首轮 prompt 前置
@@ -47,9 +49,7 @@ const CAPABILITIES: AgentCapabilities = {
   interrupt: true, // kill 子进程
   injectMidTurn: false,
   skillManagement: true, // --skill <path>，Pi 原生 skills
-  // Pi 的 extension 机制确实有 `tool_call` 事件（见 json.md 的 extension_error 示例），
-  // 理论上可做阻塞式 HITL，但需要额外写 Pi extension + RPC 编排，本 adapter 未接。
-  // 诚实声明为空：不要让编排层误以为能拦。
+  // Without a configured bridge there is genuinely no gate, so never advertise one.
   hooks: [],
   streaming: true, // --mode json 真流式
   workflowRoles: ["executor", "worker"],
@@ -65,6 +65,8 @@ export interface PiEnv {
   models?: ModelInfo[];
   /** 追加到 system prompt 的内容（persona / 项目规约等）。 */
   appendSystemPrompt?: string;
+  /** Device HITL gate. When present, the blocking tool_call extension is loaded. */
+  hitl?: AdapterHitlContext;
 }
 
 /** 解析后的 Pi JSONL 事件子集（本 adapter 关心的部分）。 */
@@ -228,9 +230,21 @@ class PiSession implements AdapterSession {
       if (this.model && this.model !== "default") args.push("--model", this.model);
       if (this.env.appendSystemPrompt) args.push("--append-system-prompt", this.env.appendSystemPrompt);
 
+      const hitl = this.env.hitl;
+      const childEnv: NodeJS.ProcessEnv = buildChildProcessEnvironment(opts.environment);
+      if (hitl?.bridgeUrl) {
+        // Load the blocking tool_call extension so a human decision actually gates tools.
+        args.push("--extension", materializePiHitlExtension(piHitlStateDir()));
+        childEnv.AGENT_PHONON_HITL_BRIDGE = hitl.bridgeUrl;
+        childEnv.AGENT_PHONON_HITL_SESSION = this.sessionId;
+        childEnv.AGENT_PHONON_HITL_FAIL_MODE = hitl.failMode ?? "closed";
+        if (hitl.timeoutMs !== undefined) childEnv.AGENT_PHONON_HITL_TIMEOUT_MS = String(hitl.timeoutMs);
+        if (hitl.token) childEnv.AGENT_PHONON_HITL_TOKEN = hitl.token;
+      }
+
       const child = spawnAgent(this.env.binPath ?? "pi", args, {
         cwd: this.cwd,
-        env: buildChildProcessEnvironment(opts.environment),
+        env: childEnv,
       });
       this.current = child;
 
@@ -367,11 +381,28 @@ class PiSession implements AdapterSession {
 
 export class PiAdapter implements AgentAdapter {
   readonly name = "pi";
-  readonly capabilities = CAPABILITIES;
-  private readonly env: PiEnv;
+  /** Blocking pre_tool HITL is only real when a device bridge is configured.
+   *  Not readonly: the daemon re-derives this once the hook bridge binds. */
+  capabilities: AgentCapabilities;
+  private env: PiEnv;
 
   constructor(opts: { env?: PiEnv } = {}) {
     this.env = opts.env ?? {};
+    this.capabilities = this.deriveCapabilities();
+  }
+
+  /**
+   * Attach (or clear) the device HITL gate. The daemon calls this once the hook
+   * bridge has bound, because only then is its real port known — a port chosen at
+   * construction time can be wrong when the configured port is dynamic (0).
+   */
+  setHitl(hitl: AdapterHitlContext | undefined): void {
+    this.env = { ...this.env, hitl };
+    this.capabilities = this.deriveCapabilities();
+  }
+
+  private deriveCapabilities(): AgentCapabilities {
+    return { ...BASE_CAPABILITIES, hooks: this.env.hitl?.bridgeUrl ? ["pre_tool"] : [] };
   }
 
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
@@ -386,7 +417,7 @@ export class PiAdapter implements AgentAdapter {
         available: false,
         unavailableReason: "pi CLI not found (install: curl -fsSL https://pi.dev/install.sh | sh)",
         models: [],
-        capabilities: CAPABILITIES,
+        capabilities: this.capabilities,
         scannedAt: new Date().toISOString(),
       }];
     }
@@ -397,7 +428,7 @@ export class PiAdapter implements AgentAdapter {
       available: true,
       ...(version ? { version } : {}),
       models: await this.resolveModels(signal),
-      capabilities: CAPABILITIES,
+      capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
   }
