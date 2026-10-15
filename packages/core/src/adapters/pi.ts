@@ -157,6 +157,41 @@ export function parsePiVersion(text: string): string | undefined {
 }
 
 /**
+ * Session flags this Pi build actually accepts.
+ *
+ * `--session-id` (create-if-absent) and `--name` only exist in newer Pi. Pi 0.70.6
+ * rejects them outright — `Error: Unknown option: --session-id` — which made every
+ * session fail. Older builds offer `--session <path|id>` (lookup only) and
+ * `--continue`. Detect from `pi --help` instead of trusting the docs, which track main.
+ */
+export interface PiSessionFlags {
+  sessionId: boolean;
+  name: boolean;
+  session: boolean;
+  continueFlag: boolean;
+}
+
+export function parsePiSessionFlags(help: string): PiSessionFlags {
+  return {
+    sessionId: /--session-id\b/.test(help),
+    name: /(?:^|\s)-n,\s*--name\b|--name\b/.test(help),
+    session: /--session\s+<|--session\s+[a-z]/i.test(help),
+    continueFlag: /--continue\b/.test(help),
+  };
+}
+
+/** Best-effort capability probe; an unreadable help yields all-false (no session flags). */
+export function probePiSessionFlags(binPath = "pi"): PiSessionFlags {
+  try {
+    const r = spawnSyncAgent(binPath, ["--help"], { timeout: 10_000, encoding: "utf8" });
+    if (r.status !== 0) return { sessionId: false, name: false, session: false, continueFlag: false };
+    return parsePiSessionFlags(`${r.stdout ?? ""}\n${r.stderr ?? ""}`);
+  } catch {
+    return { sessionId: false, name: false, session: false, continueFlag: false };
+  }
+}
+
+/**
  * Pi 的探测类命令把输出写到 **stderr**（`pi --version` / `pi --list-models` 实测均是，
  * stdout 为空）。`discoveryProbe` 只回 stdout，会把已安装的 Pi 误报成 unavailable，
  * 所以这里自己跑一遍并合并两个流。
@@ -198,15 +233,20 @@ class PiSession implements AdapterSession {
   private readonly cwd: string;
   private readonly env: PiEnv;
   private readonly piSessionId: string;
+  /** Session flags accepted by the installed Pi build; probed, never assumed. */
+  private readonly sessionFlags: PiSessionFlags;
+  /** True after the first completed turn, so --continue/--session only apply from turn 2. */
+  private started = false;
   private pendingInject: string[] = [];
   private nativeSessionId?: string;
   private current?: ChildProcess;
 
-  constructor(sessionId: string, model: string, cwd: string, env: PiEnv, initialContext?: ContextItem[]) {
+  constructor(sessionId: string, model: string, cwd: string, env: PiEnv, initialContext: ContextItem[] | undefined, sessionFlags: PiSessionFlags) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.env = env;
+    this.sessionFlags = sessionFlags;
     this.piSessionId = toPiSessionId(sessionId);
     this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
@@ -226,7 +266,13 @@ class PiSession implements AdapterSession {
   private run(prompt: string, opts: SendOptions): Promise<void> {
     return new Promise((resolve) => {
       const { turnId, emit } = opts;
-      const args = ["--mode", "json", "--session-id", this.piSessionId];
+      const args = ["--mode", "json"];
+      // Only pass session flags this Pi build actually accepts; older builds abort
+      // on an unknown option instead of ignoring it.
+      if (this.sessionFlags.sessionId) args.push("--session-id", this.piSessionId);
+      else if (this.sessionFlags.name) args.push("--name", this.piSessionId);
+      else if (this.sessionFlags.session && this.started) args.push("--session", this.piSessionId);
+      else if (this.sessionFlags.continueFlag && this.started) args.push("--continue");
       if (this.model && this.model !== "default") args.push("--model", this.model);
       if (this.env.appendSystemPrompt) args.push("--append-system-prompt", this.env.appendSystemPrompt);
 
@@ -266,6 +312,9 @@ class PiSession implements AdapterSession {
             message: adapterDiagnostic(message ?? "pi failed"), status: "failed", final: true,
           } as StreamEvent);
         } else {
+          // A completed turn means the next one may address the same native
+          // session; --continue/--session are only meaningful from turn 2 on.
+          this.started = true;
           emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at, text: acc, status, final: true } as StreamEvent);
         }
         resolve();
@@ -385,10 +434,19 @@ export class PiAdapter implements AgentAdapter {
    *  Not readonly: the daemon re-derives this once the hook bridge binds. */
   capabilities: AgentCapabilities;
   private env: PiEnv;
+  /** Cached Pi session-flag probe; undefined until first use. */
+  private sessionFlags: PiSessionFlags | undefined;
 
   constructor(opts: { env?: PiEnv } = {}) {
     this.env = opts.env ?? {};
+    this.sessionFlags = undefined;
     this.capabilities = this.deriveCapabilities();
+  }
+
+  /** Detect once; older Pi builds reject newer session flags outright. */
+  private flags(): PiSessionFlags {
+    this.sessionFlags ??= probePiSessionFlags(this.env.binPath ?? "pi");
+    return this.sessionFlags;
   }
 
   /**
@@ -402,7 +460,14 @@ export class PiAdapter implements AgentAdapter {
   }
 
   private deriveCapabilities(): AgentCapabilities {
-    return { ...BASE_CAPABILITIES, hooks: this.env.hitl?.bridgeUrl ? ["pre_tool"] : [] };
+    // Probe eagerly so discovery reports the truth rather than an optimistic claim.
+    const flags = this.flags();
+    return {
+      ...BASE_CAPABILITIES,
+      // Deterministic cross-turn resume needs a create-if-absent selector.
+      nativeSession: flags.sessionId || flags.name,
+      hooks: this.env.hitl?.bridgeUrl ? ["pre_tool"] : [],
+    };
   }
 
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
@@ -435,7 +500,7 @@ export class PiAdapter implements AgentAdapter {
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "default");
-    return new PiSession(params.sessionId, model, params.cwd, this.env, params.initialContext);
+    return new PiSession(params.sessionId, model, params.cwd, this.env, params.initialContext, this.flags());
   }
 
   private async resolveModels(signal?: AbortSignal): Promise<ModelInfo[]> {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PiAdapter, parsePiEvent, parsePiModels, parsePiVersion, toPiSessionId } from "@agent-phonon/core";
+import { PiAdapter, parsePiEvent, parsePiModels, parsePiVersion, toPiSessionId, probePiSessionFlags } from "@agent-phonon/core";
 
 /**
  * Fixtures below are copied verbatim from Pi's official docs
@@ -131,7 +131,13 @@ test("pi adapter declares capabilities honestly", () => {
   const a = new PiAdapter();
   assert.equal(a.name, "pi");
   assert.equal(a.capabilities.streaming, true, "pi --mode json is real streaming");
-  assert.equal(a.capabilities.nativeSession, true, "--session-id gives deterministic resume");
+  // nativeSession is derived from what the installed Pi actually accepts, not from
+  // the docs: --session-id/--name only exist in newer Pi, and Pi 0.70.6 aborts on
+  // an unknown option. Asserting a hard-coded true here is what let the doc/CLI
+  // mismatch ship unnoticed.
+  const flags = probePiSessionFlags("pi");
+  assert.equal(a.capabilities.nativeSession, flags.sessionId || flags.name,
+    "nativeSession must mirror the probed create-if-absent selector, not optimism");
   // No blocking pre-tool hook is wired, so orchestrators must not assume HITL can stop a command.
   assert.deepEqual(a.capabilities.hooks, []);
   // Pi compacts on its own thresholds but exposes no on-demand flag; do not claim nativeCompression.

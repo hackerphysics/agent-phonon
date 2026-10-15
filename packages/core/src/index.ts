@@ -791,8 +791,9 @@ export { CopilotAdapter, parseCopilotEvent, parseCopilotModelsHelp } from "./ada
 export type { CopilotEnv, ParsedCopilotEvent } from "./adapters/copilot.js";
 export { HerdrAdapter, parseHerdrKind, parseHerdrVersion, probeHerdrSync, HERDR_KINDS } from "./adapters/herdr.js";
 export type { HerdrEnv, HerdrKind } from "./adapters/herdr.js";
-export { PiAdapter, parsePiEvent, parsePiModels, parsePiVersion, toPiSessionId } from "./adapters/pi.js";
-export type { PiEnv, ParsedPiEvent } from "./adapters/pi.js";
+export { PiAdapter, parsePiEvent, parsePiModels, parsePiVersion, toPiSessionId,
+  parsePiSessionFlags, probePiSessionFlags } from "./adapters/pi.js";
+export type { PiEnv, ParsedPiEvent, PiSessionFlags } from "./adapters/pi.js";
 export { PI_HITL_EXTENSION_SOURCE, materializePiHitlExtension, piHitlExtensionHash, piHitlExtensionPath, piHitlStateDir } from "./pi-hitl-extension.js";
 export { RescueAdapter } from "./adapters/rescue.js";
 export type { RescueAdapterOptions } from "./adapters/rescue.js";
