@@ -5,7 +5,8 @@ import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, HerdrAdapter, PiAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
-import { loadConfig, writeConfig, readOpenClawGatewayToken, type AdapterConfig, type DaemonConfig } from "./config.js";
+import { loadConfig, writeConfig, readOpenClawGatewayToken, DEFAULT_CONFIG_PATH, type AdapterConfig, type DaemonConfig } from "./config.js";
+import { LaunchdService } from "./launchd.js";
 
 /**
  * CLI 辅助命令（让 phonon 真正可用）：doctor / discover / adapter / plugin。
@@ -293,104 +294,6 @@ function serviceUnitContent(): string {
   return `[Unit]\nDescription=agent-phonon device daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=${node} ${cli} start\nRestart=always\nRestartSec=5\nMemoryMax=256M\n\n[Install]\nWantedBy=default.target\n`;
 }
 
-// ── macOS launchd ──────────────────────────────────────────────
-const LAUNCHD_LABEL = "ai.phonon.agent";
-
-function launchAgentPath(): string {
-  return join(homedir(), "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`);
-}
-
-function launchAgentContent(): string {
-  const node = process.execPath;
-  const cli = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
-  const logDir = join(homedir(), ".agent-phonon");
-  const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${esc(node)}</string>
-    <string>${esc(cli)}</string>
-    <string>start</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${esc(join(logDir, "daemon.out.log"))}</string>
-  <key>StandardErrorPath</key><string>${esc(join(logDir, "daemon.err.log"))}</string>
-</dict>
-</plist>
-`;
-}
-
-function launchctl(args: string[], opts: { check?: boolean } = {}): void {
-  const r = spawnSync("launchctl", args, { stdio: "inherit" });
-  if (opts.check && r.status !== 0) fail(`launchctl ${args.join(" ")} failed`);
-}
-
-/** 人话化的 launchd 服务状态（解析 launchctl list <label> 的 PID/LastExitStatus）。 */
-function launchctlStatus(label: string): void {
-  const r = spawnSync("launchctl", ["list", label], { encoding: "utf8" });
-  if (r.status !== 0) {
-    console.log(`✗ ${label}: not loaded (run: agent-phonon service install)`);
-    return;
-  }
-  const out = r.stdout ?? "";
-  const pidM = out.match(/"PID"\s*=\s*(\d+)/);
-  const exitM = out.match(/"LastExitStatus"\s*=\s*(-?\d+)/);
-  if (pidM) {
-    console.log(`✓ ${label}: running (PID ${pidM[1]})`);
-  } else {
-    const exit = exitM ? exitM[1] : "?";
-    console.log(`✗ ${label}: loaded but not running (last exit status ${exit})`);
-  }
-}
-
-function cmdServiceLaunchd(sub: string | undefined, opts: { force?: boolean }): void {
-  const plist = launchAgentPath();
-  switch (sub) {
-    case "install": {
-      if (existsSync(plist) && !opts.force) fail(`${plist} already exists (use --force to overwrite)`);
-      mkdirSync(dirname(plist), { recursive: true });
-      mkdirSync(join(homedir(), ".agent-phonon"), { recursive: true });
-      writeFileSync(plist, launchAgentContent(), { mode: 0o644 });
-      chmodSync(plist, 0o644);
-      launchctl(["unload", plist]); // best-effort（覆盖安装时先卸）
-      launchctl(["load", "-w", plist], { check: true });
-      console.log(`installed + loaded launchd user agent → ${plist}`);
-      console.log("it will start at login and is running now (RunAtLoad).");
-      if (!existsSync(join(homedir(), ".agent-phonon", "config.json"))) console.log("config not found yet; run: agent-phonon init");
-      break;
-    }
-    case "start":
-      launchctl(["start", LAUNCHD_LABEL], { check: true });
-      console.log(`started ${LAUNCHD_LABEL}`);
-      break;
-    case "stop":
-      launchctl(["stop", LAUNCHD_LABEL], { check: true });
-      console.log(`stopped ${LAUNCHD_LABEL}`);
-      break;
-    case "restart":
-      launchctl(["stop", LAUNCHD_LABEL]);
-      launchctl(["start", LAUNCHD_LABEL], { check: true });
-      console.log(`restarted ${LAUNCHD_LABEL}`);
-      break;
-    case "status":
-      // 人话化输出：✓ running (PID) / ✗ not loaded / ✗ loaded but not running
-      launchctlStatus(LAUNCHD_LABEL);
-      break;
-    case "uninstall":
-      launchctl(["unload", "-w", plist]);
-      rmSync(plist, { force: true });
-      console.log(`removed ${plist}`);
-      break;
-    default:
-      fail("usage: agent-phonon service install|start|stop|restart|status|uninstall [--force]");
-  }
-}
-
 function cmdServiceWindowsGuidance(): void {
   // Windows 没有 systemd//launchd 等价的「用户级常驻服务」一键方案：
   // Task Scheduler 不适合长驻守护，正经做法是 nssm/winsw（需外部二进制）。
@@ -407,9 +310,13 @@ function cmdServiceWindowsGuidance(): void {
   console.log("  Register-ScheduledTask -TaskName agent-phonon -Action $a -Trigger $t -RunLevel Limited");
 }
 
-export function cmdService(sub: string | undefined, opts: { force?: boolean } = {}): void {
+export async function cmdService(sub: string | undefined, opts: { force?: boolean } = {}): Promise<void> {
   const plat = platform();
-  if (plat === "darwin") return cmdServiceLaunchd(sub, opts);
+  if (plat === "darwin") return new LaunchdService({
+    home: homedir(), node: process.execPath,
+    cli: resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
+    configPath: resolve(DEFAULT_CONFIG_PATH), path: process.env.PATH, uid: process.getuid!(),
+  }).run(sub, opts);
   if (plat === "win32") return cmdServiceWindowsGuidance();
   if (plat !== "linux") {
     fail(`service ${sub ?? ""} not supported on platform=${plat} (linux systemd / macOS launchd / Windows nssm only)`);

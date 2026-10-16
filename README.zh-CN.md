@@ -69,7 +69,7 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
   - Pi：`pi` — 安装：`curl -fsSL https://pi.dev/install.sh | sh`
   - OpenClaw Gateway / plugin
 
-Linux 服务管理目前支持 **systemd --user**。macOS launchd 和 Windows service 后续单独支持。
+用户级服务管理支持 Linux **systemd --user** 和 macOS **launchd**。Windows 当前提供 nssm / Task Scheduler 手动配置指引。
 
 ## 安装设备侧 daemon
 
@@ -160,6 +160,33 @@ systemctl --user enable agent-phonon.service
 ```bash
 loginctl enable-linger "$USER"
 ```
+
+## 作为 macOS 用户服务运行
+
+使用已登录的 macOS 用户运行，不要加 `sudo`：
+
+```bash
+agent-phonon init                 # 仅在尚无配置时执行
+agent-phonon service install
+agent-phonon service start
+agent-phonon service status
+```
+
+LaunchAgent 位于 `~/Library/LaunchAgents/ai.phonon.agent.plist`。安装准备登录自启，但**不会立即启动或打断现有 daemon**。`start` 将服务注册到当前用户的 GUI 登录会话；已经运行时不重复启动。崩溃后由 launchd 自动恢复，重启节流为 5 秒。
+
+```bash
+agent-phonon service stop         # 停止到下次登录或显式 start，不被 KeepAlive 拉起
+agent-phonon service restart      # 等待旧进程退出，再加载已安装的 plist
+agent-phonon service uninstall    # 只移除服务，保留全部用户数据
+```
+
+plist 固定 Node / CLI 的绝对路径并记录可执行文件搜索路径，包括当前 Node 安装与 Homebrew。只写入 `HOME`、`PATH` 和选定的 `PHONON_CONFIG` 路径，不复制 shell API key。后台凭据应使用受保护的配置或 key 文件，不依赖交互 shell 的 export。
+
+日志写入 `~/.agent-phonon/daemon.out.log` 和 `daemon.err.log`；安装时保留日志内容并将权限设为仅 owner 可读写（`0600`）。这是登录用户服务，不是开机系统级 daemon；退出登录后不继续运行，也不会阻止 macOS 休眠。
+
+常驻服务支持不代表全部 RPC 已跨平台：当前安全文件 broker 使用 Linux `/proc` 文件描述符锚点，macOS 上相关文件操作仍明确拒绝，不降级绕过符号链接竞态保护。
+
+更换 Node / npm 安装路径后，从新 CLI 执行 `service install --force`，再执行 `service restart`。现有配置、设备凭据、SQLite 数据与日志均保留。服务运行时不要再用同一配置启动前台 daemon。
 
 ## 前台运行
 

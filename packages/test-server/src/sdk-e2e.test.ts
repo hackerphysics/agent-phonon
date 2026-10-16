@@ -42,7 +42,7 @@ function dialPhononHR(serverUrl: string, deviceId: string, deviceKey?: string) {
   return new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, deviceKey });
 }
 
-test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, async () => {
+test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, async t => {
   const server = new PhononServer({ authenticate: (id) => ({ tenantId: `t-${id}` }) });
   const port = await server.listen();
 
@@ -52,6 +52,7 @@ test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, a
   });
 
   const client = dialPhonon(`ws://127.0.0.1:${port}`, "dev-1", "key-1");
+  t.after(async () => { await client.close(); await server.close(); });
   await client.connect();
   const device = await deviceReady;
   assert.equal(device.deviceId, "dev-1");
@@ -71,9 +72,16 @@ test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, a
   const envs = await device.env.list() as { variables: Array<{ name: string; redacted: boolean }> };
   assert.ok(envs.variables.some((v) => v.name === "SDK_TOKEN" && v.redacted));
   const proj = await device.project.create({ name: "p", git: false });
-  await device.file.write({ projectId: proj.project.projectId, path: "hello.txt", data: "from-sdk" });
-  const fileRead = await device.file.read({ projectId: proj.project.projectId, path: "hello.txt" }) as { data: string };
-  assert.equal(fileRead.data, "from-sdk");
+  if (info.os.platform === "linux") {
+    await device.file.write({ projectId: proj.project.projectId, path: "hello.txt", data: "from-sdk" });
+    const fileRead = await device.file.read({ projectId: proj.project.projectId, path: "hello.txt" }) as { data: string };
+    assert.equal(fileRead.data, "from-sdk");
+  } else {
+    const unsupported = (error: { message?: string; data?: { appCode?: string } }) =>
+      error.data?.appCode === "errPolicyDenied" && error.message === "secure file broker unsupported on this platform";
+    await assert.rejects(device.file.write({ projectId: proj.project.projectId, path: "hello.txt", data: "from-sdk" }), unsupported);
+    await assert.rejects(device.file.read({ projectId: proj.project.projectId, path: "hello.txt" }), unsupported);
+  }
   const session = await device.createSession({ project: proj.project.projectId, agent: "mock:default", model: "m1" });
 
   const streamed: string[] = [];

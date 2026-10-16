@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import dns from "node:dns";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,18 +66,31 @@ for (const match of [false, true]) {
   });
 }
 
-test("A5 daemon JSON -> client: strict plaintext default/false, explicit exception connects locally", { timeout: 10000 }, async () => {
-  // 127.0.0.2 is OS loopback, but deliberately outside core's exact 127.0.0.1 allowlist.
-  // Thus exercise its non-loopback policy branch without external traffic/wildcard listeners.
-  const server = new PhononServer({ host: "127.0.0.2", authenticate: () => ({ tenantId: "tenant-fixture" }) });
+test("A5 daemon JSON -> client: strict plaintext default/false, explicit exception connects locally", { timeout: 10000 }, async t => {
+  // Resolve a reserved non-loopback hostname locally. macOS does not assign
+  // 127.0.0.2 by default; no interface changes or external DNS are needed.
+  let remoteLookups = 0;
+  t.mock.method(dns, "lookup", (hostname: string, options: dns.LookupOptions,
+    callback: (error: Error | null, address: unknown, family?: number) => void) => {
+    assert.ok(hostname === "127.0.0.1" || hostname === "plaintext.phonon.invalid");
+    if (hostname === "plaintext.phonon.invalid") remoteLookups++;
+    if (options.all) callback(null, [{ address: "127.0.0.1", family: 4 }]);
+    else callback(null, "127.0.0.1", 4);
+  });
+  const server = new PhononServer({ host: "127.0.0.1", authenticate: () => ({ tenantId: "tenant-fixture" }) });
   const port = await server.listen();
   try {
     for (const allowInsecure of [undefined, false, true]) {
-      const daemon = new PhononDaemon(config({ url: `ws://127.0.0.2:${port}`, allowInsecure, expectedTenantId: "tenant-fixture" }), { adapters: [] });
+      const daemon = new PhononDaemon(config({ url: `ws://plaintext.phonon.invalid:${port}`, allowInsecure, expectedTenantId: "tenant-fixture" }), { adapters: [] });
       try {
         if (allowInsecure === true) { await daemon.start(); await waitConnected(daemon); }
-        else { await assert.rejects(daemon.start(), /insecure.*rejected/); assert.equal(server.listDevices().length, 0); }
+        else {
+          await assert.rejects(daemon.start(), /insecure.*rejected/);
+          assert.equal(server.listDevices().length, 0);
+          assert.equal(remoteLookups, 0, "plaintext must be rejected before DNS or connection");
+        }
       } finally { await daemon.stop(); }
     }
+    assert.ok(remoteLookups > 0, "explicit exception reaches the actual local WebSocket server");
   } finally { await server.close(); }
 });

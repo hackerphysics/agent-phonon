@@ -1,7 +1,23 @@
-import { resolve, join } from "node:path";
+import { realpathSync } from "node:fs";
+import { resolve, join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { TenantPolicy, DEFAULT_TENANT_POLICY, isPathUnderRoots, type TenantPolicy as TenantPolicyT } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
+
+function canonicalPath(path: string): string {
+  let current = resolve(path);
+  const suffix: string[] = [];
+  for (;;) {
+    try { return resolve(realpathSync(current), ...suffix); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      suffix.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
 
 /**
  * 本地安全策略执行器（design D27 / bug-bash P0-1）。
@@ -17,14 +33,13 @@ export class PolicyEnforcer {
   readonly policy: TenantPolicyT;
   /** 受控工作区根（项目缺省建在这下面）。 */
   readonly workspaceRoot: string;
+  private readonly projectRoots: string[];
 
   constructor(opts?: { policy?: Partial<TenantPolicyT>; workspaceRoot?: string; trustLocal?: boolean }) {
-    // resolve 规范化：默认值用 join 而非字符串拼 `/`（Windows 上 homedir 是 C:\…，
-    // 拼 `/phonon-projects` 会产生混合分隔符）；workspaceRoot 与 assertProjectPath
-    // 的待检查路径必须同一基准，否则 Windows 上合法路径被误拒（resolve 后是
-    // C:\work\proj，而未规范化的 root 仍是 /work → isPathUnderRoots 不匹配）。
+    // Match ProjectManager's canonical paths, including macOS /var aliases.
+    // Non-existent roots retain their suffix after resolving existing ancestors.
     const rawRoot = opts?.workspaceRoot ?? process.env.PHONON_PROJECTS_ROOT ?? join(homedir(), "phonon-projects");
-    this.workspaceRoot = resolve(rawRoot);
+    this.workspaceRoot = canonicalPath(rawRoot);
     if (opts?.policy) {
       this.policy = TenantPolicy.parse(opts.policy);
     } else if (opts?.trustLocal) {
@@ -43,14 +58,15 @@ export class PolicyEnforcer {
     } else {
       this.policy = DEFAULT_TENANT_POLICY;
     }
+    // Pin authorized root identities once; retargeting a configured symlink
+    // must not grant access to a different directory later.
+    this.projectRoots = [this.workspaceRoot, ...this.policy.allowedProjectRoots.map(canonicalPath)];
   }
 
   /** 项目路径是否允许（落在 allowedProjectRoots 或受控根下）。 */
   assertProjectPath(path: string): void {
-    const abs = resolve(path);
-    // roots 也 resolve 规范化，与 abs 同一基准（Windows 盘符/分隔符/相对段一致）。
-    const roots = [this.workspaceRoot, ...this.policy.allowedProjectRoots].map((r) => resolve(r));
-    if (!isPathUnderRoots(abs, roots)) {
+    const abs = canonicalPath(path);
+    if (!isPathUnderRoots(abs, this.projectRoots)) {
       throw new PhononError("errPolicyDenied", `project path outside allowed roots: ${abs}`);
     }
   }

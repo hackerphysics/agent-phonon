@@ -78,3 +78,12 @@ jobs:
       - run: pnpm --filter @agent-phonon/test-server build
       - name: Run maintenance/rescue tests
         run: node --test packages/test-server/dist/fn-maintenance.test.js packages/test-server/dist/fn-maintenance-rpc.test.js packages/test-server/dist/fn-rescue-adapter.test.js
+      - name: Build daemon service tests
+        run: pnpm --filter agent-phonon build:test
+      - name: Run path-policy and launchd lifecycle unit tests
+        run: node --test packages/test-server/dist/fn-policy-paths.test.js packages/daemon/dist-test/launchd.test.js
+      - name: Run native macOS launchd acceptance
+        if: runner.os == 'macOS'
+        env:
+          PHONON_TEST_LAUNCHD: '1'
+        run: pnpm --filter agent-phonon test:launchd

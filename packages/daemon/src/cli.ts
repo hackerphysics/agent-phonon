@@ -16,7 +16,7 @@ import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall
 /**
  * agent-phonon CLI（bug-bash B4）。
  *   agent-phonon init                 生成默认配置
- *   agent-phonon start                启动 daemon（前台；systemd 托管）
+ *   agent-phonon start                启动 daemon（前台；可由系统服务托管）
  *   agent-phonon server add <url> [--trust-local]   加一个 server 连接
  *   agent-phonon server list          列已配 server
  *   agent-phonon config               打印当前配置路径与内容
@@ -160,7 +160,7 @@ async function main(): Promise<void> {
       break;
     }
     case "service": {
-      cmdService(args[0], { force: flag("force") });
+      await cmdService(args[0], { force: flag("force") });
       break;
     }
     case "plugin": {
@@ -189,6 +189,7 @@ async function main(): Promise<void> {
       console.log("  rescue configure [opts]       configure rescue (--wire-api chat|responses|anthropic|gemini; --no-auth: loopback only)");
       console.log("  plugin install openclaw       install OpenClaw HITL plugin");
       console.log("  service install|start|status  manage autostart service (Linux systemd / macOS launchd / Windows nssm)");
+      console.log("  service stop|restart|uninstall  stop, reload or remove the user service");
       console.log("  server add <url> [--trust-local] [--device-key <k>]");
       console.log("  server list");
       console.log("  server remove <url|index>");
@@ -197,7 +198,7 @@ async function main(): Promise<void> {
       console.log("  config [--show-secrets]       show config (redacted by default)");
       console.log("\nrun:");
       console.log("  discover                      list available agents (without starting daemon)");
-      console.log("  start                         start the daemon (systemd-managed)");
+      console.log("  start                         run the daemon in the foreground");
       console.log("\nadapter add examples:");
       console.log("  agent-phonon adapter add openclaw --agent phonon");
       console.log("  agent-phonon adapter add codex --base-url https://gw/v1 --api-key <k> --model gpt-5.5");

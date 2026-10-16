@@ -75,8 +75,8 @@ for development and integration testing.
   - Pi: `pi` — install with `curl -fsSL https://pi.dev/install.sh | sh`
   - OpenClaw Gateway/plugin for OpenClaw integration
 
-Linux service management currently targets **systemd --user**. macOS launchd and
-Windows service support are planned separately.
+User-service management supports **systemd --user** on Linux and **launchd** on
+macOS. Windows currently provides manual nssm/Task Scheduler guidance.
 
 ## Install the device daemon
 
@@ -169,6 +169,46 @@ linger for your user:
 ```bash
 loginctl enable-linger "$USER"
 ```
+
+## Run as a macOS user service
+
+Run these commands as the signed-in macOS user, without `sudo`:
+
+```bash
+agent-phonon init                 # only if no config exists yet
+agent-phonon service install
+agent-phonon service start
+agent-phonon service status
+```
+
+The LaunchAgent is `~/Library/LaunchAgents/ai.phonon.agent.plist`. Installation
+prepares login autostart but does **not** start or interrupt a running daemon.
+`start` registers it in the user's GUI login session; an already-running service
+is left alone. launchd restarts crashes with a five-second throttle.
+
+```bash
+agent-phonon service stop         # stays stopped until start or the next login
+agent-phonon service restart      # waits for exit, then reloads the installed plist
+agent-phonon service uninstall    # removes only the service; keeps all user data
+```
+
+The plist pins absolute Node/CLI paths and captures executable search paths
+(including the selected Node installation and Homebrew). Only `HOME`, `PATH`,
+and the selected `PHONON_CONFIG` path are recorded; shell API keys are not copied.
+Use protected config/key files for service credentials, not interactive exports.
+Logs go to `~/.agent-phonon/daemon.out.log` and `daemon.err.log`; installation
+preserves their content and sets owner-only permissions (`0600`). This is a
+login service, not a system-wide boot daemon; it
+does not stay active after logout or prevent macOS sleep.
+
+Service support does not imply platform parity for every RPC: the current secure
+file broker uses Linux `/proc` fd anchors and rejects file-broker operations on
+macOS rather than weakening symlink-race protection.
+
+After changing the Node/npm installation path, run `service install --force`
+from the new CLI, then `service restart`. Existing configuration, credentials,
+SQLite data and logs are preserved. Do not also run a foreground daemon against
+the same configuration while the service is active.
 
 ## Run in the foreground
 

@@ -15,6 +15,10 @@ function setup() {
   return { tc, root };
 }
 
+function brokerUnavailable(error: { message?: string; data?: { appCode?: string } }): boolean {
+  return error.data?.appCode === "errPolicyDenied" && /secure file broker unsupported on this platform/.test(error.message ?? "");
+}
+
 test("device.info: returns OS/machine scheduling metadata", async () => {
   const { tc } = setup();
   const res = await tc.call("device.info", {}) as Record<string, any>;
@@ -55,10 +59,25 @@ test("device.fs.list: browses workspaceRoot and rejects escaping root", async ()
   await assert.rejects(() => tc.call("device.fs.list", { root: "workspaceRoot", path: ".." }), (e: any) => e?.data?.appCode === "errPolicyDenied");
 });
 
-test("file.*: mkdir/write/read/stat/list within project", async () => {
+test("file.*: project round-trip on Linux; explicit denial on unsupported platforms", async () => {
   const { tc } = setup();
   const p = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string; path: string } };
   const projectId = p.project.projectId;
+
+  if (process.platform !== "linux") {
+    await mkdir(join(p.project.path, "notes"));
+    await writeFile(join(p.project.path, "notes/a.txt"), "unchanged");
+    for (const [method, params] of [
+      ["file.mkdir", { path: "new-directory" }],
+      ["file.write", { path: "notes/a.txt", data: "overwrite" }],
+      ["file.read", { path: "notes/a.txt" }],
+      ["file.stat", { path: "notes/a.txt" }],
+      ["file.list", { path: "." }],
+    ] as const) await assert.rejects(() => tc.call(method, { projectId, ...params }), brokerUnavailable);
+    assert.equal(await readFile(join(p.project.path, "notes/a.txt"), "utf8"), "unchanged");
+    assert.equal(existsSync(join(p.project.path, "new-directory")), false);
+    return;
+  }
 
   const mk = await tc.call("file.mkdir", { projectId, path: "notes" }) as { created: boolean };
   assert.equal(mk.created, true);
@@ -113,6 +132,12 @@ test("file.*: symlink escape is blocked (read/write/list does not follow)", asyn
 
   // 3) a symlink to a file is reported as "symlink", never followed/escaped.
   await symlink(join(outside, "secret.txt"), join(p.project.path, "link.txt"));
+  if (process.platform !== "linux") {
+    await assert.rejects(() => tc.call("file.stat", { projectId, path: "link.txt" }), brokerUnavailable);
+    await assert.rejects(() => tc.call("file.list", { projectId, path: ".", recursive: true }), brokerUnavailable);
+    assert.equal(await readFile(join(outside, "secret.txt"), "utf8"), "TOP-SECRET");
+    return;
+  }
   const st = await tc.call("file.stat", { projectId, path: "link.txt" }) as { stat: { type: string } };
   assert.equal(st.stat.type, "symlink");
 
@@ -125,10 +150,15 @@ test("file.*: symlink escape is blocked (read/write/list does not follow)", asyn
   assert.ok(ls.entries.some((e) => e.path === "evil" && e.type === "symlink"));
 });
 
-test("file.read supports maxBytes truncation and base64", async () => {
+test("file.read: Linux truncation/base64; unsupported platforms never expose bytes", async () => {
   const { tc } = setup();
-  const p = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string } };
+  const p = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string; path: string } };
   const projectId = p.project.projectId;
+  if (process.platform !== "linux") {
+    await writeFile(join(p.project.path, "bin.dat"), "abcdef");
+    await assert.rejects(() => tc.call("file.read", { projectId, path: "bin.dat", encoding: "base64", maxBytes: 3 }), brokerUnavailable);
+    return;
+  }
   await tc.call("file.write", { projectId, path: "bin.dat", encoding: "base64", data: Buffer.from("abcdef").toString("base64") });
   const rd = await tc.call("file.read", { projectId, path: "bin.dat", encoding: "base64", maxBytes: 3 }) as { data: string; truncated: boolean; sizeBytes: number };
   assert.equal(Buffer.from(rd.data, "base64").toString(), "abc");
