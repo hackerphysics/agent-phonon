@@ -1,23 +1,8 @@
-import { realpathSync } from "node:fs";
-import { resolve, join, dirname, basename } from "node:path";
+import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 import { TenantPolicy, DEFAULT_TENANT_POLICY, isPathUnderRoots, type TenantPolicy as TenantPolicyT } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
-
-function canonicalPath(path: string): string {
-  let current = resolve(path);
-  const suffix: string[] = [];
-  for (;;) {
-    try { return resolve(realpathSync(current), ...suffix); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const parent = dirname(current);
-      if (parent === current) throw error;
-      suffix.unshift(basename(current));
-      current = parent;
-    }
-  }
-}
+import {canonicalWorkspacePath as canonicalPath,workspacePathsOverlap,workspacePathKey} from "./workspace-paths.js";
 
 /**
  * 本地安全策略执行器（design D27 / bug-bash P0-1）。
@@ -70,6 +55,10 @@ export class PolicyEnforcer {
       throw new PhononError("errPolicyDenied", `project path outside allowed roots: ${abs}`);
     }
   }
+  assertProjectDirectoryNavigation(path:string):void{
+    const key=workspacePathKey(canonicalPath(path));
+    if(!this.projectRoots.some(root=>workspacePathsOverlap(key,workspacePathKey(root))))throw new PhononError("errPolicyDenied","directory is outside configured workspace routes");
+  }
 
   /** 文档路径是否允许（默认 project-scoped；外部需 allowExternalDocuments）。 */
   assertDocumentPath(absPath: string, projectRoot: string | undefined): void {
@@ -89,6 +78,9 @@ export class PolicyEnforcer {
 
   assertGlobalSkillInstall(): void {
     if (!this.policy.allowGlobalSkillInstall) throw new PhononError("errPolicyDenied", "global skill install disabled by policy");
+  }
+  assertSkillRecovery():void{
+    if(!this.policy.allowSkillRecovery)throw new PhononError("errPolicyDenied","skill recovery requires explicit local permission");
   }
 
   assertUrlSkillInstall(): void {
@@ -122,6 +114,12 @@ export class PolicyEnforcer {
   /** A2/A3: project.exec 需独立 gate（默认禁；trustLocal 开）。 */
   assertExec(): void {
     if (!this.policy.allowExec) throw new PhononError("errPolicyDenied", "project.exec disabled by policy (allowExec)");
+  }
+  assertEmployeeProfiles():void {
+    if(!this.policy.allowEmployeeProfiles)throw new PhononError("errPolicyDenied","employee profile management requires allowEmployeeProfiles");
+  }
+  assertProjectProvision():void{
+    if(!this.policy.allowProjectProvision)throw new PhononError("errPolicyDenied","controlled workspace provisioning requires explicit local permission");
   }
 
   /** A4: device.fs.* 浏览整个文件系统需 allowDeviceFsBrowse（默认开）。 */

@@ -1,8 +1,27 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import {randomUUID} from "node:crypto";
+import { mkdirSync,existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { deliveryOptions, DeliveryCapacity, type DeliveryConfig, type DeliveryChannel, type DeliveryPending } from "./delivery-capacity.js";
 import { SecretBox } from "./secret-box.js";
+import { ConversationArchive } from "./conversation-archive.js";
+import { PeerContextJournal } from "./peer-context.js";
+import { PhononError } from "./rpc.js";
+import {canonicalWorkspacePath,workspacePathKey,assertNamespacePathAvailable,assertNamespaceBrowsePath,type NamespacePath} from "./workspace-paths.js";
+import {requestFingerprint} from "./idempotency.js";
+import {SkillInstallFenceResult,type SkillInstallFenceParams,type SkillInstallRecoveryContext} from "@agent-phonon/protocol";
+
+export interface StoredSkillRecord {
+  agent:string;name:string;scope:"project"|"global";projectId?:string;version?:string;hash?:string;installedPath:string;installedAt:string;revision?:string;
+  publication?:{kind:"immutable";versionId:string;treeHash:string};
+}
+
+export interface StoredSkillInstall {
+  tenant_id:string;request_id:string;request_hash:string;agent_id:string;name:string;scope:"project"|"global";project_id:string|null;
+  receiver_id:string|null;
+  fence_id:string|null;
+  state:"prepared"|"dispatched"|"confirmed"|"failed"|"unknown";resource_key:string|null;owner_id:string|null;result_json:string|null;created_at:string;updated_at:string;
+}
 
 /**
  * 本地持久化（design D6 / bug-bash B3）。
@@ -14,8 +33,13 @@ import { SecretBox } from "./secret-box.js";
  * connection_tenants, idempotency, pending_interactions。tenant/inbox_queue 后续按需。
  */
 export class PhononStore {
+  readonly activeCompressions = new Set<string>();
+  readonly activeSessionControls = new Set<string>();
+  readonly activeSkillInstalls = new Set<string>();
   private db: DatabaseSync;
   private dbPath: string;
+  private archives?: ConversationArchive;
+  private peers?: PeerContextJournal;
   /** env 变量值 at-rest 加密(AES-256-GCM)。密钥文件与库同目录、0600。 */
   private secrets: SecretBox;
 
@@ -42,6 +66,18 @@ export class PhononStore {
   transcriptDir(): string | undefined {
     if (this.dbPath === ":memory:") return undefined;
     return join(dirname(this.dbPath), "sessions");
+  }
+  get supportsConversationArchives(): boolean { return this.dbPath !== ":memory:"; }
+  peerContextJournal(): PeerContextJournal {
+    return this.peers ??= new PeerContextJournal(this.dbPath === ":memory:" ? ":memory:" : this.dbPath + ".peers.sqlite");
+  }
+  hasPeerContextJournal():boolean{return !!this.peers||this.dbPath!==":memory:"&&existsSync(this.dbPath+".peers.sqlite");}
+  get supportsDurableSkillInstalls():boolean{return this.dbPath!==":memory:";}
+  projectProvisionPath():string|undefined{return this.dbPath===":memory:"?undefined:this.dbPath+".projects.sqlite";}
+  conversationArchives(): ConversationArchive {
+    if (!this.supportsConversationArchives) throw new PhononError("errArchiveUnavailable", "conversation archives require a persistent device database");
+    try { return this.archives ??= new ConversationArchive(this.dbPath + ".conversations.sqlite"); }
+    catch (error) { if (error instanceof PhononError) throw error; throw new PhononError("errArchiveUnavailable"); }
   }
 
   private migrate(): void {
@@ -95,6 +131,10 @@ export class PhononStore {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_outbox_tenant ON outbox_events(tenant_id, session_id, seq);
+      CREATE TABLE IF NOT EXISTS workflow_cancel_intents (
+        tenant_id TEXT NOT NULL, dispatch_key TEXT NOT NULL, project_id TEXT NOT NULL,
+        created_at TEXT NOT NULL, PRIMARY KEY(tenant_id,dispatch_key)
+      );
       CREATE TABLE IF NOT EXISTS outbox_acks (
         tenant_id  TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -120,6 +160,21 @@ export class PhononStore {
         timeout_seconds INTEGER,
         created_at      TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS interaction_receipts (
+        tenant_id TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+        request_json TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT, decision_hash TEXT,
+        updated_at TEXT NOT NULL, PRIMARY KEY(tenant_id,request_id)
+      );
+      CREATE TABLE IF NOT EXISTS employee_profiles (
+        tenant_id TEXT NOT NULL,employee_id TEXT NOT NULL,document TEXT NOT NULL,
+        PRIMARY KEY(tenant_id,employee_id)
+      );
+      CREATE TABLE IF NOT EXISTS compression_receipts (
+        tenant_id TEXT NOT NULL, operation_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        state TEXT NOT NULL, document TEXT NOT NULL, PRIMARY KEY(tenant_id,operation_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS compression_one_active ON compression_receipts(tenant_id,session_id)
+        WHERE state IN ('running','unknown');
       CREATE TABLE IF NOT EXISTS audit_events (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         ts         TEXT NOT NULL,
@@ -170,6 +225,14 @@ export class PhononStore {
       );
       CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id, created_at);
+      CREATE TABLE IF NOT EXISTS workflow_input_receipts (
+        tenant_id TEXT NOT NULL,workflow_id TEXT NOT NULL,input_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+        node_id TEXT NOT NULL,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN('inserting','inserted','unknown')),error_code TEXT,
+        created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+        PRIMARY KEY(tenant_id,workflow_id,input_id),
+        FOREIGN KEY(workflow_id) REFERENCES workflows(workflow_id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS workflow_events (
         workflow_id TEXT NOT NULL,
         tenant_id   TEXT NOT NULL,
@@ -231,9 +294,36 @@ export class PhononStore {
     // 用 PRAGMA table_info 检查后 ALTER TABLE ADD COLUMN。
     // sessions.transcript_path：phonon 自存的会话快照 JSONL 路径（可观测/审计）。
     this.ensureColumn("sessions", "transcript_path", "TEXT");
+    this.ensureColumn("projects","directory_identity","TEXT");
     // Keep fingerprints out of the unrestricted request-key namespace. Legacy
     // results/ambiguous old sidecar rows are retained without guessing a hash.
     this.ensureColumn("idempotency", "request_hash", "TEXT");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS skill_install_operations(
+      tenant_id TEXT NOT NULL,request_id TEXT NOT NULL,request_hash TEXT NOT NULL,
+      agent_id TEXT NOT NULL,name TEXT NOT NULL,scope TEXT NOT NULL CHECK(scope IN ('project','global')),project_id TEXT,
+      state TEXT NOT NULL CHECK(state IN ('prepared','dispatched','confirmed','failed','unknown')),
+      resource_key TEXT,owner_id TEXT,result_json TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,request_id));
+      CREATE UNIQUE INDEX IF NOT EXISTS skill_install_resource_active ON skill_install_operations(resource_key)
+      WHERE resource_key IS NOT NULL AND state IN ('dispatched','unknown')`);
+    this.ensureColumn("skill_install_operations","receiver_id","TEXT");
+    this.ensureColumn("skill_install_operations","fence_id","TEXT");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS skill_receivers(tenant_id TEXT PRIMARY KEY,receiver_id TEXT NOT NULL UNIQUE);
+      CREATE TRIGGER IF NOT EXISTS skill_receiver_update_immutable BEFORE UPDATE ON skill_receivers BEGIN SELECT RAISE(ABORT,'skill receiver identity is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS skill_receiver_delete_immutable BEFORE DELETE ON skill_receivers BEGIN SELECT RAISE(ABORT,'skill receiver identity is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS skill_install_receiver_immutable BEFORE UPDATE OF receiver_id ON skill_install_operations
+      WHEN NEW.receiver_id IS NOT OLD.receiver_id BEGIN SELECT RAISE(ABORT,'skill install receiver proof is immutable'); END`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS skill_install_fences(
+      tenant_id TEXT NOT NULL,request_id TEXT NOT NULL,original_request_id TEXT NOT NULL,request_hash TEXT NOT NULL,fence_id TEXT NOT NULL,result_json TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,request_id),UNIQUE(tenant_id,original_request_id));
+      CREATE TRIGGER IF NOT EXISTS skill_fence_receipt_immutable BEFORE UPDATE ON skill_install_fences BEGIN SELECT RAISE(ABORT,'skill fence receipt is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS skill_fence_receipt_delete_immutable BEFORE DELETE ON skill_install_fences BEGIN SELECT RAISE(ABORT,'skill fence receipt is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS skill_install_fence_immutable BEFORE UPDATE OF fence_id ON skill_install_operations
+      WHEN OLD.fence_id IS NOT NULL AND NEW.fence_id IS NOT OLD.fence_id BEGIN SELECT RAISE(ABORT,'skill installation fence is immutable'); END`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS skill_project_roots(tenant_id TEXT NOT NULL,project_id TEXT NOT NULL,path TEXT NOT NULL,root_identity TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(tenant_id,project_id));
+      CREATE TABLE IF NOT EXISTS managed_skill_versions(installation_id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,project_id TEXT NOT NULL,name TEXT NOT NULL,record_json TEXT NOT NULL,execution_json TEXT NOT NULL,revoked_at TEXT,created_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS managed_skill_versions_scope ON managed_skill_versions(tenant_id,project_id,name);
+      CREATE TABLE IF NOT EXISTS skill_selection_history(id INTEGER PRIMARY KEY,tenant_id TEXT NOT NULL,project_id TEXT NOT NULL,name TEXT NOT NULL,request_id TEXT NOT NULL,records_json TEXT NOT NULL,created_at TEXT NOT NULL)`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS workflow_resume_dispatches (
       tenant_id TEXT NOT NULL, request_key TEXT NOT NULL, request_hash TEXT NOT NULL,
       workflow_id TEXT NOT NULL, result_json TEXT NOT NULL,
@@ -246,6 +336,7 @@ export class PhononStore {
     this.ensureColumn("runs", "attempt", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("runs", "max_attempts", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("runs", "retry_history_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("runs", "dispatch_json", "TEXT");
     // L3 recovery ownership + durable mode cursor. owner_epoch is a fencing
     // token: a replaced connection can no longer overwrite its successor.
     this.ensureColumn("workflows", "checkpoint_json", "TEXT");
@@ -254,6 +345,30 @@ export class PhononStore {
     this.ensureColumn("workflows", "lease_until", "INTEGER");
     // Nullable legacy namespace is deliberately not guessed/backfilled.
     this.ensureColumn("projects", "namespace", "TEXT");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS projects_directory_reference ON projects(namespace,path) WHERE directory_identity IS NOT NULL AND substr(project_id,1,4)='dir-'");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS project_path_owners(
+      path_key TEXT PRIMARY KEY,path TEXT NOT NULL,namespace TEXT NOT NULL,created_at TEXT NOT NULL)`);
+    // Legacy skill provenance remains unknown. Project visibility can be
+    // proven through its current namespace; global rows cannot be inferred.
+    this.ensureColumn("skills", "tenant_id", "TEXT");
+    this.ensureColumn("skills", "execution_json", "TEXT");
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS skills_tenant_identity
+      ON skills(tenant_id,agent_id,scope,name,IFNULL(project_id,'')) WHERE tenant_id IS NOT NULL`);
+    this.ensureColumn("projects", "employee_id", "TEXT");
+    this.ensureColumn("sessions", "employee_id", "TEXT");
+    this.ensureColumn("sessions", "employee_revision", "INTEGER");
+    this.ensureColumn("sessions", "recovery_json", "TEXT");
+    this.ensureColumn("sessions", "native_stop_json", "TEXT");
+    this.db.exec(`CREATE TABLE IF NOT EXISTS session_native_owners(
+      tenant_id TEXT NOT NULL,session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,
+      owner_pid INTEGER NOT NULL CHECK(owner_pid>0),PRIMARY KEY(tenant_id,session_id))`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS session_upstream_runs(
+      tenant_id TEXT NOT NULL,session_id TEXT NOT NULL,upstream_id TEXT NOT NULL,
+      PRIMARY KEY(tenant_id,session_id,upstream_id),FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE);
+      CREATE TABLE IF NOT EXISTS native_proactive_seen(
+      tenant_id TEXT NOT NULL,session_id TEXT NOT NULL,upstream_id TEXT NOT NULL,payload_hash TEXT NOT NULL,
+      seq INTEGER NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(tenant_id,session_id,upstream_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE)`);
     this.ensureColumn("workflows", "metadata_json", "TEXT");
     this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_dispatch_identity ON workflows(tenant_id,json_extract(metadata_json,'$._phononDispatch.key')) WHERE json_extract(metadata_json,'$._phononDispatch.key') IS NOT NULL`);
 
@@ -374,20 +489,21 @@ export class PhononStore {
   }
 
   // ---- projects ----
-  upsertProject(r: { projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string; namespace?: string }): void {
+  upsertProject(r: { projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string; namespace?: string; employeeId?:string;directoryIdentity?:string }): void {
     this.db
       .prepare(
-        `INSERT INTO projects(project_id,name,path,git,remote,created_at,namespace)
-         VALUES(?,?,?,?,?,?,?)
-         ON CONFLICT(project_id) DO UPDATE SET name=excluded.name, path=excluded.path, git=excluded.git, remote=excluded.remote`,
+        `INSERT INTO projects(project_id,name,path,git,remote,created_at,namespace,employee_id,directory_identity)
+         VALUES(?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(project_id) DO UPDATE SET name=excluded.name, path=excluded.path, git=excluded.git, remote=excluded.remote,
+         directory_identity=COALESCE(projects.directory_identity,excluded.directory_identity)`,
       )
-      .run(r.projectId, r.name, r.path, r.git ? 1 : 0, r.remote ?? null, r.createdAt, r.namespace ?? null);
+      .run(r.projectId, r.name, r.path, r.git ? 1 : 0, r.remote ?? null, r.createdAt, r.namespace ?? null,r.employeeId??null,r.directoryIdentity??null);
   }
   deleteProject(projectId: string): void {
     this.db.prepare("DELETE FROM projects WHERE project_id=?").run(projectId);
     this.db.prepare("DELETE FROM worktrees WHERE project_id=?").run(projectId);
   }
-  loadProjects(): Array<{ projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string; namespace?: string }> {
+  loadProjects(): Array<{ projectId: string; name: string; path: string; git: boolean; remote?: string; createdAt: string; namespace?: string; employeeId?:string;directoryIdentity?:string }> {
     return (this.db.prepare("SELECT * FROM projects").all() as Record<string, unknown>[]).map((row) => ({
       projectId: row.project_id as string,
       name: row.name as string,
@@ -396,6 +512,8 @@ export class PhononStore {
       remote: (row.remote as string) ?? undefined,
       createdAt: row.created_at as string,
       namespace: (row.namespace as string) ?? undefined,
+      employeeId:(row.employee_id as string)??undefined,
+      directoryIdentity:(row.directory_identity as string)??undefined,
     }));
   }
 
@@ -422,23 +540,218 @@ export class PhononStore {
     }));
   }
 
+  private namespacePaths():NamespacePath[]{
+    return (this.db.prepare(`SELECT path,namespace,NULL path_key FROM projects
+      UNION ALL SELECT w.path,p.namespace,NULL FROM worktrees w LEFT JOIN projects p ON p.project_id=w.project_id
+      UNION ALL SELECT path,namespace,path_key FROM project_path_owners`).all() as Array<Record<string,unknown>>)
+      .map(row=>({path:String(row.path),namespace:row.namespace==null?undefined:String(row.namespace),key:row.path_key==null?undefined:String(row.path_key)}));
+  }
+  assertWorkspacePath(path:string,namespace:string):void{
+    assertNamespacePathAvailable(canonicalWorkspacePath(path),namespace,this.namespacePaths());
+  }
+  assertWorkspaceBrowsePath(path:string,namespace:string):void{
+    assertNamespaceBrowsePath(canonicalWorkspacePath(path),namespace,this.namespacePaths());
+  }
+  reserveWorkspacePath(path:string,namespace:string):void{
+    if(!namespace)throw new PhononError("errInvalidParams","workspace namespace is required");
+    const canonical=canonicalWorkspacePath(path);
+    // Commit ownership before asynchronous mkdir/git operations. Retain it on
+    // uncertain failures or metadata removal; neither transfers existing files.
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      assertNamespacePathAvailable(canonical,namespace,this.namespacePaths());
+      this.db.prepare("INSERT INTO project_path_owners(path_key,path,namespace,created_at) VALUES(?,?,?,?) ON CONFLICT(path_key) DO NOTHING")
+        .run(workspacePathKey(canonical),canonical,namespace,new Date().toISOString());
+      this.db.exec("COMMIT");
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+
   // ---- skills ----
-  upsertSkill(r: { agent: string; name: string; scope: string; projectId?: string; version?: string; hash?: string; installedPath: string; installedAt: string }): void {
-    this.db
+  skillReceiverIdentity(tenant:string,create=true):string|undefined{
+    if(!this.supportsDurableSkillInstalls)return undefined;
+    const current=this.db.prepare("SELECT receiver_id FROM skill_receivers WHERE tenant_id=?").get(tenant) as {receiver_id:string}|undefined;
+    if(current)return current.receiver_id;
+    if(!create)return undefined;
+    this.db.prepare("INSERT INTO skill_receivers(tenant_id,receiver_id) VALUES(?,?) ON CONFLICT(tenant_id) DO NOTHING").run(tenant,randomUUID());
+    return (this.db.prepare("SELECT receiver_id FROM skill_receivers WHERE tenant_id=?").get(tenant) as {receiver_id:string}).receiver_id;
+  }
+  skillInstallOperation(tenant:string,requestId:string):StoredSkillInstall|undefined{
+    return this.db.prepare("SELECT * FROM skill_install_operations WHERE tenant_id=? AND request_id=?").get(tenant,requestId) as StoredSkillInstall|undefined;
+  }
+  assertSkillInstallUnfenced(tenant:string,requestId:string):void{
+    if(this.skillInstallOperation(tenant,requestId)?.fence_id!=null)throw new PhononError("errSkillInstallUnconfirmed","the original skill transaction is fenced; its outcome remains unknown");
+  }
+  skillRecoveryContext(tenant:string,row:StoredSkillInstall):SkillInstallRecoveryContext|undefined{
+    if(row.tenant_id!==tenant)throw new PhononError("errPolicyDenied");
+    const receiverID=this.skillReceiverIdentity(tenant,false);if(!receiverID||row.scope!=="project")return undefined;
+    const revision=requestFingerprint({schema:1,receiverID,operation:row,selection:this.skillSelectionRevision(tenant,row.name,row.scope,row.project_id??undefined)});
+    return {revision,receiverID,originalReceiverID:row.receiver_id,fenced:row.fence_id!==null,...(row.fence_id?{fenceID:row.fence_id}:{})};
+  }
+  fenceSkillInstall(tenant:string,input:SkillInstallFenceParams):SkillInstallFenceResult{
+    const fingerprint=requestFingerprint(input);
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      if(!this.supportsDurableSkillInstalls||this.skillReceiverIdentity(tenant,false)!==input.expectedReceiverID)throw new PhononError("errSkillInstallUnconfirmed","skill recovery receiver changed");
+      if(!this.db.prepare("SELECT 1 FROM projects WHERE project_id=? AND namespace=?").get(input.projectId,tenant))throw new PhononError("errProjectNotFound");
+      const row=this.skillInstallOperation(tenant,input.originalRequestId);
+      if(!row||row.agent_id!==input.agent||row.name!==input.name||row.scope!=="project"||row.project_id!==input.projectId)throw new PhononError("errSkillNotFound");
+      if(row.receiver_id!==null&&row.receiver_id!==input.expectedReceiverID)throw new PhononError("errSkillInstallUnconfirmed","the original receiver binding differs");
+      const prior=this.db.prepare("SELECT request_hash,result_json FROM skill_install_fences WHERE tenant_id=? AND request_id=?").get(tenant,input.clientRequestId) as {request_hash:string;result_json:string}|undefined;
+      if(prior){
+        if(prior.request_hash!==fingerprint)throw new PhononError("errInvalidParams","skill recovery identity changed");
+        const result=SkillInstallFenceResult.parse(JSON.parse(prior.result_json));
+        if(result.clientRequestId!==input.clientRequestId||result.originalRequestId!==input.originalRequestId||result.agent!==input.agent||result.name!==input.name||result.projectId!==input.projectId
+          ||result.receiverID!==input.expectedReceiverID||result.originalReceiverID!==row.receiver_id||result.fenceID!==row.fence_id)throw new PhononError("errSkillInstallUnconfirmed","the original recovery receipt differs");
+        this.db.exec("COMMIT");return result;
+      }
+      if(this.skillRecoveryContext(tenant,row)?.revision!==input.baseRecoveryRevision)throw new PhononError("errSkillRevisionChanged","skill recovery observation changed");
+      if(row.fence_id!==null||!["dispatched","unknown"].includes(row.state)||!row.resource_key||!/^[a-f0-9]{64}$/.test(row.resource_key))
+        throw new PhononError("errSkillInstallUnconfirmed","only a claimed uncertain transaction can be fenced");
+      const fenceID=randomUUID(),recordedAt=new Date().toISOString();
+      const changed=this.db.prepare(`UPDATE skill_install_operations SET state='unknown',fence_id=?,updated_at=? WHERE tenant_id=? AND request_id=?
+        AND state IN ('dispatched','unknown') AND fence_id IS NULL`).run(fenceID,recordedAt,tenant,input.originalRequestId);
+      if(changed.changes!==1)throw new PhononError("errSkillInstallUnconfirmed","skill recovery claim changed");
+      const result:SkillInstallFenceResult={clientRequestId:input.clientRequestId,originalRequestId:input.originalRequestId,agent:input.agent,name:input.name,scope:"project",projectId:input.projectId,
+        receiverID:input.expectedReceiverID,originalReceiverID:row.receiver_id,fenceID,disposition:"unconfirmed_metadata_fenced",outcomeKnown:false,targetLocked:true,filesDeleted:false,originalWritesMayContinue:true,recordedAt};
+      this.db.prepare("INSERT INTO skill_install_fences(tenant_id,request_id,original_request_id,request_hash,fence_id,result_json) VALUES(?,?,?,?,?,?)")
+        .run(tenant,input.clientRequestId,input.originalRequestId,fingerprint,fenceID,JSON.stringify(result));
+      this.db.exec("COMMIT");return result;
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+  prepareSkillInstall(input:{tenant:string;requestId:string;requestHash:string;agent:string;name:string;scope:"project"|"global";projectId?:string}):StoredSkillInstall{
+    const now=new Date().toISOString();
+    this.db.prepare(`INSERT INTO skill_install_operations(tenant_id,request_id,request_hash,agent_id,name,scope,project_id,state,created_at,updated_at,receiver_id)
+      VALUES(?,?,?,?,?,?,?,'prepared',?,?,?) ON CONFLICT(tenant_id,request_id) DO NOTHING`)
+      .run(input.tenant,input.requestId,input.requestHash,input.agent,input.name,input.scope,input.scope==="project"?input.projectId??null:null,now,now,this.skillReceiverIdentity(input.tenant)??null);
+    return this.skillInstallOperation(input.tenant,input.requestId)!;
+  }
+  claimSkillInstall(tenant:string,requestId:string,requestHash:string,resourceKey:string,owner:string):boolean{
+    return this.db.prepare(`UPDATE skill_install_operations SET state='dispatched',resource_key=?,owner_id=?,updated_at=?
+      WHERE tenant_id=? AND request_id=? AND request_hash=? AND state='prepared' AND fence_id IS NULL`)
+      .run(resourceKey,owner,new Date().toISOString(),tenant,requestId,requestHash).changes===1;
+  }
+  failSkillInstallPreparation(tenant:string,requestId:string,requestHash:string):void{
+    this.db.prepare(`UPDATE skill_install_operations SET state='failed',updated_at=? WHERE tenant_id=? AND request_id=? AND request_hash=? AND state='prepared'`)
+      .run(new Date().toISOString(),tenant,requestId,requestHash);
+  }
+  unconfirmSkillInstall(tenant:string,requestId:string,owner:string):void{
+    this.db.prepare(`UPDATE skill_install_operations SET state='unknown',updated_at=? WHERE tenant_id=? AND request_id=? AND owner_id=? AND state='dispatched'`)
+      .run(new Date().toISOString(),tenant,requestId,owner);
+  }
+  assertSkillTargetWritable(resourceKey:string,owner?:string):void{
+    const row=this.db.prepare("SELECT owner_id,state FROM skill_install_operations WHERE resource_key=? AND state IN ('dispatched','unknown')")
+      .get(resourceKey) as {owner_id:string;state:string}|undefined;
+    if(row&&(!owner||row.owner_id!==owner||row.state!=="dispatched"))throw new PhononError("errSkillInstallUnconfirmed","an earlier skill write is active or unconfirmed; do not retry with another identity");
+  }
+  private skillSelectionRows(tenant:string,name:string,scope:"project"|"global",projectId?:string):Record<string,unknown>[] {
+    return this.db.prepare(`SELECT agent_id,name,scope,project_id,version,hash,installed_path,installed_at,tenant_id,execution_json FROM skills
+      WHERE name=? AND scope=? AND IFNULL(project_id,'')=IFNULL(?,'') AND(tenant_id=? OR(tenant_id IS NULL AND scope='project'
+        AND EXISTS(SELECT 1 FROM projects p WHERE p.project_id=skills.project_id AND p.namespace=?))) ORDER BY agent_id`)
+      .all(name,scope,scope==="project"?projectId??null:null,tenant,tenant) as Record<string,unknown>[];
+  }
+  skillSelectionRevision(tenant:string,name:string,scope:"project"|"global",projectId?:string):string|null{
+    const rows=this.skillSelectionRows(tenant,name,scope,projectId);return rows.length?requestFingerprint(rows):null;
+  }
+  pinSkillProjectRoot(tenant:string,projectId:string,path:string,identity:string):void{
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      if(!this.db.prepare("SELECT 1 FROM projects WHERE project_id=? AND namespace=? AND path=?").get(projectId,tenant,path))throw new PhononError("errProjectNotFound");
+      const previous=this.db.prepare("SELECT path,root_identity FROM skill_project_roots WHERE tenant_id=? AND project_id=?").get(tenant,projectId) as {path:string;root_identity:string}|undefined;
+      if(previous&&(previous.path!==path||previous.root_identity!==identity)||this.db.prepare("SELECT 1 FROM skill_project_roots WHERE root_identity=? AND tenant_id<>?").get(identity,tenant))
+        throw new PhononError("errSkillScopeInvalid","skill Project root identity changed or has another namespace");
+      this.db.prepare("INSERT INTO skill_project_roots(tenant_id,project_id,path,root_identity,created_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING").run(tenant,projectId,path,identity,new Date().toISOString());
+      this.db.exec("COMMIT");
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+  assertSkillProjectRoot(tenant:string,projectId:string,path:string,identity:string):void{
+    if(!this.db.prepare("SELECT 1 FROM skill_project_roots WHERE tenant_id=? AND project_id=? AND path=? AND root_identity=?").get(tenant,projectId,path,identity))
+      throw new PhononError("errSkillScopeInvalid","skill Project root binding is not current");
+  }
+  managedSkillVersion(tenant:string,id:string):{project_id:string;name:string;record_json:string;execution_json:string;revoked_at:string|null}|undefined{
+    return this.db.prepare("SELECT project_id,name,record_json,execution_json,revoked_at FROM managed_skill_versions WHERE tenant_id=? AND installation_id=?").get(tenant,id) as {project_id:string;name:string;record_json:string;execution_json:string;revoked_at:string|null}|undefined;
+  }
+  hasLiveManagedSkillVersions(tenant:string,project:string,name:string):boolean{
+    return !!this.db.prepare("SELECT 1 FROM managed_skill_versions WHERE tenant_id=? AND project_id=? AND name=? AND revoked_at IS NULL LIMIT 1").get(tenant,project,name);
+  }
+  private archiveSkillSelection(tenant:string,projectId:string,name:string,requestId:string):void{
+    this.db.prepare("INSERT INTO skill_selection_history(tenant_id,project_id,name,request_id,records_json,created_at) VALUES(?,?,?,?,?,?)")
+      .run(tenant,projectId,name,requestId,JSON.stringify(this.skillSelectionRows(tenant,name,"project",projectId)),new Date().toISOString());
+    this.db.prepare("DELETE FROM skills WHERE scope='project' AND project_id=? AND name=? AND(tenant_id=? OR tenant_id IS NULL)").run(projectId,name,tenant);
+  }
+  unpublishSkill(tenant:string,input:{clientRequestId:string;projectId:string;name:string;baseRevision:string},resourceKey:string,fingerprint:string):{projectId:string;name:string;deactivated:true;previousRevision:string}{
+    const key=tenant+"\0skill.unpublish\0"+input.clientRequestId;
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      if(!this.db.prepare("SELECT 1 FROM projects WHERE project_id=? AND namespace=?").get(input.projectId,tenant))throw new PhononError("errProjectNotFound");
+      const prior=this.idempotencyGet(key);
+      if(prior!==undefined){if(this.idempotencyFingerprint(key)!==fingerprint)throw new PhononError("errInvalidParams","unpublish identity changed");this.db.exec("COMMIT");return JSON.parse(prior);}
+      this.assertSkillTargetWritable(resourceKey);
+      if(this.skillSelectionRevision(tenant,input.name,"project",input.projectId)!==input.baseRevision)throw new PhononError("errSkillRevisionChanged","skill selection changed");
+      this.archiveSkillSelection(tenant,input.projectId,input.name,input.clientRequestId);
+      this.db.prepare("UPDATE managed_skill_versions SET revoked_at=? WHERE tenant_id=? AND project_id=? AND name=? AND revoked_at IS NULL").run(new Date().toISOString(),tenant,input.projectId,input.name);
+      const result={projectId:input.projectId,name:input.name,deactivated:true as const,previousRevision:input.baseRevision};
+      this.db.prepare("INSERT INTO idempotency(k,result,created_at,request_hash) VALUES(?,?,?,?)").run(key,JSON.stringify(result),Date.now(),fingerprint);
+      this.db.exec("COMMIT");return result;
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+  confirmSkillInstall(tenant:string,requestId:string,owner:string,record:StoredSkillRecord,executionJson?:string,expectedRevision?:string|null):StoredSkillRecord{
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      const row=this.skillInstallOperation(tenant,requestId);
+      if(!row||row.state!=="dispatched"||row.fence_id!==null||row.owner_id!==owner||row.agent_id!==record.agent||row.name!==record.name||row.scope!==record.scope||row.project_id!==(record.projectId??null))
+        throw new PhononError("errSkillInstallUnconfirmed","skill installation claim is no longer current");
+      if(expectedRevision!==undefined){
+        if(record.scope!=="project"||!record.projectId||this.skillSelectionRevision(tenant,record.name,"project",record.projectId)!==expectedRevision)throw new PhononError("errSkillRevisionChanged","skill selection changed before activation");
+        this.archiveSkillSelection(tenant,record.projectId,record.name,requestId);
+      }
+      this.upsertSkill({...record,tenantId:tenant,executionJson});
+      const result={...record,revision:this.skillSelectionRevision(tenant,record.name,record.scope,record.projectId)!};
+      if(record.publication){
+        if(expectedRevision===undefined||!executionJson||record.scope!=="project"||!record.projectId)throw new PhononError("errSkillInstallUnconfirmed","immutable activation is missing its original proof");
+        this.db.prepare("INSERT INTO managed_skill_versions(installation_id,tenant_id,project_id,name,record_json,execution_json,created_at) VALUES(?,?,?,?,?,?,?)")
+          .run(record.publication.versionId,tenant,record.projectId,record.name,JSON.stringify(result),executionJson,new Date().toISOString());
+      }
+      this.db.prepare(`UPDATE skill_install_operations SET state='confirmed',result_json=?,updated_at=? WHERE tenant_id=? AND request_id=? AND owner_id=? AND state='dispatched'`)
+        .run(JSON.stringify({skill:result}),new Date().toISOString(),tenant,requestId,owner);
+      this.db.exec("COMMIT");return result;
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+  upsertSkill(r: { agent: string; name: string; scope: string; projectId?: string; version?: string; hash?: string; installedPath: string; installedAt: string;tenantId?:string;executionJson?:string }): void {
+    if(r.tenantId!==undefined&&(!r.tenantId||r.scope==="project"&&!this.db.prepare("SELECT 1 FROM projects WHERE project_id=? AND namespace=?").get(r.projectId??null,r.tenantId)))
+      throw new PhononError("errProjectNotFound","skill project is not in the current tenant");
+    const result=this.db
       .prepare(
-        `INSERT INTO skills(agent_id,name,scope,project_id,version,hash,installed_path,installed_at)
-         VALUES(?,?,?,?,?,?,?,?)
-         ON CONFLICT(agent_id,scope,name,project_id) DO UPDATE SET version=excluded.version, hash=excluded.hash, installed_path=excluded.installed_path, installed_at=excluded.installed_at`,
+        `INSERT INTO skills(agent_id,name,scope,project_id,version,hash,installed_path,installed_at,tenant_id,execution_json)
+         VALUES(?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT DO UPDATE SET version=excluded.version,hash=excluded.hash,installed_path=excluded.installed_path,
+           installed_at=excluded.installed_at,tenant_id=excluded.tenant_id,execution_json=excluded.execution_json
+         WHERE skills.tenant_id IS excluded.tenant_id OR(skills.tenant_id IS NULL AND excluded.tenant_id IS NOT NULL AND excluded.scope='project'
+           AND EXISTS(SELECT 1 FROM projects WHERE project_id=excluded.project_id AND namespace=excluded.tenant_id))`,
       )
-      .run(r.agent, r.name, r.scope, r.projectId ?? null, r.version ?? null, r.hash ?? null, r.installedPath, r.installedAt);
+      .run(r.agent,r.name,r.scope,r.scope==="project"?r.projectId??null:null,r.version??null,r.hash??null,r.installedPath,r.installedAt,r.tenantId??null,r.executionJson??null);
+    if(result.changes!==1)throw new PhononError("errPolicyDenied","skill metadata belongs to a different tenant");
   }
-  deleteSkill(r: { agent: string; name: string; scope: string; projectId?: string }): void {
+  skillExecutionReceipt(tenantId:string,record:{agent:string;name:string;scope:string;projectId?:string}):string|undefined{
+    return (this.db.prepare(`SELECT execution_json FROM skills WHERE tenant_id=? AND agent_id=? AND name=? AND scope=?
+      AND IFNULL(project_id,'')=IFNULL(?,'') AND(scope='global' OR EXISTS(SELECT 1 FROM projects WHERE project_id=skills.project_id AND namespace=?))`)
+      .get(tenantId,record.agent,record.name,record.scope,record.scope==="project"?record.projectId??null:null,tenantId) as {execution_json?:string}|undefined)?.execution_json??undefined;
+  }
+  deleteSkill(r: { agent: string; name: string; scope: string; projectId?: string;tenantId?:string }): void {
+    if(r.tenantId&&r.scope==="project")this.db.prepare(`UPDATE managed_skill_versions SET revoked_at=? WHERE tenant_id=? AND project_id=? AND name=? AND revoked_at IS NULL
+      AND EXISTS(SELECT 1 FROM projects WHERE project_id=? AND namespace=?)`).run(new Date().toISOString(),r.tenantId,r.projectId??null,r.name,r.projectId??null,r.tenantId);
     this.db
-      .prepare("DELETE FROM skills WHERE agent_id=? AND name=? AND scope=? AND IFNULL(project_id,'')=IFNULL(?,'')")
-      .run(r.agent, r.name, r.scope, r.projectId ?? null);
+      .prepare(`DELETE FROM skills WHERE agent_id=? AND name=? AND scope=? AND IFNULL(project_id,'')=IFNULL(?,'')
+        AND(? IS NULL OR tenant_id=? OR(tenant_id IS NULL AND scope='project'
+          AND EXISTS(SELECT 1 FROM projects WHERE projects.project_id=skills.project_id AND namespace=?)))`)
+      .run(r.agent,r.name,r.scope,r.scope==="project"?r.projectId??null:null,r.tenantId??null,r.tenantId??null,r.tenantId??null);
   }
-  loadSkills(): Array<{ agent: string; name: string; scope: "global" | "project"; projectId?: string; version?: string; hash?: string; installedPath: string; installedAt: string }> {
-    return (this.db.prepare("SELECT * FROM skills").all() as Record<string, unknown>[]).map((row) => ({
+  loadSkills(tenantId?:string):StoredSkillRecord[] {
+    const rows=tenantId===undefined?this.db.prepare("SELECT * FROM skills").all():this.db.prepare(`SELECT * FROM skills
+      WHERE(scope='global' AND tenant_id=?) OR(scope='project' AND(tenant_id=? OR tenant_id IS NULL)
+        AND EXISTS(SELECT 1 FROM projects WHERE projects.project_id=skills.project_id AND namespace=?))`).all(tenantId,tenantId,tenantId);
+    return (rows as Record<string, unknown>[]).map((row) => {
+      let publication:StoredSkillRecord["publication"];try{const receipt=JSON.parse(String(row.execution_json));if(receipt.schema===2&&typeof receipt.installationId==="string"&&typeof receipt.tree?.hash==="string")publication={kind:"immutable",versionId:receipt.installationId,treeHash:receipt.tree.hash};}catch{}
+      return {
       agent: row.agent_id as string,
       name: row.name as string,
       scope: row.scope as "global" | "project",
@@ -447,21 +760,52 @@ export class PhononStore {
       hash: (row.hash as string) ?? undefined,
       installedPath: row.installed_path as string,
       installedAt: row.installed_at as string,
-    }));
+      ...(publication?{publication}:{}),...(tenantId?{revision:this.skillSelectionRevision(tenantId,String(row.name),row.scope as "project"|"global",row.project_id as string??undefined)!}:{}),
+    };});
   }
 
   // ---- sessions（元数据，OpenClaw 原生可 resume）----
-  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string; streamSeq?: number }): void {
+  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string; streamSeq?: number; employeeId?:string; employeeRevision?:number; recoveryJSON?:string; ownerInstance?:string; nativeStopJSON?:string }): void {
     this.db
       .prepare(
-        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path,stream_seq)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path,stream_seq,employee_id,employee_revision,recovery_json,native_stop_json)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, status=excluded.status, last_active=excluded.last_active,
            transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path),
-           stream_seq=MAX(sessions.stream_seq, excluded.stream_seq)
-         WHERE sessions.tenant_id=excluded.tenant_id`,
+           stream_seq=MAX(sessions.stream_seq, excluded.stream_seq),employee_revision=excluded.employee_revision,recovery_json=excluded.recovery_json,native_stop_json=excluded.native_stop_json
+         WHERE sessions.tenant_id=excluded.tenant_id AND (? IS NULL OR EXISTS(
+           SELECT 1 FROM session_native_owners o WHERE o.tenant_id=sessions.tenant_id AND o.session_id=sessions.session_id AND o.owner_instance=?))`,
       )
-      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null, r.streamSeq ?? 0);
+      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null, r.streamSeq ?? 0,r.employeeId??null,r.employeeRevision??null,r.recoveryJSON??null,r.nativeStopJSON??null,r.ownerInstance??null,r.ownerInstance??null);
+  }
+
+  private nativeOwnerAlive(pid:number):boolean {
+    if(!Number.isSafeInteger(pid)||pid<=0)return true;
+    try{process.kill(pid,0);return true;}catch(error){return (error as NodeJS.ErrnoException).code!=="ESRCH";}
+  }
+  nativeSessionOwnedElsewhere(tenant:string,session:string,owner:string):boolean {
+    const row=this.db.prepare("SELECT owner_instance,owner_pid FROM session_native_owners WHERE tenant_id=? AND session_id=?").get(tenant,session) as {owner_instance:string;owner_pid:number}|undefined;
+    return !!row && row.owner_instance!==owner && this.nativeOwnerAlive(Number(row.owner_pid));
+  }
+  ownsNativeSession(tenant:string,session:string,owner:string):boolean {
+    return !!this.db.prepare("SELECT 1 FROM session_native_owners WHERE tenant_id=? AND session_id=? AND owner_instance=?").get(tenant,session,owner);
+  }
+  nativeSessionSnapshot(tenant:string,session:string):Record<string,unknown>|undefined {
+    return this.db.prepare("SELECT * FROM sessions WHERE tenant_id=? AND session_id=?").get(tenant,session) as Record<string,unknown>|undefined;
+  }
+  claimNativeSession(tenant:string,session:string,owner:string,expected?:{checkpoint:string|null;nativeStopJSON?:string|null;project:string;agent:string;model:string;employeeId?:string;employeeRevision?:number}):boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try{
+      if(this.nativeSessionOwnedElsewhere(tenant,session,owner)){this.db.exec("ROLLBACK");return false;}
+      const row=this.db.prepare("SELECT * FROM sessions WHERE session_id=? AND tenant_id=?").get(session,tenant) as Record<string,unknown>|undefined;
+      if(expected ? !row || !["idle","paused"].includes(String(row.status)) || row.recovery_json!==expected.checkpoint || expected.nativeStopJSON!==undefined&&(row.native_stop_json??null)!==expected.nativeStopJSON || row.project_id!==expected.project || row.agent_id!==expected.agent || row.model!==expected.model || (row.employee_id??null)!==(expected.employeeId??null) || (row.employee_revision??null)!==(expected.employeeRevision??null) : !!row){this.db.exec("ROLLBACK");return false;}
+      this.db.prepare(`INSERT INTO session_native_owners(tenant_id,session_id,owner_instance,owner_pid) VALUES(?,?,?,?)
+        ON CONFLICT(tenant_id,session_id) DO UPDATE SET owner_instance=excluded.owner_instance,owner_pid=excluded.owner_pid`).run(tenant,session,owner,process.pid);
+      this.db.exec("COMMIT");return true;
+    }catch(error){this.db.exec("ROLLBACK");throw error;}
+  }
+  releaseNativeSession(tenant:string,session:string,owner:string):void {
+    this.db.prepare("DELETE FROM session_native_owners WHERE tenant_id=? AND session_id=? AND owner_instance=?").run(tenant,session,owner);
   }
   loadSessions(tenantId?: string): Array<Record<string, unknown>> {
     if (tenantId !== undefined) {
@@ -476,16 +820,27 @@ export class PhononStore {
   /** 删一条 session 元数据（不动快照文件，由调用方决定）。 */
   deleteSession(sessionId: string): void {
     this.db.prepare("DELETE FROM sessions WHERE session_id=?").run(sessionId);
+    this.db.prepare("DELETE FROM session_native_owners WHERE session_id=?").run(sessionId);
   }
 
   // ---- outbox ----
-  outboxAdd(tenantId: string, sessionId: string, seq: number, payload: string, createdAt: string): boolean {
+  rememberUpstreamRun(tenant:string,session:string,id:string):void{
+    this.db.prepare("INSERT OR IGNORE INTO session_upstream_runs(tenant_id,session_id,upstream_id) VALUES(?,?,?)").run(tenant,session,id);
+  }
+  ownsUpstreamRun(tenant:string,session:string,id:string):boolean{return !!this.db.prepare("SELECT 1 FROM session_upstream_runs WHERE tenant_id=? AND session_id=? AND upstream_id=?").get(tenant,session,id);}
+  proactiveEventHash(tenant:string,session:string,id:string):string|undefined{return (this.db.prepare("SELECT payload_hash FROM native_proactive_seen WHERE tenant_id=? AND session_id=? AND upstream_id=?").get(tenant,session,id) as {payload_hash:string}|undefined)?.payload_hash;}
+  outboxAdd(tenantId: string, sessionId: string, seq: number, payload: string, createdAt: string,proactive?:{id:string;hash:string}): boolean {
     return this.deliveryWrite(() => {
       // Event durability and sequence advancement are one transaction. Advancing
       // sessions.stream_seq first would leave a permanent protocol gap if the
       // process crashed before the outbox row was inserted.
       this.db.exec("BEGIN IMMEDIATE");
       try {
+        if(proactive){
+          const existing=this.proactiveEventHash(tenantId,sessionId,proactive.id);
+          if(existing){if(existing!==proactive.hash)throw new Error("native proactive identity changed");this.db.exec("COMMIT");return false;}
+          this.db.prepare("INSERT INTO native_proactive_seen(tenant_id,session_id,upstream_id,payload_hash,seq,created_at) VALUES(?,?,?,?,?,?)").run(tenantId,sessionId,proactive.id,proactive.hash,seq,createdAt);
+        }
         const result = this.db.prepare("INSERT OR IGNORE INTO outbox_events(tenant_id,session_id,seq,payload,created_at) VALUES(?,?,?,?,?)")
           .run(tenantId, sessionId, seq, payload, createdAt);
         this.db.prepare("UPDATE sessions SET stream_seq=MAX(stream_seq, ?) WHERE session_id=? AND tenant_id=?")
@@ -604,7 +959,51 @@ export class PhononStore {
     }));
   }
 
+  interactionReceipt(tenant: string, request: string): Record<string,unknown> | undefined {
+    return this.db.prepare("SELECT * FROM interaction_receipts WHERE tenant_id=? AND request_id=?").get(tenant,request) as Record<string,unknown> | undefined;
+  }
+  compressionReceipt(tenant:string,id:string):Record<string,any>|undefined{
+    const row=this.db.prepare("SELECT document FROM compression_receipts WHERE tenant_id=? AND operation_id=?").get(tenant,id) as {document:string}|undefined;
+    return row?JSON.parse(row.document):undefined;
+  }
+  latestCompression(tenant:string,session:string):Record<string,any>|undefined{
+    const row=this.db.prepare("SELECT document FROM compression_receipts WHERE tenant_id=? AND session_id=? ORDER BY json_extract(document,'$.createdAt') DESC,rowid DESC LIMIT 1").get(tenant,session) as {document:string}|undefined;
+    return row?JSON.parse(row.document):undefined;
+  }
+  compressionBlocked(tenant:string,session:string):boolean{
+    return !!this.db.prepare("SELECT 1 FROM compression_receipts WHERE tenant_id=? AND session_id=? AND state IN ('running','unknown')").get(tenant,session);
+  }
+  beginCompression(tenant:string,receipt:{operationId:string;sessionId:string;state:string}):void{
+    this.db.prepare("INSERT INTO compression_receipts(tenant_id,operation_id,session_id,state,document) VALUES(?,?,?,?,?)")
+      .run(tenant,receipt.operationId,receipt.sessionId,receipt.state,JSON.stringify(receipt));
+  }
+  finishCompression(tenant:string,receipt:{operationId:string;state:string}):void{
+    this.db.prepare("UPDATE compression_receipts SET state=?,document=? WHERE tenant_id=? AND operation_id=?")
+      .run(receipt.state,JSON.stringify(receipt),tenant,receipt.operationId);
+  }
+  employeeProfile(tenant:string,id:string):Record<string,any>|undefined{
+    const row=this.db.prepare("SELECT document FROM employee_profiles WHERE tenant_id=? AND employee_id=?").get(tenant,id) as {document:string}|undefined;
+    return row?JSON.parse(row.document):undefined;
+  }
+  saveEmployeeProfile(tenant:string,id:string,document:unknown):void{
+    this.db.prepare("INSERT INTO employee_profiles(tenant_id,employee_id,document) VALUES(?,?,?) ON CONFLICT(tenant_id,employee_id) DO UPDATE SET document=excluded.document").run(tenant,id,JSON.stringify(document));
+  }
+  employeeBusy(tenant:string,id:string):boolean{
+    return !!this.db.prepare(`SELECT 1 FROM sessions s WHERE s.tenant_id=? AND s.employee_id=? AND
+      (s.status IN ('running','paused') OR EXISTS(SELECT 1 FROM compression_receipts c WHERE c.tenant_id=s.tenant_id AND c.session_id=s.session_id AND c.state IN ('running','unknown'))) LIMIT 1`).get(tenant,id);
+  }
+  beginInteraction(tenant: string, request: string, hash: string, payload: string): void {
+    this.db.prepare(`INSERT INTO interaction_receipts(tenant_id,request_id,request_hash,request_json,state,updated_at)
+      VALUES(?,?,?,?,'pending',?) ON CONFLICT DO NOTHING`).run(tenant,request,hash,payload,new Date().toISOString());
+  }
+  updateInteraction(tenant: string, request: string, state: string, response?: string, hash?: string): void {
+    this.db.prepare(`UPDATE interaction_receipts SET state=?,response_json=COALESCE(?,response_json),
+      decision_hash=COALESCE(?,decision_hash),updated_at=? WHERE tenant_id=? AND request_id=?`)
+      .run(state,response??null,hash??null,new Date().toISOString(),tenant,request);
+  }
   close(): void {
+    this.peers?.close();
+    this.archives?.close();
     this.db.close();
   }
 
@@ -660,12 +1059,38 @@ export class PhononStore {
     return this.db.prepare(`SELECT * FROM workflows WHERE tenant_id=? AND json_extract(metadata_json,'$._phononDispatch.key')=? LIMIT 1`).get(tenantId,key) as Record<string,unknown>|undefined;
   }
 
+  workflowCancelIntent(tenantId:string,key:string): {project_id:string}|undefined {
+    return this.db.prepare("SELECT project_id FROM workflow_cancel_intents WHERE tenant_id=? AND dispatch_key=?").get(tenantId,key) as {project_id:string}|undefined;
+  }
+  recordWorkflowCancelIntent(tenantId:string,key:string,project:string):void {
+    const previous=this.workflowCancelIntent(tenantId,key);
+    if(previous&&previous.project_id!==project)throw new Error("dispatch cancellation scope mismatch");
+    this.db.prepare("INSERT INTO workflow_cancel_intents(tenant_id,dispatch_key,project_id,created_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING").run(tenantId,key,project,new Date().toISOString());
+  }
+
   workflowResumeDispatch(tenantId: string, key: string): { requestHash: string; resultJson: string } | undefined {
     return this.db.prepare("SELECT request_hash AS requestHash,result_json AS resultJson FROM workflow_resume_dispatches WHERE tenant_id=? AND request_key=?")
       .get(tenantId, key) as { requestHash: string; resultJson: string } | undefined;
   }
 
   // ---- workflows (L3 checkpoint) ----
+  workflowInputGet(tenantId:string,workflowId:string,inputId:string):Record<string,unknown>|undefined {
+    return this.db.prepare('SELECT * FROM workflow_input_receipts WHERE tenant_id=? AND workflow_id=? AND input_id=?').get(tenantId,workflowId,inputId) as Record<string,unknown>|undefined;
+  }
+  workflowInputReserve(input:{tenantId:string;workflowId:string;inputId:string;contentHash:string;nodeId:string;sessionId:string;turnId:string;ownerId:string;ownerEpoch:number;controlEpoch:number}):boolean {
+    const now=new Date().toISOString();
+    const result=this.db.prepare(`INSERT INTO workflow_input_receipts(tenant_id,workflow_id,input_id,request_hash,node_id,session_id,turn_id,state,created_at,updated_at)
+      SELECT ?,?,?,?,?,?,?,'inserting',?,? FROM workflows w WHERE w.tenant_id=? AND w.workflow_id=? AND w.owner_id=? AND w.owner_epoch=?
+        AND w.status='running' AND w.lease_until>? AND json_extract(w.checkpoint_json,'$.controlEpoch')=?
+        AND (SELECT count(*) FROM workflow_input_receipts i WHERE i.tenant_id=w.tenant_id AND i.workflow_id=w.workflow_id)<256
+      ON CONFLICT(tenant_id,workflow_id,input_id) DO NOTHING`).run(input.tenantId,input.workflowId,input.inputId,input.contentHash,input.nodeId,input.sessionId,input.turnId,now,now,
+        input.tenantId,input.workflowId,input.ownerId,input.ownerEpoch,Date.now(),input.controlEpoch);
+    return Number(result.changes)===1;
+  }
+  workflowInputFinish(tenantId:string,workflowId:string,inputId:string,contentHash:string,state:'inserted'|'unknown',errorCode?:string):void {
+    this.db.prepare(`UPDATE workflow_input_receipts SET state=?,error_code=?,updated_at=?
+      WHERE tenant_id=? AND workflow_id=? AND input_id=? AND request_hash=? AND state='inserting'`).run(state,errorCode??null,new Date().toISOString(),tenantId,workflowId,inputId,contentHash);
+  }
   upsertWorkflow(w: {
     workflowId: string; tenantId: string; projectId?: string; worktreeId?: string;
     mode: string; planJson: string; input?: string; policyJson?: string; sharedJson?: string;
@@ -888,15 +1313,15 @@ export class PhononStore {
     sessionId?: string; workflowId?: string; startedAt?: string; finishedAt?: string;
     exitReason?: string; error?: string; transcriptPath?: string; resultText?: string;
     usageJson?: string; pushState?: string; ackedSeq?: number; createdAt: string;
-    attempt?: number; maxAttempts?: number; retryHistoryJson?: string; inputJson?: string;
+    attempt?: number; maxAttempts?: number; retryHistoryJson?: string; inputJson?: string; dispatchJson?: string;
     phase?: string; retryAt?: number; ownerId?: string; ownerEpoch?: number; leaseUntil?: number; eventSeq?: number;
   }): boolean {
     // May run inside append/accept transaction: publish gauges only after commit.
     return this.deliveryWrite(() => {
       const result = this.db
         .prepare(
-          `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at,attempt,max_attempts,retry_history_json,input_json,phase,retry_at,owner_id,owner_epoch,lease_until,event_seq)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          `INSERT INTO runs(id,schedule_id,tenant_id,trigger_source,status,session_id,workflow_id,started_at,finished_at,exit_reason,error,transcript_path,result_text,usage_json,push_state,acked_seq,created_at,attempt,max_attempts,retry_history_json,input_json,phase,retry_at,owner_id,owner_epoch,lease_until,event_seq,dispatch_json)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
              status=excluded.status, session_id=excluded.session_id, workflow_id=excluded.workflow_id,
              started_at=excluded.started_at, finished_at=excluded.finished_at,
@@ -907,6 +1332,7 @@ export class PhononStore {
              acked_seq=MAX(runs.acked_seq, excluded.acked_seq),
              attempt=excluded.attempt, max_attempts=excluded.max_attempts,
              retry_history_json=excluded.retry_history_json, input_json=excluded.input_json,
+             dispatch_json=COALESCE(runs.dispatch_json,excluded.dispatch_json),
              phase=excluded.phase, retry_at=excluded.retry_at, lease_until=excluded.lease_until,
              event_seq=MAX(runs.event_seq, excluded.event_seq)
            WHERE runs.tenant_id=excluded.tenant_id AND
@@ -920,6 +1346,7 @@ export class PhononStore {
           r.usageJson ?? null, r.pushState ?? "pending", r.ackedSeq ?? -1, r.createdAt,
           r.attempt ?? 0, r.maxAttempts ?? 1, r.retryHistoryJson ?? "[]", r.inputJson ?? null,
           r.phase ?? null, r.retryAt ?? null, r.ownerId ?? null, r.ownerEpoch ?? 0, r.leaseUntil ?? null, r.eventSeq ?? 0,
+          r.dispatchJson ?? null,
         );
       return Number(result.changes) === 1;
     }, false);
@@ -1012,12 +1439,13 @@ export class PhononStore {
     if (row && tenantId !== undefined && row.tenant_id !== tenantId) return undefined; // B1
     return row;
   }
-  listRunsForSchedule(scheduleId: string, opts?: { status?: string; limit?: number; tenantId?: string }): Array<Record<string, unknown>> {
+  listRunsForSchedule(scheduleId: string, opts?: { status?: string; limit?: number; tenantId?: string; unackedOnly?: boolean }): Array<Record<string, unknown>> {
     const where: string[] = ["schedule_id=?"];
     const params: unknown[] = [scheduleId];
     if (opts?.tenantId !== undefined) { where.push("tenant_id=?"); params.push(opts.tenantId); } // B1
     if (opts?.status) { where.push("status=?"); params.push(opts.status); }
-    const sql = `SELECT * FROM runs WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`;
+    if (opts?.unackedOnly) where.push("push_state<>'acked'");
+    const sql = `SELECT * FROM runs WHERE ${where.join(" AND ")} ORDER BY created_at ${opts?.unackedOnly ? "ASC" : "DESC"},id LIMIT ?`;
     params.push(opts?.limit ?? 50);
     return this.db.prepare(sql).all(...(params as never[])) as Array<Record<string, unknown>>;
   }

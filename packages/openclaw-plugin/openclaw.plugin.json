@@ -5,6 +5,27 @@
   "activation": {
     "onStartup": true
   },
+  "contracts": {
+    "agentToolResultMiddleware": ["openclaw"],
+    "tools": [
+      "phonon_request_interaction",
+      "phonon_acknowledge_interaction",
+      "phonon_conversation_board",
+      "phonon_workflow",
+      "phonon_conversation_message",
+      "phonon_publish_document",
+      "phonon_project_coordination"
+    ]
+  },
+  "toolMetadata": {
+    "phonon_request_interaction": { "optional": true },
+    "phonon_acknowledge_interaction": { "optional": true },
+    "phonon_conversation_board": { "optional": true },
+    "phonon_workflow": { "optional": true },
+    "phonon_conversation_message": { "optional": true },
+    "phonon_publish_document": { "optional": true },
+    "phonon_project_coordination": { "optional": true }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -17,6 +38,20 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Tool names to intercept (empty = intercept all)"
+      },
+      "bridgeToken": {
+        "type": "string",
+        "description": "Bearer token for the legacy HITL bridge; not a native turn capability"
+      },
+      "nativeInteractions": {
+        "type": "boolean",
+        "default": false,
+        "description": "Explicitly enable turn-scoped Phonon human-input, board and workflow tools, and admin-only binding RPCs"
+      },
+      "peerContext": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable private current-run collaboration checkpoints and coordination-only tools for qualified native OpenClaw runtimes; receive also requires explicit prompt-injection and conversation-access hook grants, and tools retain native policy"
       }
     }
   }

@@ -13,6 +13,9 @@ import type {
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
+import { qualifyClaudePeerContext, prepareClaudePeerRunner, type ClaudeSdkBinding } from "./claude-peer-context.js";
+import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { PhononError } from "../rpc.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 
 /**
@@ -30,6 +33,7 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, Mode
 const CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // --session-id / --resume
   nativeCompression: false, // 无原生 compact，core custom 兜底
+  customCompression: true,
   contextInjection: true, // --append-system-prompt / stdin
   proactiveOutput: false, // 一次性，无自发输出
   modelSwitch: true, // --model 每轮可变
@@ -89,7 +93,15 @@ class ClaudeCodeSession implements AdapterSession {
   private env: ClaudeCodeEnv;
   private started = false; // 是否已建过（决定 --session-id vs --resume）
   private current?: ProcessSupervisor;
+  private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   private pendingInject: string[] = [];
+  private peerBinding?: ClaudeSdkBinding;
+  async qualifyPeerContext(): Promise<void> {
+    this.peerBinding=await qualifyClaudePeerContext(this.env.binPath??"claude");
+  }
+  peerContextCapability() {
+    return this.peerBinding?{mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.uuid} as const:undefined;
+  }
   constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[]) {
     this.sessionId = sessionId;
     this.model = model;
@@ -123,6 +135,7 @@ class ClaudeCodeSession implements AdapterSession {
     if (this.env.settingsPath) args.push("--setting-sources", "", "--settings", this.env.settingsPath);
     if (this.model !== "default") args.push("--model", this.model);
     // 首轮 --session-id，后续 --resume（持续会话）
+    const resumed=this.started;
     if (this.started) args.push("--resume", this.uuid);
     else args.push("--session-id", this.uuid);
     this.started = true;
@@ -132,11 +145,14 @@ class ClaudeCodeSession implements AdapterSession {
       message: { role: "user", content: [{ type: "text", text: prompt }] },
     }) + "\n";
 
-    await this.run(args, envelope, turnId, emit, opts);
+    await this.run(args, envelope, turnId, emit, opts, resumed);
   }
 
-  private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
-    return new Promise((resolve) => {
+  private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions, resumed: boolean): Promise<void> {
+    const peer=(opts.peerContext||opts.projectCoordination)&&this.peerBinding?prepareClaudePeerRunner(opts,this.peerBinding,{sessionId:this.uuid,
+      prompt:JSON.parse(stdin).message.content[0].text,model:this.model,resume:resumed,settingsPath:this.env.settingsPath}):undefined;
+    let owned:ProcessSupervisor|undefined;
+    return new Promise<void>((resolve) => {
       // 剥离 CLAUDECODE* env（避免外层污染）
       const inherited: NodeJS.ProcessEnv = {};
       for (const [k, v] of Object.entries(process.env)) {
@@ -145,6 +161,8 @@ class ClaudeCodeSession implements AdapterSession {
       }
 
       const environment = buildChildProcessEnvironment(opts.environment, inherited);
+      environment.PWD=this.cwd;
+      if(!peer){environment.AGENT_PHONON_PEER_CONTEXT_URL="";environment.AGENT_PHONON_PEER_CONTEXT_TOKEN="";}
       // Trusted host configuration is passed only in the child environment, never
       // copied into a settings file or command-line argument. Native auth stays intact.
       try { claudeSettingsEnvironment(this.env, environment); }
@@ -152,14 +170,19 @@ class ClaudeCodeSession implements AdapterSession {
         emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: "Invalid standalone Claude settings: expected an absolute JSON file with self-contained endpoint authentication", status: "failed", final: true } as StreamEvent);
         resolve(); return;
       }
-      const supervisor = spawnSupervisedAgent(this.env.binPath ?? "claude", args, { cwd: this.cwd, env: environment });
+      const supervisor = spawnSupervisedAgent(peer?process.execPath:this.env.binPath ?? "claude", peer?peer.args:args, { cwd: this.cwd, env: environment });
+      owned=supervisor;
       const child = supervisor.child;
       this.current = supervisor;
+      this.lastNative={turnId,supervisor};
       const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
       child.once("close", releaseCurrent);
       child.once("error", releaseCurrent);
       let buf = "";
       let acc = "";
+      let outcome:Record<string,unknown>|undefined;
+      const quietTools=new Set<string>();
+      let stderr="";
       let settled = false;
       const abort = (): void => { void supervisor.terminate(); finish("interrupted", acc); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
@@ -179,27 +202,55 @@ class ClaudeCodeSession implements AdapterSession {
       if (opts.signal?.aborted) abort();
       else opts.signal?.addEventListener("abort", abort, { once: true });
 
+      const consume=(line:string)=>{
+        if(settled||!line.trim())return;
+        let ev:Record<string,unknown>;try{ev=JSON.parse(line);}catch{return;}
+        if(ev.parent_tool_use_id)return;
+        if(["assistant","user","result"].includes(String(ev.type))&&ev.session_id!==this.uuid){
+          void supervisor.terminate();finish("failed","","Claude native session identity changed");return;
+        }
+        if(ev.type==="result")outcome=ev;
+        const message=ev.message as {content?:Array<Record<string,unknown>>}|undefined;
+        if(message?.content){
+          const content=message.content.filter(block=>{
+            if(block.type==="tool_use"&&block.name==="mcp__phonon_current_turn__phonon_project_coordination"){
+              if(typeof block.id==="string")quietTools.add(block.id);return false;
+            }
+            if(block.type==="tool_result"&&typeof block.tool_use_id==="string"&&quietTools.has(block.tool_use_id)){quietTools.delete(block.tool_use_id);return false;}
+            return true;
+          });
+          ev={...ev,message:{...message,content}};
+        }
+        this.handleStreamEvent(ev,turnId,emit,text=>{acc+=text;});
+      };
       child.stdout.on("data", (d) => {
         buf += d.toString();
         let nl;
         while ((nl = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, nl).trim();
           buf = buf.slice(nl + 1);
-          if (!line) continue;
-          let ev: Record<string, unknown>;
-          try { ev = JSON.parse(line); } catch { continue; }
-          this.handleStreamEvent(ev, turnId, emit, (t) => (acc += t));
+          consume(line);
         }
       });
-      child.stderr.on("data", () => { /* stream-json 已含错误 */ });
+      child.stderr.on("data", chunk=>{stderr=(stderr+String(chunk)).slice(-16000);});
       child.on("error", (e) => finish("failed", "", e.message));
       child.on("close", (code) => {
         if (settled) return;
-        finish(code === 0 ? "completed" : "failed", acc, code !== 0 ? `claude exited ${code}` : undefined);
+        consume(buf);
+        const success=code===0&&outcome?.subtype==="success"&&outcome.is_error===false&&typeof outcome.result==="string"&&!!outcome.result.trim();
+        const text=typeof outcome?.result==="string"?outcome.result:acc;
+        finish(success?"completed":"failed",text,success?undefined:adapterDiagnostic(`claude exited ${code}: ${stderr||"native result was not confirmed"}`,
+          [opts.environment?.AGENT_PHONON_PEER_CONTEXT_TOKEN,opts.environment?.AGENT_PHONON_INTERACTION_TOKEN,this.env.authToken]));
       });
 
-      child.stdin.write(stdin);
+      child.stdin.write(peer?peer.stdin:stdin);
       child.stdin.end();
+    }).finally(async()=>{
+      if(owned&&!owned.hasStopped())await owned.terminate();
+      const deadline=Date.now()+1000;
+      while(owned&&!owned.hasStopped()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+      if(owned&&!owned.hasStopped())throw new PhononError("errSessionBusy","Claude native process termination is unconfirmed; invocation assets retained");
+      peer?.cleanup();
     });
   }
 
@@ -259,10 +310,12 @@ class ClaudeCodeSession implements AdapterSession {
   async interrupt(): Promise<void> {
     if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
+  async observeNativeStop(turnId:string){return this.lastNative?.turnId===turnId&&this.lastNative.supervisor.hasStopped()?"process_tree_exit" as const:undefined;}
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
     for (const c of context) this.pendingInject.push(`[${c.role}] ${c.content}`);
   }
+  compressionModes(){return {native:false,custom:!!this.resolveSessionFile()};}
   async terminate(): Promise<void> { await this.interrupt(); }
 }
 
@@ -294,7 +347,10 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
-    return new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
+    if(params.reattach)throw new PhononError("errSessionBusy","Claude native recovery is not verified; refusing a replacement session");
+    const session=new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
+    await session.qualifyPeerContext();
+    return session;
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {

@@ -69,10 +69,15 @@ export const PhononErrorCode = z.enum([
   "errModelUnavailable", // 模型不在该 agent 的可用列表内
   // session 生命周期
   "errSessionNotFound",
+  "errCompressionNotFound",
   "errSessionTerminated", // 操作了已结束的 session
   "errSessionBusy", // session 正忙（如上一轮未结束）
+  'errWorkflowObservationChanged',
+  'errWorkflowNotFound',
+  'errWorkflowResultChanged',
   // 能力
   "errCapabilityUnsupported", // adapter 不支持该操作（如 native 压缩缺失）
+  "errReasoningUnconfirmed",
   // hook / HITL
   "errHookResolveInvalid", // hook.resolve 的裁决非法
   "errHookTimeout", // 等待服务端裁决超时
@@ -80,9 +85,13 @@ export const PhononErrorCode = z.enum([
   "errProjectNotFound",
   "errProjectExists", // 同名/同路径项目已存在
   "errProjectHasActiveSessions", // 项目下还有 active session（remove 拦）
+  "errProjectProvisionUnconfirmed",
+  "errProjectProvisionChanged",
   "errSkillNotFound",
   "errSkillScopeInvalid", // scope=project 但缺 projectId 等
   "errSkillInstallFailed",
+  "errSkillInstallUnconfirmed",
+  "errSkillRevisionChanged",
   // git / worktree（D25）
   "errWorktreeNotFound",
   "errWorktreeHasChanges", // 未提交变更，非 force 不清

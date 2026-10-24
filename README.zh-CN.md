@@ -2,11 +2,14 @@
 
 [English](./README.md)
 
-> 把多种本地 Agent 编排成一个系统——在你的设备上运行，从任何地方调度。
+> 从你的私人 AI 助手，到你带领的数字员工团队。
 
 **agent-phonon** 是一个设备侧 daemon。它会发现本机已安装的 AI Coding Agent
-（Claude Code、Codex、GitHub Copilot CLI、Pi、Herdr 多代理运行时、OpenCode、OpenClaw、Hermes 等），并通过统一的
+（Claude Code、Codex、GitHub Copilot CLI、Pi、OpenCode、OpenClaw、Hermes 等），并通过统一的
 WebSocket/JSON 协议暴露给服务端。
+
+不支持、不兼容 Herdr，也不自动迁移其会话；请显式配置受支持的原生适配器。
+参见[运行时范围决策](docs/decisions/2026-10-24-native-agents-only.md)。
 
 名字来自凝聚态物理里的 **phonon（声子）**：大量原子共同振动时涌现出的集体准粒子。
 单个 Agent 各自为战；编排在一起，就形成一个统一系统。*More is different.*
@@ -14,6 +17,17 @@ WebSocket/JSON 协议暴露给服务端。
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 ---
+
+## 产品定位
+
+**一个系统，既承载你的私人助手，也承载你带领的数字员工团队。** 具体体验取决于连接了哪些设备与 Agent，而不是让用户在两套独立产品之间做选择。
+
+- **私人助手**：在自己的电脑上创建一个专属 OpenClaw Agent，让它利用已具备的工具和权限，在这台电脑上帮你处理个人事务、执行任务。
+- **数字员工团队**：让多个 Agent 分别承担不同职责，由连接的应用或服务端协调它们分工协作。它们可以运行在同一台设备上，也可以分布在不同设备上，不要求每名数字员工独占一台设备。
+
+**设备决定任务在哪里执行，Agent 决定由谁执行、如何协作。** 用户可以从一个帮自己做事的助手开始，再按需要逐步扩展为一组自己带领的数字员工，不必一开始就选择“私人助手”或“员工团队”。
+
+agent-phonon 提供共用的设备侧执行底座；用户体验与跨设备协调由连接的应用或服务端承接。创建 Agent 与执行任务仍以 adapter 声明的真实能力和设备主人的本地授权为准。详见[产品设计说明](docs/design.md#11-产品定位私人助手与数字员工团队)。
 
 ## 它解决什么问题
 
@@ -63,7 +77,6 @@ Adapter 会声明真实能力；agent-phonon 不会假装所有 Agent 都完全�
   - Claude Code：`claude`
   - Codex CLI：`codex`
   - GitHub Copilot CLI：`copilot`
-  - Herdr 多代理运行时：`herdr` — 委托给所选 kind（如 `herdr:codex`、`herdr:claude` …）
   - OpenCode：`opencode`
   - Hermes：`hermes`
   - Pi：`pi` — 安装：`curl -fsSL https://pi.dev/install.sh | sh`
@@ -208,10 +221,6 @@ agent-phonon discover
 自动发现策略：
 
 - 通过执行 CLI 的 version 命令判断是否可用；
-- Herdr 委派给其 CLI（`herdr workspace create` + `herdr agent start --kind <kind>`），
-  轮询 lifecycle 状态并读取 pane 最近输出；不提供结构化 tool 事件，adapter
-  诚实声明 `streaming:false` / `hooks:[]`，用于跨 OS 一致性与复用 Herdr 的 pane / 状态
-  检测能力，不用于深度遥测；
 - 尽量解析成绝对路径，避免 systemd/launchd 的 PATH 和交互 shell 不一致；
 - Codex 会读取用户自己的 `~/.codex/config.toml`，从 provider endpoint 请求 `GET <base_url>/models`；失败时使用安全 fallback；
 - GitHub Copilot CLI 会从 `copilot help config` 解析模型清单，并使用 JSONL 真流式输出和原生命名会话续接；

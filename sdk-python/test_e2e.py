@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from agent_phonon import PhononServer  # noqa: E402
+from agent_phonon.rpc import RpcError  # noqa: E402
 
 REPO = str(Path(__file__).resolve().parents[1])
 
@@ -64,6 +65,9 @@ async def run_phonon(url: str, device_id: str) -> asyncio.subprocess.Process:
 
 async def main() -> None:
     results: dict[str, str] = {}
+    errors: list[Exception] = []
+    completed = asyncio.Event()
+    completed_count = 0
 
     server = PhononServer(authenticate=lambda did, key: asyncio.sleep(0, result=f"t-{did}"))
     port = await server.listen()
@@ -84,9 +88,18 @@ async def main() -> None:
         await device.env_set("global", "PY_SDK_TOKEN", "secret-value")
         envs = await device.env_list()
         assert any(v["name"] == "PY_SDK_TOKEN" and v["redacted"] for v in envs["variables"]), "env list failed"
-        await device.file_write(project_id, "hello.txt", "from-python")
-        file_read = await device.file_read(project_id, "hello.txt")
-        assert file_read["data"] == "from-python", "file read/write failed"
+        if {"secure_file_broker_linux_v1", "secure_file_transfer_darwin_v1"}.intersection(info.get("capabilities", [])):
+            await device.file_write(project_id, "hello.txt", "from-python")
+            file_read = await device.file_read(project_id, "hello.txt")
+            assert file_read["data"] == "from-python", "file read/write failed"
+        else:
+            try:
+                await device.file_write(project_id, "hello.txt", "from-python")
+            except RpcError as error:
+                assert error.app_code == "errPolicyDenied" and "unsupported" in str(error), str(error)
+            else:
+                raise AssertionError("Unadvertised secure file write unexpectedly succeeded")
+            print(f"[py-server] {device.device_id}: unsupported file broker rejection verified")
         session = await device.create_session(project_id, "mock:default", "m1")
         await session.send("hello from python")
         text = ""
@@ -96,25 +109,46 @@ async def main() -> None:
         results[device.device_id] = text
         await session.terminate()
 
-    server.on_device(on_device)
+    async def checked_device(device):
+        nonlocal completed_count
+        try:
+            await on_device(device)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            completed_count += 1
+            if completed_count >= 2:
+                completed.set()
 
-    # 启动 2 个 phonon 设备（多设备）
-    procs = await asyncio.gather(
-        run_phonon(f"ws://127.0.0.1:{port}", "py-dev-1"),
-        run_phonon(f"ws://127.0.0.1:{port}", "py-dev-2"),
-    )
-    # 等编排完成
-    for _ in range(200):
-        if len(results) >= 2:
-            break
-        await asyncio.sleep(0.1)
-
-    for p in procs:
-        p.terminate()
-    await server.close()
+    server.on_device(checked_device)
+    procs = []
+    try:
+        started = await asyncio.gather(
+            run_phonon(f"ws://127.0.0.1:{port}", "py-dev-1"),
+            run_phonon(f"ws://127.0.0.1:{port}", "py-dev-2"),
+            return_exceptions=True,
+        )
+        procs = [process for process in started if isinstance(process, asyncio.subprocess.Process)]
+        for process in started:
+            if isinstance(process, BaseException):
+                raise process
+        await asyncio.wait_for(completed.wait(), timeout=30)
+    finally:
+        for process in procs:
+            if process.returncode is None:
+                process.terminate()
+        await server.close()
+        for process in procs:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
 
     # 断言
     assert len(devices_seen) == 2, f"expected 2 devices, got {devices_seen}"
+    assert not errors, f"device callback failed: {errors!r}"
+    assert set(results) == {"py-dev-1", "py-dev-2"}, f"missing device results: {results}"
     assert all("py-echo:hello from python" in t for t in results.values()), f"stream mismatch: {results}"
     print(f"[py-server] ✅ MULTI-DEVICE OK: {list(results.keys())}")
     print(f"[py-server] streamed: {results}")

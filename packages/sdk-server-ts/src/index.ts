@@ -12,6 +12,9 @@ export type {
   WorkflowCommunicationGraphInput,
   WorkflowDiscussionTerminationInput,
   WorkflowPlanInput,
+  ScheduleTargetInput,
+  RunResolveInput,
+  SkillSelectionInput,
 } from "./server.js";
 export { RpcPeer } from "./rpc.js";
 export type { Transport } from "./rpc.js";
@@ -36,4 +39,7 @@ export type {
   WorkflowFeedbackDirective,
   WorkflowReplyDirective,
   WorkflowDoneDirective,
+  ScheduleDispatch,
+  RunResolveResult,
+  SkillInstallStatusResult,
 } from "@agent-phonon/protocol";

@@ -12,6 +12,8 @@ import type {
   WorkflowResumeFrom,
   WorkflowEvent,
   WorkflowStatusResult,
+  WorkflowCancelResult,
+  WorkflowDispatchCancelResult,
   WorkflowListResult,
   WorkflowListParams,
   WorkflowRunResult,
@@ -26,19 +28,31 @@ import type {
   Run,
   RunStatus,
   RunTriggerSource,
+  ConversationArchiveScope,
+  ConversationArchiveAppendParams,
+  ConversationArchiveAppendResult,
+  ConversationArchiveReadParams,
+  ConversationArchiveReadResult,
+  ConversationArchiveStatusResult,
+  ConversationArchiveEntitiesParams, ConversationArchiveEntitiesResult,
+  ConversationArchiveBlob, ConversationArchiveBlobWriteParams, ConversationArchiveBlobStatusResult,
+  ConversationArchiveBlobReadResult,
 } from "@agent-phonon/protocol";
 
 /** Schedule target 宽松型（SDK 使用面，避免调用方手动 cast 品牌类型）。 */
 export interface ScheduleTargetInput {
-  runKind?: "session" | "workflow";
+  runKind?: "session" | "workflow" | "dispatch";
   project: string;
   agent?: string;
   model?: string;
   prompt?: string;
   plan?: WorkflowPlanInput;
   agentConfig?: Record<string, unknown>;
-  skills?: string[];
+  skills?: SkillSelectionInput[];
+  dispatch?: import("@agent-phonon/protocol").ScheduleDispatch;
 }
+export type RunResolveInput = Omit<import("@agent-phonon/protocol").RunResolveParams, "runId"> & { runId: string };
+export type SkillSelectionInput=string|{name:string;version?:string;scope?:"global"|"project";force?:boolean;revision?:string;installationId?:string};
 
 /**
  * Workflow plan 宝松型（SDK 使用面）。
@@ -54,6 +68,7 @@ export interface WorkflowNodeInput {
   role?: string;
   input?: string;
   systemPrompt?: string;
+  skills?: SkillSelectionInput[];
   sessionId?: string;
   dependsOn?: string[];
   agentConfig?: Record<string, unknown>;
@@ -92,6 +107,31 @@ export type WorkflowPlanInput =
       termination?: WorkflowDiscussionTerminationInput;
     };
 
+function workflowSkills(plan:WorkflowPlanInput):SkillSelectionInput[]{
+  const nodes=plan.mode==="dag"?plan.nodes:plan.mode==="graph"?[plan.executor,...plan.workers]:plan.participants;
+  return nodes.flatMap(node=>{
+    if(node.skills!==undefined&&!Array.isArray(node.skills))throw Error("invalid_workflow_skill_selection");
+    return node.skills??[];
+  });
+}
+function pinnedSkills(skills:SkillSelectionInput[]){
+  return skills.some(value=>typeof value==="object"&&value!==null&&(value.revision!==undefined||value.installationId!==undefined));
+}
+async function requireSkillCapabilities(device:Pick<PhononDevice,"info">,skills:SkillSelectionInput[],workflow:boolean){
+  const required=[...(workflow&&skills.length?["workflow_skill_selection_v1"]:[]),...(pinnedSkills(skills)?["pinned_skill_selection_v1"]:[])];
+  if(!required.length)return;
+  const info=await device.info() as {capabilities?:unknown};
+  const capabilities=info?.capabilities;
+  if(!Array.isArray(capabilities)||required.some(flag=>!capabilities.includes(flag)))throw Error("skill_selection_device_update_required");
+}
+function skillTarget(target?:ScheduleTargetInput){
+  const direct=target?.skills??[];
+  if(!Array.isArray(direct))throw Error("invalid_skill_selection");
+  const workflow=target?.plan?workflowSkills(target.plan):[];
+  return {skills:[...direct,...workflow],workflow:workflow.length>0};
+}
+const wireSnapshot=<T>(value:T):T=>JSON.parse(JSON.stringify(value)) as T;
+
 /**
  * agent-phonon Server SDK。
  *
@@ -121,9 +161,20 @@ export class PhononSession extends EventEmitter {
     this.sessionId = sessionId;
   }
 
-  /** 发任务（结果走 'stream' 事件）。 */
-  async send(input: string, opts?: { verbosity?: "final" | "messages" | "tools" | "trace"; skills?: string[]; whenBusy?: "queue" | "interrupt" | "inject"; clientRequestId?: string }): Promise<SendResult> {
-    return this.device.call("session.send", { sessionId: this.sessionId, input, ...opts }) as Promise<SendResult>;
+  /** Send input; inject resolves only after application to the current turn.
+   * Unsupported modes reject unless an explicit supported fallback is given. */
+  async send(input: string, opts?: { verbosity?: "final" | "messages" | "tools" | "trace"; skills?: SkillSelectionInput[]; whenBusy?: "queue" | "interrupt" | "inject"; fallback?: "queue" | "interrupt" | "inject"; turnId?: string; clientRequestId?: string; reasoning?: {level:"low"|"standard"|"high"|"xhigh"|"max"|null} }): Promise<SendResult> {
+    const payload={sessionId:this.sessionId,input,...opts};
+    if(pinnedSkills(payload.skills??[])){
+      const frozen=wireSnapshot(payload);await requireSkillCapabilities(this.device,frozen.skills??[],false);
+      return this.device.call("session.send",frozen) as Promise<SendResult>;
+    }
+    return this.device.call("session.send",payload) as Promise<SendResult>;
+  }
+
+  /** Verify/reopen the same native Session without sending model input. */
+  recover(expected: {project:string;agent:string;model:string}): Promise<SessionMeta> {
+    return this.device.call("session.recover", {...expected, sessionId:this.sessionId}) as Promise<SessionMeta>;
   }
 
   inject(context: Array<{ role: "system" | "user" | "assistant"; content: string }>): Promise<unknown> {
@@ -135,9 +186,10 @@ export class PhononSession extends EventEmitter {
   switchModel(model: string): Promise<unknown> {
     return this.device.call("session.switchModel", { sessionId: this.sessionId, model });
   }
-  compress(mode: "native" | "custom" = "native"): Promise<unknown> {
-    return this.device.call("session.compress", { sessionId: this.sessionId, mode });
+  compress(mode: "native" | "custom" = "native",opts?:{clientRequestId?:string;strategy?:string;keepRecentToolCalls?:number;background?:boolean}): Promise<unknown> {
+    return this.device.call("session.compress", { sessionId: this.sessionId, mode,...opts });
   }
+  compressionStatus(operationId:string):Promise<unknown>{return this.device.call("session.compression.status",{sessionId:this.sessionId,operationId});}
   status(): Promise<SessionMeta> {
     return this.device.call("session.status", { sessionId: this.sessionId }) as Promise<SessionMeta>;
   }
@@ -177,6 +229,11 @@ export class PhononDevice extends EventEmitter {
   private sessions = new Map<string, PhononSession>();
   private hookDecider?: HookDecider;
   private interactionHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private conversationBoardHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private conversationWorkflowHandler?: (params:unknown)=>Promise<unknown>|unknown;
+  private conversationMessageHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private projectCoordinationHandler?: (params: unknown) => Promise<unknown> | unknown;
+  private projectCoordinationEvidenceHandler?: (params: unknown) => Promise<unknown> | unknown;
   private documentHandler?: (params: unknown) => Promise<unknown> | unknown;
   private prepareUploadHandler?: (params: unknown) => Promise<unknown> | unknown;
   private streamEventHandler?: (ev: StreamEvent) => Promise<boolean | {ackSeq:number}> | boolean | {ackSeq:number};
@@ -192,9 +249,26 @@ export class PhononDevice extends EventEmitter {
     this.peer = peer;
   }
 
-  call(method: string, params: unknown): Promise<unknown> {
-    return this.peer.request(method, params);
+  /** A deadline only bounds the reply wait; it does not cancel remote execution. */
+  call(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
+    return this.peer.request(method, params, timeoutMs);
   }
+  readonly mcp = {
+    configure: (params: import("@agent-phonon/protocol").ManagedMcpConfigureParams) => this.peer.request("mcp.configure", params) as Promise<import("@agent-phonon/protocol").ManagedMcpStatusResult>,
+    status: () => this.peer.request("mcp.status", {}) as Promise<import("@agent-phonon/protocol").ManagedMcpStatusResult>,
+  };
+
+  readonly conversationArchive = {
+    blob: {
+      write: (params: ConversationArchiveBlobWriteParams) => this.peer.request("conversation.archive.blob.write", params) as Promise<ConversationArchiveBlobStatusResult>,
+      status: (params: ConversationArchiveBlob) => this.peer.request("conversation.archive.blob.status", params) as Promise<ConversationArchiveBlobStatusResult>,
+      read: (params: ConversationArchiveBlob & {offset?: number}) => this.peer.request("conversation.archive.blob.read", params) as Promise<ConversationArchiveBlobReadResult>,
+    },
+    entities: (params: Omit<ConversationArchiveEntitiesParams, "limit"> & Partial<Pick<ConversationArchiveEntitiesParams, "limit">>) => this.peer.request("conversation.archive.entities", params) as Promise<ConversationArchiveEntitiesResult>,
+    append: (params: ConversationArchiveAppendParams) => this.peer.request("conversation.archive.append", params) as Promise<ConversationArchiveAppendResult>,
+    read: (params: Omit<ConversationArchiveReadParams, "afterSequence" | "limit"> & Partial<Pick<ConversationArchiveReadParams, "afterSequence" | "limit">>) => this.peer.request("conversation.archive.read", params) as Promise<ConversationArchiveReadResult>,
+    status: (params: ConversationArchiveScope) => this.peer.request("conversation.archive.status", params) as Promise<ConversationArchiveStatusResult>,
+  };
 
   /** 确定性宿主机维护面：不依赖任何外部 Agent/LLM。 */
   readonly maintenance = {
@@ -222,7 +296,7 @@ export class PhononDevice extends EventEmitter {
   }
 
   /** 建会话。 */
-  async createSession(params: { project: string; agent: string; model: string; worktreeId?: string; verbosity?: "final" | "messages" | "tools" | "trace"; clientRequestId?: string }): Promise<PhononSession> {
+  async createSession(params: { project: string; agent: string; model: string; worktreeId?: string; verbosity?: "final" | "messages" | "tools" | "trace"; clientRequestId?: string; clientTag?: string; agentConfig?: Record<string, unknown>; initialContext?: Array<{ role: "system" | "user" | "assistant"; content: string }> }): Promise<PhononSession> {
     const r = (await this.peer.request("session.create", { verbosity: "messages", ...params })) as { sessionId: string };
     const s = new PhononSession(this, r.sessionId);
     this.sessions.set(r.sessionId, s);
@@ -234,7 +308,8 @@ export class PhononDevice extends EventEmitter {
     return this.peer.request("session.list", filter ?? {}) as Promise<{ sessions: SessionMeta[]; nextCursor?: string }>;
   }
 
-  /** 设备 OS/机器信息，用于 server 做任务调度决策。 */
+  /** OS metadata plus optional ssh hints (username, port and public/private/Tailscale IPs).
+   * Hints contain no credentials and do not assert SSH reachability. Older devices may omit ssh. */
   info(): Promise<unknown> {
     return this.peer.request("device.info", {});
   }
@@ -250,13 +325,28 @@ export class PhononDevice extends EventEmitter {
   }
 
   /** Device-level directory listing under safe roots or absolute root paths. */
-  fsList(params?: { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number }): Promise<unknown> {
+  async fsList(params?: { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number;projectCandidates?:boolean;directoryInput?:string }): Promise<unknown> {
+    if(params?.directoryInput!==undefined&&params.projectCandidates!==true)throw Error("directory_mode_required");
+    if(params?.projectCandidates){const info=await this.info() as {capabilities?:unknown}|null;
+      if(!info||!Array.isArray(info.capabilities)||!info.capabilities.includes("workspace_directory_picker_v1"))throw Error("workspace_directory_device_update_required");}
     return this.peer.request("device.fs.list", params ?? {});
   }
 
   // ---- project / file / skill 便捷封装 ----
   project = {
-    create: (p: { name: string; path?: string; git?: boolean; remote?: string; clientRequestId?: string }) => this.peer.request("project.create", p) as Promise<{ project: { projectId: string; path: string } }>,
+    provision: async (input: import("@agent-phonon/protocol").ProjectProvisionParams) => {
+      const frozen=structuredClone(input),info=await this.info() as {capabilities?:unknown;projectProvisionReceiverID?:unknown}|null;
+      if(!info||!Array.isArray(info.capabilities)||!info.capabilities.includes("project_provision_v1")||info.projectProvisionReceiverID!==frozen.expectedReceiverID)throw Error("project_provision_device_update_required");
+      return this.peer.request("project.provision",frozen) as Promise<import("@agent-phonon/protocol").ProjectProvisionStatusResult>;
+    },
+    provisionStatus: (input: import("@agent-phonon/protocol").ProjectProvisionStatusParams) => this.peer.request("project.provision.status",input) as Promise<import("@agent-phonon/protocol").ProjectProvisionStatusResult>,
+    create: async (p: { name: string; path?: string; git?: boolean; remote?: string; clientRequestId?: string;existingDirectoryIdentity?:string }):Promise<{project:import("@agent-phonon/protocol").ProjectDescriptor}> => {
+      if(p.existingDirectoryIdentity!==undefined){const info=await this.info() as {capabilities?:unknown}|null;
+        if(!info||!Array.isArray(info.capabilities)||!info.capabilities.includes("workspace_directory_picker_v1"))throw Error("workspace_directory_device_update_required");}
+      const result=await this.peer.request("project.create",p) as {project:import("@agent-phonon/protocol").ProjectDescriptor};
+      if(p.existingDirectoryIdentity!==undefined&&result.project.directoryIdentity!==p.existingDirectoryIdentity)throw Error("workspace_directory_unconfirmed");
+      return result;
+    },
     list: () => this.peer.request("project.list", {}) as Promise<{ projects: unknown[] }>,
     get: (projectId: string) => this.peer.request("project.get", { projectId }),
     remove: (projectId: string, opts?: { deleteFiles?: boolean; whenActiveSessions?: "reject" | "cascade" }) => this.peer.request("project.remove", { projectId, ...opts }),
@@ -295,7 +385,11 @@ export class PhononDevice extends EventEmitter {
 
   skill = {
     install: (p: { agent: string; name: string; scope: "global" | "project"; projectId?: string; source: unknown; clientRequestId?: string }) => this.peer.request("skill.install", p),
-    uninstall: (p: { agent: string; name: string; scope: "global" | "project"; projectId?: string }) => this.peer.request("skill.uninstall", p),
+    installStatus: (p: {clientRequestId:string;agent:string;name:string;scope:"global"|"project";projectId?:string;includeReceiverIdentity?:true;includeRecoveryContext?:true}) => this.peer.request("skill.install.status",p),
+    fence:(p:{clientRequestId:string;originalRequestId:string;agent:string;name:string;projectId:string;scope?:"project";expectedReceiverID:string;baseRecoveryRevision:string})=>this.peer.request("skill.install.fence",p),
+    publish:(p:{clientRequestId:string;agent:string;name:string;projectId:string;scope?:"project";baseRevision:string|null;expectedReceiverID?:string;source:unknown})=>this.peer.request("skill.publish",p),
+    unpublish:(p:{clientRequestId:string;agent:string;name:string;projectId:string;scope?:"project";baseRevision:string})=>this.peer.request("skill.unpublish",p),
+    uninstall: (p: { agent: string; name: string; scope: "global" | "project"; projectId?: string; clientRequestId?: string }) => this.peer.request("skill.uninstall", p),
     list: (filter?: { agent?: string; scope?: "global" | "project"; projectId?: string }) => this.peer.request("skill.list", filter ?? {}),
     dirs: (filter?: { agent?: string; scope?: "global" | "project"; projectId?: string }) => this.peer.request("skill.dirs", filter ?? {}),
   };
@@ -315,7 +409,8 @@ export class PhononDevice extends EventEmitter {
    *   const status = await device.workflow.status(run.workflowId);
    */
   workflow = {
-    run: (params: {
+    cancelDispatch:(params:{dispatchKey:string;project:string;reason?:string})=>this.peer.request("workflow.dispatch.cancel",params) as Promise<WorkflowDispatchCancelResult>,
+    run: async (params: {
       project?: string;
       worktreeId?: string;
       branch?: string;
@@ -326,11 +421,18 @@ export class PhononDevice extends EventEmitter {
       resumeFrom?: WorkflowResumeFrom;
       clientRequestId?: string;
       metadata?: Record<string, unknown>;
-    }) => this.peer.request("workflow.run", params) as Promise<WorkflowRunResult>,
+    }) => {
+      if(workflowSkills(params.plan).length){const frozen=wireSnapshot(params);await requireSkillCapabilities(this,workflowSkills(frozen.plan),true);return this.peer.request("workflow.run",frozen) as Promise<WorkflowRunResult>;}
+      return this.peer.request("workflow.run",params) as Promise<WorkflowRunResult>;
+    },
     status: (workflowId: string) =>
       this.peer.request("workflow.status", { workflowId }) as Promise<WorkflowStatusResult>,
+    result: (params: import('@agent-phonon/protocol').WorkflowResultParams) =>
+      this.peer.request("workflow.result", params) as Promise<import('@agent-phonon/protocol').WorkflowResultPage>,
+    input:(params:Omit<import('@agent-phonon/protocol').WorkflowInputParams,'sessionId'>&{sessionId:string})=>this.peer.request("workflow.input",params) as Promise<import('@agent-phonon/protocol').WorkflowInputReceipt>,
+    inputStatus:(workflowId:string,inputId:string)=>this.peer.request("workflow.input.status",{workflowId,inputId}) as Promise<import('@agent-phonon/protocol').WorkflowInputStatusResult>,
     cancel: (workflowId: string, reason?: string) =>
-      this.peer.request("workflow.cancel", { workflowId, reason }) as Promise<{ workflowId: string; status: "cancelled" }>,
+      this.peer.request("workflow.cancel", { workflowId, reason }) as Promise<WorkflowCancelResult>,
     pause: (workflowId: string, reason?: string) =>
       this.peer.request("workflow.pause", { workflowId, reason }) as Promise<{ workflowId: string; status: "paused" }>,
     list: (filter?: WorkflowListParams & {dispatchKey?:string}) =>
@@ -374,7 +476,7 @@ export class PhononDevice extends EventEmitter {
    *   });
    */
   schedule = {
-    create: (params: {
+    create: async (params: {
       name: string;
       trigger: ScheduleTrigger;
       target: ScheduleTargetInput;
@@ -382,8 +484,12 @@ export class PhononDevice extends EventEmitter {
       policy?: SchedulePolicy;
       enabled?: boolean;
       clientRequestId?: string;
-    }) => this.peer.request("schedule.create", params) as Promise<ScheduleCreateResult>,
-    update: (params: {
+    }): Promise<ScheduleCreateResult> => {
+      const selected=skillTarget(params.target);
+      if(selected.workflow||pinnedSkills(selected.skills)){const frozen=wireSnapshot(params),bound=skillTarget(frozen.target);await requireSkillCapabilities(this,bound.skills,bound.workflow);return this.peer.request("schedule.create",frozen) as Promise<ScheduleCreateResult>;}
+      return this.peer.request("schedule.create",params) as Promise<ScheduleCreateResult>;
+    },
+    update: async (params: {
       scheduleId: string;
       name?: string;
       enabled?: boolean;
@@ -392,7 +498,11 @@ export class PhononDevice extends EventEmitter {
       consent?: ScheduleConsent;
       policy?: SchedulePolicy;
       clientRequestId?: string;
-    }) => this.peer.request("schedule.update", params) as Promise<{ schedule: Schedule }>,
+    }): Promise<{schedule:Schedule}> => {
+      const selected=skillTarget(params.target);
+      if(selected.workflow||pinnedSkills(selected.skills)){const frozen=wireSnapshot(params),bound=skillTarget(frozen.target);await requireSkillCapabilities(this,bound.skills,bound.workflow);return this.peer.request("schedule.update",frozen) as Promise<{schedule:Schedule}>;}
+      return this.peer.request("schedule.update",params) as Promise<{schedule:Schedule}>;
+    },
     delete: (scheduleId: string, clientRequestId?: string) =>
       this.peer.request("schedule.delete", { scheduleId, clientRequestId }) as Promise<{ scheduleId: string; deleted: boolean }>,
     list: (filter?: ScheduleListParams) =>
@@ -407,7 +517,7 @@ export class PhononDevice extends EventEmitter {
     trigger: (params: { scheduleId: string; source?: RunTriggerSource; input?: string | Record<string, unknown>; clientRequestId?: string }) =>
       this.peer.request("schedule.trigger", params) as Promise<{ scheduleId: string; runId: string; status: RunStatus }>,
     runs: {
-      list: (params: { scheduleId: string; status?: RunStatus; limit?: number }) =>
+      list: (params: { scheduleId: string; status?: RunStatus; limit?: number; unackedOnly?: boolean }) =>
         this.peer.request("schedule.runs.list", params) as Promise<{ runs: Run[] }>,
     },
     /** 手动 ack 终态 run（平时不需调用，SDK 在 run.finished 入口自动 ack）。 */
@@ -418,6 +528,8 @@ export class PhononDevice extends EventEmitter {
   /** L4 run 观测。 */
   run = {
     get: (runId: string) => this.peer.request("run.get", { runId }) as Promise<{ run: Run }>,
+    resolve: (params: RunResolveInput) =>
+      this.peer.request("run.resolve", params) as Promise<import("@agent-phonon/protocol").RunResolveResult>,
     events: {
       subscribe: (runId: string) =>
         this.peer.request("run.events.subscribe", { runId }) as Promise<{ runId: string; subscribed: boolean; sessionId?: string }>,
@@ -461,9 +573,22 @@ export class PhononDevice extends EventEmitter {
    * 不设置时，SDK 默认回 { action: "cancel" }，phonon 端会按 rejected 处理。
    * 推荐返回 `{ values: { approved: boolean, feedback?: string, reviewer?: string } }`。
    */
+  /** Native/Dev requests retain nativeRunId/devRunId and their original workflow/turn attribution. */
   setInteractionHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
     this.interactionHandler = fn;
   }
+  /** Handle controller-stamped conversation board reads/writes; absent is unsupported. */
+  setConversationBoardHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
+    this.conversationBoardHandler = fn;
+  }
+  setConversationWorkflowHandler(fn:(params:unknown)=>Promise<unknown>|unknown):void{this.conversationWorkflowHandler=fn;}
+  /** Controller-owned group messages, including explicit immutable attachmentIDs.
+   * Recorded receipts do not establish verified recipient file delivery. */
+  setConversationMessageHandler(fn: (params: unknown) => Promise<unknown> | unknown): void { this.conversationMessageHandler = fn; }
+  /** Preserve device-owned receive metadata outside action; only an accepting host returns receiveReporting: 1. */
+  setProjectCoordinationHandler(fn: (params: unknown) => Promise<unknown> | unknown): void { this.projectCoordinationHandler = fn; }
+  /** Device-only historical runtime observations; absent handlers never fabricate receipts. */
+  setProjectCoordinationEvidenceHandler(fn:(params:unknown)=>Promise<unknown>|unknown):void{this.projectCoordinationEvidenceHandler=fn;}
   /** v0.7: 设置 document.send 处理器（不设则默认 delivered=[]）。 */
   setDocumentHandler(fn: (params: unknown) => Promise<unknown> | unknown): void {
     this.documentHandler = fn;
@@ -477,6 +602,17 @@ export class PhononDevice extends EventEmitter {
    * after filling a gap), or true only when the prefix through ev.seq is safe.
    * False retains ordinary SDK routing; rejection sends no ACK. */
   setStreamEventHandler(fn: (ev: StreamEvent) => Promise<boolean | {ackSeq:number}> | boolean | {ackSeq:number}): void { this.streamEventHandler=fn; }
+  /** Resend unacknowledged frames without reconnecting/restarting a model. */
+  replayStream(sessionId: string, options?: { fromSeq?: number; limit?: number }): Promise<{ sessionId: string; replayed: number; nextSeq?: number }> {
+    return this.peer.request("stream.replay", { sessionId, ...options }) as Promise<{ sessionId: string; replayed: number; nextSeq?: number }>;
+  }
+  interactionStatus(requestId:string):Promise<import("@agent-phonon/protocol").InteractionStatusResult>{
+    return this.peer.request("interaction.status",{requestId}) as Promise<import("@agent-phonon/protocol").InteractionStatusResult>;
+  }
+  employeeProfiles={
+    apply:(params:import("@agent-phonon/protocol").EmployeeProfileApplyParams)=>this.peer.request("employee.profile.apply",params) as Promise<import("@agent-phonon/protocol").EmployeeProfileStatusResult>,
+    status:(employeeId:string)=>this.peer.request("employee.profile.status",{employeeId}) as Promise<import("@agent-phonon/protocol").EmployeeProfileStatusResult>,
+  };
   /** 设置自发输出回调。 */
   setUnsolicitedHandler(fn: (ev: StreamEvent) => void): void {
     this.onUnsolicited = fn;
@@ -497,6 +633,7 @@ export class PhononDevice extends EventEmitter {
           this.peer.notify("stream.ack",{sessionId:ev.sessionId,lastSeq:ackSeq});return null;
         }
       }
+      if(ev.nativeProactive!==undefined)return null;
       const s = this.sessions.get((ev as { sessionId: string }).sessionId);
       if (s) {
         s._onStream(ev);
@@ -537,6 +674,26 @@ export class PhononDevice extends EventEmitter {
       if (this.prepareUploadHandler) return await this.prepareUploadHandler(params);
       return { uploadRef: newId(), uploadUrl: "", method: "PUT" };
     }
+    if (method === "conversation.board") {
+      if (!this.conversationBoardHandler) throw new Error("Conversation boards are not supported by this server");
+      return await this.conversationBoardHandler(params);
+    }
+    if (method === "conversation.message") {
+      if (!this.conversationMessageHandler) throw new Error("Conversation messages are not supported by this server");
+      return await this.conversationMessageHandler(params);
+    }
+    if (method === "project.coordination") {
+      if (!this.projectCoordinationHandler) throw new Error("Project coordination is not supported by this server");
+      return await this.projectCoordinationHandler(params);
+    }
+    if(method==="project.coordination.evidence"){
+      if(!this.projectCoordinationEvidenceHandler)throw new Error("Project coordination evidence is not supported by this server");
+      return await this.projectCoordinationEvidenceHandler(params);
+    }
+    if(method==="conversation.workflow"){
+      if(!this.conversationWorkflowHandler)throw new Error("Conversation workflows are not supported by this server");
+      return await this.conversationWorkflowHandler(params);
+    }
     if (method === "interaction.request") {
       this.emit("interaction", params);
       if (this.interactionHandler) return await this.interactionHandler(params);
@@ -559,8 +716,11 @@ export class PhononDevice extends EventEmitter {
       const ev = params as { run: Run; push: SchedulePushConsent };
       if (this.runFinishedHandler) await this.runFinishedHandler(ev);
       this.emit("runFinished", params);
-      // 可靠消费后自动 ack run.finished，停止补推
-      if (ev?.run?.id) this.peer.notify("schedule.ack", { runId: ev.run.id, finished: true });
+      // Controller dispatches must remain replayable until a durable consumer
+      // or the polling controller explicitly acknowledges the occurrence.
+      if (ev?.run?.id && (!(ev.run.controllerDispatch || ev.run.dispatch) || this.runFinishedHandler)) {
+        this.peer.notify("schedule.ack", { runId: ev.run.id, finished: true });
+      }
       return null;
     }
     return null;

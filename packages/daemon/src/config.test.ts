@@ -1,9 +1,145 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeConfig, redactConfig, defaultConfig, configureRescueAgent } from "./config.js";
+import { ADAPTER_TYPES, writeConfig, redactConfig, defaultConfig, configureRescueAgent, loadConfig, type AdapterConfig } from "./config.js";
+import { autoDetectAdapters, buildRegistry } from "./commands.js";
+import * as core from "@agent-phonon/core";
+import { fileURLToPath } from "node:url";
+import { PhononDaemon } from "./daemon.js";
+import { AdapterRegistry, CopilotAdapter, HermesAdapter } from "@agent-phonon/core";
+import { withPeerFixture } from "../../core/dist/testing/peer-fixture.js";
+import { hermesProfileFixture } from "./hermes-profile.test-fixture.js";
+
+function configuredHermes(f: ReturnType<typeof hermesProfileFixture>, flag?: boolean) {
+  const cfg = defaultConfig(), missing = join(f.root, "not-installed"), path = join(f.root, "daemon.json");
+  cfg.dbPath = join(f.root, "state.db"); cfg.workspaceRoot = f.root; cfg.servers = []; cfg.rescueAgent = { enabled: false }; cfg.obs = { enabled: false };
+  cfg.adapters = [{ type: "hermes", hermesBinPath: f.entry, hermesModel: "selected-model", hermesManagedProfileNativeTools: flag },
+    { type: "opencode", opencodeBinPath: missing }, { type: "copilot", copilotBinPath: missing }, { type: "pi", piBinPath: missing },
+    { type: "claude-code", claudeBinPath: missing }, { type: "codex", codexBinPath: missing }];
+  writeConfig(cfg, path);
+  const daemon = new PhononDaemon(loadConfig(path));
+  const adapter = (daemon as unknown as { registry: AdapterRegistry }).registry.resolve("hermes:default");
+  assert.ok(adapter instanceof HermesAdapter);
+  return { daemon, adapter };
+}
+
+test("config: Copilot peer receive is a strict local default-off option passed unchanged to its adapter", () => withPeerFixture("copilot-peer-config", async scope => {
+  const path = join(scope.root, "config.json");
+  for (const flag of [undefined, false, true]) {
+    const cfg = defaultConfig(); cfg.dbPath = join(scope.root, "state.sqlite"); cfg.workspaceRoot = scope.root; cfg.servers = [];
+    cfg.rescueAgent = { enabled: false }; cfg.obs = { enabled: false };
+    cfg.adapters = [{ type: "copilot", copilotBinPath: join(scope.root, "not-installed"), ...(flag === undefined ? {} : { copilotPeerContext: flag }) }];
+    writeConfig(cfg, path); const loaded = loadConfig(path);
+    assert.equal(loaded.adapters[0]?.copilotPeerContext, flag);
+    const daemon = new PhononDaemon(loaded);
+    try {
+      const adapter = (daemon as unknown as { registry: AdapterRegistry }).registry.resolve("copilot");
+      assert.ok(adapter instanceof CopilotAdapter);
+      assert.equal((adapter as unknown as { env: { peerContext?: boolean } }).env.peerContext, flag);
+    } finally { await daemon.stop(); }
+  }
+  for (const flag of ["true", 1, null, {}]) {
+    const cfg = defaultConfig(); cfg.adapters = [{ type: "copilot", copilotPeerContext: flag as boolean }];
+    writeConfig(cfg, path); assert.throws(() => loadConfig(path), /copilotPeerContext must be a boolean/);
+  }
+}));
+
+test("config: removed and unknown adapters are rejected without migration or config writes", () => withPeerFixture("unsupported-adapter-config", async scope => {
+  const path = join(scope.root, "config.json");
+  for (const type of ["herdr", "herdr:codex", "unknown-adapter"]) {
+    const source = JSON.stringify({ ...defaultConfig(), adapters: [{ type }] });
+    writeFileSync(path, source, { mode: 0o600 });
+    assert.throws(() => loadConfig(path), /unsupported adapter type/);
+    const adapters = [{ type }] as AdapterConfig[];
+    assert.throws(() => autoDetectAdapters(adapters), /unsupported adapter type/);
+    assert.throws(() => buildRegistry(adapters, { enabled: false }), /unsupported adapter type/);
+    assert.equal(readFileSync(path, "utf8"), source);
+  }
+}));
+
+test("runtime scope: only maintained native adapters are exported and implemented", () => {
+  assert.deepEqual([...ADAPTER_TYPES], ["openclaw-gateway", "openclaw-cli", "claude-code", "codex", "hermes", "opencode", "copilot", "pi"]);
+  assert.equal("HerdrAdapter" in core, false);
+  function check(directory: string) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) check(path);
+      else if (entry.name.endsWith(".ts") && !entry.name.includes(".test.") && !entry.name.endsWith(".d.ts")) {
+        assert.doesNotMatch(entry.name, /herdr/i, path);
+        assert.doesNotMatch(readFileSync(path, "utf8"), /herdr/i, path);
+      }
+    }
+  }
+  check(fileURLToPath(new URL("../../core/src/", import.meta.url)));
+  check(fileURLToPath(new URL("../src/", import.meta.url)));
+});
+
+test("config: employee file runtime assets are an optional absolute local setting",()=>{
+  const root=mkdtempSync(join(tmpdir(),"phonon-profile-assets-")),path=join(root,"config.json");
+  try{
+    const cfg=defaultConfig();cfg.employeeProfileFileBrokerRoot=join(root,"native-fs");writeConfig(cfg,path);
+    assert.equal(loadConfig(path).employeeProfileFileBrokerRoot,cfg.employeeProfileFileBrokerRoot);
+    for(const value of ["relative-assets",true,null,"bad\0path"]){
+      writeFileSync(path,JSON.stringify({...cfg,employeeProfileFileBrokerRoot:value}));assert.throws(()=>loadConfig(path),/absolute local runtime path/);
+    }
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+for (const flag of [undefined, false, true]) test(`configured daemon provisions fresh native 0.16 CLI tool selection with Hermes opt-in=${flag}`, { skip: process.platform === "win32" }, async () => {
+  const f = hermesProfileFixture(), { daemon, adapter } = configuredHermes(f, flag);
+  try {
+    const before = readFileSync(join(f.native, "config.yaml"));
+    await adapter.provisionEmployee(f.target);
+    const config = f.profileConfig(), selected = f.select();
+    assert.deepEqual(config.platform_toolsets.cli, ["hermes-cli", ...(flag ? ["mcp-phonon_current_turn"] : [])]);
+    assert.deepEqual(config.platform_toolsets.telegram, ["hermes-telegram"]);
+    assert.equal(selected.ready, flag === true);
+    assert.equal(selected.selected.includes("mcp-phonon_current_turn"), flag === true);
+    assert.equal(selected.names.length, flag ? 2 : 0);
+    assert.equal(selected.exactNativeDefinitions, !!process.env.PHONON_TEST_HERMES_016_SELECTION_SOURCE);
+    assert.deepEqual(readFileSync(join(f.native, "config.yaml")), before);
+    assert.equal(existsSync(join(f.home, "auth.json")), false);
+    assert.equal(existsSync(join(f.home, "memories/MEMORY.md")), false);
+    assert.match(readFileSync(join(f.home, ".env"), "utf8"), /approved-inference-fixture/);
+    assert.doesNotMatch(readFileSync(join(f.home, ".env"), "utf8"), /HERMES_SAFE_MODE/);
+    if (flag) {
+      config.platform_toolsets.cli = ["hermes-cli"];
+      writeFileSync(join(f.home, "config.yaml"), JSON.stringify(config), { mode: 0o600 });
+      const unchanged = readFileSync(join(f.home, "config.yaml"));
+      await assert.rejects(adapter.provisionEmployee(f.target), /Hermes profile operation refused/);
+      assert.deepEqual(readFileSync(join(f.home, "config.yaml")), unchanged, "retry verifies but never migrates an existing profile");
+    }
+  } finally { await daemon.stop(); f.close(); }
+});
+
+for (const kind of ["explicit-deny", "no-mcp", "empty-cli", "alias-conflict", "dotenv-safe-mode"]) test(`configured Hermes daemon opt-in cannot override ${kind}`, { skip: process.platform === "win32" }, async () => {
+  const f = hermesProfileFixture(config => {
+    if (kind === "explicit-deny") config.agent.disabled_toolsets = ["mcp-phonon_current_turn"];
+    if (kind === "no-mcp") config.platform_toolsets.cli.push("no_mcp");
+    if (kind === "empty-cli") config.platform_toolsets.cli = [];
+    if (kind === "alias-conflict") config.mcp_servers = { phonon_current_turn: { enabled: false } };
+  }, kind === "dotenv-safe-mode" ? "HERMES_SAFE_MODE=1\n" : "");
+  const { daemon, adapter } = configuredHermes(f, true), before = readFileSync(join(f.native, "config.yaml"));
+  try {
+    await assert.rejects(adapter.provisionEmployee(f.target), (error: any) => /^employee_profile_native_tools_/.test(error.appCode));
+    assert.equal(existsSync(f.home), false);
+    assert.deepEqual(readFileSync(join(f.native, "config.yaml")), before);
+  } finally { await daemon.stop(); f.close(); }
+});
+
+test("config: managed Hermes native tools are a strict local default-off opt-in",()=>{
+  const path=join(mkdtempSync(join(tmpdir(),"phonon-hermes-opt-in-")),"config.json");
+  for(const flag of [undefined,false,true]){
+    const cfg=defaultConfig();cfg.adapters=[{type:"hermes",...(flag===undefined?{}:{hermesManagedProfileNativeTools:flag})}];
+    writeConfig(cfg,path);assert.equal(loadConfig(path).adapters[0]?.hermesManagedProfileNativeTools,flag);
+  }
+  for(const flag of ["true",1,null,{}]){
+    const cfg=defaultConfig();cfg.adapters=[{type:"hermes",hermesManagedProfileNativeTools:flag as boolean}];
+    writeConfig(cfg,path);assert.throws(()=>loadConfig(path),/hermesManagedProfileNativeTools must be a boolean/);
+  }
+});
 
 /** config 安全回归测试（bug-bash#2 B4：chmod 600 + 脱敏）。 */
 

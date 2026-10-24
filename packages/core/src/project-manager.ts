@@ -2,21 +2,25 @@ import { spawn } from "node:child_process";
 import { spawnSupervised } from "./process-supervisor.js";
 import { mkdir, rm, readdir, stat, realpath } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
-import { join, resolve, basename, sep, relative, isAbsolute } from "node:path";
+import { join, resolve, basename, dirname, sep, relative, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { PhononError } from "./rpc.js";
 import { buildChildProcessEnvironment } from "./child-env.js";
-import { randomUUID } from "node:crypto";
+import { randomUUID,createHash } from "node:crypto";
+import {canonicalWorkspacePath,workspacePathKey,workspacePathsOverlap,assertNamespacePathAvailable,assertProcessPathAvailable,assertNamespaceBrowsePath,assertProcessBrowsePath,rememberProcessPath,type NamespacePath} from "./workspace-paths.js";
+import {assertDirectoryIdentity} from "./directory-identity.js";
 
 /**
  * 项目管理（design §8c / D23 + D25）。
  *
  * 一个项目 = 一个目录 + Git。core 直接跑 git 命令实现 worktree/分支操作。
- * 项目设备级共享、不受 tenant 隔离（D23 修正）。
+ * 注册标识与目录归属受 namespace 隔离；本机管理员检查不等于远端账号权限。
  * 持久化 v0 用内存表 + 磁盘探测；后续接 sqlite。
  */
 
 export interface ProjectRecord {
+  directoryIdentity?:string;
+  employeeId?:string;
   projectId: string;
   namespace?: string;
   name: string;
@@ -117,6 +121,7 @@ export class ProjectManager {
   private assertProjectPath?: (path: string) => void;
   private assertDeleteFiles?: () => void;
   private namespace?: string;
+  private assertPreparedIdentity?: (id:string,path:string)=>void;
 
   constructor(
     hasActiveSessions: (projectId: string) => string[] = () => [],
@@ -124,6 +129,7 @@ export class ProjectManager {
   ) {
     this.hasActiveSessions = hasActiveSessions;
     this.namespace = hooks?.namespace;
+    if(this.namespace!==undefined&&!this.namespace)throw new PhononError("errInvalidParams","project namespace must not be empty");
     this.hasActiveSessionsForWorktree = hooks?.hasActiveSessionsForWorktree ?? (() => []);
     this.assertProjectPath = hooks?.assertProjectPath;
     this.assertDeleteFiles = hooks?.assertDeleteFiles;
@@ -141,15 +147,73 @@ export class ProjectManager {
   private workspaceRoot?: string;
 
   /**
-   * Project records are device-scoped (D23), while each tenant connection owns
-   * its own ProjectManager. Refresh from the shared store before reads so a
-   * project registered through one connection is immediately usable by the
-   * other connections on the same device.
+   * Refresh metadata shared by connections, then apply the current namespace
+   * and physical ownership boundary before returning or using any reference.
    */
   private refreshFromStore(): void {
     if (!this.store) return;
     this.projects = new Map(this.store.loadProjects().map((p) => [p.projectId, p]));
     this.worktrees = new Map(this.store.loadWorktrees().map((w) => [w.worktreeId, w]));
+  }
+  private inMemoryPaths():NamespacePath[]{
+    return [...this.projects.values()].map(row=>({path:row.path,namespace:row.namespace})).concat(
+      [...this.worktrees.values()].map(row=>({path:row.path,namespace:this.projects.get(row.projectId)?.namespace})));
+  }
+  private assertOwnership(path:string):string{
+    const canonical=canonicalWorkspacePath(path);
+    if(this.namespace!==undefined){
+      assertProcessPathAvailable(canonical,this.namespace);
+      if(this.store)this.store.assertWorkspacePath(canonical,this.namespace);
+      else assertNamespacePathAvailable(canonical,this.namespace,this.inMemoryPaths());
+    }
+    return canonical;
+  }
+  private reserveOwnership(path:string):string{
+    const canonical=this.assertOwnership(path);
+    if(this.namespace!==undefined){this.store?.reserveWorkspacePath(canonical,this.namespace);rememberProcessPath(canonical,this.namespace);}
+    return canonical;
+  }
+  directoryAccess(path:string):{path:string;selectable:boolean}{
+    this.refreshFromStore();const canonical=canonicalWorkspacePath(path),key=workspacePathKey(canonical);
+    if(this.namespace!==undefined){
+      assertProcessBrowsePath(canonical,this.namespace);
+      if(this.store)this.store.assertWorkspaceBrowsePath(canonical,this.namespace);else assertNamespaceBrowsePath(canonical,this.namespace,this.inMemoryPaths());
+      const storage=workspacePathKey(canonicalWorkspacePath(join(this.workspaceRoot??defaultWorkspaceRoot(),".namespaces")));
+      const own=workspacePathKey(canonicalWorkspacePath(this.namespaceRoot(this.workspaceRoot??defaultWorkspaceRoot())));
+      if(key.startsWith(storage+sep)&&key!==own&&!key.startsWith(own+sep))throw new PhononError("errPolicyDenied","foreign namespace storage is not browsable");
+    }
+    const homes=[...this.projects.values()].filter(row=>!!row.employeeId);
+    if(homes.some(row=>{const home=workspacePathKey(row.path);return key===home||key.startsWith(home+sep);}))throw new PhononError("errPolicyDenied","private employee directories are not project directories");
+    let selectable=true;
+    try{
+      this.assertProjectPath?.(canonical);this.assertStorageContainer(canonical,this.workspaceRoot??defaultWorkspaceRoot());this.assertOwnership(canonical);
+      if(homes.some(row=>workspacePathsOverlap(key,workspacePathKey(row.path))))selectable=false;
+    }catch(error){if(error instanceof PhononError&&error.appCode==="errPolicyDenied")selectable=false;else throw error;}
+    return {path:canonical,selectable};
+  }
+  private namespaceRoot(root:string):string{
+    return join(root,".namespaces",createHash("sha256").update(this.namespace!).digest("hex"));
+  }
+  setPreparedIdentityGuard(guard:(id:string,path:string)=>void){this.assertPreparedIdentity=guard;}
+  assertPreparedPathAvailable(path:string){
+    this.refreshFromStore();this.assertProjectPath?.(path);this.assertOwnership(path);
+    if(this.inMemoryPaths().some(record=>workspacePathsOverlap(workspacePathKey(record.path),workspacePathKey(path))))throw new PhononError("errProjectExists","managed workspace cannot nest an existing Project or worktree");
+  }
+  reservePreparedPath(path:string){this.assertPreparedPathAvailable(path);this.reserveOwnership(path);}
+  registerPrepared(record:ProjectRecord):ProjectRecord{
+    if(record.namespace!==this.namespace||record.git||record.employeeId)throw new PhononError("errPolicyDenied");
+    this.refreshFromStore();this.assertProjectPath?.(record.path);const canonical=this.reserveOwnership(record.path);
+    if(canonical!==record.path)throw new PhononError("errProjectProvisionChanged");
+    const existing=this.projects.get(record.projectId);
+    if(existing){if(existing.namespace!==record.namespace||existing.path!==record.path||existing.name!==record.name||existing.git)throw new PhononError("errProjectProvisionChanged");return this.get(record.projectId);}
+    if([...this.projects.values()].some(project=>project.path===record.path))throw new PhononError("errProjectExists");
+    this.assertPreparedIdentity?.(record.projectId,record.path);this.store?.upsertProject(record);this.projects.set(record.projectId,record);return record;
+  }
+  private assertStorageContainer(path:string,root:string):void{
+    if(this.namespace===undefined)return;
+    const container=workspacePathKey(canonicalWorkspacePath(join(root,".namespaces"))),candidate=workspacePathKey(path),own=workspacePathKey(canonicalWorkspacePath(this.namespaceRoot(root)));
+    if(workspacePathsOverlap(candidate,container)&&(candidate===own||!candidate.startsWith(own+sep)))
+      throw new PhononError("errPolicyDenied","namespace storage containers are not selectable Projects");
   }
 
   /** 解析 projectId → 工作目录（session.create / file.* 用）。 */
@@ -158,32 +222,51 @@ export class ProjectManager {
     if (worktreeId) {
       const wt = this.worktrees.get(worktreeId);
       if (!wt || wt.projectId !== projectId) throw new PhononError("errWorktreeNotFound", `worktree ${worktreeId} not found`);
-      return wt.path;
+      this.assertProjectPath?.(wt.path);return this.assertOwnership(wt.path);
     }
     return project.path;
   }
 
-  async create(params: { name: string; path?: string; git?: boolean; remote?: string }): Promise<ProjectRecord> {
-    const projectId = `proj-${Date.now()}-${randomUUID()}`;
+  async create(params: { name: string; path?: string; git?: boolean; remote?: string; employeeId?:string;existingDirectoryIdentity?:string },assertCurrent?:()=>void): Promise<ProjectRecord> {
+    if(params.existingDirectoryIdentity){
+      if(!params.path||!isAbsolute(params.path)||params.git!==false||params.remote!==undefined||params.employeeId||params.name.length>120||/[\x00-\x1f\x7f]/.test(params.name))throw new PhononError("errInvalidParams","existing directory registration cannot initialize a repository");
+      this.assertProjectPath?.(params.path);
+      assertCurrent?.();assertDirectoryIdentity(params.path,params.existingDirectoryIdentity);
+      const access=this.directoryAccess(params.path);if(!access.selectable)throw new PhononError("errPolicyDenied","directory is not selectable");
+      const existing=[...this.projects.values()].find(row=>row.projectId.startsWith("dir-")&&row.path===access.path&&(this.namespace===undefined||row.namespace===this.namespace));
+      if(existing){
+        const current=this.get(existing.projectId);assertCurrent?.();assertDirectoryIdentity(current.path,params.existingDirectoryIdentity);
+        const pinned={...current,directoryIdentity:params.existingDirectoryIdentity};this.store?.upsertProject(pinned);this.projects.set(pinned.projectId,pinned);return pinned;
+      }
+    }
+    const projectId = params.existingDirectoryIdentity?`dir-${randomUUID()}`:`proj-${Date.now()}-${randomUUID()}`;
     const root = this.workspaceRoot ?? defaultWorkspaceRoot();
-    let path = params.path ? resolve(params.path) : join(root, params.name);
+    let path = params.path ? resolve(params.path) : this.namespace===undefined?join(root,params.name):join(this.namespaceRoot(root),projectId);
     // 路径校验（P0-1）：policy 执行越界拒绝（不再「记风险但放行」）
     if (this.assertProjectPath) this.assertProjectPath(path);
-    if (existsSync(path) && (await readdir(path)).length > 0) {
+    path=canonicalWorkspacePath(path);this.assertStorageContainer(path,root);this.assertPreparedIdentity?.(projectId,path);path=this.reserveOwnership(path);
+    if(params.existingDirectoryIdentity){assertDirectoryIdentity(path,params.existingDirectoryIdentity);}
+    else if (existsSync(path) && (await readdir(path)).length > 0) {
       // 目录已存在且非空：当作既有项目接管，不报错
     } else {
-      await mkdir(path, { recursive: true });
+      await mkdir(path, { recursive: true,mode:0o700 });
     }
     // realpath 归一化：让对外 path 与文件系统真实路径一致（macOS /var → /private/var
     // 是 symlink；不归一会导致 project.exec 子进程 cwd、skill 安装路径报 /private/var
     // 而 project.path 是 /var，上层做前缀匹配/围栏判断时跨平台错配）。
     path = await realpath(path);
+    this.assertProjectPath?.(path);this.assertOwnership(path);
+    if(params.existingDirectoryIdentity){assertCurrent?.();assertDirectoryIdentity(path,params.existingDirectoryIdentity);}
+    if(params.existingDirectoryIdentity){
+      this.refreshFromStore();const existing=[...this.projects.values()].find(row=>row.projectId.startsWith("dir-")&&row.path===path&&row.namespace===this.namespace);
+      if(existing){assertDirectoryIdentity(existing.path,params.existingDirectoryIdentity);return this.get(existing.projectId);}
+    }
     const git = params.git !== false;
     if (git && !existsSync(join(path, ".git"))) {
       await runGit(path, ["init"]);
       if (params.remote) { assertRemote(params.remote); await runGit(path, ["remote", "add", "origin", "--", params.remote]).catch(() => {}); }
     }
-    const rec: ProjectRecord = { projectId, namespace: this.namespace, name: params.name, path, git, createdAt: new Date().toISOString() };
+    const rec: ProjectRecord = { projectId, namespace: this.namespace, name: params.name, path, git, createdAt: new Date().toISOString(),...(params.employeeId?{employeeId:params.employeeId}:{}),...(params.existingDirectoryIdentity?{directoryIdentity:params.existingDirectoryIdentity}:{}) };
     this.projects.set(projectId, rec);
     this.store?.upsertProject(rec);
     return rec;
@@ -191,16 +274,21 @@ export class ProjectManager {
 
   list(): ProjectRecord[] {
     this.refreshFromStore();
-    return [...this.projects.values()].filter(p => !p.namespace || p.namespace===this.namespace).filter(p=>{ try { this.assertProjectPath?.(p.path); return true; } catch { return false; } });
+    return [...this.projects.values()].filter(p => this.namespace===undefined||p.namespace===this.namespace)
+      .filter(p=>{try{this.assertProjectPath?.(p.path);if(p.directoryIdentity)assertDirectoryIdentity(p.path,p.directoryIdentity);return true;}catch(error){if(error instanceof PhononError&&error.appCode==="errPolicyDenied"||p.directoryIdentity)return false;throw error;}})
+      .map(p=>{this.assertOwnership(p.path);this.assertPreparedIdentity?.(p.projectId,p.path);return p;});
   }
 
   get(projectId: string,options?: {readonly?:boolean}): ProjectRecord {
     this.refreshFromStore();
     const rec = this.projects.get(projectId);
-    if (!rec || (this.namespace && rec.namespace!==this.namespace && !(options?.readonly && !rec.namespace))) throw new PhononError("errProjectNotFound", `project ${projectId} not found`);
+    if (!rec || (this.namespace!==undefined&&rec.namespace!==this.namespace)) throw new PhononError("errProjectNotFound", `project ${projectId} not found`);
     const canonical=realpathSync(rec.path);
     if (rec.namespace && canonical!==rec.path) throw new PhononError("errPolicyDenied","registered project root identity changed");
     this.assertProjectPath?.(canonical);
+    this.assertOwnership(canonical);
+    this.assertPreparedIdentity?.(rec.projectId,canonical);
+    if(rec.directoryIdentity)assertDirectoryIdentity(rec.path,rec.directoryIdentity);
     return rec;
   }
 
@@ -214,6 +302,9 @@ export class ProjectManager {
       terminatedSessions = active; // cascade：调用方负责 terminate（engine 注入回调）
     }
     let filesDeleted = false;
+    if(opts.deleteFiles)this.assertDeleteFiles?.();
+    this.reserveOwnership(rec.path);
+    for(const wt of this.worktrees.values())if(wt.projectId===projectId)this.reserveOwnership(wt.path);
     if (opts.deleteFiles) {
       if (this.assertDeleteFiles) this.assertDeleteFiles(); // policy：allowDeleteFiles
       await rm(rec.path, { recursive: true, force: true });
@@ -233,14 +324,16 @@ export class ProjectManager {
     assertRefName(params.baseBranch, "baseBranch");
     if (params.newBranch) assertRefName(params.newBranch, "newBranch");
     const worktreeId = `wt-${Date.now()}-${randomUUID()}`;
-    const wtPath = params.path ? resolve(params.path) : join(proj.path, "..", `${proj.name}-${params.newBranch ?? params.baseBranch}`.replace(/\//g, "-"));
+    let wtPath = params.path ? resolve(params.path) : this.namespace===undefined?join(proj.path,"..",`${proj.name}-${params.newBranch??params.baseBranch}`.replace(/\//g,"-")):join(dirname(proj.path),worktreeId);
     // 自定义 worktree path 同样走 policy 路径校验（bug-bash#2 B8）
-    if (params.path && this.assertProjectPath) this.assertProjectPath(wtPath);
+    this.assertProjectPath?.(wtPath);wtPath=canonicalWorkspacePath(wtPath);
+    this.assertStorageContainer(wtPath,this.workspaceRoot??defaultWorkspaceRoot());wtPath=this.reserveOwnership(wtPath);
     const branch = params.newBranch ?? params.baseBranch;
     const args = ["worktree", "add"];
     if (params.newBranch) args.push("-b", params.newBranch);
     args.push(wtPath, params.baseBranch);
     await runGit(proj.path, args);
+    wtPath=await realpath(wtPath);this.assertProjectPath?.(wtPath);this.assertOwnership(wtPath);
     const rec: WorktreeRecord = { worktreeId, projectId: params.projectId, path: wtPath, branch, isPrimary: false, createdAt: new Date().toISOString() };
     this.worktrees.set(worktreeId, rec);
     this.store?.upsertWorktree(rec);
@@ -249,17 +342,18 @@ export class ProjectManager {
 
   worktreeList(projectId: string): WorktreeRecord[] {
     this.get(projectId);
-    return [...this.worktrees.values()].filter((w) => w.projectId === projectId);
+    return [...this.worktrees.values()].filter((w) => w.projectId === projectId).map(w=>{this.assertProjectPath?.(w.path);this.assertOwnership(w.path);return w;});
   }
 
   async worktreeRemove(params: { projectId: string; worktreeId: string; force?: boolean }): Promise<{ affectedSessions?: string[] }> {
     const proj = this.get(params.projectId);
     const wt = this.worktrees.get(params.worktreeId);
-    if (!wt) throw new PhononError("errWorktreeNotFound", `worktree ${params.worktreeId} not found`);
+    if (!wt||wt.projectId!==params.projectId) throw new PhononError("errWorktreeNotFound", `worktree ${params.worktreeId} not found`);
     // 精确到该 worktree 的 active session（不是整个 project，bug-bash#2 B8）
     const active = this.hasActiveSessionsForWorktree(params.worktreeId).filter(Boolean);
     if (active.length > 0 && !params.force)
       throw new PhononError("errWorktreeInUse", "worktree has active sessions");
+    this.assertProjectPath?.(wt.path);this.reserveOwnership(wt.path);
     const args = ["worktree", "remove", wt.path];
     if (params.force) args.push("--force");
     await runGit(proj.path, args).catch((e) => {
@@ -296,11 +390,7 @@ export class ProjectManager {
 
   /** 内部：解析 worktree cwd（不传走主目录）。 */
   private cwdFor(projectId: string, worktreeId?: string): string {
-    const project = this.get(projectId);
-    if (!worktreeId) return project.path;
-    const wt = this.worktrees.get(worktreeId);
-    if (!wt || wt.projectId !== projectId) throw new PhononError("errWorktreeNotFound", `worktree ${worktreeId} not found`);
-    return wt.path;
+    return this.resolveCwd(projectId,worktreeId);
   }
 
   async gitCommit(params: { projectId: string; worktreeId?: string; message: string; files?: string[]; allowEmpty?: boolean; author?: { name: string; email: string } }): Promise<{ commitSha: string; filesChanged: number; insertions?: number; deletions?: number }> {

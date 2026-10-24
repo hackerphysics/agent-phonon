@@ -5,7 +5,27 @@ import type {
   ContextItem,
   StreamEvent,
   CompressMode,
+  InteractionRequestResult,
+  AgentBoardInput, ConversationBoardParams, ConversationBoardResult,
+  TurnReasoning,
+  AgentWorkflowInput,ConversationWorkflowParams,ConversationWorkflowResult,
+  AgentMessageInput, ConversationMessageParams, ConversationMessageResult,
+  NativeDocumentInput, DocumentSendResult,
+  AgentCoordinationInput, ProjectCoordinationParams, ProjectCoordinationResult,
 } from "@agent-phonon/protocol";
+import type { AgentInteractionInput } from "./agent-interaction-bridge.js";
+import type { EmployeeProfileApplyParams } from "@agent-phonon/protocol";
+import type { PeerContextAccess, PeerContextCapability } from "./peer-context.js";
+
+export interface EmployeeRuntimeBinding {
+  employeeId:string;revision:number;runtimeProfile:string;provider:string;home:string;context:ContextItem[];
+}
+export interface EmployeeProfileTarget {
+  input:EmployeeProfileApplyParams;runtimeProfile:string;workspace:string;nonce:string;previousHashes?:Record<string,string>;
+  workspaceIdentity?:string;
+  previousNativeIdentity?:string;
+}
+export interface EmployeeProfileObservation {documentHashes:Record<string,string>;memoryBytes:number;home:string;nativeIdentity?:string;}
 
 /**
  * Adapter 接口（design D8）。
@@ -20,6 +40,10 @@ import type {
 export interface AdapterSession {
   /** phonon 侧 sessionId。 */
   readonly sessionId: string;
+  /** Optional read-only readiness assessment before an authorized coordination turn. */
+  preparePeerContext?(environment?: Record<string,string>, signal?: AbortSignal): Promise<void>;
+  /** Separate peer-data path; ordinary user steering is not equivalent. */
+  peerContextCapability?(environment?: Record<string, string>): PeerContextCapability | undefined;
   /** 绑定的 model（可被 switchModel 改）。 */
   model: string;
 
@@ -36,8 +60,14 @@ export interface AdapterSession {
   /** 注入上下文（D8 contextInjection）。 */
   inject?(context: ContextItem[]): Promise<void>;
 
+  /** Resolve only after current-turn model input is applied at a tool gap.
+   * Reject on abort/closed turn; never store this as next-turn context or restart.
+   * Advertise injectMidTurn only when this operation is genuinely implemented. */
+  insertAtToolGap?(input: string, options: { turnId: string; signal: AbortSignal }): Promise<void>;
+
   /** 压缩上下文（native）。 */
-  compressNative?(): Promise<{ summary?: string }>;
+  compressNative?(): Promise<{ applied?: boolean; summary?: string }>;
+  compressionModes?(): { native: boolean; custom: boolean };
 
   /** 自定义压缩（如 dropToolIO）。adapter 能定位/编辑自身 session 存储时实现。 */
   compressCustom?(strategy?: string, options?: { keepRecentToolCalls?: number }): Promise<{ summary?: string; filesChanged?: number; recordsChanged?: number; blocksRemoved?: number; bytesBefore?: number; bytesAfter?: number; backups?: string[] }>;
@@ -50,6 +80,8 @@ export interface AdapterSession {
 
   /** 可选：返回上下文信息（context 窗口/已用 token 等，D33）。 */
   describe?(): Promise<{ contextWindow?: number; usedTokens?: number; usagePercent?: number; compactions?: number }>;
+  /** Cached context reading for session metadata, which is built synchronously. */
+  contextSnapshot?(): { contextWindow?: number; usedTokens?: number } | undefined;
 
   /**
    * 可选：设置「自发输出」水槽（D16 unsolicited）。
@@ -57,9 +89,22 @@ export interface AdapterSession {
    * 通过这个 sink 推成 origin:unsolicited 的 stream.event。
    */
   setUnsolicitedSink?(sink: (event: StreamEvent) => void): void;
+  /** Actual native subscription acknowledgement, not just static harness support. */
+  proactiveOutputReady?():boolean;
+  /** Device-local native identity/context, not a transcript or executable command. */
+  recoveryCheckpoint?(): Record<string, unknown> | undefined;
+  /** Passive native evidence for the exact turn; abort acknowledgement alone
+   * is not proof that the supervised tree/native run ended. */
+  observeNativeStop?(turnId:string):Promise<"process_tree_exit"|"native_terminal"|undefined>;
 }
 
 export interface SendOptions {
+  /** Controller-owned current-turn checkpoints; never a new prompt or an approval answer. */
+  peerContext?: PeerContextAccess;
+  /** Best-effort native preference; settings evidence is separate from task outcome. */
+  reasoning?: TurnReasoning;
+  /** Actual native value only; the controller may leave the preference unconfirmed. */
+  acknowledgeReasoning?: (nativeValue: string | null) => void;
   /** 本轮 turnId（core 生成或透传）。 */
   turnId: string;
   /** 详细度（决定 emit 哪些事件）。 */
@@ -72,6 +117,14 @@ export interface SendOptions {
   emit: (event: StreamEvent) => void;
   /** 取消信号（interrupt 时 core 触发）。 */
   signal?: AbortSignal;
+  /** Embedded harnesses can request a form without a shell/HTTP tool. */
+  requestInteraction?: (input: AgentInteractionInput) => Promise<InteractionRequestResult>;
+  acknowledgeInteraction?: (requestId: string, decisionHash: string) => void;
+  conversationBoard?: (input: AgentBoardInput) => Promise<ConversationBoardResult>;
+  conversationWorkflow?: (input:AgentWorkflowInput)=>Promise<ConversationWorkflowResult>;
+  conversationMessage?: (input: AgentMessageInput) => Promise<ConversationMessageResult>;
+  projectCoordination?: (input: AgentCoordinationInput) => Promise<ProjectCoordinationResult>;
+  publishDocument?: (input: NativeDocumentInput) => Promise<DocumentSendResult>;
 }
 
 /** adapter 创建 session 的参数。 */
@@ -88,15 +141,29 @@ export interface AdapterHitlContext {
 }
 
 export interface AdapterRuntimeContext {
+  prepareSkills?:(tenant:string,project:string,agent:string,selections:import("@agent-phonon/protocol").SkillSelection[])=>import("./skill-execution.js").FrozenSkillSet;
+  loadSkills?:(tenant:string,project:string,agent:string,selected:import("./skill-execution.js").FrozenSkillSet)=>Promise<import("./skill-execution.js").LoadedSkillSet>;
   /** Tenant-bound, policy-enforced deterministic host-maintenance broker. */
   maintenance?: MaintenanceRuntime;
   /** Device policy re-check for internal/scheduled session creation. */
   assertAgentAllowed?: (agentId: string) => void;
   /** Device-local human-in-the-loop gate; absent means the harness declares no HITL. */
   hitl?: AdapterHitlContext;
+  requestInteraction?: (params: unknown, signal?: AbortSignal) => Promise<InteractionRequestResult>;
+  conversationBoard?: (params: ConversationBoardParams) => Promise<ConversationBoardResult>;
+  conversationWorkflow?: (params:ConversationWorkflowParams)=>Promise<ConversationWorkflowResult>;
+  conversationMessage?: (params: ConversationMessageParams) => Promise<ConversationMessageResult>;
+  projectCoordination?: (params: ProjectCoordinationParams) => Promise<ProjectCoordinationResult>;
+  coordinationEvidenceAuthority?:string;
+  coordinationEvidenceChanged?:()=>void;
+  publishDocument?: (params: NativeDocumentInput & {nativeRunId:string;workflowId:string;sessionId:string;turnId:string;projectId:string;worktreeId?:string}) => Promise<DocumentSendResult>;
+  acknowledgeInteraction?: (requestId: string, decisionHash: string) => void;
+  resolveEmployee?: (tenant:string,id:string,revision:number|undefined,agent:string)=>Promise<EmployeeRuntimeBinding>;
+  useEmployee?: (tenant:string,id:string)=>()=>void;
 }
 
 export interface CreateSessionParams {
+  upstreamRuns?:{remember:(id:string)=>void;owns:(id:string)=>boolean};
   sessionId: string;
   /** discover 返回的完整 agentId（多 agent runtime 带前缀，如 openclaw:phonon）。 */
   agentId: string;
@@ -110,6 +177,8 @@ export interface CreateSessionParams {
   reattach?: boolean;
   /** Internal-only device capabilities; never accepted from the wire. */
   runtimeContext?: AdapterRuntimeContext;
+  /** Controller-resolved identity, never copied directly from agentConfig. */
+  employee?:EmployeeRuntimeBinding;
 }
 
 /**
@@ -155,6 +224,14 @@ export interface AgentAdapter {
    * 创建一个 session。agentId 是 discover 返回的完整 id（可能带 runtime 前缀）。
    */
   createSession(params: CreateSessionParams): Promise<AdapterSession>;
+  /** Verify and reopen the original native session without sending model input.
+   * Must reject missing/mismatched state; never fall back to createSession. */
+  recoverSession?(params: CreateSessionParams, checkpoint: Record<string, unknown>): Promise<AdapterSession>;
+  /** Read the original device-owned native history when an older controller did
+   * not persist a checkpoint. Must not launch, create, repair or replay work. */
+  observeSessionCheckpoint?(params: CreateSessionParams): Promise<Record<string, unknown> | undefined>;
+  provisionEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
+  inspectEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
 
   /**
    * global skill 安装目录（design D24 + 安全边界规则）。

@@ -3,6 +3,7 @@ import type {FileHandle} from "node:fs/promises";
 import { mkdir, open, readdir, lstat, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep,relative } from "node:path";
 import { PhononError } from "./rpc.js";
+import { darwinFileRead, darwinFileWrite } from "./darwin-file-broker.js";
 
 export interface FileScopeResolver {
   resolveCwd(projectId: string, worktreeId?: string): string;
@@ -95,7 +96,12 @@ export class FileManager {
   }
 
   async read(params: { projectId: string; worktreeId?: string; path: string; encoding?: "utf8" | "base64"; maxBytes?: number }) {
-    const file=await this.anchored(params.projectId,params.worktreeId,params.path,constants.O_RDONLY);
+    if(process.platform==="darwin"){
+      const abs=await this.resolvePath(params.projectId,params.worktreeId,params.path),root=await realpath(this.resolver.resolveCwd(params.projectId,params.worktreeId));
+      const result=await darwinFileRead(root,relative(root,abs),params.maxBytes),encoding=params.encoding??"utf8";
+      return {path:params.path,encoding,data:encoding==="base64"?String(result.data):Buffer.from(String(result.data),"base64").toString("utf8"),sizeBytes:Number(result.sizeBytes),truncated:result.truncated===true};
+    }
+    const file=await this.anchored(params.projectId,params.worktreeId,params.path,constants.O_RDONLY|constants.O_NONBLOCK);
     let out: Buffer,sizeBytes: number;
     try {
       const stat=await file.stat();if(!stat.isFile())throw new PhononError("errInvalidParams","file.read requires a regular file");sizeBytes=stat.size;
@@ -115,9 +121,18 @@ export class FileManager {
 
   async write(params: { projectId: string; worktreeId?: string; path: string; encoding?: "utf8" | "base64"; data: string; overwrite?: boolean; createDirs?: boolean }) {
     const content = params.encoding === "base64" ? Buffer.from(params.data, "base64") : Buffer.from(params.data, "utf8");
-    const flags=constants.O_WRONLY|constants.O_CREAT|(params.overwrite===false?constants.O_EXCL:constants.O_TRUNC);
+    if(process.platform==="darwin"){
+      const abs=await this.resolvePath(params.projectId,params.worktreeId,params.path),root=await realpath(this.resolver.resolveCwd(params.projectId,params.worktreeId));
+      await darwinFileWrite(root,relative(root,abs),content,params.overwrite??true,params.createDirs??true);
+      return {path:params.path,sizeBytes:content.length,written:true as const};
+    }
+    const flags=constants.O_WRONLY|constants.O_CREAT|constants.O_NONBLOCK|(params.overwrite===false?constants.O_EXCL:0);
     const file=await this.anchored(params.projectId,params.worktreeId,params.path,flags,params.createDirs??true);
-    try{await file.writeFile(content);}finally{await file.close();}
+    try{
+      if(!(await file.stat()).isFile())throw new PhononError("errInvalidParams","file.write requires a regular file");
+      if(params.overwrite!==false)await file.truncate(0);
+      await file.writeFile(content);
+    }finally{await file.close();}
     return { path: params.path, sizeBytes: content.length, written: true as const };
   }
 

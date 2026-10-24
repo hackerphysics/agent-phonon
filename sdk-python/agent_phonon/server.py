@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from copy import deepcopy
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, TypedDict, Union, Sequence, Literal
 
 import websockets
 
@@ -20,6 +21,68 @@ Authenticate = Callable[[str, Optional[str]], Awaitable[Optional[str]]]
 HookDecider = Callable[[dict, Optional["PhononSession"]], Awaitable[Any]]
 
 
+class _SkillName(TypedDict):
+    name: str
+
+
+class SkillReference(_SkillName, total=False):
+    version: str
+    scope: Literal["global", "project"]
+    force: bool
+    revision: str
+    installationId: str
+
+
+SkillSelection = Union[str, SkillReference]
+
+
+def _workflow_skills(plan: dict) -> list[SkillSelection]:
+    mode = plan.get("mode")
+    if mode == "dag":
+        nodes = plan.get("nodes")
+    elif mode == "graph":
+        nodes = [plan.get("executor"), *plan.get("workers", [])]
+    elif mode == "discussion":
+        nodes = plan.get("participants")
+    else:
+        raise ValueError("invalid_workflow_plan")
+    if not isinstance(nodes, (list, tuple)):
+        raise ValueError("invalid_workflow_plan")
+    selected: list[SkillSelection] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("invalid_workflow_plan")
+        if "skills" in node:
+            if not isinstance(node["skills"], (list, tuple)):
+                raise ValueError("invalid_workflow_skill_selection")
+            selected.extend(node["skills"])
+    return selected
+
+
+def _pinned_skills(skills: Sequence[SkillSelection]) -> bool:
+    return any(isinstance(value, dict) and ("revision" in value or "installationId" in value) for value in skills)
+
+
+def _target_skills(target: dict | None) -> tuple[list[SkillSelection], bool]:
+    if target is None:
+        return [], False
+    direct = target.get("skills", [])
+    if not isinstance(direct, (list, tuple)):
+        raise ValueError("invalid_skill_selection")
+    workflow = _workflow_skills(target["plan"]) if target.get("plan") is not None else []
+    return [*direct, *workflow], bool(workflow)
+
+
+async def _require_skill_capabilities(device: PhononDevice, skills: Sequence[SkillSelection], workflow: bool) -> None:
+    required = (["workflow_skill_selection_v1"] if workflow and skills else []) + (["pinned_skill_selection_v1"] if _pinned_skills(skills) else [])
+    if not required:
+        return
+    info = await device.info()
+    capabilities = info.get("capabilities") if isinstance(info, dict) else None
+    if not isinstance(capabilities, list) or any(flag not in capabilities for flag in required):
+        raise RuntimeError("skill_selection_device_update_required")
+
+
 class PhononSession:
     """一个会话。流式输出用 async iterator。"""
 
@@ -29,8 +92,23 @@ class PhononSession:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._last_seq = -1
 
-    async def send(self, text: str, **opts: Any) -> dict:
-        return await self.device.call("session.send", {"sessionId": self.session_id, "input": text, **opts})
+    async def send(self, text: str, *, skills: Optional[Sequence[SkillSelection]] = None, **opts: Any) -> dict:
+        """Forward whenBusy/fallback/turnId/clientRequestId without changing modes.
+
+        inject acknowledges actual application to the current turn; unsupported
+        modes fail unless the caller explicitly provides a supported fallback.
+        """
+        payload = {"sessionId": self.session_id, "input": text, **opts}
+        if skills is not None:
+            payload["skills"] = list(skills)
+        if _pinned_skills(payload.get("skills", [])):
+            payload = deepcopy(payload)
+            await _require_skill_capabilities(self.device, payload["skills"], False)
+        return await self.device.call("session.send", payload)
+
+    async def recover(self, *, project: str, agent: str, model: str) -> dict:
+        """Verify/reopen the same settled native Session; never sends input."""
+        return await self.device.call("session.recover", {"sessionId": self.session_id, "project": project, "agent": agent, "model": model})
 
     async def stream(self) -> AsyncIterator[dict]:
         """异步迭代本会话的流式事件，直到 final。"""
@@ -49,8 +127,11 @@ class PhononSession:
     async def switch_model(self, model: str) -> Any:
         return await self.device.call("session.switchModel", {"sessionId": self.session_id, "model": model})
 
-    async def compress(self, mode: str = "native") -> Any:
-        return await self.device.call("session.compress", {"sessionId": self.session_id, "mode": mode})
+    async def compress(self, mode: str = "native", **opts: Any) -> Any:
+        return await self.device.call("session.compress", {"sessionId": self.session_id, "mode": mode, **opts})
+
+    async def compression_status(self, operation_id: str) -> Any:
+        return await self.device.call("session.compression.status", {"sessionId": self.session_id, "operationId": operation_id})
 
     async def status(self) -> dict:
         return await self.device.call("session.status", {"sessionId": self.session_id})
@@ -80,15 +161,54 @@ class PhononDevice:
         self._document_handler: Optional[Callable[[dict], None]] = None
         self._prepare_upload_handler: Optional[Callable[[dict], dict]] = None
         self._interaction_handler: Optional[Callable[[dict], dict]] = None
-        self._stream_event_handler: Optional[Callable[[dict], Awaitable[bool] | bool]] = None
+        self._conversation_board_handler: Optional[Callable[[dict], Any]] = None
+        self._conversation_workflow_handler: Optional[Callable[[dict], Any]] = None
+        self._conversation_message_handler: Optional[Callable[[dict], Any]] = None
+        self._project_coordination_handler: Optional[Callable[[dict], Any]] = None
+        self._project_coordination_evidence_handler: Optional[Callable[[dict], Any]] = None
+        self._stream_event_handler: Optional[Callable[[dict], Awaitable[bool | dict] | bool | dict]] = None
         self._workflow_event_handler: Optional[Callable[[dict], Awaitable[None] | None]] = None
         self._schedule_changed_handler: Optional[Callable[[dict], None]] = None
         self._run_started_handler: Optional[Callable[[dict], None]] = None
         self._run_event_handler: Optional[Callable[[dict], None]] = None
         self._run_finished_handler: Optional[Callable[[dict], Awaitable[None] | None]] = None
 
-    async def call(self, method: str, params: Any) -> Any:
-        return await self._peer.request(method, params)
+    async def call(self, method: str, params: Any, timeout: Optional[float] = None) -> Any:
+        """Bound the reply wait in seconds, not the remote operation's lifetime."""
+        if timeout is None:
+            return await self._peer.request(method, params)
+        return await self._peer.request(method, params, timeout=timeout)
+
+    async def mcp_configure(self, revision: int, bindings: list[dict]) -> dict:
+        return await self._peer.request("mcp.configure", {"revision": revision, "bindings": bindings})
+
+    async def mcp_status(self) -> dict:
+        return await self._peer.request("mcp.status", {})
+
+    async def conversation_archive_blob_write(self, params: dict) -> dict:
+        return await self._peer.request("conversation.archive.blob.write", params)
+
+    async def conversation_archive_blob_status(self, params: dict) -> dict:
+        return await self._peer.request("conversation.archive.blob.status", params)
+
+    async def conversation_archive_blob_read(self, params: dict) -> dict:
+        return await self._peer.request("conversation.archive.blob.read", params)
+
+    async def conversation_archive_append(self, params: dict) -> dict:
+        """Append a frozen contiguous archive batch; never executes an agent."""
+        return await self._peer.request("conversation.archive.append", params)
+
+    async def conversation_archive_read(self, params: dict) -> dict:
+        """Read a bounded, hash-checked range from permanent device history."""
+        return await self._peer.request("conversation.archive.read", params)
+
+    async def conversation_archive_status(self, params: dict) -> dict:
+        """Inspect the original archive identity and committed checkpoint."""
+        return await self._peer.request("conversation.archive.status", params)
+
+    async def conversation_archive_entities(self, params: dict) -> dict:
+        """Query complete indexed entity versions without invoking an agent."""
+        return await self._peer.request("conversation.archive.entities", params)
 
     async def discover(self) -> list[dict]:
         r = await self._peer.request("discovery.list", {})
@@ -107,8 +227,31 @@ class PhononDevice:
     async def list_sessions(self, **filt: Any) -> dict:
         return await self._peer.request("session.list", filt)
 
+    async def replay_stream(self, session_id: str, **opts: Any) -> dict:
+        """Resend unacknowledged frames; this never restarts a model or ACKs."""
+        return await self._peer.request("stream.replay", {"sessionId": session_id, **opts})
+
+    async def interaction_status(self, request_id: str) -> dict:
+        """Read the tenant-bound durable delivery/application receipt."""
+        return await self._peer.request("interaction.status", {"requestId": request_id})
+
+    async def employee_profile_apply(self, **params: Any) -> dict:
+        """Provision an isolated employee under the device's explicit local policy."""
+        return await self._peer.request("employee.profile.apply", params)
+
+    async def employee_profile_status(self, employee_id: str) -> dict:
+        """Read the real device installation/version and known memory metadata."""
+        return await self._peer.request("employee.profile.status", {"employeeId": employee_id})
+
+    async def workflow_cancel_dispatch(self, dispatch_key: str, project: str, **opts: Any) -> dict:
+        """Persist cancellation; preserve nativeStop evidence, which may be unconfirmed."""
+        return await self._peer.request("workflow.dispatch.cancel", {"dispatchKey": dispatch_key, "project": project, **opts})
+
     async def info(self) -> dict:
-        """设备 OS/机器信息，用于服务端做任务调度决策。"""
+        """OS metadata and optional ssh username/port/public/private/Tailscale IP hints.
+
+        No credentials or reachability assertion; older devices may omit ssh.
+        """
         return await self._peer.request("device.info", {})
 
     async def resources(self) -> dict:
@@ -121,6 +264,12 @@ class PhononDevice:
 
     async def fs_list(self, **opts: Any) -> dict:
         """Device-level directory listing under safe roots or absolute root paths."""
+        if "directoryInput" in opts and opts.get("projectCandidates") is not True:
+            raise RuntimeError("directory_mode_required")
+        if opts.get("projectCandidates"):
+            info = await self.info()
+            if not isinstance(info, dict) or not isinstance(info.get("capabilities"), list) or "workspace_directory_picker_v1" not in info["capabilities"]:
+                raise RuntimeError("workspace_directory_device_update_required")
         return await self._peer.request("device.fs.list", opts)
 
     # ---- deterministic host maintenance (no external agent/LLM required) ----
@@ -152,8 +301,27 @@ class PhononDevice:
         return await self._peer.request("maintenance.service.restart", {"targetId": target_id, "serviceId": service_id, **opts})
 
     # ---- project / file / skill 便捷封装 ----
+    async def project_provision(self, client_request_id: str, name: str, expected_receiver_id: str) -> dict:
+        payload = {"clientRequestId": client_request_id, "name": name, "expectedReceiverID": expected_receiver_id}
+        info = await self.info()
+        if not isinstance(info, dict) or not isinstance(info.get("capabilities"), list) or "project_provision_v1" not in info["capabilities"] or info.get("projectProvisionReceiverID") != expected_receiver_id:
+            raise RuntimeError("project_provision_device_update_required")
+        return await self._peer.request("project.provision", payload)
+
+    async def project_provision_status(self, client_request_id: str, expected_receiver_id: str) -> dict:
+        return await self._peer.request("project.provision.status", {"clientRequestId": client_request_id, "expectedReceiverID": expected_receiver_id})
+
     async def project_create(self, name: str, git: bool = True, **opts: Any) -> dict:
-        return await self._peer.request("project.create", {"name": name, "git": git, **opts})
+        expected = opts.get("existingDirectoryIdentity")
+        strict = "existingDirectoryIdentity" in opts
+        if strict:
+            info = await self.info()
+            if not isinstance(info, dict) or not isinstance(info.get("capabilities"), list) or "workspace_directory_picker_v1" not in info["capabilities"]:
+                raise RuntimeError("workspace_directory_device_update_required")
+        result = await self._peer.request("project.create", {"name": name, "git": git, **opts})
+        if strict and (not isinstance(result, dict) or not isinstance(result.get("project"), dict) or result["project"].get("directoryIdentity") != expected):
+            raise RuntimeError("workspace_directory_unconfirmed")
+        return result
 
     async def project_list(self) -> dict:
         return await self._peer.request("project.list", {})
@@ -225,11 +393,40 @@ class PhononDevice:
     async def file_mkdir(self, project_id: str, path: str, **opts: Any) -> dict:
         return await self._peer.request("file.mkdir", {"projectId": project_id, "path": path, **opts})
 
-    async def skill_install(self, agent: str, name: str, scope: str, source: dict, project_id: str | None = None) -> Any:
-        return await self._peer.request("skill.install", {"agent": agent, "name": name, "scope": scope, "projectId": project_id, "source": source})
+    async def skill_install(self, agent: str, name: str, scope: str, source: dict, project_id: str | None = None, *, client_request_id: str | None = None) -> Any:
+        params: dict = {"agent": agent, "name": name, "scope": scope, "source": source}
+        if project_id is not None: params["projectId"] = project_id
+        if client_request_id is not None: params["clientRequestId"] = client_request_id
+        return await self._peer.request("skill.install", params)
 
-    async def skill_uninstall(self, agent: str, name: str, scope: str, project_id: str | None = None) -> Any:
-        return await self._peer.request("skill.uninstall", {"agent": agent, "name": name, "scope": scope, "projectId": project_id})
+    async def skill_install_status(self, agent: str, name: str, scope: str, client_request_id: str, project_id: str | None = None, *, include_receiver_identity: bool = False, include_recovery_context: bool = False) -> Any:
+        params = {"agent": agent, "name": name, "scope": scope, "clientRequestId": client_request_id}
+        if project_id is not None:
+            params["projectId"] = project_id
+        if include_receiver_identity:
+            params["includeReceiverIdentity"] = True
+        if include_recovery_context:
+            params["includeRecoveryContext"] = True
+        return await self._peer.request("skill.install.status", params)
+
+    async def skill_install_fence(self, agent: str, name: str, project_id: str, original_request_id: str, expected_receiver_id: str, base_recovery_revision: str, client_request_id: str) -> Any:
+        return await self._peer.request("skill.install.fence", {"agent": agent, "name": name, "scope": "project", "projectId": project_id,
+            "originalRequestId": original_request_id, "expectedReceiverID": expected_receiver_id, "baseRecoveryRevision": base_recovery_revision, "clientRequestId": client_request_id})
+
+    async def skill_uninstall(self, agent: str, name: str, scope: str, project_id: str | None = None, *, client_request_id: str | None = None) -> Any:
+        params: dict = {"agent": agent, "name": name, "scope": scope}
+        if project_id is not None: params["projectId"] = project_id
+        if client_request_id is not None: params["clientRequestId"] = client_request_id
+        return await self._peer.request("skill.uninstall", params)
+
+    async def skill_publish(self, agent: str, name: str, project_id: str, source: dict, base_revision: str | None, client_request_id: str, *, expected_receiver_id: str | None = None) -> Any:
+        params = {"agent": agent, "name": name, "scope": "project", "projectId": project_id, "source": source, "baseRevision": base_revision, "clientRequestId": client_request_id}
+        if expected_receiver_id is not None:
+            params["expectedReceiverID"] = expected_receiver_id
+        return await self._peer.request("skill.publish", params)
+
+    async def skill_unpublish(self, agent: str, name: str, project_id: str, base_revision: str, client_request_id: str) -> Any:
+        return await self._peer.request("skill.unpublish", {"agent": agent, "name": name, "scope": "project", "projectId": project_id, "baseRevision": base_revision, "clientRequestId": client_request_id})
 
     async def skill_list(self, **filt: Any) -> dict:
         return await self._peer.request("skill.list", filt)
@@ -257,7 +454,7 @@ class PhononDevice:
         policy: { onNodeFailure?: "fail_workflow"|"skip_dependents"|"continue",
                   timeoutSeconds?, perNodeTimeoutSeconds?, maxParallel? }
         shared_context: { text?, files?, placement: "prepend"|"append" }
-        resume_from: { workflowId, strategy, rerunNodes? }
+        resume_from: { workflowId, strategy, rerunNodes?, expectedSeq? }
         """
         params: dict = {"plan": plan}
         if project is not None:
@@ -278,10 +475,37 @@ class PhononDevice:
             params["clientRequestId"] = client_request_id
         if metadata is not None:
             params["metadata"] = metadata
+        if _workflow_skills(plan):
+            params = deepcopy(params)
+            await _require_skill_capabilities(self, _workflow_skills(params["plan"]), True)
         return await self._peer.request("workflow.run", params)
 
     async def workflow_status(self, workflow_id: str) -> dict:
         return await self._peer.request("workflow.status", {"workflowId": workflow_id})
+
+    async def workflow_input(self, workflow_id: str, node_id: str, session_id: str,
+                             turn_id: str, input_id: str, text: str) -> dict:
+        """Insert only into the original active turn; an unknown receipt must not be replayed."""
+        return await self._peer.request("workflow.input", {"workflowId": workflow_id,
+            "nodeId": node_id, "sessionId": session_id, "turnId": turn_id,
+            "inputId": input_id, "input": text})
+
+    async def workflow_input_status(self, workflow_id: str, input_id: str) -> dict:
+        """Read the original durable receipt without inserting or starting a turn."""
+        return await self._peer.request("workflow.input.status", {
+            "workflowId": workflow_id, "inputId": input_id})
+
+    async def workflow_result(self, workflow_id: str, node_id: str | None = None,
+                              offset: int = 0, version: str | None = None,
+                              known_version: str | None = None) -> dict:
+        params: dict = {"workflowId": workflow_id, "offset": offset}
+        if node_id is not None:
+            params["nodeId"] = node_id
+        if version is not None:
+            params["version"] = version
+        if known_version is not None:
+            params["knownVersion"] = known_version
+        return await self._peer.request("workflow.result", params)
 
     async def workflow_resume(
         self,
@@ -301,6 +525,7 @@ class PhononDevice:
         return await self._peer.request("workflow.resume", params)
 
     async def workflow_cancel(self, workflow_id: str, reason: str | None = None) -> dict:
+        """Request cancellation. Native work is stopped only when nativeStop is confirmed."""
         return await self._peer.request("workflow.cancel", {"workflowId": workflow_id, "reason": reason})
 
     async def workflow_pause(self, workflow_id: str, reason: str | None = None) -> dict:
@@ -368,10 +593,21 @@ class PhononDevice:
         if policy is not None: params["policy"] = policy
         if enabled is not None: params["enabled"] = enabled
         if client_request_id is not None: params["clientRequestId"] = client_request_id
+        selected, workflow = _target_skills(params["target"])
+        if workflow or _pinned_skills(selected):
+            params = deepcopy(params)
+            selected, workflow = _target_skills(params["target"])
+            await _require_skill_capabilities(self, selected, workflow)
         return await self._peer.request("schedule.create", params)
 
     async def schedule_update(self, schedule_id: str, **patch: Any) -> dict:
-        return await self._peer.request("schedule.update", {"scheduleId": schedule_id, **patch})
+        params = {"scheduleId": schedule_id, **patch}
+        selected, workflow = _target_skills(params.get("target"))
+        if workflow or _pinned_skills(selected):
+            params = deepcopy(params)
+            selected, workflow = _target_skills(params.get("target"))
+            await _require_skill_capabilities(self, selected, workflow)
+        return await self._peer.request("schedule.update", params)
 
     async def schedule_delete(self, schedule_id: str, client_request_id: str | None = None) -> dict:
         params: dict = {"scheduleId": schedule_id}
@@ -399,8 +635,9 @@ class PhononDevice:
         if input is not None: params["input"] = input
         return await self._peer.request("schedule.trigger", params)
 
-    async def schedule_runs_list(self, schedule_id: str, status: str | None = None, limit: int | None = None) -> dict:
+    async def schedule_runs_list(self, schedule_id: str, status: str | None = None, limit: int | None = None, unacked_only: bool | None = None) -> dict:
         params: dict = {"scheduleId": schedule_id}
+        if unacked_only is not None: params["unackedOnly"] = unacked_only
         if status is not None: params["status"] = status
         if limit is not None: params["limit"] = limit
         return await self._peer.request("schedule.runs.list", params)
@@ -416,6 +653,21 @@ class PhononDevice:
 
     async def run_get(self, run_id: str) -> dict:
         return await self._peer.request("run.get", {"runId": run_id})
+
+    async def run_resolve(
+        self, run_id: str, dispatch: dict, status: str,
+        result_text: str | None = None, error: str | None = None,
+        client_request_id: str | None = None,
+    ) -> dict:
+        """Settle a controller-dispatch occurrence, without launching any work."""
+        params: dict = {"runId": run_id, "dispatch": dispatch, "status": status}
+        if result_text is not None:
+            params["resultText"] = result_text
+        if error is not None:
+            params["error"] = error
+        if client_request_id is not None:
+            params["clientRequestId"] = client_request_id
+        return await self._peer.request("run.resolve", params)
 
     async def run_events_subscribe(self, run_id: str) -> dict:
         return await self._peer.request("run.events.subscribe", {"runId": run_id})
@@ -442,10 +694,36 @@ class PhononDevice:
         self._prepare_upload_handler = fn
 
     def set_interaction_handler(self, fn: Callable[[dict], dict]) -> None:
+        """Preserve nativeRunId/devRunId and original workflow/turn attribution."""
         self._interaction_handler = fn
 
-    def set_stream_event_handler(self, fn: Callable[[dict], Awaitable[bool] | bool]) -> None:
-        """True acknowledges only after durable consumption; False retains normal routing."""
+    def set_conversation_board_handler(self, fn: Callable[[dict], Any]) -> None:
+        """Handle controller-stamped board reads/writes. Unset means unsupported."""
+        self._conversation_board_handler = fn
+
+    def set_conversation_workflow_handler(self, fn: Callable[[dict], Any]) -> None:
+        self._conversation_workflow_handler = fn
+
+    def set_conversation_message_handler(self, fn: Callable[[dict], Any]) -> None:
+        """Handle stamped group messages with optional immutable attachmentIDs.
+
+        Recorded receipts are not proof of verified recipient file delivery.
+        """
+        self._conversation_message_handler = fn
+
+    def set_project_coordination_handler(self, fn: Callable[[dict], Any]) -> None:
+        """Handle private coordination, preserving device-owned receive outside action.
+
+        Only a host accepting receive reports returns receiveReporting: 1.
+        """
+        self._project_coordination_handler = fn
+
+    def set_project_coordination_evidence_handler(self, fn: Callable[[dict], Any]) -> None:
+        """Record device-only historical observations, never model ACKs or new work."""
+        self._project_coordination_evidence_handler = fn
+
+    def set_stream_event_handler(self, fn: Callable[[dict], Awaitable[bool | dict] | bool | dict]) -> None:
+        """True ACKs this event; {ackSeq} proves a committed contiguous cursor."""
         self._stream_event_handler = fn
 
     def set_workflow_event_handler(self, fn: Callable[[dict], Awaitable[None] | None]) -> None:
@@ -477,9 +755,15 @@ class PhononDevice:
                 consumed = self._stream_event_handler(ev)
                 if inspect.isawaitable(consumed):
                     consumed = await consumed
-                if consumed is True:
-                    await self._peer.notify("stream.ack", {"sessionId": ev.get("sessionId"), "lastSeq": ev.get("seq")})
+                if consumed is True or isinstance(consumed, dict):
+                    ack = ev.get("seq") if consumed is True else consumed.get("ackSeq")
+                    seq = ev.get("seq")
+                    if isinstance(ack, bool) or not isinstance(ack, int) or ack > 9007199254740991 or isinstance(seq, bool) or not isinstance(seq, int) or seq < 0 or seq > 9007199254740991 or ack < seq:
+                        raise ValueError("invalid cumulative stream ACK cursor")
+                    await self._peer.notify("stream.ack", {"sessionId": ev.get("sessionId"), "lastSeq": ack})
                     return None
+            if "nativeProactive" in ev:
+                return None
             s = self._sessions.get(ev.get("sessionId"))
             if s is not None:
                 s._on_stream(ev)
@@ -532,16 +816,18 @@ class PhononDevice:
             ev = params or {}
             if self._run_finished_handler:
                 res = self._run_finished_handler(ev)
-                if asyncio.iscoroutine(res):
+                if inspect.isawaitable(res):
                     await res
-            rid = (ev.get("run") or {}).get("id")
-            if rid:
+            run = ev.get("run") or {}
+            rid = run.get("id")
+            controller_dispatch = run.get("controllerDispatch") is True or bool(run.get("dispatch"))
+            if rid and (not controller_dispatch or self._run_finished_handler):
                 await self._peer.notify("schedule.ack", {"runId": rid, "finished": True})
             return None
         if method == "document.send":
             if self._document_handler:
                 res = self._document_handler(params or {})
-                if asyncio.iscoroutine(res):
+                if inspect.isawaitable(res):
                     res = await res
                 if isinstance(res, dict):
                     return res
@@ -553,6 +839,33 @@ class PhononDevice:
                     res = await res
                 return res
             return {"uploadRef": new_id(), "uploadUrl": "", "method": "PUT"}
+        if method == "conversation.message":
+            if not self._conversation_message_handler:
+                raise RuntimeError("Conversation messages are not supported by this server")
+            res = self._conversation_message_handler(params or {})
+            return await res if inspect.isawaitable(res) else res
+        if method == "project.coordination.evidence":
+            if not self._project_coordination_evidence_handler:
+                raise RuntimeError("Project coordination evidence is not supported by this server")
+            res = self._project_coordination_evidence_handler(params or {})
+            if inspect.isawaitable(res):
+                res = await res
+            return res
+        if method == "project.coordination":
+            if not self._project_coordination_handler:
+                raise RuntimeError("Project coordination is not supported by this server")
+            res = self._project_coordination_handler(params or {})
+            return await res if inspect.isawaitable(res) else res
+        if method == "conversation.workflow":
+            if not self._conversation_workflow_handler:
+                raise RuntimeError("Conversation workflows are not supported by this server")
+            res = self._conversation_workflow_handler(params or {})
+            return await res if inspect.isawaitable(res) else res
+        if method == "conversation.board":
+            if not self._conversation_board_handler:
+                raise RuntimeError("Conversation boards are not supported by this server")
+            res = self._conversation_board_handler(params or {})
+            return await res if asyncio.iscoroutine(res) else res
         if method == "interaction.request":
             if self._interaction_handler:
                 res = self._interaction_handler(params or {})

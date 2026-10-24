@@ -11,6 +11,7 @@ import {
   type DaemonConfig,
 } from "./config.js";
 import { existsSync } from "node:fs";
+import { configureManagedMcpConsent, runManagedMcpProxy,managedMcpSourceFingerprint } from "./managed-mcp.js";
 import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall, cmdService, cmdSessions } from "./commands.js";
 
 /**
@@ -33,6 +34,14 @@ function opt(name: string): string | undefined {
 
 async function main(): Promise<void> {
   switch (cmd) {
+    case "mcp": {
+      if (args[0] === "proxy") {
+        const server = opt("server"), binding = opt("binding");
+        if (!server || !binding) throw new Error("mcp proxy requires a registered server and binding");
+        await runManagedMcpProxy({ configPath: opt("config") ?? DEFAULT_CONFIG_PATH, server, binding,sourceFingerprint:opt("source") });
+      } else configureManagedMcpConsent(args);
+      break;
+    }
     case "init": {
       if (existsSync(DEFAULT_CONFIG_PATH) && !flag("force")) {
         console.error(`config already exists at ${DEFAULT_CONFIG_PATH} (use --force to overwrite)`);
@@ -65,7 +74,7 @@ async function main(): Promise<void> {
         }
       } else if (sub === "list") {
         if (cfg.servers.length === 0) console.log("(no servers configured)");
-        cfg.servers.forEach((s, i) => console.log(`${i}: ${s.url}${s.trustLocal ? " [trustLocal]" : ""}${s.deviceKey ? " [deviceKey]" : ""}`));
+        cfg.servers.forEach((s, i) => console.log(`${i}: ${s.url}${s.trustLocal ? " [trustLocal]" : ""}${s.deviceKey ? " [deviceKey]" : ""}${managedMcpSourceFingerprint(s)?" [source="+managedMcpSourceFingerprint(s)+"]":""}`));
       } else if (sub === "remove" || sub === "rm") {
         const target = args[1];
         if (!target) {
@@ -98,7 +107,7 @@ async function main(): Promise<void> {
     }
     case "start": {
       const cfg: DaemonConfig = loadConfig();
-      const daemon = new PhononDaemon(cfg);
+      const daemon = new PhononDaemon(cfg, { configPath: DEFAULT_CONFIG_PATH });
       await daemon.start();
       console.log(`[agent-phonon] daemon started (device=${cfg.deviceId}, servers=${cfg.servers.length})`);
       const shutdown = async () => {
@@ -196,6 +205,9 @@ async function main(): Promise<void> {
       console.log("  sessions list                 list sessions + transcript snapshot paths");
       console.log("  sessions prune --older-than <days>|--keep <n> [--yes]  delete old session snapshots");
       console.log("  config [--show-secrets]       show config (redacted by default)");
+      console.log("  mcp allow --server <url> --agents codex,pi  allow managed MCP registration locally (--all is explicit)");
+      console.log("  mcp deny --server <url>       immediately disable local managed MCP proxy calls");
+      console.log("  mcp allow|deny --server <url> --source <source>  select an exact registered source");
       console.log("\nrun:");
       console.log("  discover                      list available agents (without starting daemon)");
       console.log("  start                         run the daemon in the foreground");
@@ -203,7 +215,6 @@ async function main(): Promise<void> {
       console.log("  agent-phonon adapter add openclaw --agent phonon");
       console.log("  agent-phonon adapter add codex --base-url https://gw/v1 --api-key <k> --model gpt-5.5");
       console.log("  agent-phonon adapter add copilot --model gpt-5.4");
-      console.log("  agent-phonon adapter add herdr --model gpt-5.4");
       console.log("  agent-phonon adapter add pi --model anthropic/claude-sonnet-4-6");
       console.log("  agent-phonon adapter add hermes");
       break;

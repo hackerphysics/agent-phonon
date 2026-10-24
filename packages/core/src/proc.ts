@@ -6,7 +6,8 @@ import type { SpawnOptions, SpawnSyncOptions, SpawnSyncReturns, ChildProcessWith
  *
  * Windows 上 npm 全局 CLI（claude/codex/openclaw/opencode…）是 `.cmd` shim，
  * Node 22+ 不带 shell 直接 spawn `.cmd` 会抛 EINVAL（CVE-2024-27980 之后收紧）。
- * 所以 Windows 必须 `shell: true`。但 `shell: true` 下 Node 把 command 原样拼进
+ * 所以这些 shim 必须 `shell: true`；原生 `.exe` 直接启动，不经过 cmd.exe。
+ * 但 `shell: true` 下 Node 把 command 原样拼进
  * cmd.exe 命令行——如果 command 是含空格的全路径（如
  * `C:\Program Files\nodejs\claude.cmd`）且未加引号，就会在空格处截断：
  *   'C:\Program' is not recognized as an internal or external command
@@ -20,6 +21,9 @@ import type { SpawnOptions, SpawnSyncOptions, SpawnSyncReturns, ChildProcessWith
 export function spawnAgent(command: string, args: readonly string[] = [], options: SpawnOptions = {}): ChildProcessWithoutNullStreams {
   if (process.platform !== "win32") {
     return spawn(command, args as string[], options) as ChildProcessWithoutNullStreams;
+  }
+  if (/\.exe$/i.test(command)) {
+    return spawn(command, args as string[], { ...options, shell: false, windowsVerbatimArguments: false }) as ChildProcessWithoutNullStreams;
   }
   const cmd = quoteWinArg(command);
   const quotedArgs = args.map(quoteWinArg);
@@ -41,12 +45,15 @@ export function quoteWinArg(s: string): string {
 
 /**
  * 同步版跨平台安全 spawn（doctor probe / commandPath 探测用）。
- * 同样在 win32 下 shell:true + 引用 command/args，避免含空格全路径（如
+ * 原生 `.exe` 直接启动；其他 win32 命令使用 shell:true + 引用 command/args，避免含空格全路径（如
  * `C:\Program Files\nodejs\claude.cmd`）被 cmd.exe 在空格处截断。
  */
 export function spawnSyncAgent(command: string, args: readonly string[] = [], options: SpawnSyncOptions = {}): SpawnSyncReturns<string | Buffer> {
   if (process.platform !== "win32") {
     return spawnSync(command, args as string[], options);
+  }
+  if (/\.exe$/i.test(command)) {
+    return spawnSync(command, args as string[], { ...options, shell: false, windowsVerbatimArguments: false });
   }
   const cmd = quoteWinArg(command);
   const quotedArgs = args.map(quoteWinArg);

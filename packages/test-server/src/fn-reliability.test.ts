@@ -119,6 +119,7 @@ test("restart recovery: sessions restored as paused, reattach on send", async ()
     const p = (await tc.call("project.create", { name: "p", git: false })) as { project: { projectId: string } };
     const s = (await tc.call("session.create", { project: p.project.projectId, agent: "mock:default", model: "m1", verbosity: "messages" })) as { sessionId: string };
     sessionId = s.sessionId;
+    await tc.conn.dispose();
     store.close();
   }
   // 第二次：新 store + engine（模拟重启）→ session 恢复为 paused

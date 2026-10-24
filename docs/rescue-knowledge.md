@@ -1,5 +1,12 @@
 # Rescue repair knowledge pack
 
+Current adapter note (2026-10-20): maintained Hermes tool observation now uses
+native stable-ID start/complete callbacks where available, with transcript
+reconciliation as a fallback; see [Native MCP observation](NATIVE_MCP.md#observation-and-verification).
+The hash-pinned repair pack below describes its reviewed historical adapter
+revision. Its buffered-tool description is not a capability check for a newer
+device runtime; historical evidence/procedure hashes are not silently rewritten.
+
 Rescue has a **bundled, read-only, structured knowledge index**, not conversation memory or a vector database. Every new session receives the short lookup instruction and the existing official AI SDK `tool` interface. It retrieves only the applicable procedures, not whole acceptance reports in the system prompt.
 
 ## Product integration and distribution

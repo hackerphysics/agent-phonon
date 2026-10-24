@@ -4,8 +4,17 @@ import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, statSync, lstatSync, realpathSync, constants, readFileSync,openSync,readSync,closeSync,fstatSync } from "node:fs";
+import { z } from "zod";
+import { parse as parseToml } from "smol-toml";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
+import { nativeReasoning, reportedReasoningLevels } from "../reasoning.js";
+import { PhononError } from "../rpc.js";
+import {codexNativeToolArgs} from "./codex-native-tools.js";
+import {codexTerminalInput} from "./codex-terminal-guidance.js";
+import {readCodexContext,resolveCodexContextFile} from "./codex-context.js";
+import { CodexPeerContext, qualifyCodexPeerContext, stopCodexPeerProcess } from "./codex-peer-context.js";
+import { discoverCodexNativeModels } from "./codex-models.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -34,8 +43,10 @@ const CODEX_FALLBACK_MODELS: ModelInfo[] = [
 ];
 
 const CAPABILITIES: AgentCapabilities = {
+  reasoningControl:true,
   nativeSession: true, // exec resume <thread_id>
   nativeCompression: false,
+  customCompression: true,
   contextInjection: true, // 拼进下轮 prompt
   proactiveOutput: false,
   modelSwitch: true,
@@ -67,9 +78,9 @@ export function resolveCodexSessionFile(threadId: string, codexHome = join(homed
     for (const name of names) {
       const full = join(dir, name);
       let st;
-      try { st = statSync(full); } catch { continue; }
+      try { st = lstatSync(full); } catch { continue; }
       if (st.isDirectory()) walk(full);
-      else if (name.endsWith(`-${threadId}.jsonl`)) hits.push({ path: full, mtime: st.mtimeMs });
+      else if (st.isFile() && name.endsWith(`-${threadId}.jsonl`)) hits.push({ path: full, mtime: st.mtimeMs });
     }
   };
   walk(root);
@@ -80,16 +91,16 @@ export function resolveCodexSessionFile(threadId: string, codexHome = join(homed
 
 function parseCodexConfig(configPath = join(homedir(), ".codex", "config.toml")): { model?: string; providerId?: string; baseUrl?: string } {
   if (!existsSync(configPath)) return {};
-  const text = readFileSync(configPath, "utf8");
-  const model = text.match(/^model\s*=\s*"([^"]+)"/m)?.[1];
-  const providerId = text.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1];
-  let baseUrl: string | undefined;
-  if (providerId) {
-    const escaped = providerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const section = text.match(new RegExp(`\\[model_providers\\.${escaped}\\]([\\s\\S]*?)(?:\\n\\[|$)`))?.[1];
-    baseUrl = section?.match(/^base_url\s*=\s*"([^"]+)"/m)?.[1];
-  }
-  return { model, providerId, baseUrl };
+  try {
+    if (statSync(configPath).size > 2_000_000) return {};
+    const config = parseToml(readFileSync(configPath, "utf8"));
+    const model = typeof config.model === "string" ? config.model : undefined;
+    const providerId = typeof config.model_provider === "string" ? config.model_provider : undefined;
+    const providers = config.model_providers as Record<string, unknown> | undefined;
+    const provider = providerId ? providers?.[providerId] as Record<string, unknown> | undefined : undefined;
+    const baseUrl = typeof provider?.base_url === "string" ? provider.base_url : undefined;
+    return { ...(model ? { model } : {}), ...(providerId ? { providerId } : {}), ...(baseUrl ? { baseUrl } : {}) };
+  } catch { return {}; }
 }
 
 function normalizeOpenAiModels(data: unknown): ModelInfo[] {
@@ -104,7 +115,8 @@ function normalizeOpenAiModels(data: unknown): ModelInfo[] {
     const id = typeof obj.id === "string" ? obj.id : undefined;
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, ...(typeof obj.name === "string" ? { displayName: obj.name } : {}), available: true });
+    const levels=reportedReasoningLevels(obj.supported_reasoning_levels ?? obj.reasoning_levels);
+    out.push({ id, ...(typeof obj.name === "string" ? { displayName: obj.name } : {}), ...(levels?{reasoningLevels:levels}:{}), available: true });
   }
   return out;
 }
@@ -138,6 +150,8 @@ function fetchJson(url: string, headers?: Record<string, string>, signal?: Abort
 }
 
 export interface CodexEnv {
+  /** Explicit native storage root; also passed as CODEX_HOME to the child. */
+  codexHome?: string;
   /** Codex executable path. Prefer an absolute path when running under systemd/launchd. */
   binPath?: string;
   /** Optional OpenAI-compatible endpoint override. Omit to use the user's native Codex config. */
@@ -156,40 +170,68 @@ export interface CodexEnv {
   providerName?: string;
 }
 
+function codexProviderArgs(env: CodexEnv): string[] {
+  if (!env.baseUrl || !env.apiKey) return [];
+  const id = env.providerId ?? "phonon_gateway", name = env.providerName ?? "phonon-gateway";
+  return ["-c", `model_provider=${id}`, "-c", `model_providers.${id}.name=${name}`,
+    "-c", `model_providers.${id}.base_url=${env.baseUrl}`, "-c", `model_providers.${id}.wire_api=${env.wireApi ?? "responses"}`,
+    "-c", `model_providers.${id}.env_key=OPENAI_API_KEY`];
+}
+
+function codexNativeEnvironment(env: CodexEnv, overlay?: Record<string, string>): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { ...buildChildProcessEnvironment(overlay), ...(env.codexHome ? { CODEX_HOME: env.codexHome } : {}), ...(env.apiKey ? { OPENAI_API_KEY: env.apiKey } : {}) };
+  for (const key of ["AGENT_PHONON_PEER_CONTEXT_URL", "AGENT_PHONON_PEER_CONTEXT_TOKEN", "AGENT_PHONON_CODEX_PEER_URL", "AGENT_PHONON_CODEX_PEER_TOKEN"]) delete environment[key];
+  return environment;
+}
+
 class CodexSession implements AdapterSession {
   readonly sessionId: string;
   model: string;
   private cwd: string;
   private env: CodexEnv;
   private threadId?: string; // Codex thread_id（= 会话），从 thread.started 抓
+  private contextNotBefore?: number;
   private current?: ProcessSupervisor;
+  private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   private pendingInject: string[] = [];
+  private nativeToolCalls = new Set<string>();
+  private nativeToolResults = new Set<string>();
+  private peerSupported = false;
+  private peerAbort?: AbortController;
+  async preparePeerContext(environment?: Record<string,string>, signal?: AbortSignal): Promise<void> {
+    if (this.current && !this.current.hasStopped()) throw new PhononError("errSessionBusy","Codex peer readiness cannot replace an active native runtime");
+    this.peerSupported = false;
+    try {
+      this.peerSupported = await qualifyCodexPeerContext(this.env.binPath??"codex",{cwd:this.cwd,env:this.nativeEnvironment(environment),signal,
+        onRuntime:runtime=>{this.current=runtime;}});
+    } finally { if (this.current?.hasStopped()) this.current=undefined; }
+  }
+  peerContextCapability() {
+    return this.peerSupported ? {mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.threadId} as const : undefined;
+  }
 
-  constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[]) {
+  constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[], recovered?: {threadId:string;pendingInject:string[];contextNotBefore?:number}) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.env = env;
+    this.threadId = recovered?.threadId;
+    this.contextNotBefore = recovered?.contextNotBefore;
+    if (recovered) this.pendingInject.push(...recovered.pendingInject);
     // contextInjection: 注入 initialContext（含 workflow systemPrompt）进首轮 message
     this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
   private providerArgs(): string[] {
-    if (!this.env.baseUrl || !this.env.apiKey) return [];
-    const id = this.env.providerId ?? "phonon_gateway";
-    const name = this.env.providerName ?? "phonon-gateway";
-    return [
-      "-c", `model_provider=${id}`,
-      "-c", `model_providers.${id}.name=${name}`,
-      "-c", `model_providers.${id}.base_url=${this.env.baseUrl}`,
-      "-c", `model_providers.${id}.wire_api=${this.env.wireApi ?? "responses"}`,
-      "-c", `model_providers.${id}.env_key=OPENAI_API_KEY`,
-    ];
+    return codexProviderArgs(this.env);
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    this.contextNotBefore=Date.now();
     const { turnId, emit } = opts;
-    let prompt = input;
+    const nativeTools = codexNativeToolArgs(opts);
+    this.nativeToolCalls.clear();this.nativeToolResults.clear();
+    let prompt = codexTerminalInput(input,this.env.binPath);
     if (this.pendingInject.length > 0) {
       prompt = this.pendingInject.join("\n") + "\n\n" + prompt;
       this.pendingInject = [];
@@ -201,23 +243,66 @@ class CodexSession implements AdapterSession {
     const args = this.threadId
       ? ["exec", "resume", this.threadId, "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : [])]
       : ["exec", "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : [])];
+    // exec defaults to read-only; -c also works for resume, which has no --sandbox option.
+    args.push("-c", 'sandbox_mode="workspace-write"');
+    // Phonon authorizes the working directory; ordinary chats need no Git repo.
+    args.push("--skip-git-repo-check");
+    if(opts.reasoning?.level)args.push("-c",`model_reasoning_effort=${nativeReasoning(opts.reasoning.level)}`);
+    args.push(...nativeTools);
 
-    await this.run(args, prompt, turnId, emit, opts);
+    let peer: CodexPeerContext | undefined;
+    const abort = new AbortController(); this.peerAbort = abort;
+    const options = {...opts,signal:opts.signal?AbortSignal.any([opts.signal,abort.signal]):abort.signal};
+    try {
+      if (opts.peerContext && this.peerSupported) {
+        peer = new CodexPeerContext({access:opts.peerContext,cwd:this.cwd,prompt,nativeThread:this.threadId,signal:options.signal,
+          context:{home:this.env.codexHome??this.nativeEnvironment(options.environment).CODEX_HOME??join(homedir(),".codex"),model:this.model,notBefore:this.contextNotBefore!},
+          onRuntime:runtime=>{this.current=runtime;}});
+        try {
+          await peer.listen();
+          args.push(...await peer.nativeArguments(this.env.binPath??"codex",this.nativeEnvironment(options.environment)));
+        } catch {
+          await peer.close(); peer=undefined;
+          // An optional receiver failure must not restart or replace the assigned task.
+          console.warn("[codex] coordination.receiver_unavailable; retaining native task and policy");
+        } finally { if (this.current?.hasStopped()) this.current=undefined; }
+      }
+      if (options.signal.aborted) {
+        emit({type:"result",sessionId:this.sessionId,turnId,seq:0,at:new Date().toISOString(),text:"",status:"interrupted",final:true} as StreamEvent);
+        return;
+      }
+      await this.run(args,prompt,turnId,emit,options,peer);
+    } finally {
+      peer?.deactivate();
+      if (this.lastNative?.turnId===turnId) await stopCodexPeerProcess(this.lastNative.supervisor);
+      await peer?.close();
+      if (this.peerAbort===abort) this.peerAbort=undefined;
+    }
   }
 
-  private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
+  private nativeEnvironment(overlay?: Record<string,string>): NodeJS.ProcessEnv {
+    return codexNativeEnvironment(this.env, overlay);
+  }
+
+  private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions, peer?: CodexPeerContext): Promise<void> {
+    const startedAt=Date.now();
+    const prior=this.threadId?resolveCodexSessionFile(this.threadId,this.env.codexHome):undefined;
+    const offset=prior?statSync(prior).size:0;
+    const peerEnvironment = peer?.environment();
     return new Promise((resolve) => {
       const supervisor = spawnSupervisedAgent(this.env.binPath ?? "codex", args, {
         cwd: this.cwd,
-        env: { ...buildChildProcessEnvironment(opts.environment), ...(this.env.apiKey ? { OPENAI_API_KEY: this.env.apiKey } : {}) },
+        env: this.nativeEnvironment(opts.environment),
       });
       const child = supervisor.child;
       this.current = supervisor;
+      this.lastNative={turnId,supervisor};
       const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
       child.once("close", releaseCurrent);
       child.once("error", releaseCurrent);
       let buf = "";
       let acc = "";
+      let finalMessage = "";
       let stderr = "";
       let nativeError = "";
       let sawCompletion = false;
@@ -227,6 +312,7 @@ class CodexSession implements AdapterSession {
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
+        peer?.deactivate();
         clearTimeout(guard);
         opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
@@ -241,14 +327,29 @@ class CodexSession implements AdapterSession {
       else opts.signal?.addEventListener("abort", abort, { once: true });
 
       const consume = (line: string): void => {
-        if (!line.trim()) return;
+        if (settled || !line.trim()) return;
         let ev: Record<string, unknown>;
         try { ev = JSON.parse(line); } catch { return; }
+        if (ev.type === "thread.started" && this.threadId && ev.thread_id !== this.threadId) {
+          void supervisor.terminate();
+          finish("failed", "", "Codex resumed a different native Session");
+          return;
+        }
+        if (peer && ev.type === "thread.started") {
+          try { peer.bindNativeThread(String(ev.thread_id)); }
+          catch { void supervisor.terminate();finish("failed","","Codex native peer identity was not confirmed");return; }
+        }
+        if (ev.type === "turn.completed" || ev.type === "turn.failed") peer?.deactivate();
         if (ev.type === "turn.failed" || ev.type === "error") {
           nativeError = String((ev.error as { message?: string } | undefined)?.message ?? ev.message ?? "Codex turn failed");
         }
         if (ev.type === "turn.completed") { sawCompletion = true; nativeError = ""; }
-        this.handleEvent(ev, turnId, emit, (t) => (acc += t));
+        this.handleEvent(ev, turnId, emit, (text) => {
+          acc += text;
+          // Completed items contain whole messages. Like the native SDK, use
+          // the last one for the result; earlier commentary remains streamed.
+          finalMessage = text;
+        });
       };
       child.stdout.on("data", (d) => {
         buf += d.toString();
@@ -261,9 +362,26 @@ class CodexSession implements AdapterSession {
       child.on("close", (code) => {
         if (settled) return;
         consume(buf);
-        const failed = code !== 0 || !!nativeError || !sawCompletion || !acc.trim();
-        const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [this.env.apiKey]);
-        finish(failed ? "failed" : "completed", acc, failed ? `codex exited ${code}: ${detail}` : undefined);
+        if(opts.reasoning && code===0 && sawCompletion && !opts.signal?.aborted){
+          try{
+            const file=this.threadId?resolveCodexSessionFile(this.threadId,this.env.codexHome):undefined;
+            if(!file)throw new PhononError("errReasoningUnconfirmed");
+            const fd=openSync(file,"r");let bytes:Buffer;
+            try{
+              const start=file===prior?offset:0,size=fstatSync(fd).size-start;
+              if(size<1||size>2000000)throw new PhononError("errReasoningUnconfirmed");
+              bytes=Buffer.alloc(size);let read=0;
+              while(read<size){const count=readSync(fd,bytes,read,size-read,start+read);if(!count)throw new PhononError("errReasoningUnconfirmed");read+=count;}
+            }finally{closeSync(fd);}
+            const contexts=bytes.toString("utf8").split("\n").flatMap(line=>{try{const row=JSON.parse(line);return row.type==="turn_context"&&Date.parse(row.timestamp)>=startedAt&&(this.model==="default"||row.payload?.model===this.model)?[row.payload]:[];}catch{return [];}});
+            const context=contexts.at(-1);
+            if(!context||typeof context.effort!=="string")throw new PhononError("errReasoningUnconfirmed");
+            opts.acknowledgeReasoning?.(context.effort);
+          }catch{ /* Preserve the actual execution outcome; optional setting stays unconfirmed. */ }
+        }
+        const failed = code !== 0 || !!nativeError || !sawCompletion || !finalMessage.trim();
+        const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [this.env.apiKey,opts.environment?.AGENT_PHONON_INTERACTION_TOKEN,peerEnvironment?.AGENT_PHONON_CODEX_PEER_TOKEN]);
+        finish(failed ? "failed" : "completed", failed ? acc : finalMessage, failed ? `codex exited ${code}: ${detail}` : undefined);
       });
 
       child.stdin.write(stdin);
@@ -277,22 +395,66 @@ class CodexSession implements AdapterSession {
     const type = ev.type as string;
     if (type === "thread.started") {
       this.threadId = ev.thread_id as string; // 记录会话 id 供 resume
-    } else if (type === "item.completed") {
-      const item = ev.item as { type?: string; text?: string; name?: string; command?: string } | undefined;
+    } else if (type === "item.started" || type === "item.completed") {
+      const item = ev.item as Record<string,unknown> | undefined;
+      if (item?.type === "mcp_tool_call" && typeof item.id === "string" && typeof item.tool === "string") {
+        const key = turnId + ":" + item.id, toolName = typeof item.server === "string" ? item.server + ":" + item.tool : item.tool;
+        const base = {sessionId:this.sessionId,turnId,seq:0,at:now,toolName,toolCallId:item.id};
+        if (!this.nativeToolCalls.has(key)) {
+          this.nativeToolCalls.add(key);
+          emit({...base,type:"tool_call",...(item.arguments !== undefined ? {args:item.arguments} : {})} as StreamEvent);
+        }
+        if (type === "item.completed" && !this.nativeToolResults.has(key) && (item.result !== undefined || item.error !== undefined)) {
+          this.nativeToolResults.add(key);
+          const failed = item.status === "failed" || item.error != null || (item.result as {isError?:unknown}|undefined)?.isError === true;
+          emit({...base,type:"tool_result",ok:!failed,output:item.error ?? item.result} as StreamEvent);
+        }
+        return;
+      }
+      if (item?.type === "command_execution" && typeof item.command === "string") {
+        const id = typeof item.id === "string" && item.id.length > 0 && item.id.length <= 512 ? item.id : undefined;
+        // Older CLI frames without native IDs remain unpaired observations.
+        if (!id) {
+          if (type === "item.completed") emit({type:"tool_call",sessionId:this.sessionId,turnId,seq:0,at:now,toolName:"command_execution",args:{command:item.command}} as StreamEvent);
+          return;
+        }
+        const key = turnId + ":command:" + id;
+        const base = {sessionId:this.sessionId,turnId,seq:0,at:now,toolName:"command_execution",toolCallId:id};
+        if (!this.nativeToolCalls.has(key)) {
+          this.nativeToolCalls.add(key);
+          emit({...base,type:"tool_call",args:{command:item.command}} as StreamEvent);
+        }
+        const exitKnown = typeof item.exit_code === "number" && Number.isInteger(item.exit_code);
+        const statusKnown = item.status === undefined || item.status === "completed" || item.status === "failed";
+        if (type === "item.completed" && !this.nativeToolResults.has(key) && statusKnown && (exitKnown || item.status === "failed")) {
+          this.nativeToolResults.add(key);
+          emit({...base,type:"tool_result",ok:item.status !== "failed" && item.exit_code === 0,
+            output:{command:item.command,...(typeof item.aggregated_output === "string" ? {output:item.aggregated_output} : {}),
+              ...(exitKnown ? {exitCode:item.exit_code} : {}),...(typeof item.status === "string" ? {status:item.status} : {})}} as StreamEvent);
+        }
+        return;
+      }
+      if (type !== "item.completed") return;
       if (item?.type === "agent_message" && typeof item.text === "string") {
         addText(item.text);
         emit({ type: "message", sessionId: this.sessionId, turnId, seq: 0, at: now, role: "assistant", text: item.text, delta: true } as StreamEvent);
-      } else if (item?.type === "command_execution") {
-        emit({ type: "tool_call", sessionId: this.sessionId, turnId, seq: 0, at: now, toolName: "command_execution", args: { command: item.command } } as StreamEvent);
       }
     }
     // turn.completed 由 close 收尾
   }
 
   async interrupt(): Promise<void> {
+    this.peerAbort?.abort();
     if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
-  async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
+  async observeNativeStop(turnId:string){return this.lastNative?.turnId===turnId&&this.lastNative.supervisor.hasStopped()?"process_tree_exit" as const:undefined;}
+  async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model;this.contextNotBefore=Date.now();return {}; }
+  async describe() {
+    const threadID=this.threadId,model=this.model,notBefore=this.contextNotBefore,home=this.env.codexHome??join(homedir(),".codex");
+    const file=threadID?await resolveCodexContextFile(home,threadID):undefined;
+    const value=file&&threadID?await readCodexContext(file,{home,cwd:this.cwd,threadID,model,notBefore}):{};
+    return this.threadId===threadID&&this.model===model&&this.contextNotBefore===notBefore?value:{};
+  }
   async inject(context: ContextItem[]): Promise<void> {
     for (const c of context) this.pendingInject.push(`[${c.role}] ${c.content}`);
   }
@@ -304,12 +466,14 @@ class CodexSession implements AdapterSession {
   async compressCustom(strategy = "dropToolIO", options?: { keepRecentToolCalls?: number }): Promise<{ summary?: string; filesChanged?: number; recordsChanged?: number; blocksRemoved?: number; bytesBefore?: number; bytesAfter?: number; backups?: string[] }> {
     if (strategy !== "dropToolIO") throw new Error(`unsupported custom compression strategy: ${strategy}`);
     if (!this.threadId) throw new Error("Codex session has no thread_id yet (no turn run); nothing to compress");
-    const file = resolveCodexSessionFile(this.threadId);
+    const file = resolveCodexSessionFile(this.threadId,this.env.codexHome);
     if (!file) throw new Error(`Codex rollout file not found for thread ${this.threadId}`);
-    const r = await dropToolIOFromJsonlFiles([file], options);
+    const r = await dropToolIOFromJsonlFiles([file], {...options,invalidateCodexTokenUsage:true});
     return { summary: `dropToolIO removed ${r.blocksRemoved} tool records from Codex rollout`, ...r };
   }
 
+  recoveryCheckpoint() { return this.threadId ? {threadId:this.threadId, nativeHome:realpathSync(this.env.codexHome ?? join(homedir(),".codex")), pendingInject:[...this.pendingInject],...(this.contextNotBefore!==undefined?{contextNotBefore:this.contextNotBefore}:{})} : undefined; }
+  compressionModes(){return {native:false,custom:!this.current&&!!this.threadId&&!!resolveCodexSessionFile(this.threadId,this.env.codexHome)};}
   async terminate(): Promise<void> { await this.interrupt(); }
 }
 
@@ -320,13 +484,13 @@ export class CodexAdapter implements AgentAdapter {
   private modelCatalog?: { baseUrl: string; models: ModelInfo[] };
 
   constructor(opts: { env: CodexEnv }) {
-    this.env = opts.env;
+    this.env = {...opts.env, codexHome:opts.env.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex")};
   }
 
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
-    const models = await this.discoverModels(signal);
+    const models = await this.discoverModels(signal, available);
     return [{
       agentId: "codex" as AgentDescriptor["agentId"],
       displayName: "Codex",
@@ -341,13 +505,49 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
-    return new CodexSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
+    if (params.reattach) throw new PhononError("errSessionBusy", "Codex recovery requires a verified native checkpoint");
+    return new CodexSession(params.sessionId,params.model,params.cwd,this.env,params.initialContext);
   }
 
-  private async discoverModels(signal?: AbortSignal): Promise<ModelInfo[]> {
-    if (this.env.models?.length) return this.env.models;
-    const cfg = parseCodexConfig();
-    const baseUrl = this.env.baseUrl ?? cfg.baseUrl;
+  async recoverSession(params: CreateSessionParams, checkpoint: Record<string, unknown>): Promise<AdapterSession> {
+    const saved = z.object({threadId:z.string().uuid(), nativeHome:z.string().min(1), pendingInject:z.array(z.string()).max(256),contextNotBefore:z.number().int().nonnegative().safe().optional()}).strict().safeParse(checkpoint);
+    if (!saved.success || params.employee) throw new PhononError("errSessionBusy", "Codex native recovery checkpoint is invalid");
+    let fd:number | undefined;
+    try {
+      if (realpathSync(this.env.codexHome!) !== saved.data.nativeHome) throw new Error("native storage identity changed");
+      const file = resolveCodexSessionFile(saved.data.threadId, this.env.codexHome);
+      if (!file) throw new Error("original native Session is missing");
+      fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+      if (!fstatSync(fd).isFile()) throw new Error("not a native session file");
+      const bytes = Buffer.alloc(65536), count = readSync(fd, bytes, 0, bytes.length, 0);
+      const end = bytes.subarray(0, count).indexOf(10);
+      if (end < 0) throw new Error("native metadata is incomplete");
+      const meta = z.object({type:z.literal("session_meta"),payload:z.object({id:z.string().uuid(),cwd:z.string().min(1)})}).parse(JSON.parse(bytes.subarray(0,end).toString("utf8")));
+      if (meta.payload.id !== saved.data.threadId || realpathSync(meta.payload.cwd) !== realpathSync(params.cwd)) throw new Error("native identity changed");
+    } catch {
+      throw new PhononError("errSessionBusy", "Codex native Session identity could not be verified");
+    } finally { if (fd !== undefined) closeSync(fd); }
+    return new CodexSession(params.sessionId,params.model,params.cwd,this.env,undefined,saved.data);
+  }
+
+  private async discoverModels(signal?: AbortSignal, available = true): Promise<ModelInfo[]> {
+    const cfg = parseCodexConfig(join(this.env.codexHome!, "config.toml"));
+    const baseUrl = this.env.baseUrl && this.env.apiKey ? this.env.baseUrl : cfg.baseUrl;
+    let native: ModelInfo[] = [];
+    // Use the same native provider arguments, HOME and credentials as real turns. A generic
+    // compatible /models response often has IDs only; it must not erase native effort metadata.
+    if (available && !(this.env.models?.length && this.env.models.every(model => model.reasoningLevels !== undefined))) {
+      try {
+        native = await discoverCodexNativeModels({ bin: this.env.binPath ?? "codex", args: codexProviderArgs(this.env),
+          env: codexNativeEnvironment(this.env), ...(signal ? { signal } : {}) });
+      } catch { signal?.throwIfAborted(); }
+    }
+    const enrich = (models: ModelInfo[]) => models.map(model => {
+      const nativeID = model.id === "default" ? cfg.model : model.id;
+      const levels = native.find(row => row.id === nativeID)?.reasoningLevels;
+      return model.reasoningLevels !== undefined || levels === undefined ? model : { ...model, reasoningLevels: levels };
+    });
+    if (this.env.models?.length) return enrich(this.env.models);
     if (baseUrl) {
       let models: ModelInfo[] = [];
       try {
@@ -362,14 +562,32 @@ export class CodexAdapter implements AgentAdapter {
       if (models.length > 0) {
         const configured = this.env.defaultModel !== "default" ? this.env.defaultModel : cfg.model;
         const preferred = configured && models.find((model) => model.id === configured);
-        return preferred ? [preferred, ...models.filter((model) => model.id !== configured)] : models;
+        return enrich(preferred ? [preferred, ...models.filter((model) => model.id !== configured)] : models);
       }
     }
     const configured = this.env.defaultModel !== "default" ? this.env.defaultModel : cfg.model;
+    if (native.length) {
+      const preferred = native.find(model => model.id === configured);
+      return preferred ? [preferred, ...native.filter(model => model.id !== configured)]
+        : configured ? [{ id: configured, available: true }, ...native] : native;
+    }
     const base = configured ? [{ id: configured, available: true }] : [];
     const seen = new Set(base.map((m) => m.id));
     for (const m of CODEX_FALLBACK_MODELS) if (!seen.has(m.id)) base.push(m);
-    return base.length > 0 ? base : CODEX_FALLBACK_MODELS;
+    const result:ModelInfo[]=base.length > 0 ? base : CODEX_FALLBACK_MODELS;
+    if(!baseUrl&&(!cfg.providerId||cfg.providerId==="openai")){
+      try{
+        const file=join(this.env.codexHome!,"models_cache.json");
+        if(statSync(file).size>2000000)return result;
+        const cache=JSON.parse(readFileSync(file,"utf8"));
+        if(Array.isArray(cache.models))return result.map(model=>{
+          const native=cache.models.find((row:{slug?:string})=>row.slug===model.id);
+          const levels=reportedReasoningLevels(native?.supported_reasoning_levels);
+          return {...model,...(levels?{reasoningLevels:levels}:{})};
+        });
+      }catch{ /* Missing native metadata leaves reasoning support unknown. */ }
+    }
+    return result;
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {

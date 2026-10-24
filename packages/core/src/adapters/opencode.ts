@@ -1,4 +1,5 @@
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { PhononError } from "../rpc.js";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
 import { DatabaseSync } from "node:sqlite";
@@ -7,6 +8,8 @@ import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
+import { openCodePure, prepareOpenCodePeerContext } from "./opencode-peer-context.js";
+import {parseOpenCodeNativeModels} from "./opencode-models.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -14,7 +17,7 @@ import type {
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
-import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } from "@agent-phonon/protocol";
+import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem,ModelInfo,ReasoningLevel } from "@agent-phonon/protocol";
 
 /**
  * OpenCode adapter（design D10，单 agent runtime）。
@@ -30,6 +33,7 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } fro
 const CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // -s <sessionID> / -c continue
   nativeCompression: false,
+  customCompression: true,
   contextInjection: true,
   proactiveOutput: false,
   modelSwitch: true, // -m
@@ -74,9 +78,21 @@ class OpenCodeSession implements AdapterSession {
   private bin: string;
   private ocSessionId?: string; // OpenCode ses_ id（从事件抓，供 -s resume）
   private current?: ProcessSupervisor;
+  private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   private pendingInject: string[] = [];
+  private peerSupported = false;
+  private peerNativeSession?: string;
 
-  constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[]) {
+  async qualifyPeerContext(): Promise<void> {
+    try { this.peerSupported = (await discoveryProbe(this.bin, ["--version"]))?.trim() === "1.14.20"; }
+    catch { this.peerSupported = false; }
+  }
+  peerContextCapability(environment?: Record<string,string>) {
+    return this.peerSupported && !openCodePure(environment) ? {mode:"context_hook",boundary:"before_model",visibility:"hidden",
+      evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.peerNativeSession} as const : undefined;
+  }
+
+  constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[],private readonly variants=new Map<string,Map<ReasoningLevel,string>>(),private readonly defaultVariantModel?:string) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
@@ -99,18 +115,30 @@ class OpenCodeSession implements AdapterSession {
     const args = ["run", "--format", "json"];
     if (this.model) args.push("--model", this.model);
     if (this.ocSessionId) args.push("--session", this.ocSessionId); // 持续会话
+    const variant=opts.reasoning?.level?this.variants.get(this.model||this.defaultVariantModel||"")?.get(opts.reasoning.level):undefined;
+    if(variant)args.push("--variant",variant);
     args.push(message); // prompt 作为位置参数放最后
 
     await this.run(args, turnId, emit, opts);
   }
 
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
-    return new Promise((resolve) => {
+    this.peerNativeSession = undefined;
+    const peer = this.peerSupported?prepareOpenCodePeerContext(opts, this.ocSessionId,args.at(-1)):undefined;
+    let owned:ProcessSupervisor|undefined;
+    return new Promise<void>((resolve) => {
       // 关键：stdin 设 ignore(=DEVNULL)，否则 OpenCode 检测到 stdin pipe 会等交互输入卡死
       // shell:win32 — bin 回退为 PATH 上的 `opencode`（.cmd shim），Node 22 不带 shell spawn .cmd 会抛 EINVAL（与其它 adapter 一致）。
-      const supervisor = spawnSupervisedAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: buildChildProcessEnvironment(opts.environment) });
+      const environment = buildChildProcessEnvironment(opts.environment);
+      // OpenCode also consults PWD; it must not retain the daemon's project directory.
+      environment.PWD = this.cwd;
+      if (peer) Object.assign(environment, peer.environment);
+      else { environment.AGENT_PHONON_PEER_CONTEXT_URL="";environment.AGENT_PHONON_PEER_CONTEXT_TOKEN=""; }
+      const supervisor = spawnSupervisedAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: environment });
+      owned=supervisor;
       const child = supervisor.child;
       this.current = supervisor;
+      this.lastNative={turnId,supervisor};
       const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
       child.once("close", releaseCurrent);
       child.once("error", releaseCurrent);
@@ -120,12 +148,28 @@ class OpenCodeSession implements AdapterSession {
       let nativeError = "";
       let sawCompletion = false;
       const tools = new Map<string, { called: boolean; finished: boolean }>();
-      child.stderr.on("data", (d) => { stderr = (stderr + String(d)).slice(-16000); });
+      let stderrLines = "";
+      child.stderr.on("data", (d) => {
+        stderr = (stderr + String(d)).slice(-16000);
+        if (!peer) return;
+        stderrLines += String(d);
+        let nl: number;
+        while ((nl = stderrLines.indexOf("\n")) >= 0) {
+          const line = stderrLines.slice(0,nl);stderrLines=stderrLines.slice(nl+1);
+          const prefix = "PHONON_OPENCODE_PEER_READY_"+peer.nonce+":";
+          if (line.startsWith(prefix)) {
+            const sid=line.slice(prefix.length);
+            if (/^ses_[A-Za-z0-9]+$/.test(sid) && sid.length<=512 && (!this.ocSessionId || this.ocSessionId===sid) && !this.peerNativeSession) this.peerNativeSession=sid;
+          }
+        }
+        stderrLines=stderrLines.slice(-16000);
+      });
       let settled = false;
       const abort = (): void => { void supervisor.terminate(); finish("interrupted", acc); };
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
+        this.peerNativeSession = undefined;
         clearTimeout(guard);
         opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
@@ -164,10 +208,12 @@ class OpenCodeSession implements AdapterSession {
         if (settled) return;
         consume(buf);
         const failed = code !== 0 || !!nativeError || !sawCompletion || !acc.trim();
-        const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", []);
+        const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [opts.environment?.AGENT_PHONON_PEER_CONTEXT_TOKEN,opts.environment?.AGENT_PHONON_INTERACTION_TOKEN]);
         finish(failed ? "failed" : "completed", acc, failed ? `opencode exited ${code}: ${detail}` : undefined);
       });
-    });
+    }).finally(async()=>{if(owned&&!owned.hasStopped())await owned.terminate();const deadline=Date.now()+1000;
+      while(owned&&!owned.hasStopped()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+      if(owned&&!owned.hasStopped())throw new PhononError("errSessionBusy","OpenCode native process termination is unconfirmed; invocation assets retained");peer?.cleanup();});
   }
 
   /** 解析 OpenCode JSON 事件 → phonon StreamEvent。 */
@@ -191,6 +237,7 @@ class OpenCodeSession implements AdapterSession {
       const seen = tools.get(id) ?? { called: false, finished: false };
       tools.set(id, seen);
       const toolName = String(part?.tool ?? part?.name ?? "?");
+      if(toolName==="phonon_project_coordination")return;
       const terminal = ["completed", "error", "cancelled", "canceled"].includes(String(state.status));
       // Pending input may still be a partial buffer. Wait for running or final.
       if (!seen.called && (state.status === "running" || terminal)) {
@@ -213,6 +260,7 @@ class OpenCodeSession implements AdapterSession {
   async interrupt(): Promise<void> {
     if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
+  async observeNativeStop(turnId:string){return this.lastNative?.turnId===turnId&&this.lastNative.supervisor.hasStopped()?"process_tree_exit" as const:undefined;}
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
     for (const c of context) this.pendingInject.push(`[${c.role}] ${c.content}`);
@@ -244,14 +292,17 @@ class OpenCodeSession implements AdapterSession {
     return { summary: `dropToolIO removed ${r.blocksRemoved} tool parts from OpenCode session ${sid}`, ...r };
   }
 
+  compressionModes(){return {native:false,custom:!!this.ocSessionId&&existsSync(resolveOpenCodeDbPath())};}
   async terminate(): Promise<void> { await this.interrupt(); }
 }
 
 export class OpenCodeAdapter implements AgentAdapter {
   readonly name = "opencode";
-  readonly capabilities = CAPABILITIES;
+  readonly capabilities = {...CAPABILITIES,reasoningControl:false};
   private bin: string;
   private defaultModel?: string;
+  private variants=new Map<string,Map<ReasoningLevel,string>>();
+  private configuredModel?:string;
 
   constructor(opts: { env?: OpenCodeEnv } = {}) {
     this.bin = resolveBin(opts.env?.binPath);
@@ -261,6 +312,20 @@ export class OpenCodeAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    let models:ModelInfo[]=[];
+    this.capabilities.reasoningControl=false;
+    if(available)try{
+      const help=await discoveryProbe(this.bin,["run","--help"],signal);
+      this.capabilities.reasoningControl=/--variant\b/.test(help??"");
+      const output=await discoveryProbe(this.bin,["models","--pure","--verbose"],signal);
+      if(output){const catalog=parseOpenCodeNativeModels(output);models=catalog.models;this.variants=catalog.variants;}
+      const config=await discoveryProbe(this.bin,["debug","config","--pure"],signal);
+      const configured=config?JSON.parse(config).model:undefined;
+      this.configuredModel=typeof configured==="string"&&models.some(model=>model.id===configured)?configured:undefined;
+    }catch{/* Optional inventory never blocks the existing execution path. */}
+    const selected=this.defaultModel??"default",actual=selected==="default"?this.configuredModel:selected;
+    const alias:ModelInfo={id:selected,displayName:selected==="default"?"OpenCode default (from config)":selected,available:true,
+      ...(models.find(model=>model.id===actual)?.reasoningLevels?{reasoningLevels:models.find(model=>model.id===actual)!.reasoningLevels}:{})};
     return [{
       agentId: "opencode" as AgentDescriptor["agentId"],
       displayName: "OpenCode",
@@ -268,17 +333,19 @@ export class OpenCodeAdapter implements AgentAdapter {
       available,
       ...(available ? {} : { unavailableReason: "opencode CLI not found" }),
       ...(version ? { version } : {}),
-      models: this.defaultModel
-        ? [{ id: this.defaultModel, available: true }]
-        : [{ id: "default", displayName: "OpenCode default (from config)", available: true }],
-      capabilities: CAPABILITIES,
+      models: [alias,...models.filter(model=>model.id!==selected)],
+      capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
+    if (params.reattach) throw new PhononError("errSessionBusy", "OpenCode native recovery is not verified; refusing a replacement session");
     const model = params.model && params.model !== "default" ? params.model : (this.defaultModel ?? "");
-    return new OpenCodeSession(params.sessionId, model, params.cwd, this.bin, params.initialContext);
+    const variants=this.capabilities.reasoningControl?this.variants:undefined;
+    const session = new OpenCodeSession(params.sessionId, model, params.cwd, this.bin, params.initialContext,variants,this.configuredModel);
+    await session.qualifyPeerContext();
+    return session;
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {

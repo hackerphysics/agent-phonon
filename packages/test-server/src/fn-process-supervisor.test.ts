@@ -45,6 +45,7 @@ test("ProcessSupervisor signals the POSIX process group with grace then force", 
     { pid: 4242, signal: "SIGKILL" },
   ]);
   assert.deepEqual(child.killedSignals, [], "group signaling is preferred over killing only the direct child");
+  assert.equal(supervisor.hasStopped(),false,"a sent force signal is not tree-exit evidence");
 });
 
 test("ProcessSupervisor cancels force escalation when the tree exits during grace", async () => {
@@ -66,6 +67,7 @@ test("ProcessSupervisor cancels force escalation when the tree exits during grac
   assert.deepEqual(signals, ["SIGTERM"]);
   assert.equal(child.listenerCount("close"), 0);
   assert.equal(child.listenerCount("error"), 0);
+  assert.equal(supervisor.hasStopped(),true);
 });
 
 test("ProcessSupervisor does not treat a running child's error event as process-tree exit", async () => {
@@ -105,6 +107,7 @@ test("ProcessSupervisor keeps force escalation when leader exits but descendants
   child.close();
   await terminating;
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(supervisor.hasStopped(),false,"leader exit cannot confirm surviving descendants stopped");
 });
 
 test("ProcessSupervisor uses Windows tree termination and /F-equivalent escalation", async () => {
@@ -123,4 +126,5 @@ test("ProcessSupervisor uses Windows tree termination and /F-equivalent escalati
     { pid: 4242, force: false },
     { pid: 4242, force: true },
   ]);
+  assert.equal(supervisor.hasStopped(),false,"default Windows tree observation remains unconfirmed");
 });

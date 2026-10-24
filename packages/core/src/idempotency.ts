@@ -46,7 +46,7 @@ export class IdempotencyStore {
     if (!clientRequestId) return fn();
     this.gc();
     const k = this.key(tenantId, method, clientRequestId);
-    const fingerprint = request === undefined ? undefined : createHash("sha256").update(stableRequestJson(request)).digest("hex");
+    const fingerprint = request === undefined ? undefined : requestFingerprint(request);
     const mismatch = () => { throw new PhononError("errInvalidParams", "idempotency payload mismatch or unverifiable legacy identity"); };
     const existing = this.map.get(k);
     if (existing) {
@@ -86,6 +86,7 @@ export class IdempotencyStore {
 }
 
 /** Canonical parsed request; key order does not change retry identity. */
+export function requestFingerprint(value:unknown):string{return createHash("sha256").update(stableRequestJson(value)).digest("hex");}
 function stableRequestJson(value: unknown): string {
   if (value === undefined) return "null";
   if (value === null || typeof value !== "object") return JSON.stringify(value);

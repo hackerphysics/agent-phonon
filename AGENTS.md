@@ -39,3 +39,23 @@ Then follow `docs/COMMIT_RELEASE_CHECKLIST.md`.
 - Do not publish raw npm workspace packages; publish `pnpm pack` tarballs so `workspace:*` dependencies are rewritten.
 
 Treat this file as a hard project policy, not a suggestion.
+
+## Native Agent Runtime Scope
+
+The accepted 2026-10-24 user decision removes Herdr support and compatibility.
+Do not reintroduce its adapter, nested bindings, discovery, config aliases,
+plugin installers or fallback/session-migration paths. Maintain the native
+Claude Code, Codex, Copilot, Pi, Hermes, OpenCode and OpenClaw integrations.
+Research is not a compatibility commitment. See
+`docs/decisions/2026-10-24-native-agents-only.md` and
+`docs/research/herdr-agent-interaction.md`.
+
+## Message Delivery
+
+Reasoning settings are best-effort preferences. Missing/unsupported setting
+metadata or missing confirmation must not reject the original input or replace
+an actual native completion with failure. Do not replay a task to obtain setting
+proof. Confirm only actual native values; keep execution outcome, delivery and
+setting application separate. Owner/session/turn identity, permissions, required
+approvals and cancellation are not optional and must still be revalidated before
+effects after optional asynchronous work.

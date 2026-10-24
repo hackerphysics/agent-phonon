@@ -1,5 +1,8 @@
 import { z } from "zod";
+import { NativeStopProof } from "./native-stop.js";
 import { AgentId, ProjectId, SessionId, Timestamp } from "./common.js";
+import { TurnReasoning } from "./reasoning.js";
+import { SkillSelection } from "./skill.js";
 
 /**
  * L3 Orchestration Protocol (workflow.*)
@@ -37,6 +40,8 @@ export const WorkflowNode = z.object({
   nodeId: WorkflowNodeId,
   agent: AgentId,
   model: ModelId,
+  reasoning: TurnReasoning.optional(),
+  skills: z.array(SkillSelection).max(16).optional(),
   /** 该节点在 workflow 中扮演的角色（由调用方定义，phonon 仅回显）。 */
   role: WorkflowRoleId.optional(),
   input: z.string().optional(),
@@ -213,6 +218,8 @@ export type WorkflowSharedContext = z.infer<typeof WorkflowSharedContext>;
 export const WorkflowResumeFrom = z.object({
   /** 要恢复的 workflowId（必须先前 run 过，并有 checkpoint）。 */
   workflowId: WorkflowId,
+  /** Reject a fresh resume if the observed native event cursor has changed. */
+  expectedSeq:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   /**
    * 起点策略：
    * - "last_success_dependents" : 从最后成功节点的下游开始（DAG 默认）
@@ -342,7 +349,23 @@ export type WorkflowNodeRuntime = z.infer<typeof WorkflowNodeRuntime>;
 export const WorkflowStatusParams = z.object({ workflowId: WorkflowId });
 export type WorkflowStatusParams = z.infer<typeof WorkflowStatusParams>;
 
+export const WorkflowInputParams=z.object({workflowId:WorkflowId.max(512),nodeId:WorkflowNodeId.max(512),
+  sessionId:SessionId,turnId:TurnId.max(512),inputId:ClientRequestId.max(255),input:z.string().min(1).max(16000).refine(value=>!!value.trim())}).strict();
+export type WorkflowInputParams=z.infer<typeof WorkflowInputParams>;
+export const WorkflowInputStatusParams=z.object({workflowId:WorkflowId.max(512),inputId:ClientRequestId.max(255)}).strict();
+export type WorkflowInputStatusParams=z.infer<typeof WorkflowInputStatusParams>;
+export const WorkflowInputReceipt=z.object({workflowId:WorkflowId,nodeId:WorkflowNodeId,sessionId:SessionId,turnId:TurnId,
+  inputId:ClientRequestId,contentHash:z.string().regex(/^[a-f0-9]{64}$/),state:z.enum(['inserting','inserted','unknown']),
+  createdAt:Timestamp,updatedAt:Timestamp,errorCode:z.string().max(120).optional()}).strict();
+export type WorkflowInputReceipt=z.infer<typeof WorkflowInputReceipt>;
+export const WorkflowInputStatusResult=z.discriminatedUnion('found',[
+  z.object({found:z.literal(false),workflowId:WorkflowId,inputId:ClientRequestId}).strict(),
+  z.object({found:z.literal(true),receipt:WorkflowInputReceipt}).strict(),
+]);
+export type WorkflowInputStatusResult=z.infer<typeof WorkflowInputStatusResult>;
+
 export const WorkflowStatusResult = z.object({
+  nativeStop:NativeStopProof.optional(),
   dispatchKey: z.string().optional(),
   workflowId: WorkflowId,
   status: WorkflowStatus,
@@ -360,9 +383,42 @@ export const WorkflowStatusResult = z.object({
 });
 export type WorkflowStatusResult = z.infer<typeof WorkflowStatusResult>;
 
+const ResultVersion = z.string().regex(/^[a-f0-9]{64}$/);
+export const WorkflowResultParams = z.object({
+  workflowId: WorkflowId,
+  nodeId: WorkflowNodeId.optional(),
+  offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+  version: ResultVersion.optional(),
+  knownVersion: ResultVersion.optional(),
+}).strict();
+export type WorkflowResultParams = z.infer<typeof WorkflowResultParams>;
+export const WorkflowResultPage = z.object({
+  workflowId: WorkflowId,
+  project: ProjectId.optional(),
+  nodeId: WorkflowNodeId.optional(),
+  status: WorkflowStatus,
+  version: ResultVersion,
+  offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  end: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  totalLength: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  text: z.string().max(16000).optional(),
+  omitted: z.literal(true).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.end < value.offset || value.end > value.totalLength || value.end - value.offset > 16000
+    || value.end < value.totalLength && value.end === value.offset
+    || (value.omitted === true ? value.text !== undefined : value.text === undefined || value.text.length !== value.end - value.offset)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid workflow result page' });
+  }
+});
+export type WorkflowResultPage = z.infer<typeof WorkflowResultPage>;
+
 export const WorkflowCancelParams = z.object({ workflowId: WorkflowId, reason: z.string().optional() });
 export type WorkflowCancelParams = z.infer<typeof WorkflowCancelParams>;
-export const WorkflowCancelResult = z.object({ workflowId: WorkflowId, status: z.literal("cancelled") });
+export const WorkflowDispatchCancelParams=z.object({ dispatchKey:z.string().min(1).max(255),project:ProjectId,reason:z.string().max(1000).optional() });
+export type WorkflowDispatchCancelParams=z.infer<typeof WorkflowDispatchCancelParams>;
+export const WorkflowDispatchCancelResult=z.object({ dispatchKey:z.string(),workflowId:WorkflowId.optional(),status:WorkflowStatus,cancelledBeforeStart:z.boolean(),nativeStop:NativeStopProof.optional() });
+export type WorkflowDispatchCancelResult=z.infer<typeof WorkflowDispatchCancelResult>;
+export const WorkflowCancelResult = z.object({ workflowId: WorkflowId, status: WorkflowStatus,nativeStop:NativeStopProof.optional() });
 export type WorkflowCancelResult = z.infer<typeof WorkflowCancelResult>;
 
 export const WorkflowPauseParams = z.object({ workflowId: WorkflowId, reason: z.string().optional() });
@@ -393,6 +449,7 @@ export type WorkflowListResult = z.infer<typeof WorkflowListResult>;
 // ---------------------------------------------------------------------------
 
 export const WorkflowEvent = z.object({
+  nativeStop:NativeStopProof.optional(),
   workflowId: WorkflowId,
   seq: z.number().int().nonnegative(),
   type: z.enum([

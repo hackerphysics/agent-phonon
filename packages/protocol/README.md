@@ -16,7 +16,7 @@
 | **phonon → server** (`p2s`) | `connect.hello`、`discovery.changed`、`stream.event`、`hook.fired` |
 | **server → phonon** (`s2p`) | `discovery.list/get`、`session.*`、`hook.resolve` |
 
-## 方法一览（33 个）
+## 常用方法（完整注册表见 METHODS）
 
 ```
 connect.hello        握手：协议版本 + 设备身份 → 服务端回 tenant 绑定
@@ -28,6 +28,7 @@ session.inject       上下文注入
 session.compress     压缩双模 native | custom（D7）
 session.terminate    结束会话
 session.status/list   查会话（始终携带 agent 身份）
+session.recover       验证并接回原生会话，不发送任务；需 project/agent/model 原身份
 stream.event         phonon 上推流式结果（按 verbosity 分档）
 hook.fired           到 hook 点抛事件，阻塞等服务端裁决（HITL，design §8）
 hook.resolve         服务端裁决：continue | inject | modify | abort
@@ -68,3 +69,34 @@ pnpm json-schema   # 导出 dist/json-schema/*.json（供非 TS 服务端）
 ## 状态
 
 🚧 **v0.0.1 草案** — 协议仍在和需求方对齐中，字段可能调整。未发布。
+
+## Current-Turn Group Channel
+
+`conversation.message` adds strict `AgentMessageInput`, controller-stamped
+`ConversationMessageParams` and bounded `ConversationMessageResult` schemas.
+It never accepts model-owned sender/chat/owner routing. See
+[Native Group Messages](../../docs/NATIVE_GROUP_MESSAGES.md) for explicit DE
+mentions, server-enforced causal budgets, receipts and SDK handlers.
+
+## Durable Conversation Archive
+
+`conversation.archive.append/read/status/entities` are server-to-device requests for
+independent, append-only normalized history. `conversation_archive_v1` requires
+explicit local policy, a persistent store and configured service identity.
+Decimal cursors stay strings; frozen payload text is hash-bound and range reads
+pin an upper checkpoint. `conversation_archive_entities_v1` additionally exposes
+indexed complete entity versions in logical order at that pinned checkpoint;
+optional immutable entry catalogs are hash-bound, while legacy entry hashes
+remain unchanged. `conversation_archive_blobs_v1` adds immutable manifest-scoped
+`conversation.archive.blob.write/status/read`: 256 KiB wire chunks, binary SQLite
+storage, restart-safe resume and full SHA-256 verification before completion.
+This does not enable server retention cleanup. See [Conversation Archives](../../docs/CONVERSATION_ARCHIVE.md)
+for scope, hashes, limits, replay receipts and TypeScript/Python examples.
+
+## Managed MCP Registration
+
+`managed_mcp_v1` advertises typed s2p `mcp.configure` (revisioned full binding
+snapshot) and `mcp.status`. Remote commands, file paths, endpoints and secrets
+are not parameters. Device-local consent is required, conflicts are preserved,
+and configuration success is separate from actual tool use. See
+[Managed MCP](../../docs/MANAGED_MCP.md).

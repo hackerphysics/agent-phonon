@@ -5,8 +5,8 @@ import { ProjectId, Timestamp } from "./common.js";
  * 项目管理协议（design D23）。
  *
  * 一个项目 = 一个目录 + Git。所有 session 必须绑定一个项目（projectId）。
- * 项目是磁盘上的客观目录，**设备级共享、不受 tenant 隔离**——不同 tenant 都能看到/用
- * 同一项目，在其下各干各的；冲突风险用户自担。（隔离发生在会话/任务层，不在文件层。）
+ * 项目对应本机目录，但注册的 projectId 归属连接 namespace；其他 tenant 的标识及
+ * 未映射的旧记录不能自动借用。本机用户显式共享目录不等于 API 授予跨 namespace 权限。
  */
 
 /** 项目描述。 */
@@ -14,10 +14,13 @@ export const ProjectDescriptor = z.object({
   projectId: ProjectId,
   /** Creator connection namespace. Missing means an unmapped legacy record, not implicit ownership. */
   namespace: z.string().optional(),
+  /** Internal employee home, not a Registry project binding. */
+  employeeId:z.string().uuid().optional(),
   /** 展示名。 */
   name: z.string().min(1),
   /** 项目目录的绝对路径（设备本地）。 */
   path: z.string().min(1),
+  directoryIdentity:z.string().regex(/^dir:[a-f0-9]+:[a-f0-9]+$/).max(96).optional(),
   /** 是否已 git init。 */
   git: z.boolean().default(true),
   /** 当前分支（若有）。 */
@@ -42,13 +45,30 @@ export const ProjectCreateParams = z.object({
   git: z.boolean().default(true),
   /** 可选：初始化时设置的远端。 */
   remote: z.string().optional(),
-});
+  existingDirectoryIdentity:z.string().regex(/^dir:[a-f0-9]+:[a-f0-9]+$/).max(96).optional(),
+}).refine(value=>value.existingDirectoryIdentity===undefined||!!value.path&&value.git===false&&value.remote===undefined&&value.name.length<=120,"Existing directory registration needs a path, no Git initialization and a bounded name");
 export type ProjectCreateParams = z.infer<typeof ProjectCreateParams>;
 
 export const ProjectCreateResult = z.object({
   project: ProjectDescriptor,
 });
 export type ProjectCreateResult = z.infer<typeof ProjectCreateResult>;
+
+const provisionIdentity=z.string().regex(/^[pw]:[a-f0-9]+:[a-f0-9]+$/).max(80);
+export const ProjectProvisionParams=z.object({clientRequestId:z.string().uuid(),name:z.string().min(1).max(120),expectedReceiverID:z.string().uuid()}).strict();
+export type ProjectProvisionParams=z.infer<typeof ProjectProvisionParams>;
+export const ProjectProvisionStatusParams=ProjectProvisionParams.pick({clientRequestId:true,expectedReceiverID:true}).strict();
+export type ProjectProvisionStatusParams=z.infer<typeof ProjectProvisionStatusParams>;
+const provisionStatus={clientRequestId:z.string().uuid(),receiverID:z.string().uuid()};
+export const ProjectProvisionStatusResult=z.discriminatedUnion("state",[
+  z.object({...provisionStatus,state:z.literal("not_found"),found:z.literal(false),outcomeKnown:z.literal(false)}).strict(),
+  z.object({...provisionStatus,state:z.literal("prepared"),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(false)}).strict(),
+  z.object({...provisionStatus,state:z.enum(["dispatched","unknown"]),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(true)}).strict(),
+  z.object({...provisionStatus,state:z.literal("failed"),found:z.literal(true),outcomeKnown:z.literal(true),dispatchClaimed:z.literal(true),reasonCode:z.literal("creation_refused")}).strict(),
+  z.object({...provisionStatus,state:z.literal("confirmed"),found:z.literal(true),outcomeKnown:z.literal(true),dispatchClaimed:z.literal(true),
+    project:ProjectDescriptor,rootIdentity:provisionIdentity,workspaceIdentity:provisionIdentity}).strict(),
+]);
+export type ProjectProvisionStatusResult=z.infer<typeof ProjectProvisionStatusResult>;
 
 // --- project.list ---
 export const ProjectListParams = z.object({}).default({});

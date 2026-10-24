@@ -1,19 +1,31 @@
 import { parse as parseYaml } from "yaml";
 import { HERMES_BRIDGE } from "./hermes-bridge.js";
+import { HERMES_PROFILE_BRIDGE } from "./hermes-profile-bridge.js";
+import { hermesNativeToolEnvironment } from "./hermes-native-tools.js";
+import { hermesPeerContextEnvironment, hermesPeerContextSupported } from "./hermes-peer-context.js";
+import { hermesCommand, hermesBridgeInvocation } from "./hermes-command.js";
+import { NativeFileBroker } from "../native-file-broker.js";
+import { HermesCheckpoint,observeHermesSession,sameHermesSession,type HermesNativeObservation } from "./hermes-recovery.js";
+import { execFile } from "node:child_process";
+import { employeeDocuments } from "../employee-profiles.js";
+import { PhononError } from "../rpc.js";
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { join, dirname, delimiter, isAbsolute } from "node:path";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join, dirname, delimiter, isAbsolute, basename } from "node:path";
+import { existsSync, readFileSync, realpathSync, constants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
+import { nativeReasoning, reportedReasoningLevels } from "../reasoning.js";
 import type {
   AgentAdapter,
   AdapterSession,
   CreateSessionParams,
   SendOptions,
+  EmployeeProfileTarget,EmployeeProfileObservation,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
@@ -56,8 +68,11 @@ const HERMES_PROVIDER_FALLBACK_MODELS: Record<string, string[]> = {
 };
 
 const CAPABILITIES: AgentCapabilities = {
+  reasoningControl:true,
+  employeeProfiles:true,
   nativeSession: true, // --resume / --pass-session-id
   nativeCompression: false,
+  customCompression: true,
   contextInjection: true, // 拼进下轮 prompt
   proactiveOutput: false,
   modelSwitch: true, // -m 每轮可变
@@ -82,15 +97,15 @@ export function parseHermesConfig(configPath = join(process.env.HERMES_HOME || j
   return { defaultModel: str(typeof model === "string" ? model : model?.default ?? model?.model), provider: str(model?.provider), catalogUrl: str(cfg.model_catalog?.url) };
 }
 
+export function parseHermesReasoningLevels(help: string): ModelInfo["reasoningLevels"] {
+  const block = help.match(/^[ \t]*--reasoning[^\r\n]*(?:\r?\n(?![ \t]*-)[ \t]{6,}[^\r\n]*)*/m)?.[0];
+  const values = block?.match(/\b(?:low|medium|high|xhigh|max)\b/g);
+  return values?.length ? reportedReasoningLevels(values) : undefined;
+}
+
 /** Use the installed console script's own interpreter; never another Python's packages. */
 function bridgeCommand(bin: string): { python: string; entry: string } {
-  const entry = isAbsolute(bin) ? bin : (process.env.PATH ?? "").split(delimiter).map(p => join(p, bin)).find(p => existsSync(p));
-  if (!entry) throw new Error("Hermes CLI not found on daemon PATH; configure hermesBinPath");
-  const real = realpathSync(entry);
-  const shebang = readFileSync(real, "utf8").split("\n", 1)[0]?.trim() ?? "";
-  const python = shebang.match(/^#!(\/[^\r\n]+\/python[\d.]*)$/)?.[1];
-  if (!python || !existsSync(python)) throw new Error("Hermes structured bridge requires an installed Python console script (configure hermesBinPath); refusing unstructured success fallback");
-  return { python, entry: real };
+  return hermesCommand(bin);
 }
 
 function fetchHermesCatalogModels(url: string, provider?: string, signal?: AbortSignal): Promise<ModelInfo[]> {
@@ -139,6 +154,10 @@ export interface HermesEnv {
   provider?: string;
   /** 额外 toolsets。 */
   toolsets?: string;
+  /** Local operator opt-in; grants only newly created owned employee profiles. */
+  managedProfileNativeTools?: boolean;
+  /** Pinned, locally prepared runtime assets; never supplied by employee RPC. */
+  profileFileBrokerRoot?: string;
 }
 
 class HermesSession implements AdapterSession {
@@ -148,24 +167,48 @@ class HermesSession implements AdapterSession {
   private env: HermesEnv;
   private profile: string;
   private hermesSessionId?: string;
+  private profileHome?: string;
+  private expectedProfileHome?: string;
   private convName: string;
   private started = false;
   private current?: ProcessSupervisor;
+  private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   private pendingInject: string[] = [];
+  private nativeObservation?:HermesNativeObservation;
+  private employeeId?:string;
+  private peerSupported = false;
+  private peerNativeSession?: string;
 
-  constructor(sessionId: string, model: string, cwd: string, env: HermesEnv, profile: string, initialContext?: ContextItem[]) {
+  async qualifyPeerContext(): Promise<void> {
+    this.peerSupported = await hermesPeerContextSupported(this.env.binPath ?? "hermes");
+  }
+  peerContextCapability() {
+    return this.peerSupported ? {mode:"context_hook",boundary:"before_model",visibility:"hidden",evidence:"provider_payload",
+      budget:"native_estimate",nativeSessionId:this.peerNativeSession} as const : undefined;
+  }
+
+  constructor(sessionId: string, model: string, cwd: string, env: HermesEnv, profile: string, initialContext?: ContextItem[],profileHome?:string,recovered?:HermesCheckpoint,employee?:CreateSessionParams["employee"]) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.env = env;
     this.profile = profile;
+    this.profileHome=profileHome;this.expectedProfileHome=profileHome;
+    this.employeeId=employee?.employeeId;
     this.convName = `phonon-${sessionId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
     // contextInjection: 注入 initialContext（含 workflow systemPrompt）进首轮 message
     this.pendingInject.push(...formatInitialContextLines(initialContext));
+    if(recovered){this.hermesSessionId=recovered.native.sessionId;this.profileHome=recovered.native.nativeHome;this.expectedProfileHome=this.profileHome;
+      this.nativeObservation=recovered.native;this.pendingInject=[...recovered.pendingInject];this.started=true;}
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
     const { turnId, emit } = opts;
+    if(this.hermesSessionId){
+      const current=await observeHermesSession(this.env.binPath??"hermes",this.profile,this.hermesSessionId,this.cwd,this.env.profileFileBrokerRoot);
+      if(current.nativeHome!==this.profileHome||this.nativeObservation&&!sameHermesSession(this.nativeObservation,current))throw new PhononError("errSessionBusy","Hermes native Session changed before send");
+    }
+    this.nativeObservation=undefined;
     let prompt = input;
     if (this.pendingInject.length > 0) {
       prompt = this.pendingInject.join("\n") + "\n\n" + prompt;
@@ -179,6 +222,7 @@ class HermesSession implements AdapterSession {
     if (this.model) args.push("-m", this.model);
     if (this.env.provider) args.push("--provider", this.env.provider);
     if (this.env.toolsets) args.push("-t", this.env.toolsets);
+    if (opts.reasoning?.level) args.push("--reasoning",nativeReasoning(opts.reasoning.level)!);
     // Preserve native approval policy; do not auto-elevate tools.
     // Native chat creates the first session; resume only its observed real id.
     if (this.hermesSessionId) args.push("--resume", this.hermesSessionId);
@@ -188,6 +232,7 @@ class HermesSession implements AdapterSession {
   }
 
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
+    this.peerNativeSession = undefined;
     return new Promise((resolve) => {
       let command: ReturnType<typeof bridgeCommand>;
       try { command = bridgeCommand(this.env.binPath ?? "hermes"); }
@@ -195,14 +240,18 @@ class HermesSession implements AdapterSession {
         emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: adapterDiagnostic(String(e)), status: "failed", final: true } as StreamEvent);
         resolve(); return;
       }
-      const supervisor = spawnSupervisedAgent(command.python, ["-c", HERMES_BRIDGE, command.entry, ...args], {
+      const invocation=hermesBridgeInvocation(HERMES_BRIDGE,[command.entry,...args]);
+      const supervisor = spawnSupervisedAgent(command.python, invocation.args, {
         cwd: this.cwd,
-        env: buildChildProcessEnvironment(opts.environment),
+        env: {...buildChildProcessEnvironment(opts.environment),...hermesNativeToolEnvironment(opts),...hermesPeerContextEnvironment(opts),PHONON_REASONING_REQUEST:opts.reasoning?JSON.stringify({level:nativeReasoning(opts.reasoning.level)}):"",
+          PHONON_HERMES_EXPECTED_PROFILE_HOME:this.expectedProfileHome??"",
+          PHONON_HERMES_EXPECTED_SESSION:this.hermesSessionId?JSON.stringify({sessionId:this.hermesSessionId,home:this.profileHome,cwd:this.cwd}):""},
       });
       // No interactive input is required by native chat -Q -q.
-      supervisor.child.stdin.end();
+      supervisor.child.stdin.end(invocation.stdin);
       const child = supervisor.child;
       this.current = supervisor;
+      this.lastNative={turnId,supervisor};
       const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
       child.once("close", releaseCurrent);
       child.once("error", releaseCurrent);
@@ -219,6 +268,7 @@ class HermesSession implements AdapterSession {
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", text: string, message?: string) => {
         if (settled) return;
         settled = true;
+        this.peerNativeSession = undefined;
         clearTimeout(guard);
         opts.signal?.removeEventListener("abort", abort);
         if (status === "failed") {
@@ -241,7 +291,18 @@ class HermesSession implements AdapterSession {
         let ev: Record<string, any>;
         try { ev = JSON.parse(line); } catch { return; }
         const base = { sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString() };
-        if (ev.type === "hermes_result") {
+        if(ev.type==="hermes_runtime"){
+          try{
+            const home=typeof ev.profile_home==="string"&&isAbsolute(ev.profile_home)?realpathSync(ev.profile_home):undefined;
+            this.profileHome=home&&(!this.expectedProfileHome||realpathSync(this.expectedProfileHome)===home)?home:undefined;
+          }catch{this.profileHome=undefined;}
+        }else if (ev.type === "hermes_peer_ready" && opts.peerContext) {
+          if (typeof ev.native_session_id === "string" && ev.native_session_id.length > 0 && ev.native_session_id.length <= 512
+            && (!this.hermesSessionId || this.hermesSessionId === ev.native_session_id) && !this.peerNativeSession) this.peerNativeSession = ev.native_session_id;
+        }else if (ev.type === "hermes_reasoning" && opts.reasoning) {
+          try { opts.acknowledgeReasoning?.(ev.native_value); }
+          catch { /* Optional setting evidence must not stop the native conversation. */ }
+        }else if (ev.type === "hermes_result") {
           outcome = ev;
           out = typeof ev.final_response === "string" ? ev.final_response : "";
           if (typeof ev.session_id === "string") this.hermesSessionId = ev.session_id;
@@ -262,8 +323,8 @@ class HermesSession implements AdapterSession {
           if (!calls.has(id) || results.has(id)) return;
           results.add(id);
           let payload: any;
-          try { payload = JSON.parse(m.content); } catch { /* native text result */ }
-          emit({ ...base, type: "tool_result", toolName: calls.get(id)!, toolCallId: id, ok: !(payload?.error || payload?.success === false || m.is_error), output: m.content } as StreamEvent);
+          try { payload = typeof m.content === "string" ? JSON.parse(m.content) : m.content; } catch { /* native text result */ }
+          emit({ ...base, type: "tool_result", toolName: calls.get(id)!, toolCallId: id, ok: !(payload?.error || payload?.success === false || m.is_error || calls.get(id) === "terminal" && typeof payload?.exit_code === "number" && payload.exit_code !== 0), output: m.content } as StreamEvent);
         }
       };
       child.stdout.setEncoding("utf8");
@@ -280,8 +341,13 @@ class HermesSession implements AdapterSession {
         consume(buffer);
         if (outcome?.interrupted) { finish("interrupted", out.trim()); return; }
         const success = code === 0 && outcome?.completed === true && !outcome.failed && !outcome.partial && !outcome.error && !!out.trim();
-        const detail = adapterDiagnostic(String(outcome?.error || err || "Native CLI returned no successful structured completion/output"));
-        finish(success ? "completed" : "failed", out.trim(), success ? undefined : `hermes exited ${code}: ${detail}`);
+        const detail = adapterDiagnostic(String(outcome?.error || err || "Native CLI returned no successful structured completion/output"),[opts.environment?.AGENT_PHONON_INTERACTION_TOKEN]);
+        const finishObserved=()=>finish(success ? "completed" : "failed", out.trim(), success ? undefined : `hermes exited ${code}: ${detail}`);
+        if(success&&this.hermesSessionId&&this.profileHome){
+          void observeHermesSession(this.env.binPath??"hermes",this.profile,this.hermesSessionId,this.cwd,this.env.profileFileBrokerRoot).then(native=>{
+            if(!settled&&native.nativeHome===this.profileHome)this.nativeObservation=native;
+          }).catch(()=>{}).finally(finishObserved);
+        }else finishObserved();
       });
     });
   }
@@ -289,6 +355,7 @@ class HermesSession implements AdapterSession {
   async interrupt(): Promise<void> {
     if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
+  async observeNativeStop(turnId:string){return this.lastNative?.turnId===turnId&&this.lastNative.supervisor.hasStopped()?"process_tree_exit" as const:undefined;}
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
     for (const c of context) this.pendingInject.push(`[${c.role}] ${c.content}`);
@@ -303,11 +370,9 @@ class HermesSession implements AdapterSession {
    */
   async compressCustom(strategy = "dropToolIO", options?: { keepRecentToolCalls?: number }): Promise<{ summary?: string; filesChanged?: number; recordsChanged?: number; blocksRemoved?: number; bytesBefore?: number; bytesAfter?: number; backups?: string[] }> {
     if (strategy !== "dropToolIO") throw new Error(`unsupported custom compression strategy: ${strategy}`);
-    if (!this.started) throw new Error("Hermes session not started yet (no turn run); nothing to compress");
-    const dbPath = resolveHermesDbPath();
-    if (!existsSync(dbPath)) throw new Error(`Hermes state.db not found: ${dbPath}`);
-    const dbSessionId = this.hermesSessionId ?? resolveHermesSessionByTitle(dbPath, this.convName);
-    if (!dbSessionId) throw new Error(`Hermes session not found for title ${this.convName}`);
+    const target=this.compressionTarget();
+    if(!target)throw new PhononError("errCapabilityUnsupported","Hermes compression requires the verified native profile and Session id");
+    const {dbPath,sessionId:dbSessionId}=target;
     const r = await dropToolIORowsSqlite({
       dbPath,
       keepRecentToolCalls: options?.keepRecentToolCalls,
@@ -333,9 +398,23 @@ class HermesSession implements AdapterSession {
         }
       },
     });
+    this.nativeObservation=await observeHermesSession(this.env.binPath??"hermes",this.profile,dbSessionId,this.cwd,this.env.profileFileBrokerRoot).catch(()=>undefined);
     return { summary: `dropToolIO trimmed ${r.blocksRemoved} tool rows from Hermes session ${dbSessionId}`, ...r };
   }
 
+  private compressionTarget():{dbPath:string;sessionId:string}|undefined{
+    if(!this.started||!this.profileHome||!this.hermesSessionId)return;
+    const dbPath=join(this.profileHome,"state.db");if(!existsSync(dbPath))return;
+    try{
+      const db=new DatabaseSync(dbPath,{readOnly:true});
+      try{if(db.prepare("SELECT 1 FROM sessions WHERE id=?").get(this.hermesSessionId))return {dbPath,sessionId:this.hermesSessionId};}finally{db.close();}
+    }catch{return;}
+  }
+  compressionModes(){return {native:false,custom:!!this.compressionTarget()};}
+  recoveryCheckpoint():HermesCheckpoint|undefined{
+    if(!this.nativeObservation||this.lastNative&&!this.lastNative.supervisor.hasStopped())return;
+    return {phononSessionId:this.sessionId,model:this.model,native:this.nativeObservation,pendingInject:[...this.pendingInject],...(this.employeeId?{employeeId:this.employeeId}:{})};
+  }
   async terminate(): Promise<void> { await this.interrupt(); }
 }
 
@@ -365,19 +444,25 @@ export function resolveHermesSessionByTitle(dbPath: string, title: string): stri
 
 export class HermesAdapter implements AgentAdapter {
   readonly name = "hermes";
-  readonly capabilities = CAPABILITIES;
+  readonly capabilities:AgentCapabilities;
   private env: HermesEnv;
   private defaultProfile: string;
   private modelCatalog?: { key: string; models: ModelInfo[] };
 
   constructor(opts: { env?: HermesEnv; defaultProfile?: string } = {}) {
     this.env = opts.env ?? {};
+    if(this.env.profileFileBrokerRoot!==undefined&&(!isAbsolute(this.env.profileFileBrokerRoot)||this.env.profileFileBrokerRoot.includes("\0")))throw new PhononError("errInvalidParams","profileFileBrokerRoot must be an absolute local runtime path");
+    this.capabilities={...CAPABILITIES,employeeProfiles:process.platform!=="win32"};
+    if(this.env.managedProfileNativeTools!==undefined&&typeof this.env.managedProfileNativeTools!=="boolean")throw new PhononError("errInvalidParams","managedProfileNativeTools must be a boolean");
     this.defaultProfile = opts.defaultProfile ?? "default";
   }
 
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    if(available&&process.platform==="win32"){
+      try{await this.windowsProfileRuntime();}catch{signal?.throwIfAborted();}
+    }
     if (!available) {
       return [{
         agentId: "hermes" as AgentDescriptor["agentId"],
@@ -386,12 +471,14 @@ export class HermesAdapter implements AgentAdapter {
         available: false,
         unavailableReason: "hermes CLI not found",
         models: [],
-        capabilities: CAPABILITIES,
+        capabilities: this.capabilities,
         scannedAt: new Date().toISOString(),
       }];
     }
     // 枚举所有 profile = 多个 agent（D32，同 OpenClaw）
     const profiles = await this.listProfiles(signal);
+    const reasoningHelp = await discoveryProbe(this.env.binPath ?? "hermes",["chat","--help"],signal);
+    const reasoningLevels = reasoningHelp ? parseHermesReasoningLevels(reasoningHelp) : undefined;
     const cfg = parseHermesConfig();
     const provider = this.env.provider ?? cfg.provider;
     let catalogModels: ModelInfo[] = [];
@@ -416,8 +503,8 @@ export class HermesAdapter implements AgentAdapter {
       adapter: "hermes",
       available: true,
       ...(version ? { version } : {}),
-      models: this.modelsForProfile(p.model, [...catalogModels, ...providerFallbackModels], cfg.defaultModel),
-      capabilities: CAPABILITIES,
+      models: this.modelsForProfile(p.model, [...catalogModels, ...providerFallbackModels], cfg.defaultModel).map(model=>({...model,...(model.reasoningLevels===undefined&&reasoningLevels?{reasoningLevels:[...reasoningLevels]}:{})})),
+      capabilities: this.capabilities,
       scannedAt: now,
     }));
   }
@@ -433,10 +520,57 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
+    if(params.reattach)throw new PhononError("errSessionBusy","Hermes recovery requires a verified native checkpoint");
     // 从复合 agentId 解出 profile：hermes:default → default
-    const profile = params.agentId.includes(":") ? params.agentId.split(":")[1]! : this.defaultProfile;
+    const profile = params.employee?.runtimeProfile??(params.agentId.includes(":") ? params.agentId.split(":")[1]! : this.defaultProfile);
     const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "");
-    return new HermesSession(params.sessionId, model, params.cwd, this.env, profile, params.initialContext);
+    const session = new HermesSession(params.sessionId, model, params.cwd, this.env, profile, params.initialContext,params.employee?.home,undefined,params.employee);
+    await session.qualifyPeerContext();
+    return session;
+  }
+  async recoverSession(params:CreateSessionParams,checkpoint:Record<string,unknown>):Promise<AdapterSession>{
+    const saved=HermesCheckpoint.safeParse(checkpoint);
+    if(!saved.success)throw new PhononError("errSessionBusy","Hermes native recovery checkpoint is invalid");
+    const profile=params.employee?.runtimeProfile??(params.agentId.includes(":")?params.agentId.split(":")[1]!:this.defaultProfile);
+    const model=params.model&&params.model!=="default"?params.model:(this.env.defaultModel??"");
+    if(saved.data.phononSessionId!==params.sessionId||saved.data.model!==model||saved.data.native.profile!==profile||saved.data.employeeId!==params.employee?.employeeId||params.employee&&realpathSync(params.employee.home)!==saved.data.native.nativeHome)throw new PhononError("errSessionBusy","Hermes employee recovery identity changed");
+    const current=await observeHermesSession(this.env.binPath??"hermes",profile,saved.data.native.sessionId,params.cwd,this.env.profileFileBrokerRoot);
+    if(!sameHermesSession(saved.data.native,current))throw new PhononError("errSessionBusy","Hermes native recovery identity changed");
+    const session = new HermesSession(params.sessionId,model,params.cwd,this.env,profile,undefined,current.nativeHome,{...saved.data,native:current},params.employee);
+    await session.qualifyPeerContext();
+    return session;
+  }
+  provisionEmployee(target:EmployeeProfileTarget){return this.employeeOperation("apply",target);}
+  inspectEmployee(target:EmployeeProfileTarget){return this.employeeOperation("inspect",target);}
+  private async windowsProfileRuntime():Promise<string>{
+    this.capabilities.employeeProfiles=false;
+    if(!this.env.profileFileBrokerRoot)throw new PhononError("employee_profile_platform_unsupported","Windows profiles require prepared native file runtime assets");
+    const executable=await new NativeFileBroker(this.env.profileFileBrokerRoot).verifiedExecutable();
+    this.capabilities.employeeProfiles=true;return executable;
+  }
+  private async verifyManagedToolOwner(target:EmployeeProfileTarget):Promise<void>{
+    if(!/^phn-[a-f0-9]{40}$/.test(target.runtimeProfile)||!isAbsolute(target.workspace)||basename(target.workspace)!==target.input.employeeId||typeof process.getuid!=="function")throw new PhononError("employee_profile_owner_conflict");
+    const directory=await lstat(target.workspace);
+    if(!directory.isDirectory()||directory.isSymbolicLink()||await realpath(target.workspace)!==target.workspace||directory.uid!==process.getuid()||(directory.mode&0o022)!==0)throw new PhononError("employee_profile_owner_conflict");
+    const marker=await open(join(target.workspace,".phonon-employee"),constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try{const stat=await marker.stat();if(!stat.isFile()||stat.nlink!==1||stat.uid!==process.getuid()||(stat.mode&0o022)!==0||stat.size>256||await marker.readFile("utf8")!==target.nonce)throw new PhononError("employee_profile_owner_conflict");}finally{await marker.close();}
+  }
+  private async employeeOperation(operation:string,target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>{
+    const managedProfileNativeTools=this.env.managedProfileNativeTools===true&&operation==="apply"&&!target.previousHashes;
+    if(managedProfileNativeTools&&process.platform!=="win32")await this.verifyManagedToolOwner(target);
+    const command=hermesCommand(this.env.binPath??"hermes");
+    let broker:string|undefined;
+    if(process.platform==="win32")broker=await this.windowsProfileRuntime();
+    return new Promise((resolve,reject)=>{
+      const payload=JSON.stringify({operation,employeeId:target.input.employeeId,nonce:target.nonce,runtimeProfile:target.runtimeProfile,
+        base:target.input.agent.includes(":")?target.input.agent.split(":")[1]:this.defaultProfile,model:target.input.model,provider:this.env.provider,documents:employeeDocuments(target.input),previousHashes:target.previousHashes,previousIdentity:target.previousNativeIdentity,managedProfileNativeTools,workspace:target.workspace,workspaceIdentity:target.workspaceIdentity});
+      const invocation=hermesBridgeInvocation(HERMES_PROFILE_BRIDGE,[command.entry,...(broker?[broker]:[])],payload);
+      const child=execFile(command.python,invocation.args,{timeout:20000,maxBuffer:1048576,env:process.env},(error,stdout)=>{
+        if(error){reject(new PhononError("employee_profile_native_failure","Hermes profile operation failed"));return;}
+        try{const reply=JSON.parse(stdout);if(!reply.ok)throw new PhononError(String(reply.error),"Hermes profile operation refused");resolve(reply.result);}catch(error){reject(error);}
+      });
+      child.stdin?.end(invocation.stdin);
+    });
   }
 
   /** 枚举 Hermes profile（去 ANSI 色解析 profile list）。 */
@@ -455,6 +589,13 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {
+    // The installed --version performs a synchronous remote update check on a cold home.
+    // Read the same installed package version without starting that network operation.
+    try{
+      const command=hermesCommand(this.env.binPath??"hermes");
+      const version=await discoveryProbe(command.python,["-c","import hermes_cli; print('Hermes Agent v' + hermes_cli.__version__)"],signal);
+      if(version)return version.split("\n")[0]??null;
+    }catch{signal?.throwIfAborted();}
     return (await discoveryProbe(this.env.binPath ?? "hermes", ["--version"], signal))?.split("\n")[0] ?? null;
   }
 }

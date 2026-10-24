@@ -47,6 +47,16 @@ export const DocumentDirective = z.object({
 });
 export type DocumentDirective = z.infer<typeof DocumentDirective>;
 
+export const NativeDocumentInput = z.object({
+  requestId: z.string().uuid().transform(value => value.toLowerCase()),
+  path: z.string().min(1).max(4096).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").includes("..")),
+  name: z.string().min(1).max(240).refine(value => value !== "." && value !== ".." && !/[\\/\x00-\x1f\x7f]/.test(value)).optional(),
+  mimeType: z.string().max(120).regex(/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/).optional(),
+  caption: z.string().max(2000).optional(),
+}).strict();
+export type NativeDocumentInput = z.infer<typeof NativeDocumentInput>;
+export const NATIVE_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024;
+
 /** 单个文档的线上描述（phonon 读完本地文件后封装）。 */
 export const DocumentDescriptor = z.object({
   name: z.string().min(1),
@@ -64,6 +74,9 @@ export type DocumentDescriptor = z.infer<typeof DocumentDescriptor>;
 
 // --- document.send（phonon → server）---
 export const DocumentSendParams = z.object({
+  nativeRunId: z.string().uuid().optional(),
+  workflowId: z.string().min(1).max(512).optional(),
+  requestId: z.string().uuid().optional(),
   /** 关联会话（通常有；纯设备级发送可省）。 */
   sessionId: SessionId.optional(),
   /** 关联轮次（若在某轮对话内触发）。 */

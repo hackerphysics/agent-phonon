@@ -1,12 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AdapterRegistry, PhononClient } from "@agent-phonon/core";
 import { PhononServer } from "@agent-phonon/server-sdk";
 import type { PhononDevice } from "@agent-phonon/server-sdk";
 import { MockAdapter } from "./harness.js";
+import {PeerFixture} from "../../core/dist/testing/peer-fixture.js";
 
 /**
  * L4 scheduling e2e —— 通过真实 WS + server SDK 驱动真实 phonon。
@@ -14,10 +13,9 @@ import { MockAdapter } from "./harness.js";
  * 端到端打通，并验证 SDK 自动 ack。
  */
 
-function spawnPhonon(serverUrl: string, deviceId: string, reply?: (i: string) => string) {
+function spawnPhonon(serverUrl: string, deviceId: string, cwd:string, reply?: (i: string) => string) {
   const reg = new AdapterRegistry();
   reg.register(new MockAdapter({ name: "mock", agentIds: ["mock:default"], models: ["m1"], reply: reply ?? ((i) => `ok:${i}`) }));
-  const cwd = mkdtempSync(join(tmpdir(), `phonon-l4-e2e-${deviceId}-`));
   const dbPath = join(cwd, "db.sqlite");
   return {
     client: new PhononClient({ serverUrl, deviceId, registry: reg, trustLocal: true, workspaceRoot: cwd, dbPath }),
@@ -26,16 +24,18 @@ function spawnPhonon(serverUrl: string, deviceId: string, reply?: (i: string) =>
 }
 
 async function makeFixture(reply?: (i: string) => string): Promise<{ server: PhononServer; device: PhononDevice; cleanup: () => Promise<void> }> {
+  const scope=new PeerFixture("sdk-scheduler-e2e");
   const server = new PhononServer({ authenticate: (id) => ({ tenantId: `t-${id}` }) });
-  const port = await server.listen();
-  const deviceReady = new Promise<PhononDevice>((resolve) => server.on("device", (d: PhononDevice) => resolve(d)));
-  const { client } = spawnPhonon(`ws://127.0.0.1:${port}`, `dev-${Math.random().toString(36).slice(2, 8)}`, reply);
-  await client.connect();
-  const device = await deviceReady;
-  return {
-    server, device,
-    cleanup: async () => { try { client.close(); } catch {} try { await server.close(); } catch {} },
-  };
+  let client:PhononClient|undefined;
+  scope.defer(async()=>{try{await client?.close();}finally{await server.close();}});
+  try{
+    const port = await server.listen();
+    const deviceReady = new Promise<PhononDevice>((resolve) => server.on("device", (d: PhononDevice) => resolve(d)));
+    client = spawnPhonon(`ws://127.0.0.1:${port}`, `dev-${Math.random().toString(36).slice(2, 8)}`, scope.root,reply).client;
+    await client.connect();
+    const device = await deviceReady;
+    return {server,device,cleanup:()=>scope.dispose()};
+  }catch(error){await scope.dispose();throw error;}
 }
 
 async function waitRun(device: PhononDevice, runId: string, timeoutMs = 10000): Promise<Record<string, unknown>> {

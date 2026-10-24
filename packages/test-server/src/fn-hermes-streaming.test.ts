@@ -42,15 +42,11 @@ test("hermes bridge handles both positional and keyword stream_callback forms", 
   assert.match(HERMES_BRIDGE, /kwargs\["stream_callback"\] = chained/, "must inject when absent");
 });
 
-test("hermes bridge still buffers tool messages until the run completes", () => {
-  // Tool events come from the post-run result scan, not the delta callback.
-  // This is the nuance the rescue knowledge records.
-  const deltaAt = HERMES_BRIDGE.indexOf("hermes_text_delta");
-  const toolAt = HERMES_BRIDGE.indexOf("hermes_tool_call");
+test("hermes bridge installs stable-ID tool callbacks before native execution and reconciles afterward", () => {
+  const callbackAt = HERMES_BRIDGE.indexOf("self.tool_start_callback, self.tool_complete_callback = started, completed");
   const runAt = HERMES_BRIDGE.indexOf("result = native_run");
-  assert.ok(deltaAt > 0 && toolAt > 0 && runAt > 0);
-  assert.ok(deltaAt < runAt, "text delta is emitted during the run");
-  assert.ok(toolAt > runAt, "tool call is only emitted after the run returns");
+  assert.ok(callbackAt > 0 && callbackAt < runAt);
+  assert.ok(HERMES_BRIDGE.indexOf('for m in result.get("messages", [])') > runAt);
 });
 
 test("hermes adapter now advertises streaming", () => {

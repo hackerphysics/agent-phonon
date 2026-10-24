@@ -235,6 +235,13 @@ test("skill.install global vs project scope (D24)", () => {
   assert.equal(ok.projectId, "proj1");
 });
 
+test("skill mutation schemas retain exact optional retry identities",()=>{
+  const nonce="original\u0000identity";
+  assert.equal(parseParams("skill.install",{clientRequestId:nonce,agent:"mock:default",name:"fixed",scope:"project",projectId:"owned",
+    source:{kind:"inline",files:{"SKILL.md":"Fixed bytes"}}}).clientRequestId,nonce);
+  assert.equal(parseParams("skill.uninstall",{clientRequestId:nonce,agent:"mock:default",name:"fixed",scope:"project",projectId:"owned"}).clientRequestId,nonce);
+});
+
 test("worktree create from branch (D25)", () => {
   const p = parseParams("project.worktree.create", {
     projectId: "proj1", baseBranch: "main", newBranch: "feat/x",

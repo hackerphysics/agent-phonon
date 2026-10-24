@@ -14,6 +14,14 @@ import { AgentId, ProjectId, Timestamp } from "./common.js";
 export const SkillScope = z.enum(["global", "project"]);
 export type SkillScope = z.infer<typeof SkillScope>;
 
+const skillName = z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/).refine(value => value !== "." && value !== "..");
+export const SkillSelection = z.union([
+  skillName,
+  z.object({name:skillName,version:z.string().min(1).max(128).refine(value=>!/[\p{Cc}]/u.test(value)).optional(),scope:SkillScope.optional(),force:z.boolean().optional(),
+    revision:z.string().regex(/^[a-f0-9]{64}$/).optional(),installationId:z.string().uuid().optional()}).strict(),
+]);
+export type SkillSelection = z.infer<typeof SkillSelection>;
+
 /** skill 来源：内联内容、本地路径、或远端引用。 */
 export const SkillSource = z.union([
   z.object({ kind: z.literal("inline"), files: z.record(z.string()) }), // path → content
@@ -57,12 +65,16 @@ export const SkillDescriptor = z.object({
   /** 安装落地路径（设备本地）。 */
   installedPath: z.string().optional(),
   installedAt: Timestamp.optional(),
+  revision:z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  publication:z.object({kind:z.literal("immutable"),versionId:z.string().uuid(),treeHash:z.string().regex(/^[a-f0-9]{64}$/)}).strict().optional(),
 });
 export type SkillDescriptor = z.infer<typeof SkillDescriptor>;
 
 // --- skill.install ---
 export const SkillInstallParams = z
   .object({
+    /** Exact parsed request identity; changed payloads cannot reuse a confirmed receipt. */
+    clientRequestId: z.string().min(1).max(512).optional(),
     /** 目标 agent。 */
     agent: AgentId,
     name: z.string().min(1),
@@ -82,9 +94,47 @@ export const SkillInstallResult = z.object({
 });
 export type SkillInstallResult = z.infer<typeof SkillInstallResult>;
 
+export const SkillPublishParams=z.object({clientRequestId:z.string().min(1).max(512),agent:AgentId,name:skillName,scope:z.literal("project").default("project"),projectId:ProjectId,
+  baseRevision:z.string().regex(/^[a-f0-9]{64}$/).nullable(),expectedReceiverID:z.string().uuid().optional(),source:z.union([SkillSource.options[0],SkillSource.options[1]])}).strict();
+export type SkillPublishParams=z.infer<typeof SkillPublishParams>;
+export const SkillUnpublishParams=z.object({clientRequestId:z.string().min(1).max(512),agent:AgentId,name:skillName,scope:z.literal("project").default("project"),projectId:ProjectId,
+  baseRevision:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+export type SkillUnpublishParams=z.infer<typeof SkillUnpublishParams>;
+export const SkillUnpublishResult=z.object({projectId:ProjectId,name:skillName,deactivated:z.literal(true),previousRevision:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+export type SkillUnpublishResult=z.infer<typeof SkillUnpublishResult>;
+
+export const SkillInstallStatusParams = z.object({
+  clientRequestId:z.string().min(1).max(512),agent:AgentId,name:z.string().min(1).max(255),scope:SkillScope,projectId:ProjectId.optional(),
+  includeReceiverIdentity:z.literal(true).optional(),
+  includeRecoveryContext:z.literal(true).optional(),
+}).strict().refine(value=>value.scope==="project"?!!value.projectId:value.projectId===undefined,{message:"Project scope requires projectId; global scope excludes it"});
+export type SkillInstallStatusParams = z.infer<typeof SkillInstallStatusParams>;
+export const SkillInstallRecoveryContext=z.object({revision:z.string().regex(/^[a-f0-9]{64}$/),receiverID:z.string().uuid(),originalReceiverID:z.string().uuid().nullable(),
+  fenced:z.boolean(),fenceID:z.string().uuid().optional()}).strict().refine(value=>value.fenced===!!value.fenceID);
+export type SkillInstallRecoveryContext=z.infer<typeof SkillInstallRecoveryContext>;
+const installStatusIdentity={clientRequestId:z.string().min(1).max(512),createdAt:Timestamp,updatedAt:Timestamp,receiverID:z.string().uuid().optional(),recovery:SkillInstallRecoveryContext.optional()};
+export const SkillInstallStatusResult = z.discriminatedUnion("state",[
+  z.object({clientRequestId:z.string().min(1).max(512),state:z.literal("not_found"),found:z.literal(false),outcomeKnown:z.literal(false)}).strict(),
+  z.object({...installStatusIdentity,state:z.literal("prepared"),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(false)}).strict(),
+  z.object({...installStatusIdentity,state:z.literal("dispatched"),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(true)}).strict(),
+  z.object({...installStatusIdentity,state:z.literal("unknown"),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(true),reasonCode:z.enum(["write_outcome_unconfirmed","controller_not_observed"])}).strict(),
+  z.object({...installStatusIdentity,state:z.literal("failed"),found:z.literal(true),outcomeKnown:z.literal(true),dispatchClaimed:z.literal(false),reasonCode:z.literal("preparation_failed")}).strict(),
+  z.object({...installStatusIdentity,state:z.literal("confirmed"),found:z.literal(true),outcomeKnown:z.literal(true),dispatchClaimed:z.literal(true),result:SkillInstallResult}).strict(),
+]);
+export type SkillInstallStatusResult = z.infer<typeof SkillInstallStatusResult>;
+
+export const SkillInstallFenceParams=z.object({clientRequestId:z.string().min(1).max(512),originalRequestId:z.string().min(1).max(512),agent:AgentId,
+  name:z.string().min(1).max(255),scope:z.literal("project").default("project"),projectId:ProjectId,expectedReceiverID:z.string().uuid(),baseRecoveryRevision:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+export type SkillInstallFenceParams=z.infer<typeof SkillInstallFenceParams>;
+export const SkillInstallFenceResult=z.object({clientRequestId:z.string().min(1).max(512),originalRequestId:z.string().min(1).max(512),agent:AgentId,
+  name:z.string().min(1).max(255),scope:z.literal("project"),projectId:ProjectId,receiverID:z.string().uuid(),originalReceiverID:z.string().uuid().nullable(),fenceID:z.string().uuid(),
+  disposition:z.literal("unconfirmed_metadata_fenced"),outcomeKnown:z.literal(false),targetLocked:z.literal(true),filesDeleted:z.literal(false),originalWritesMayContinue:z.literal(true),recordedAt:Timestamp}).strict();
+export type SkillInstallFenceResult=z.infer<typeof SkillInstallFenceResult>;
+
 // --- skill.uninstall ---
 export const SkillUninstallParams = z
   .object({
+    clientRequestId: z.string().optional(),
     agent: AgentId,
     name: z.string().min(1),
     scope: SkillScope,
@@ -142,6 +192,8 @@ export const SkillDirectoryDescriptor = z.object({
   /** skill 目录真实本机路径。 */
   path: z.string().min(1),
   exists: z.boolean(),
+  active:z.boolean().optional(),
+  publication:SkillDescriptor.shape.publication,
 });
 export type SkillDirectoryDescriptor = z.infer<typeof SkillDirectoryDescriptor>;
 

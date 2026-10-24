@@ -6,11 +6,14 @@ import type { PhononStore } from "./store.js";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { InteractionRequestParams as InteractionRequestParamsSchema } from "@agent-phonon/protocol";
+import { InteractionRequestParams as InteractionRequestParamsSchema,WorkflowInputReceipt as WorkflowInputReceiptSchema } from "@agent-phonon/protocol";
 import type {
   WorkflowEvent,
   WorkflowPlan,
   WorkflowStatusResult,
+  WorkflowInputParams,WorkflowInputReceipt,WorkflowInputStatusParams,WorkflowInputStatusResult,
+  WorkflowResultParams,
+  WorkflowResultPage,
   WorkflowRunResult,
   WorkflowPolicy,
   WorkflowSharedContext,
@@ -19,6 +22,9 @@ import type {
   WorkflowArtifact,
   WorkflowRoutingDirective,
   StreamEvent,
+  TurnReasoning,
+  SkillSelection,
+  NativeStopProof,NativeStopTarget,
 } from "@agent-phonon/protocol";
 
 const CONTROL_SETTLE_TIMEOUT_MS = 2_000;
@@ -82,6 +88,8 @@ interface DiscussionCursor {
 }
 
 interface WorkflowCheckpoint {
+  nativeStop?:NativeStopProof;
+  nativeStopCleaned?:boolean;
   controlEpoch: number;
   /** Absolute wall-clock deadline; automatic recovery never resets total budget. */
   deadlineAt?: number;
@@ -240,6 +248,9 @@ export class WorkflowEngine {
   private readonly leaseTimer: ReturnType<typeof setInterval>;
   private recovering = false;
   private finalizing = new Set<string>();
+  private releaseNativeStop:()=>void;
+  private refreshingNativeStops=false;
+  private inputJobs=new Set<string>();
 
   /**
    * 隔离 key → 实际 worktreeId（v0.6）。
@@ -275,7 +286,11 @@ export class WorkflowEngine {
     emit: (event: WorkflowEvent) => void;
     /** v0.7: 反向请求 server 做 HITL（用于 workflow.human_review directive） */
     requestInteraction?: (params: unknown) => Promise<unknown>;
+    acknowledgeInteraction?: (requestId: string, response: unknown) => void;
   }) {
+    this.releaseNativeStop=opts.engine.onNativeStop(proof=>{
+      for(const run of this.runs.values())if(run.checkpoint.nativeStop?.targets.some(target=>target.sessionId===proof.sessionId&&(target.turnId===undefined||target.turnId===proof.turnId)))this.mergeNativeStop(run,[proof]);
+    });
     this.leaseTimer = setInterval(() => {
       try {
         this.renewLeases();
@@ -283,6 +298,7 @@ export class WorkflowEngine {
         // the successor claims the checkpoint immediately after lease expiry
         // instead of depending on a one-shot startup race.
         void this.recover().catch(() => this.reportBackgroundFailure());
+        void this.refreshNativeStops().catch(()=>this.reportBackgroundFailure());
       } catch {
         this.reportBackgroundFailure();
       }
@@ -303,7 +319,7 @@ export class WorkflowEngine {
         if (ownerEpoch === undefined) continue;
         const run = this.restoreRow(row, ownerEpoch, true);
         try {
-          if(run.metadata?.dev_run_id){
+          if(run.metadata?.dev_run_id || run.metadata?.native_run_id){
             // A hard crash leaves uncertainty about the original model turn.
             // Claim its checkpoint but never silently execute another attempt.
             run.status="paused";run.error="process restarted; explicit checkpoint reconciliation required";
@@ -337,7 +353,7 @@ export class WorkflowEngine {
   private renewLeases(): void {
     if (this.disposed || !this.opts.store) return;
     for (const run of this.runs.values()) {
-      if (["completed", "failed", "cancelled", "timeout"].includes(run.status) && !this.finalizing.has(run.workflowId)) continue;
+      if (["completed", "failed", "cancelled", "timeout"].includes(run.status) && !this.finalizing.has(run.workflowId) && (!run.checkpoint.nativeStop||run.checkpoint.nativeStopCleaned)) continue;
       const ok = this.opts.store.renewWorkflowLease(run.workflowId, run.tenantId, this.ownerId, run.ownerEpoch, this.leaseMs);
       if (!ok) run.checkpoint.controlEpoch++;
     }
@@ -351,6 +367,7 @@ export class WorkflowEngine {
   async dispose(reason = "connection disposed"): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.releaseNativeStop();
     clearInterval(this.leaseTimer);
     for (const resolve of this.turnWaiters.values()) resolve({ status: "interrupted", text: "" });
     this.turnWaiters.clear();
@@ -379,8 +396,9 @@ export class WorkflowEngine {
         run.checkpoint.controlEpoch++;
         // Dev explicitly chooses manual continuation after an interrupted turn.
         // Transport recovery must not silently pay for/repeat a model attempt.
-        run.status = run.metadata?.dev_run_id ? "paused" : "queued";
-        run.error = run.metadata?.dev_run_id ? "transport interrupted; explicit Dev resume required" : undefined;
+        run.status = run.metadata?.dev_run_id || run.metadata?.native_run_id ? "paused" : "queued";
+        run.error = run.metadata?.dev_run_id ? "transport interrupted; explicit Dev resume required"
+          : run.metadata?.native_run_id ? "transport interrupted; explicit native reconciliation required" : undefined;
         run.completedAt = undefined;
         run.updatedAt = new Date().toISOString();
         for (const node of run.nodes) {
@@ -434,6 +452,10 @@ export class WorkflowEngine {
     // a lost response or process restart returns the original workflow identity.
     const requestHash = params.clientRequestId ? createHash("sha256").update(stableDispatchJson(params)).digest("hex") : undefined;
     if (params.metadata&&Object.prototype.hasOwnProperty.call(params.metadata,"_phononDispatch")) throw new PhononError("errInvalidParams","reserved workflow metadata");
+    if (params.metadata?.native_run_id !== undefined && (typeof params.metadata.native_run_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(params.metadata.native_run_id))) throw new PhononError("errInvalidParams","invalid native run identity");
+    if(params.metadata?.dev_run_id!==undefined&&(typeof params.metadata.dev_run_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(params.metadata.dev_run_id)))throw new PhononError('errInvalidParams','invalid Dev run identity');
+    if(params.metadata?.dev_run_id&&params.metadata?.native_run_id)throw new PhononError('errInvalidParams','workflow source domains cannot be mixed');
+    if (params.metadata?.native_chat && !params.metadata.native_run_id) throw new PhononError("errInvalidParams","native chat requires a run identity");
     if (params.clientRequestId) {
       const resumed = this.opts.store?.workflowResumeDispatch(this.opts.tenantId, params.clientRequestId);
       if (resumed) {
@@ -447,6 +469,7 @@ export class WorkflowEngine {
         if (m._phononDispatch.hash!==requestHash) throw new PhononError("errInvalidParams","workflow dispatch idempotency mismatch");
         return {workflowId:existing.workflow_id as string,status:existing.status as WorkflowRunResult["status"],createdAt:existing.created_at as string,resumed:false};
       }
+      if(this.opts.store?.workflowCancelIntent(this.opts.tenantId,params.clientRequestId))throw new PhononError("errInvalidParams","workflow dispatch was cancelled before acceptance");
     }
     if (!acceptedExecution) this.opts.store?.delivery.assertNewWork();
     // 1. 恢复路径
@@ -561,6 +584,75 @@ export class WorkflowEngine {
     throw new PhononError("errInvalidParams", `workflow ${workflowId} not found`);
   }
 
+  private inputReceipt(row:Record<string,unknown>):WorkflowInputReceipt {
+    const receipt=WorkflowInputReceiptSchema.parse({workflowId:row.workflow_id,nodeId:row.node_id,sessionId:row.session_id,turnId:row.turn_id,inputId:row.input_id,
+      contentHash:row.request_hash,state:row.state,createdAt:row.created_at,updatedAt:row.updated_at,...(row.error_code?{errorCode:row.error_code}:{})});
+    if(receipt.state==='inserting'&&!this.inputJobs.has(JSON.stringify([receipt.workflowId,receipt.inputId])))return {...receipt,state:'unknown',errorCode:'errInsertionOutcomeUnknown'};
+    return receipt;
+  }
+  inputStatus(params:WorkflowInputStatusParams):WorkflowInputStatusResult {
+    if(!this.opts.store)throw new PhononError('errCapabilityUnsupported','workflow insertion requires durable receipts');
+    if(!this.opts.store.getWorkflow(params.workflowId,this.opts.tenantId))throw new PhononError('errInvalidParams','workflow not found');
+    const row=this.opts.store.workflowInputGet(this.opts.tenantId,params.workflowId,params.inputId);
+    return row?{found:true,receipt:this.inputReceipt(row)}:{found:false,workflowId:params.workflowId,inputId:params.inputId};
+  }
+  async input(params:WorkflowInputParams):Promise<WorkflowInputReceipt> {
+    if(!this.opts.store)throw new PhononError('errCapabilityUnsupported','workflow insertion requires durable receipts');
+    const hash=createHash('sha256').update(JSON.stringify([params.workflowId,params.nodeId,params.sessionId,params.turnId,params.inputId,params.input])).digest('hex');
+    const prior=this.opts.store.workflowInputGet(this.opts.tenantId,params.workflowId,params.inputId);
+    if(prior){if(prior.request_hash!==hash)throw new PhononError('errInvalidParams','workflow input identity changed');return this.inputReceipt(prior);}
+    const run=this.runs.get(params.workflowId);
+    if(!run)throw new PhononError('errSessionBusy','the original workflow is not active on this connection');
+    const epoch=run.checkpoint.controlEpoch,assertActive=()=>{try{this.assertCurrent(run,epoch);}catch{throw new PhononError('errSessionBusy','the original workflow insertion phase or owner changed');}};
+    assertActive();
+    const node=run.nodes.find(value=>value.nodeId===params.nodeId),session=this.opts.engine.assertTenant(params.sessionId,this.opts.tenantId);
+    if(!node||node.status!=='running'||node.sessionId!==params.sessionId||node.turnId!==params.turnId
+      ||session.workflowAttr?.workflowId!==run.workflowId||session.workflowAttr.nodeId!==node.nodeId||session.agent!==node.agent||session.model!==node.model)throw new PhononError('errSessionBusy','workflow input no longer matches its original node and turn');
+    const cwd=this.opts.resolveCwd(session.project,session.worktreeId);
+    if(!session.cwd||fs.realpathSync(cwd)!==fs.realpathSync(session.cwd))throw new PhononError('errPolicyDenied','workflow input working directory changed');
+    const key=JSON.stringify([params.workflowId,params.inputId]);let reserved=false;
+    try{
+      await this.opts.engine.send(this.opts.tenantId,params.sessionId,params.input,{turnId:params.turnId,whenBusy:'inject',fallback:'inject',expectedActiveTurnId:params.turnId,
+        beforeInsertion:()=>{
+          assertActive();
+          reserved=this.opts.store!.workflowInputReserve({tenantId:this.opts.tenantId,workflowId:params.workflowId,inputId:params.inputId,contentHash:hash,nodeId:params.nodeId,sessionId:params.sessionId,turnId:params.turnId,
+            ownerId:this.ownerId,ownerEpoch:run.ownerEpoch,controlEpoch:epoch});
+          if(!reserved)throw new PhononError('errSessionBusy','workflow input could not reserve the active binding');
+          this.inputJobs.add(key);
+        }});
+      this.opts.store.workflowInputFinish(this.opts.tenantId,params.workflowId,params.inputId,hash,'inserted');
+    }catch(error){
+      if(!reserved)throw error;
+      this.opts.store.workflowInputFinish(this.opts.tenantId,params.workflowId,params.inputId,hash,'unknown','errInsertionOutcomeUnknown');
+    }finally{this.inputJobs.delete(key);}
+    const stored=this.opts.store.workflowInputGet(this.opts.tenantId,params.workflowId,params.inputId);
+    if(!stored)throw new PhononError('errSessionBusy','workflow input receipt is unavailable');
+    return this.inputReceipt(stored);
+  }
+
+  resultPage(params: WorkflowResultParams): WorkflowResultPage {
+    const memory = this.runs.get(params.workflowId);
+    const row = memory ? undefined : this.opts.store?.getWorkflow(params.workflowId, this.opts.tenantId);
+    if (!memory && !row) throw new PhononError('errWorkflowNotFound', 'Workflow result is unavailable');
+    const value = memory ? this.toStatus(memory) : this.rowToStatus(row!);
+    const node = params.nodeId === undefined ? undefined : value.nodes.find(node => node.nodeId === params.nodeId);
+    if (params.nodeId !== undefined && !node) throw new PhononError('errWorkflowNotFound', 'Workflow node result is unavailable');
+    const text = (params.nodeId === undefined ? value.finalText : node?.result?.text) ?? '';
+    const version = createHash('sha256').update(JSON.stringify([value.workflowId, params.nodeId ?? null, value.status, text])).digest('hex');
+    if (params.version !== undefined && params.version !== version || params.offset > 0 && !params.version) {
+      throw new PhononError('errWorkflowResultChanged', 'Workflow result changed; restart from the first page');
+    }
+    const offset = params.offset;
+    if (offset > text.length || offset > 0 && /[\uDC00-\uDFFF]/.test(text[offset] ?? '') && /[\uD800-\uDBFF]/.test(text[offset - 1] ?? '')) {
+      throw new PhononError('errInvalidParams', 'Invalid workflow result offset');
+    }
+    let end = Math.min(text.length, offset + 16000);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? '') && /[\uDC00-\uDFFF]/.test(text[end] ?? '')) end--;
+    return { workflowId: value.workflowId, ...(value.project ? { project: value.project } : {}), ...(params.nodeId === undefined ? {} : { nodeId: params.nodeId }),
+      status: value.status, version, offset, end, totalLength: text.length,
+      ...(params.knownVersion === version ? { omitted: true } : { text: text.slice(offset, end) }) };
+  }
+
   list(filter?: { dispatchKey?:string; status?: string; projectId?: string; since?: string; until?: string; limit?: number }): { workflows: WorkflowStatusResult[] } {
     const limit = filter?.limit ?? 50;
     // 内存优先，store 补
@@ -615,20 +707,22 @@ export class WorkflowEngine {
     return { workflowId, status: "paused" };
   }
 
-  async cancel(workflowId: string, reason?: string): Promise<{ workflowId: string; status: "cancelled" }> {
+  async cancel(workflowId: string, reason?: string): Promise<{ workflowId: string; status: WorkflowRunState["status"];nativeStop?:NativeStopProof }> {
     let run = this.runs.get(workflowId);
     if (!run) {
       const row = this.opts.store?.getWorkflow(workflowId, this.opts.tenantId);
       if (!row) throw new PhononError("errInvalidParams", `workflow ${workflowId} not found`);
-      if (["completed", "failed", "timeout", "cancelled"].includes(row.status as string)) return { workflowId, status: "cancelled" };
+      const storedMeta=row.metadata_json?JSON.parse(row.metadata_json as string):{};
+      if (["completed", "failed", "timeout", "cancelled"].includes(row.status as string)&&!storedMeta.native_run_id) return { workflowId, status: row.status as WorkflowRunState["status"] };
       const ownerEpoch = this.opts.store!.claimWorkflow(workflowId, this.opts.tenantId, this.ownerId, this.leaseMs);
       if (ownerEpoch === undefined) throw new PhononError("errInvalidParams", `workflow ${workflowId} is owned by another executor`);
       run = this.restoreRow(row, ownerEpoch, false);
       this.hydrateCheckpoint(run);
       this.runs.set(workflowId, run);
     }
+    if(run.metadata?.native_run_id)return this.cancelNative(run,reason);
     if (["completed", "failed", "timeout", "cancelled"].includes(run.status)) {
-      return { workflowId, status: "cancelled" };
+      return { workflowId, status: run.status };
     }
     this.finalizing.add(workflowId);
     try {
@@ -643,7 +737,9 @@ export class WorkflowEngine {
           const attempt = n.attempts?.at(-1);
           if (attempt?.status === "running") { attempt.status = "cancelled"; attempt.completedAt = run.updatedAt; }
           this.resolveNodeWaiter(n, "interrupted");
-          if (n.sessionId) terminations.push(this.opts.engine.terminate(this.opts.tenantId, n.sessionId).catch(() => {}));
+          if (n.sessionId) terminations.push((run.metadata?.native_chat
+            ? this.opts.engine.interrupt(this.opts.tenantId, n.sessionId, reason ?? "native chat stopped", false)
+            : this.opts.engine.terminate(this.opts.tenantId, n.sessionId)).catch(() => {}));
         }
       }
       // Commit the terminal fence before touching any potentially stuck adapter.
@@ -661,6 +757,82 @@ export class WorkflowEngine {
     } finally {
       this.finalizing.delete(workflowId);
     }
+  }
+
+  private mergeNativeStop(run:WorkflowRunState,proofs:NativeStopTarget[]){
+    const current=run.checkpoint.nativeStop;
+    if(!current||this.disposed||this.opts.store&&!this.opts.store.isWorkflowOwner(run.workflowId,run.tenantId,this.ownerId,run.ownerEpoch))return;
+    const targets=current.targets.map(target=>{
+      if(target.state==="confirmed")return target;
+      const proof=proofs.find(value=>value.sessionId===target.sessionId&&(target.turnId===undefined||target.turnId===value.turnId));
+      return proof?{...proof,...(target.nodeId?{nodeId:target.nodeId}:{})}:target;
+    });
+    if(JSON.stringify(targets)===JSON.stringify(current.targets))return;
+    const state=targets.every(value=>value.state==="confirmed")?"confirmed":targets.some(value=>value.state==="unknown")?"unknown":"pending";
+    run.checkpoint.nativeStop={version:1,state,targets,observedAt:new Date().toISOString()};run.updatedAt=run.checkpoint.nativeStop.observedAt;
+    this.persist(run);this.emit(run,{type:"workflow.status",status:"cancelled",nativeStop:run.checkpoint.nativeStop});
+  }
+
+  private async cancelNative(run:WorkflowRunState,reason?:string){
+    if(["completed","failed","timeout"].includes(run.status))return {workflowId:run.workflowId,status:run.status};
+    if(!run.checkpoint.nativeStop){
+      const legacy=run.status==="cancelled",at=new Date().toISOString();
+      run.checkpoint.controlEpoch++;run.status="cancelled";run.updatedAt=at;run.completedAt=at;
+      const targets:NativeStopTarget[]=[];
+      for(const node of run.nodes){
+        if(node.status==="completed")continue;
+        if(node.sessionId)targets.push({version:1,nodeId:node.nodeId,sessionId:node.sessionId as never,...(node.turnId?{turnId:node.turnId}:{}),state:"pending",observedAt:at});
+        node.status="cancelled";const attempt=node.attempts?.at(-1);if(attempt?.status==="running"){attempt.status="cancelled";attempt.completedAt=at;}
+        this.resolveNodeWaiter(node,"interrupted");
+      }
+      run.checkpoint.nativeStop={version:1,state:legacy?"unknown":targets.length?"pending":"confirmed",targets,observedAt:at,...(legacy?{reasonCode:"legacy_stop_unverified"}:{})};
+      this.persist(run);this.emit(run,{type:"workflow.status",status:"cancelled",nativeStop:run.checkpoint.nativeStop,payload:{reason}});
+      const calls=targets.map(async target=>{
+        try{return await this.opts.engine.stopNative(run.tenantId,target.sessionId,target.turnId,reason??"Native stop requested");}
+        catch{return {...target,state:"unknown" as const,observedAt:new Date().toISOString(),reasonCode:"native_stop_unconfirmed"};}
+      });
+      const settled=Promise.all(calls).then(proofs=>this.mergeNativeStop(run,proofs));
+      await settleWithin([settled]);
+    }else await this.reconcileNativeStop(run);
+    if(run.checkpoint.nativeStop.state==="confirmed")await this.finishNativeStop(run);
+    return {workflowId:run.workflowId,status:run.status,nativeStop:run.checkpoint.nativeStop};
+  }
+
+  private async reconcileNativeStop(run:WorkflowRunState){
+    const current=run.checkpoint.nativeStop;if(!current||current.state==="confirmed")return;
+    const proofs=await Promise.all(current.targets.map(async target=>{
+      try{return await this.opts.engine.nativeStopStatus(run.tenantId,target.sessionId,target.turnId);}
+      catch{return {...target,state:"unknown" as const,observedAt:target.observedAt,reasonCode:"native_session_unavailable"};}
+    }));this.mergeNativeStop(run,proofs);
+  }
+  private async finishNativeStop(run:WorkflowRunState){
+    if(run.checkpoint.nativeStopCleaned||this.finalizing.has(run.workflowId)||this.disposed)return;
+    this.finalizing.add(run.workflowId);
+    try{
+      if(!run.metadata?.native_chat)for(const target of run.checkpoint.nativeStop?.targets??[])await this.opts.engine.terminate(run.tenantId,target.sessionId).catch(()=>{});
+      await this.cleanupPersistent(run,false);await this.cleanupAutoWorktrees(run);
+      run.checkpoint.nativeStopCleaned=true;this.persist(run);this.opts.store?.releaseWorkflow(run.workflowId,run.tenantId,this.ownerId,run.ownerEpoch);
+    }finally{this.finalizing.delete(run.workflowId);}
+  }
+  private async refreshNativeStops(){
+    if(this.disposed||this.refreshingNativeStops)return;this.refreshingNativeStops=true;
+    try{for(const run of this.runs.values())if(run.checkpoint.nativeStop&&!run.checkpoint.nativeStopCleaned){await this.reconcileNativeStop(run);if(run.checkpoint.nativeStop.state==="confirmed")await this.finishNativeStop(run);}}
+    finally{this.refreshingNativeStops=false;}
+  }
+
+  async cancelDispatch(dispatchKey:string,project:string,reason?:string) {
+    if(!this.opts.store)throw new PhononError("errCapabilityUnsupported","durable cancellation requires a store");
+    const existing=this.opts.store.findWorkflowDispatch(this.opts.tenantId,dispatchKey);
+    if(existing&&existing.project_id!==project)throw new PhononError("errInvalidParams","dispatch cancellation scope mismatch");
+    const intent=this.opts.store.workflowCancelIntent(this.opts.tenantId,dispatchKey);
+    if(intent&&intent.project_id!==project)throw new PhononError("errInvalidParams","dispatch cancellation scope mismatch");
+    this.opts.store.recordWorkflowCancelIntent(this.opts.tenantId,dispatchKey,project);
+    if(!existing)return {dispatchKey,status:"cancelled" as const,cancelledBeforeStart:true};
+    const workflowId=String(existing.workflow_id);
+    const before=this.status(workflowId);
+    if(!["completed","failed","cancelled","timeout"].includes(String(existing.status))||before.nativeStop?.state!=="confirmed"&&JSON.parse(String(existing.metadata_json??"{}")).native_run_id)await this.cancel(workflowId,reason);
+    const current=this.status(workflowId);
+    return {dispatchKey,workflowId,status:current.status,cancelledBeforeStart:false,...(current.nativeStop?{nativeStop:current.nativeStop}:{})};
   }
 
   ack(workflowId: string, lastSeq: number): void {
@@ -904,7 +1076,9 @@ export class WorkflowEngine {
           const attempt = n.attempts?.at(-1);
           if (attempt?.status === "running") { attempt.status = "timeout"; attempt.completedAt = run.updatedAt; attempt.error = run.error; }
           this.resolveNodeWaiter(n, "timeout");
-          if (n.sessionId) terminations.push(this.opts.engine.terminate(this.opts.tenantId, n.sessionId).catch(() => {}));
+          if (n.sessionId) terminations.push((run.metadata?.native_chat
+            ? this.opts.engine.interrupt(this.opts.tenantId, n.sessionId, "native chat timed out", false)
+            : this.opts.engine.terminate(this.opts.tenantId, n.sessionId)).catch(() => {}));
         }
       }
       this.persist(run);
@@ -1007,7 +1181,7 @@ export class WorkflowEngine {
         const batch = runnable.slice(i, i + batchSize);
         const results = await Promise.allSettled(batch.map((n) =>
           this.executeNode(run, n.nodeId, n.agent, n.model, n.role, this.composeDagNodeInput(run, n, succeeded), n.agentConfig, n.systemPrompt, undefined,
-            { project: n.project, worktreeId: n.worktreeId, branch: n.branch, sessionId:n.sessionId }, executionEpoch)
+            { project: n.project, worktreeId: n.worktreeId, branch: n.branch, sessionId:n.sessionId, reasoning:n.reasoning,skills:n.skills }, executionEpoch)
         ));
         this.assertCurrent(run, executionEpoch);
         for (let j = 0; j < batch.length; j++) {
@@ -1080,7 +1254,7 @@ export class WorkflowEngine {
       "All targets must be workers connected by an explicit executor edge.",
       "Use `workflow.done` when the workflow is complete.",
     ].join("\n");
-    const execEnv = { project: plan.executor.project, worktreeId: plan.executor.worktreeId, branch: plan.executor.branch };
+    const execEnv = { project: plan.executor.project, worktreeId: plan.executor.worktreeId, branch: plan.executor.branch, reasoning:plan.executor.reasoning,skills:plan.executor.skills };
     let done = false;
 
     while (!done) {
@@ -1184,7 +1358,7 @@ export class WorkflowEngine {
           const workerResult = await this.executeNode(
             run, worker.nodeId, worker.agent, worker.model, worker.role ?? "worker", workerInput,
             worker.agentConfig, worker.systemPrompt, worker.nodeId,
-            { project: worker.project, worktreeId: worker.worktreeId, branch: worker.branch }, executionEpoch,
+            { project: worker.project, worktreeId: worker.worktreeId, branch: worker.branch, reasoning:worker.reasoning,skills:worker.skills }, executionEpoch,
           );
           this.assertCurrent(run, executionEpoch);
           cursor.workerResults.push({ nodeId: target, text: workerResult.text ?? "" });
@@ -1252,7 +1426,7 @@ export class WorkflowEngine {
               const result = await this.executeNode(
                 run, participant.nodeId, participant.agent, participant.model, participant.role ?? "participant", prompt,
                 participant.agentConfig, participant.systemPrompt, participant.nodeId,
-                { project: participant.project, worktreeId: participant.worktreeId, branch: participant.branch }, executionEpoch,
+                { project: participant.project, worktreeId: participant.worktreeId, branch: participant.branch, reasoning:participant.reasoning,skills:participant.skills }, executionEpoch,
               );
               this.assertCurrent(run, executionEpoch);
               cursor.outputs[participant.nodeId] = { role: participant.role, text: result.text ?? "" };
@@ -1297,7 +1471,7 @@ export class WorkflowEngine {
           const result = await this.executeNode(
             run, chairman.nodeId, chairman.agent, chairman.model, chairman.role ?? "chairman", chairmanPrompt,
             chairman.agentConfig, chairman.systemPrompt, chairman.nodeId,
-            { project: chairman.project, worktreeId: chairman.worktreeId, branch: chairman.branch }, executionEpoch,
+            { project: chairman.project, worktreeId: chairman.worktreeId, branch: chairman.branch, reasoning:chairman.reasoning,skills:chairman.skills }, executionEpoch,
           );
           this.assertCurrent(run, executionEpoch);
           chairmanText = result.text ?? "";
@@ -1352,7 +1526,7 @@ export class WorkflowEngine {
     nodeSystemPrompt?: string,
     persistKey?: string,
     /** v0.6: 该节点的执行环境覆写（project/worktreeId/branch）。不传默认继承 workflow 级。 */
-    nodeEnv?: { project?: string; worktreeId?: string; branch?: string; sessionId?: string },
+    nodeEnv?: { project?: string; worktreeId?: string; branch?: string; sessionId?: string; reasoning?:TurnReasoning;skills?:SkillSelection[] },
     executionEpoch = run.checkpoint.controlEpoch,
   ): Promise<WorkflowNodeResult> {
     this.assertCurrent(run, executionEpoch);
@@ -1388,10 +1562,20 @@ export class WorkflowEngine {
       // ---- session 获取：persistent 复用 cache；burner 每次新建 ----
       const cacheKey = persistKey ? `${run.workflowId}::${persistKey}` : undefined;
       let sessionId = cacheKey ? this.persistentSessions.get(cacheKey) : nodeEnv?.sessionId;
+      let replacedSessionId: string | undefined;
       if(sessionId){
+        await this.opts.engine.refreshEmployee(run.tenantId,sessionId,agentConfig?.employee);
         const existing=this.opts.engine.assertTenant(sessionId,run.tenantId);
         if(existing.project!==effectiveProject||existing.worktreeId!==effectiveWorktreeId||existing.agent!==agent||existing.model!==model||existing.status==="terminated"||existing.status==="running")throw new PhononError("errInvalidParams","native session execution binding mismatch");
-        existing.workflowAttr={workflowId:run.workflowId,nodeId,role,devTrace:!!run.metadata?.dev_run_id};
+        // Generic L3 cursor recovery deliberately retries unfinished attempts.
+        // Give such a retry a NEW Session identity if the old native context
+        // cannot be recovered. Explicit/employee/native chat Sessions never
+        // take this path, and the prior attempt/checkpoint stays auditable.
+        if(cacheKey && existing.detached && !existing.employeeId && !run.metadata?.native_run_id && !(await this.opts.engine.status(run.tenantId,sessionId)).recovery.canAttempt){
+          replacedSessionId=sessionId;
+          this.persistentSessions.delete(cacheKey);
+          sessionId=undefined;
+        }else existing.workflowAttr={workflowId:run.workflowId,nodeId,role,devTrace:!!(run.metadata?.dev_run_id || run.metadata?.native_run_id), ...(run.metadata?.native_run_id ? { nativeRunId: String(run.metadata.native_run_id) } : {}),...(run.metadata?.dev_run_id?{devRunId:String(run.metadata.dev_run_id)}:{})};
       }
       const isNewSession = !sessionId;
       if (!sessionId) {
@@ -1402,10 +1586,10 @@ export class WorkflowEngine {
           cwd,
           agent,
           model,
-          verbosity: "messages",
+          verbosity: run.metadata?.native_run_id ? "tools" : "messages",
           agentConfig,
           initialContext,
-          workflowAttr: { workflowId: run.workflowId, nodeId, role,devTrace:!!run.metadata?.dev_run_id },
+          workflowAttr: { workflowId: run.workflowId, nodeId, role,devTrace:!!(run.metadata?.dev_run_id || run.metadata?.native_run_id), ...(run.metadata?.native_run_id ? { nativeRunId: String(run.metadata.native_run_id) } : {}),...(run.metadata?.dev_run_id?{devRunId:String(run.metadata.dev_run_id)}:{}) },
         });
         sessionId = created.sessionId;
         this.sessionToNode.set(sessionId, { workflowId: run.workflowId, nodeId });
@@ -1417,16 +1601,22 @@ export class WorkflowEngine {
       node.sessionId = sessionId;
       attempt.sessionId = sessionId;
       this.persist(run);
+      if(replacedSessionId)this.emit(run,{type:"node.status",nodeId,agent,model,role,sessionId:sessionId as never,status:"running",
+        payload:{warn:"native_session_replaced_for_retry",previousSessionId:replacedSessionId,iteration:node.iterations}});
       this.assertCurrent(run, executionEpoch);
 
       const sent = await this.opts.engine.send(run.tenantId, sessionId, input, {
-        environment: this.opts.env.resolveForExecution({ projectId: effectiveProject, agent }),
+        reasoning: nodeEnv?.reasoning,
+        ...(nodeEnv?.skills===undefined?{}:{skills:nodeEnv.skills}),
+        environment: this.opts.env.resolveForExecution({ projectId: effectiveProject, agent,...(nodeEnv?.skills===undefined?{}:{skills:nodeEnv.skills}) }),
+        ...(run.metadata?.native_run_id ? { verbosity: "tools" as const } : {}),
       });
       node.turnId = sent.turnId;
       attempt.turnId = sent.turnId;
       this.persist(run);
 
       const result = await this.awaitTurnResult(run, sessionId, sent.turnId);
+      if(run.metadata?.native_run_id||run.metadata?.dev_chat)await this.awaitTurnSettlement(run,sessionId,sent.turnId,executionEpoch);
       this.assertCurrent(run, executionEpoch);
       node.result = result;
       node.status = result.status === "completed" ? "completed" : "failed";
@@ -1445,7 +1635,7 @@ export class WorkflowEngine {
 
       // burner 模式：跑完立刻纸连 session。
       // persistent 模式：保留 session，下轮复用；由 cleanupPersistent() 统一清理。
-      if (!cacheKey && !run.metadata?.dev_chat) {
+      if (!cacheKey && !run.metadata?.dev_chat && !run.metadata?.native_chat) {
         try { await this.opts.engine.terminate(run.tenantId, sessionId); } catch {}
       }
       void isNewSession;
@@ -1519,6 +1709,8 @@ export class WorkflowEngine {
       // replayed review instead of showing a second form after device restart.
       requestId,
       workflowId: run.workflowId,
+      ...(run.metadata?.native_run_id?{nativeRunId:run.metadata.native_run_id,presentation:{kind:"approval",decisionField:"approved",feedbackField:"feedback"}}:{}),
+      ...(run.metadata?.dev_run_id?{devRunId:run.metadata.dev_run_id}:{}),
       blocking: true,
       timeoutSeconds: directive.timeoutSeconds,
       at: new Date().toISOString(),
@@ -1541,11 +1733,11 @@ export class WorkflowEngine {
     let response: { approved?: boolean; feedback?: string; reviewer?: string; values?: Record<string, unknown> };
     // v0.7 补补丁：engine 本地 timeout race，防止 server 不 honor timeoutSeconds 或永远不回导致 workflow 永久挂死。
     // 策略：取 directive.timeoutSeconds + 5 秒宽限（留 server 优先回的机会），在 phonon 这边超时 → reject + emit resolved。
-    const localTimeoutMs = Math.max(1000, directive.timeoutSeconds * 1000 + 5000);
+    const localTimeoutMs = directive.timeoutSeconds>0?Math.max(1000, directive.timeoutSeconds * 1000 + 5000):0;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
       const timeoutP = new Promise<"__local_timeout__">((resolve) => {
-        timeoutHandle = setTimeout(() => resolve("__local_timeout__"), localTimeoutMs);
+        if(localTimeoutMs)timeoutHandle = setTimeout(() => resolve("__local_timeout__"), localTimeoutMs);
       });
       const raceResult = await Promise.race([
         this.opts.requestInteraction(interactionParams),
@@ -1574,6 +1766,7 @@ export class WorkflowEngine {
       feedback: typeof values?.feedback === "string" ? values.feedback : undefined,
       reviewer: typeof values?.reviewer === "string" ? values.reviewer : undefined,
     };
+    if((run.metadata?.native_run_id||run.metadata?.dev_run_id)&&(response as {action?:string}).action==="submit")this.opts.acknowledgeInteraction?.(requestId,response);
     this.emit(run, { type: "human_review.resolved", payload: result });
     return result;
   }
@@ -1747,6 +1940,19 @@ export class WorkflowEngine {
     });
   }
 
+  private async awaitTurnSettlement(run:WorkflowRunState,sessionId:string,turnId:string,executionEpoch:number):Promise<void> {
+    // A terminal model event can precede native process/bridge cleanup. Keep
+    // observing that turn; a control deadline is not an execution failure.
+    while(true){
+      this.assertCurrent(run,executionEpoch);
+      try { await this.opts.engine.settleTurn(run.tenantId,sessionId,turnId); return; }
+      catch(error){
+        if(!(error instanceof PhononError)||error.appCode!=="errSessionBusy")throw error;
+        this.assertCurrent(run,executionEpoch);
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // SharedContext: 把 sharedContext (text + files) 拼到每个 node 的 systemPrompt
   // ---------------------------------------------------------------------------
@@ -1865,7 +2071,10 @@ export class WorkflowEngine {
     }
     const row = this.opts.store.getWorkflow(rf.workflowId, this.opts.tenantId);
     if (!row) return undefined;
+    if(rf.expectedSeq!==undefined&&Number(row.seq)-1!==rf.expectedSeq)throw new PhononError('errWorkflowObservationChanged','workflow observation changed before resume');
     const priorStatus = row.status as string;
+    const nativeStop=row.checkpoint_json?JSON.parse(row.checkpoint_json as string).nativeStop:undefined;
+    if(nativeStop&&nativeStop.state!=="confirmed")throw new PhononError("errSessionBusy","Native stop must be verified before a new workflow attempt");
     if (["queued", "running"].includes(priorStatus)) {
       throw new PhononError("errInvalidParams", `workflow ${rf.workflowId} is already active`);
     }
@@ -2045,6 +2254,7 @@ export class WorkflowEngine {
   private toStatus(run: WorkflowRunState): WorkflowStatusResult {
     return {
       dispatchKey: (run.metadata?._phononDispatch as {key?:string}|undefined)?.key,
+      ...(run.checkpoint.nativeStop?{nativeStop:run.checkpoint.nativeStop}:{}),
       workflowId: run.workflowId,
       status: run.status,
       project: run.project,
@@ -2055,12 +2265,14 @@ export class WorkflowEngine {
       completedAt: run.completedAt,
       error: run.error,
       finalText: run.finalText,
-      resumable: !!this.opts.store && ["paused", "failed", "timeout", "cancelled"].includes(run.status),
+      resumable: !!this.opts.store && ["paused", "failed", "timeout", "cancelled"].includes(run.status)&&(!run.checkpoint.nativeStop||run.checkpoint.nativeStop.state==="confirmed"),
     } as WorkflowStatusResult;
   }
 
   private rowToStatus(row: Record<string, unknown>): WorkflowStatusResult {
+    const nativeStop=row.checkpoint_json?JSON.parse(row.checkpoint_json as string).nativeStop as NativeStopProof|undefined:undefined;
     return {
+      ...(nativeStop?{nativeStop:nativeStop.state==="confirmed"?nativeStop:{...nativeStop,state:"unknown" as const}}:{}),
       dispatchKey: row.metadata_json?JSON.parse(row.metadata_json as string)._phononDispatch?.key:undefined,
       workflowId: row.workflow_id as string,
       status: row.status as WorkflowStatusResult["status"],
@@ -2072,7 +2284,7 @@ export class WorkflowEngine {
       completedAt: (row.completed_at as string | null) ?? undefined,
       error: (row.error as string | null) ?? undefined,
       finalText: (row.final_text as string | null) ?? undefined,
-      resumable: ["paused", "failed", "timeout", "cancelled"].includes(row.status as string),
+      resumable: ["paused", "failed", "timeout", "cancelled"].includes(row.status as string)&&(!nativeStop||nativeStop.state==="confirmed"),
     } as WorkflowStatusResult;
   }
 

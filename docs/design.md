@@ -7,6 +7,25 @@
 
 ## 1. 定位与核心类比
 
+### 1.1 产品定位：私人助手与数字员工团队
+
+> **从你的私人 AI 助手，到你带领的数字员工团队。**
+
+agent-phonon 所支撑的产品体验同时覆盖“你的私人助手”和“你带领的一组数字员工”。这不是两套独立产品，也不是必须预先选择的两种模式，而是同一套设备与 Agent 执行体系随接入资源和协作需求自然延展的使用方式。
+
+- **私人助手场景**：用户可以在自己的电脑上单独创建一个专属 OpenClaw Agent，作为自己的私人助手。它通过该设备上可用的工具和已授权的能力，处理个人事务并执行任务，而不只是提供聊天回答。
+- **数字员工团队场景**：多个 Agent 分别承担不同职责，由上层应用或服务端组织分工、协作与结果汇总，形成用户带领的数字员工团队。多个 Agent 可以共用一台设备，也可以分布在不同设备上；设备数量与数字员工数量不一一对应。
+
+**设备决定任务在哪里执行，Agent 决定由谁执行、如何协作。** 实际可完成的任务取决于设备环境、Agent 的真实能力、可用工具和本地授权，不因被称为“助手”或“员工”就自动获得额外能力。
+
+由此形成以下产品设计原则：
+
+- **单个助手就有完整价值**：不强制用户先组建团队、配置多台设备或建立协作流程，才能开始让 Agent 做事。
+- **从一个助手逐步扩展到团队**：用户可按任务需要增加 Agent、职责和设备，不必切换到另一套产品，也不把“私人助手”和“数字员工”做成互斥入口。
+- **共用底座，保留能力边界**：私人助手与团队协作复用设备接入、Agent 发现、会话和任务执行能力；Agent 创建与执行必须遵循 adapter 能力声明和本地授权，不假定所有 runtime 都支持同样的管理操作。
+
+### 1.2 设备侧定位与核心类比
+
 phonon 是一个**部署在单台个人设备上的 agent 调度 daemon**：对下统一调度本机的多种 AI agent，对上用**一套统一协议**主动连到服务端，让任何遵循该协议的服务端把任务分发下来、远程使用本机 agent。
 
 **脊柱类比（贯穿全设计）：**
@@ -34,7 +53,7 @@ L2  统一协议 + 双向连接层            ← Phase 1 核心；**tenant 在�
         ↑
 L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等公民；**不感知 tenant**
         ↓ adapter 层
-   OpenClaw / Claude Code / Codex / GitHub Copilot CLI / Pi / Herdr / OpenCode / Hermes
+   OpenClaw / Claude Code / Codex / GitHub Copilot CLI / Pi / OpenCode / Hermes
 ```
 
 - **L1**：与单个 agent 通信，做会话管理 + 上下文管理。**发任务＝在 session 里对话。**只认 sessionId，**不感知 tenant**。
@@ -59,7 +78,7 @@ L1  单-agent 会话引擎 (session)    ← Phase 1 核心，session 是一等�
 | D7 | **压缩双模：native + custom** | native＝透传 agent 原生压缩；custom＝phonon 自有压缩引擎，便于统一自定义上下文管理。第一版 custom 策略为 `dropToolIO`：删除结构化 tool_use/tool_result/tool_call（含 Codex `function_call`/`function_call_output`）内容和返回结果，保留纯文本；默认保留最近 3 个 tool call 及其 result，可用 `keepRecentToolCalls` 配置，因为最近工具上下文通常更重要。保留计数按「tool call 锚点」位置算（非按 id），所以没有 id 的最近 tool 块也能正确保留。已接入：OpenClaw spawn/Gateway + Claude Code（编辑 session JSONL）、Codex（rollout JSONL，按 thread_id 定位）、OpenCode（`opencode.db` 的 `part` 表，删 tool part 行）、Hermes（`state.db`，按 title 定位 session：删 `role=tool` 行、清 assistant 行的 tool_calls 列以保留推理）。sqlite 改动前用 `VACUUM INTO` 一致性备份（正确处理 WAL）、IMMEDIATE 事务、FTS 触发器自动同步。 |
 | D8 | **Adapter 声明能力，core 补齐缺口** | 各 agent 厚薄不一：对外协议恒统一，对内 adapter 按 `capabilities` 声明原生支持，core 缺啥补啥。OpenClaw adapter 极薄，CLI adapter 较厚。 |
 | D9 | **单设备，不感知其他设备** | 多设备互联由上层服务管理；phonon 装到多台，各管各的。不做设备发现/互联。 |
-| D10 | **agent 支持顺序（✅ OpenClaw ✅ Claude Code ✅ Codex ✅ GitHub Copilot CLI ✅ Pi ✅ Herdr ✅ OpenCode ✅ Hermes）** | 核心 adapter 均已完成；新增 runtime 必须继续声明真实能力并提供可验证的非交互/会话/流式映射。Herdr 是特殊的 meta runtime：它不直接 spawn CLI，而是委派给 Herdr 的 workspace/pane/agent 生命周期（screen-scrape 获输出，lifecycle polling 获状态），故 `streaming:false` / `hooks:[]` —— 保留能力/可信，但不假装结构化事件。Pi 用 `--mode json` 真流式 + `--session-id` 确定性续接；**2026-10-11 已接通阻塞式 pre_tool HITL**：daemon 的 HookBridge 绑定后向 PiAdapter 注入真实端口，adapter 以 `--extension` 加载内置扩展（Pi 官方 `tool_call` handler 可 block 且 `input` 可变），故桥就绪时 `hooks:["pre_tool"]`，否则诚实回退 `[]`。桥不可达时默认 **fail-closed**（仅对 bash/powershell/write/edit 这类危险工具），可用 `AGENT_PHONON_HITL_FAIL_MODE=open` 退出——这比 OpenClaw 插件的无条件 fail-open 更严，是刻意选择：显式开启 HITL 的人要的是闸门，不是尽力而为的提示。Pi 内部会自行 compact，但无可主动调用的 flag，故 `nativeCompression:false`。**Hermes 同日由 `streaming:false` 更正为 `true`：其 `run_conversation` 一直接受原生 `stream_callback`（逐文本 delta 触发），bridge 改为**链式包装** CLI 自己的回调（CLI 有用于 TTS 的 text_queue，替换会破坏它），因此文本真流式而 tool_call/tool_result 仍缓冲至 run 结束——这一区分同时回写了 rescue knowledge。****`workflowRoles` 经核实为建议性元数据（core 从不消费），executor 路由由 `parseRoutingDirectives` 纯文本解析决定，故 codex/opencode 已由 `["worker"]` 更正为 `["executor","worker"]`，并加回归测试锁定该事实。** **2026-10-11 起支持面固定为这 8 个 harness（+ 内置 rescue），不再新增；精力转向把现有维护好。** |
+| D10 | **agent 支持顺序（✅ OpenClaw ✅ Claude Code ✅ Codex ✅ GitHub Copilot CLI ✅ Pi ✅ OpenCode ✅ Hermes）** | 核心 adapter 均已完成；新增 runtime 必须继续声明真实能力并提供可验证的非交互/会话/流式映射。Pi 用 `--mode json` 真流式 + `--session-id` 确定性续接；**2026-10-11 已接通阻塞式 pre_tool HITL**：daemon 的 HookBridge 绑定后向 PiAdapter 注入真实端口，adapter 以 `--extension` 加载内置扩展（Pi 官方 `tool_call` handler 可 block 且 `input` 可变），故桥就绪时 `hooks:["pre_tool"]`，否则诚实回退 `[]`。桥不可达时默认 **fail-closed**（仅对 bash/powershell/write/edit 这类危险工具），可用 `AGENT_PHONON_HITL_FAIL_MODE=open` 退出——这比 OpenClaw 插件的无条件 fail-open 更严，是刻意选择：显式开启 HITL 的人要的是闸门，不是尽力而为的提示。Pi 内部会自行 compact，但无可主动调用的 flag，故 `nativeCompression:false`。**Hermes 同日由 `streaming:false` 更正为 `true`：其 `run_conversation` 一直接受原生 `stream_callback`（逐文本 delta 触发），bridge 改为**链式包装** CLI 自己的回调（CLI 有用于 TTS 的 text_queue，替换会破坏它），因此文本真流式而 tool_call/tool_result 仍缓冲至 run 结束——这一区分同时回写了 rescue knowledge。****`workflowRoles` 经核实为建议性元数据（core 从不消费），executor 路由由 `parseRoutingDirectives` 纯文本解析决定，故 codex/opencode 已由 `["worker"]` 更正为 `["executor","worker"]`，并加回归测试锁定该事实。** **2026-10-24 起支持面为上述 7 个原生 harness（+ 内置 rescue）；不支持、不兼容 Herdr，不保留嵌套适配器或自动迁移。参见 [运行时范围决策](decisions/2026-10-24-native-agents-only.md)。** |
 | D11 | **phonon 是独立的底层能力** | phonon 是通用的设备侧 agent 调度底层，其上可延伸更多项目。与其他任何项目无绑定关系。 |
 | D12 | **部署＝CLI + systemd 类守护（Linux/Mac）** | Docker 太重且不便调度本机 agent。Windows 无 systemd，后续单独想办法（NSSM / Windows Service / 计划任务，待定）。 |
 | D13 | **多服务端 / 多租户，底层硬隔离，配置驱动 + CLI 管理** | phonon 同时维护 N 条到不同服务端的拨出连接，每条一把 device key，构成一个 tenant；session 及所有资源按 tenant 严格隔离（server A 不可见/不可控 server B 的 session）；隔离在 RPC 分发层强制。隔离单元＝「一条服务端连接」。 |

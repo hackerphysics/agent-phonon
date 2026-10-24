@@ -13,6 +13,20 @@ export type DeviceFsRoot = z.infer<typeof DeviceFsRoot>;
 export const DeviceInfoParams = z.object({}).default({});
 export type DeviceInfoParams = z.infer<typeof DeviceInfoParams>;
 
+export const DeviceSSHAddress = z.object({
+  address: z.string().ip(),
+  kind: z.enum(["public", "private", "tailscale"]),
+  family: z.enum(["IPv4", "IPv6"]),
+  interface: z.string().max(120).optional(),
+});
+export type DeviceSSHAddress = z.infer<typeof DeviceSSHAddress>;
+export const DeviceSSHHints = z.object({
+  username: z.string().min(1).max(255).optional(),
+  port: z.number().int().min(1).max(65535),
+  addresses: z.array(DeviceSSHAddress).max(64),
+});
+export type DeviceSSHHints = z.infer<typeof DeviceSSHHints>;
+
 export const DeviceInfoResult = z.object({
   at: z.string().datetime({ offset: true }),
   hostname: z.string(),
@@ -25,7 +39,16 @@ export const DeviceInfoResult = z.object({
   runtime: z.object({
     node: z.string().optional(),
   }).optional(),
+  /** Connection hints only, not proof that sshd or an address is reachable. No credentials. */
+  ssh: DeviceSSHHints.optional(),
+  /** Persistent namespace-scoped receiver identity, not a credential or grant. */
+  skillReceiverID:z.string().uuid().optional(),
+  projectProvisionReceiverID:z.string().uuid().optional(),
   /** 便于 server 做粗粒度任务路由：ios-development/windows-desktop-development/nvidia-gpu 等。 */
+  /** current_turn_input_v1 confirms strict no-fallback and applied-input ACK semantics;
+   * the selected adapter must additionally advertise injectMidTurn.
+   * native_interaction_receipts_v1 provides durable response-consumption proofs,
+   * not proof that a task/side effect completed or that every harness has a tool. */
   capabilities: z.array(z.string()).default([]),
 });
 export type DeviceInfoResult = z.infer<typeof DeviceInfoResult>;
@@ -91,7 +114,9 @@ export const DeviceFsListParams = z.object({
   absolutePath: z.string().optional(),
   includeHidden: z.boolean().default(false).optional(),
   limit: z.number().int().positive().max(1000).default(200).optional(),
-});
+  projectCandidates:z.boolean().optional(),
+  directoryInput:z.string().max(4096).refine(value=>!/[\x00-\x1f\x7f]/.test(value)).optional(),
+}).refine(value=>value.projectCandidates===true?value.root===undefined&&value.path===undefined&&value.absolutePath===undefined:value.directoryInput===undefined,"Directory candidates use only device-native directoryInput");
 export type DeviceFsListParams = z.infer<typeof DeviceFsListParams>;
 
 export const DeviceFsEntry = z.object({
@@ -101,6 +126,8 @@ export const DeviceFsEntry = z.object({
   kind: z.enum(["file", "directory", "symlink", "other"]),
   size: z.number().int().nonnegative().optional(),
   mtimeMs: z.number().nonnegative().optional(),
+  directoryIdentity:z.string().regex(/^dir:[a-f0-9]+:[a-f0-9]+$/).max(96).optional(),
+  selectable:z.boolean().optional(),
 });
 export type DeviceFsEntry = z.infer<typeof DeviceFsEntry>;
 
@@ -111,5 +138,8 @@ export const DeviceFsListResult = z.object({
   realPath: z.string(),
   entries: z.array(DeviceFsEntry),
   truncated: z.boolean().default(false),
+  input:z.string().max(4096).optional(),
+  pathStyle:z.enum(["posix","windows"]).optional(),
+  directoryMatch:z.object({path:z.string().min(1).max(4096),directoryIdentity:z.string().regex(/^dir:[a-f0-9]+:[a-f0-9]+$/).max(96),selectable:z.boolean()}).optional(),
 });
 export type DeviceFsListResult = z.infer<typeof DeviceFsListResult>;

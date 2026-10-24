@@ -5,6 +5,17 @@
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./native-interactions": {
+      "types": "./dist/native-interactions.d.ts",
+      "import": "./dist/native-interactions.js"
+    },
+    "./peer-context": {
+      "types": "./dist/peer-context.d.ts",
+      "import": "./dist/peer-context.js"
+    }
+  },
   "files": [
     "dist",
     "openclaw.plugin.json"
@@ -18,12 +29,19 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsup",
+    "artifact": "node scripts/prepare-artifact.mjs",
+    "test": "pnpm build",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@agent-phonon/protocol": "workspace:*",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.6.3"
   },
   "author": "agent-phonon contributors",

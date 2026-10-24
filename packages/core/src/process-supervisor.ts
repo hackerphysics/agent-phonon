@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import type { ChildProcess, ChildProcessWithoutNullStreams, SpawnOptions } from "node:child_process";
 import { spawnAgent } from "./proc.js";
+import {spawnWindowsProcessJob} from './windows-process-job.js';
 
 export interface ProcessSupervisorOptions {
   /** Time between graceful and forced tree termination. */
@@ -11,13 +12,16 @@ export interface ProcessSupervisorOptions {
   killWindowsTree?: (pid: number, force: boolean) => Promise<void> | void;
   /** True while any descendant in the supervised tree remains alive. */
   isTreeAlive?: (pid: number) => boolean;
+  /** Device-owned prepared native helper; never a remote environment value. */
+  windowsJobRoot?:string;
 }
 
 /**
  * Owns one spawned command and terminates its entire descendant tree.
  *
  * POSIX children are process-group leaders (`detached: true`) and signals are
- * sent to `-pid`. Windows uses `taskkill /T`, escalating to `/F` after grace.
+ * sent to `-pid`. Prepared Windows runtimes use an inheritable native Job;
+ * legacy runtimes retain taskkill /T with unconfirmed exit observation.
  * All callers (abort, timeout, explicit interrupt/terminate) use the same
  * graceful-then-force path.
  */
@@ -42,7 +46,7 @@ export class ProcessSupervisor {
     this.killWindowsTree = opts.killWindowsTree ?? killWindowsTree;
     this.isTreeAlive = opts.isTreeAlive ?? ((pid) => {
       if (this.platform === "win32") return this.termination !== undefined;
-      try { process.kill(-pid, 0); return true; } catch { return false; }
+      try { process.kill(-pid, 0); return true; } catch(error) { return (error as NodeJS.ErrnoException).code!=="ESRCH"; }
     });
     child.once("close", this.onClose);
     child.once("error", this.onError);
@@ -66,6 +70,13 @@ export class ProcessSupervisor {
       this.dispose();
     }, this.graceMs);
     return this.termination;
+  }
+
+  /** Read-only evidence. Sending a signal or reaching the force deadline is
+   * deliberately insufficient; unknown/permission-denied probes stay live. */
+  hasStopped():boolean {
+    if(!this.child.pid)return this.hasExited();
+    try{return this.hasExited()&&!this.isTreeAlive(this.child.pid);}catch{return false;}
   }
 
   /** Remove supervisor-owned listeners/timers after natural process exit. */
@@ -140,6 +151,9 @@ export function spawnSupervisedAgent(
   supervisorOptions: ProcessSupervisorOptions = {},
 ): ProcessSupervisor {
   const platform = supervisorOptions.platform ?? process.platform;
+  const job=platform==='win32'&&process.platform==='win32'&&!supervisorOptions.isTreeAlive
+    ?spawnWindowsProcessJob(command,args,{...options,stdio:options.stdio??['pipe','pipe','pipe']},supervisorOptions.windowsJobRoot):undefined;
+  if(job)return new ProcessSupervisor(job.child,{...supervisorOptions,platform,isTreeAlive:()=>job.alive(),killWindowsTree:(_pid,force)=>job.stop(force)});
   const child = spawnAgent(command, args, {
     ...options,
     // setsid(2) through Node's detached spawn makes the child a process-group
@@ -156,6 +170,9 @@ export function spawnSupervised(
   supervisorOptions: ProcessSupervisorOptions = {},
 ): ProcessSupervisor {
   const platform = supervisorOptions.platform ?? process.platform;
+  const job=platform==='win32'&&process.platform==='win32'&&!supervisorOptions.isTreeAlive
+    ?spawnWindowsProcessJob(command,args,{...options,stdio:options.stdio??['pipe','pipe','pipe']},supervisorOptions.windowsJobRoot):undefined;
+  if(job)return new ProcessSupervisor(job.child,{...supervisorOptions,platform,isTreeAlive:()=>job.alive(),killWindowsTree:(_pid,force)=>job.stop(force)});
   const child = nodeSpawn(command, args as string[], {
     ...options,
     ...(platform === "win32" ? {} : { detached: true }),

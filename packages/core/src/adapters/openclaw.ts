@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
+import {nativeReasoning} from "../reasoning.js";
+import {parseOpenClawNativeModels} from "./openclaw-models.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -12,7 +14,7 @@ import type {
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
-import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem } from "@agent-phonon/protocol";
+import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem,ModelInfo } from "@agent-phonon/protocol";
 
 /**
  * OpenClaw adapter（design D10，第一个 adapter）。
@@ -29,7 +31,7 @@ const OPENCLAW_CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // --session-key resume
   nativeCompression: true, // OpenClaw 有 /compact
   contextInjection: true, // 可在 message 前注入
-  proactiveOutput: true, // OpenClaw 有 cron/心跳，会自发输出
+  proactiveOutput: false, // This one-shot CLI does not subscribe to native output.
   modelSwitch: true, // --model 覆盖
   interrupt: false, // CLI 一次性调用，靠 core 兜底 kill 子进程
   injectMidTurn: false,
@@ -56,10 +58,11 @@ class OpenClawSession implements AdapterSession {
   private cwd: string;
   private openclawAgent: string;
   private current?: ProcessSupervisor;
+  private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   /** 暂存的注入上下文（下次 send 拼进 input，不单独跑一轮，修 P0#13）。 */
   private pendingInject: string[] = [];
 
-  constructor(sessionId: string, model: string, cwd: string, openclawAgent = "main", initialContext?: ContextItem[]) {
+  constructor(sessionId: string, model: string, cwd: string, openclawAgent = "main", initialContext?: ContextItem[],private readonly bin="openclaw",private readonly reasoningFlag=false) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
@@ -97,11 +100,11 @@ class OpenClawSession implements AdapterSession {
       this.sessionKey,
       "--message",
       message,
-      "--model",
-      this.model,
     ];
+    if(this.model&&this.model!=="default")args.push("--model",this.model);
+    if(this.reasoningFlag&&opts.reasoning?.level)args.push("--thinking",nativeReasoning(opts.reasoning.level)!);
 
-    const stdout = await this.run(args, opts.signal, opts.environment);
+    const stdout = await this.run(args, opts.signal, opts.environment,turnId);
     if (stdout === null) {
       // 被 interrupt
       emit({
@@ -145,6 +148,7 @@ class OpenClawSession implements AdapterSession {
       await current.terminate();
     }
   }
+  async observeNativeStop(turnId:string){return this.lastNative?.turnId===turnId&&this.lastNative.supervisor.hasStopped()?"process_tree_exit" as const:undefined;}
 
   async switchModel(model: string): Promise<{ warnings?: string[] }> {
     this.model = model;
@@ -171,7 +175,7 @@ class OpenClawSession implements AdapterSession {
       "agent", "--local", "--agent", this.openclawAgent, "--json",
       "--session-key", this.sessionKey,
       "--message", "/compact",
-      "--model", this.model,
+      ...(this.model&&this.model!=="default"?["--model",this.model]:[]),
     ]);
     return { summary: "compacted via OpenClaw /compact" };
   }
@@ -198,12 +202,13 @@ class OpenClawSession implements AdapterSession {
     return undefined;
   }
 
-  private run(args: string[], signal?: AbortSignal, environment?: Record<string, string>): Promise<string | null> {
+  private run(args: string[], signal?: AbortSignal, environment?: Record<string, string>,turnId?:string): Promise<string | null> {
     return new Promise((resolve, reject) => {
       // shell:win32 — npm 全局 `openclaw` 在 Windows 是 .cmd shim，Node 22 不带 shell 直接 spawn .cmd 会抛 EINVAL（与 claude/codex/hermes adapter 保持一致）。
-      const supervisor = spawnSupervisedAgent("openclaw", args, { cwd: this.cwd, env: buildChildProcessEnvironment(environment) });
+      const supervisor = spawnSupervisedAgent(this.bin, args, { cwd: this.cwd, env: buildChildProcessEnvironment(environment) });
       const child = supervisor.child;
       this.current = supervisor;
+      if(turnId)this.lastNative={turnId,supervisor};
       let out = "";
       let err = "";
       let killed = false;
@@ -229,12 +234,14 @@ class OpenClawSession implements AdapterSession {
 
 export class OpenClawAdapter implements AgentAdapter {
   readonly name = "openclaw";
-  readonly capabilities = OPENCLAW_CAPABILITIES;
+  readonly capabilities = {...OPENCLAW_CAPABILITIES,reasoningControl:false};
   /** 默认驱动哪个 OpenClaw agent（可被 session agentConfig.openclawAgent 覆盖）。 */
   private defaultAgent: string;
+  private bin:string;
 
-  constructor(opts: { defaultAgent?: string } = {}) {
+  constructor(opts: { defaultAgent?: string;binPath?:string } = {}) {
     this.defaultAgent = opts.defaultAgent ?? "main";
+    this.bin=opts.binPath??"openclaw";
   }
 
   async discover(): Promise<AgentDescriptor> {
@@ -245,6 +252,7 @@ export class OpenClawAdapter implements AgentAdapter {
     // 探测 openclaw 是否可用 + 版本
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.reasoningControl=false;
     if (!available) {
       return [{
         agentId: "openclaw" as AgentDescriptor["agentId"],
@@ -253,22 +261,29 @@ export class OpenClawAdapter implements AgentAdapter {
         available: false,
         unavailableReason: "openclaw CLI not found",
         models: [],
-        capabilities: OPENCLAW_CAPABILITIES,
+        capabilities: this.capabilities,
         scannedAt: new Date().toISOString(),
       }];
     }
-    // spawn 版不枚举多 agent（Gateway 版才枚举）：只报 defaultAgent
+    let models:ModelInfo[]=[];
+    try{
+      const help=await discoveryProbe(this.bin,["agent","--help"],signal);
+      this.capabilities.reasoningControl=/--thinking\s+<level>/.test(help??"");
+      const listed=await discoveryProbe(this.bin,["models","list","--agent",this.defaultAgent,"--json"],signal);
+      models=parseOpenClawNativeModels(JSON.parse(listed??"{}"));
+      const output=await discoveryProbe(this.bin,["gateway","call","models.list","--params",JSON.stringify({view:"default",agentId:this.defaultAgent}),"--json"],signal);
+      const gateway=parseOpenClawNativeModels(JSON.parse(output??"{}"));
+      models=models.map(model=>{const levels=gateway.find(row=>row.id===model.id)?.reasoningLevels;return levels?{...model,reasoningLevels:levels}:model;});
+    }catch{/* A missing optional catalog does not prevent local CLI execution. */}
+    // The one-shot path reports only its configured native agent.
     return [{
       agentId: `openclaw:${this.defaultAgent}` as AgentDescriptor["agentId"],
       displayName: `OpenClaw / ${this.defaultAgent}`,
       adapter: "openclaw",
       available: true,
       ...(version ? { version } : {}),
-      models: [
-        { id: "github-copilot/claude-opus-4.8", displayName: "Claude Opus 4.8", available: true },
-        { id: "github-copilot/gpt-5.5", displayName: "GPT-5.5", available: true },
-      ],
-      capabilities: OPENCLAW_CAPABILITIES,
+      models:models.length?models:[{id:"default",displayName:"Native CLI default selection",available:true}],
+      capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
   }
@@ -277,10 +292,10 @@ export class OpenClawAdapter implements AgentAdapter {
     const openclawAgent =
       (params.agentConfig?.openclawAgent as string) ??
       (params.agentId?.includes(":") ? params.agentId.split(":")[1]! : this.defaultAgent);
-    return new OpenClawSession(params.sessionId, params.model, params.cwd, openclawAgent, params.initialContext);
+    return new OpenClawSession(params.sessionId, params.model, params.cwd, openclawAgent, params.initialContext,this.bin,this.capabilities.reasoningControl&&openclawAgent===this.defaultAgent);
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {
-    return (await discoveryProbe("openclaw", ["--version"], signal));
+    return (await discoveryProbe(this.bin, ["--version"], signal));
   }
 }

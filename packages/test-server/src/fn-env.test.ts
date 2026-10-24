@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { AdapterRegistry, buildChildProcessEnvironment, DANGEROUS_CHILD_ENV_NAMES, isDangerousChildEnvName, PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry, buildChildProcessEnvironment, DANGEROUS_CHILD_ENV_NAMES, isDangerousChildEnvName, PhononStore, NativeFileBroker } from "@agent-phonon/core";
 import type { TenantPolicy } from "@agent-phonon/protocol";
 import { MockAdapter, TestConn } from "./harness.js";
 
@@ -27,6 +27,7 @@ function setup(opts: {
     trustLocal: opts.trustLocal ?? true,
     policy: opts.policy,
     store: opts.store,
+    ...(process.env.PHONON_FS_BROKER_ARTIFACT_ROOT?{nativeFileBroker:new NativeFileBroker(process.env.PHONON_FS_BROKER_ARTIFACT_ROOT)}:{}),
   });
   return { tc, adapter, root };
 }
@@ -63,7 +64,7 @@ test("env.set/list/delete: default list is redacted", async () => {
   assert.equal(del.deleted, true);
 });
 
-test("env variables are injected into session.send environment with precedence", async () => {
+test("env variables are injected into session.send environment with precedence", {skip:!process.env.PHONON_FS_BROKER_ARTIFACT_ROOT?"Prepared native file broker required for managed skill execution":false}, async () => {
   const { tc, adapter } = setup();
   const proj = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string } };
   const projectId = proj.project.projectId;
@@ -72,6 +73,7 @@ test("env variables are injected into session.send environment with precedence",
   await tc.call("env.set", { scope: "skill", projectId, agent: "mock:default", skillName: "s1", name: "SHARED", value: "skill" });
   await tc.call("env.set", { scope: "skill", projectId, agent: "mock:default", skillName: "s1", name: "SKILL_TOKEN", value: "skill-token" });
   await tc.call("env.set", { scope: "global", name: "API_KEY", value: "ordinary-key" });
+  await tc.call("skill.install",{agent:"mock:default",name:"s1",scope:"project",projectId,source:{kind:"inline",files:{"SKILL.md":"Environment test instructions"}}});
   const created = await tc.call("session.create", { project: projectId, agent: "mock:default", model: "m1" }) as { sessionId: string };
   const ack = await tc.call("session.send", { sessionId: created.sessionId, input: "hi", skills: ["s1"] }) as { turnId: string };
   await tc.waitTurnEnd(ack.turnId);

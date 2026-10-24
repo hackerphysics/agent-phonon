@@ -161,7 +161,10 @@ test("P2 session.list pagination (limit + cursor)", async () => {
   const page2 = engine.list("t", { limit: 2, cursor: page1.nextCursor });
   assert.equal(page2.sessions.length, 2);
   // 不重叠
-  assert.notEqual(page1.sessions[0].sessionId, page2.sessions[0].sessionId);
+  const first = page1.sessions[0], second = page2.sessions[0];
+  assert.ok(first);
+  assert.ok(second);
+  assert.notEqual(first.sessionId, second.sessionId);
 });
 
 // ============ B3: sqlite 持久化 ============

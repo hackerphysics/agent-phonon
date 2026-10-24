@@ -1,9 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
+import { prepareCopilotPeerContext } from "./copilot-peer-context.js";
+import { discoverCopilotNativeModels } from "./copilot-models.js";
+import { nativeReasoning } from "../reasoning.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -57,6 +61,8 @@ export interface CopilotEnv {
   defaultModel?: string;
   /** Optional explicit model inventory supplied by the user/server. */
   models?: ModelInfo[];
+  /** Owner opt-in to invocation-scoped peer hooks. Does not grant native extension access. */
+  peerContext?: boolean;
 }
 
 export type ParsedCopilotEvent =
@@ -121,9 +127,16 @@ export function parseCopilotModelsHelp(text: string): ModelInfo[] {
   return models;
 }
 
+/** Offline CLI builds include a banner and update advice rather than a bare version. */
+export function parseCopilotVersion(text: string): string | undefined {
+  const line = text.trim().split(/\r?\n/)[0] ?? "";
+  const value = line.startsWith("GitHub Copilot CLI ") ? line.slice("GitHub Copilot CLI ".length).replace(/\.$/, "") : line;
+  return /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(value) ? value : undefined;
+}
+
 function configuredModel(): string | undefined {
   const home = process.env.COPILOT_HOME ?? join(homedir(), ".copilot");
-  const path = join(home, "settings.json");
+  const path = existsSync(join(home,"config.json"))?join(home,"config.json"):join(home, "settings.json");
   if (!existsSync(path)) return undefined;
   try {
     const settings = JSON.parse(readFileSync(path, "utf8")) as { model?: unknown };
@@ -141,8 +154,32 @@ class CopilotSession implements AdapterSession {
   private readonly nativeName: string;
   private started: boolean;
   private current?: ProcessSupervisor;
+  private stopTurn?: () => void;
   private pendingInject: string[] = [];
   private nativeSessionId?: string;
+  private peerQualified = false;
+  private peer?: ReturnType<typeof prepareCopilotPeerContext>;
+
+  async preparePeerContext(environment?: Record<string, string>, signal?: AbortSignal): Promise<void> {
+    this.peerQualified = false;
+    if (this.env.peerContext !== true || this.started && !this.nativeSessionId) return;
+    try {
+      const version = await discoveryProbe(this.env.binPath ?? "copilot", ["--no-auto-update", "--version"], signal,
+        { cwd: this.cwd, env: buildChildProcessEnvironment(environment) });
+      this.peerQualified = version !== null && parseCopilotVersion(version) === "1.0.82";
+      if (this.peerQualified) {
+        this.nativeSessionId ??= randomUUID();
+        if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(this.nativeSessionId)) this.peerQualified = false;
+      }
+    } catch { /* Native receive is optional; preserve the original CLI path. */ }
+  }
+
+  peerContextCapability() {
+    if (!this.peerQualified) return undefined;
+    const ready = this.peer?.isReady() ?? false;
+    return { mode: "context_hook", boundary: "after_tools", visibility: "collapsed", evidence: "context_hook",
+      budget:"native_estimate", readiness: ready ? "ready" : "pending", ...(ready ? { nativeSessionId: this.nativeSessionId } : {}) } as const;
+  }
 
   constructor(
     sessionId: string,
@@ -151,6 +188,7 @@ class CopilotSession implements AdapterSession {
     env: CopilotEnv,
     initialContext?: ContextItem[],
     reattach = false,
+    private readonly reasoningFlag=false,
   ) {
     this.sessionId = sessionId;
     this.model = model;
@@ -164,6 +202,12 @@ class CopilotSession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    if (this.current) throw new Error("Copilot session already has an active turn");
+    if (opts.signal?.aborted) {
+      opts.emit({ type: "result", sessionId: this.sessionId, turnId: opts.turnId, seq: 0, at: new Date().toISOString(),
+        text: "", status: "interrupted", final: true } as StreamEvent);
+      return;
+    }
     let prompt = input;
     if (this.pendingInject.length > 0) {
       prompt = this.pendingInject.join("\n") + "\n\n" + prompt;
@@ -174,7 +218,7 @@ class CopilotSession implements AdapterSession {
     }
 
     const args = [
-      this.started ? `--resume=${this.nativeName}` : `--name=${this.nativeName}`,
+      this.started ? `--resume=${this.peerQualified ? this.nativeSessionId : this.nativeName}` : `--name=${this.nativeName}`,
       "--output-format", "json",
       "--stream", "on",
       "--no-ask-user",
@@ -182,26 +226,41 @@ class CopilotSession implements AdapterSession {
       "--no-auto-update",
       "--no-color",
     ];
+    if (opts.peerContext && this.peerQualified && this.nativeSessionId) {
+      try {
+        this.peer = prepareCopilotPeerContext(opts, { sessionId: this.nativeSessionId, cwd: this.cwd, prompt: prompt + "\n" });
+        args.push("--plugin-dir", this.peer.path);
+        if (!this.started) args.push("--session-id", this.nativeSessionId);
+      } catch { this.peerQualified = false; }
+    }
     if (this.model && this.model !== "default") args.push("--model", this.model);
-    await this.run(args, prompt + "\n", opts);
+    if(this.reasoningFlag&&opts.reasoning?.level)args.push("--reasoning-effort",nativeReasoning(opts.reasoning.level)!);
+    const peer = this.peer;
+    try { await this.run(args, prompt + "\n", opts); }
+    finally { peer?.cleanup(); if (this.peer === peer) this.peer = undefined; }
   }
 
   private run(args: string[], stdin: string, opts: SendOptions): Promise<void> {
-    return new Promise((resolve) => {
+    let runtime: ProcessSupervisor | undefined;
+    return new Promise<void>((resolve) => {
       const { turnId, emit } = opts;
+      const environment = buildChildProcessEnvironment(opts.environment);
+      delete environment.AGENT_PHONON_PEER_CONTEXT_URL;
+      delete environment.AGENT_PHONON_PEER_CONTEXT_TOKEN;
       const supervisor = spawnSupervisedAgent(this.env.binPath ?? "copilot", args, {
         cwd: this.cwd,
-        env: buildChildProcessEnvironment(opts.environment),
+        env: environment,
       });
+      runtime = supervisor;
       const child = supervisor.child;
       this.current = supervisor;
-      const releaseCurrent = (): void => { if (this.current === supervisor) this.current = undefined; };
-      child.once("close", releaseCurrent);
-      child.once("error", releaseCurrent);
       let stdoutBuf = "";
       let stderr = "";
       let acc = "";
+      let finalText = "", nativeResult = false, nativeFailure = false;
       let settled = false;
+      const startedAt=Date.now();
+      let reasoningEvidence:{sessionId:string;value:string}|undefined;
       const toolNames = new Map<string, string>();
 
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", message?: string): void => {
@@ -210,6 +269,9 @@ class CopilotSession implements AdapterSession {
         clearTimeout(guard);
         opts.signal?.removeEventListener("abort", abort);
         if (status === "completed") this.started = true;
+        if(status==="completed"&&reasoningEvidence&&reasoningEvidence.sessionId===this.nativeSessionId&&opts.reasoning?.level&&reasoningEvidence.value===nativeReasoning(opts.reasoning.level)){
+          try{opts.acknowledgeReasoning?.(reasoningEvidence.value);}catch{/* Optional evidence cannot replace the native outcome. */}
+        }
         const now = new Date().toISOString();
         if (status === "failed") {
           emit({
@@ -219,7 +281,7 @@ class CopilotSession implements AdapterSession {
         } else {
           emit({
             type: "result", sessionId: this.sessionId, turnId, seq: 0, at: now,
-            text: acc, status, final: true,
+            text: status === "completed" ? finalText : acc, status, final: true,
           } as StreamEvent);
         }
         resolve();
@@ -233,6 +295,7 @@ class CopilotSession implements AdapterSession {
         void supervisor.terminate();
         finish("interrupted");
       };
+      this.stopTurn = abort;
       if (opts.signal?.aborted) abort();
       else opts.signal?.addEventListener("abort", abort, { once: true });
 
@@ -240,6 +303,20 @@ class CopilotSession implements AdapterSession {
         if (!line.trim()) return;
         let raw: unknown;
         try { raw = JSON.parse(line); } catch { return; }
+        if (!raw || typeof raw !== "object") return;
+        const event = raw as { type?: unknown; agentId?: unknown; exitCode?: unknown; timestamp?:unknown; data?: { parentToolCallId?: unknown; content?: unknown; toolRequests?: unknown; sessionId?:unknown;selectedModel?:unknown;reasoningEffort?:unknown } };
+        if (event.agentId || event.data?.parentToolCallId) return;
+        if(this.reasoningFlag&&["session.start","session.resume"].includes(String(event.type))&&typeof event.timestamp==="string"&&Date.parse(event.timestamp)>=startedAt
+          &&event.data?.selectedModel===this.model&&typeof event.data.sessionId==="string"&&typeof event.data.reasoningEffort==="string"){
+          reasoningEvidence={sessionId:event.data.sessionId,value:event.data.reasoningEffort};
+        }
+        if (event.type === "user.message" && this.peer && !this.peer.isReady()) this.peer.deactivate();
+        if (event.type === "session.error") nativeFailure = true;
+        if (event.type === "assistant.message") {
+          finalText = typeof event.data?.content === "string" && !(Array.isArray(event.data?.toolRequests) && event.data.toolRequests.length)
+            ? event.data.content : "";
+        }
+        if (event.type === "result") { nativeResult = true; nativeFailure ||= event.exitCode !== 0; }
         const parsed = parseCopilotEvent(raw);
         const at = new Date().toISOString();
         if (parsed.kind === "message_delta") {
@@ -262,7 +339,13 @@ class CopilotSession implements AdapterSession {
             toolName, toolCallId: parsed.toolCallId ?? "",
             ok: parsed.ok, output: parsed.output,
           } as StreamEvent);
-        } else if (parsed.kind === "result" && parsed.nativeSessionId) {
+        } else if (parsed.kind === "result") {
+          if (!parsed.nativeSessionId || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(parsed.nativeSessionId)) {
+            nativeFailure = true; return;
+          }
+          if (this.peer && parsed.nativeSessionId !== this.nativeSessionId) {
+            void supervisor.terminate(); finish("failed", "Copilot native session identity changed"); return;
+          }
           this.nativeSessionId = parsed.nativeSessionId;
         }
       };
@@ -276,13 +359,14 @@ class CopilotSession implements AdapterSession {
           handleLine(line);
         }
       });
-      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-16000); });
       child.on("error", (error) => finish("failed", error.message));
       child.on("close", (code) => {
         if (settled) return;
         if (stdoutBuf.trim()) handleLine(stdoutBuf);
-        finish(code === 0 ? "completed" : "failed", code === 0
-          ? undefined
+        const completed = code === 0 && nativeResult && !nativeFailure && !!finalText.trim();
+        finish(completed ? "completed" : "failed", completed
+          ? undefined : code === 0 ? "Copilot native final result is unconfirmed"
           : (stderr.trim() || `copilot exited ${code}`));
       });
 
@@ -290,13 +374,16 @@ class CopilotSession implements AdapterSession {
         child.stdin.write(stdin);
         child.stdin.end();
       }
+    }).finally(async () => {
+      await runtime?.terminate();
+      if (this.current === runtime) { this.current = undefined; this.stopTurn = undefined; }
     });
   }
 
   async interrupt(): Promise<void> {
     if (this.current) {
       const current = this.current;
-      this.current = undefined;
+      this.stopTurn?.();
       await current.terminate();
     }
   }
@@ -317,7 +404,7 @@ class CopilotSession implements AdapterSession {
 
 export class CopilotAdapter implements AgentAdapter {
   readonly name = "copilot";
-  readonly capabilities = CAPABILITIES;
+  readonly capabilities = {...CAPABILITIES,reasoningControl:false};
   private readonly env: CopilotEnv;
 
   constructor(opts: { env?: CopilotEnv } = {}) {
@@ -327,6 +414,11 @@ export class CopilotAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.reasoningControl=false;
+    if(available){
+      try{const help=await discoveryProbe(this.env.binPath??"copilot",["--no-auto-update","--help"],signal);this.capabilities.reasoningControl=/--reasoning-effort\s+<level>/.test(help??"");}
+      catch{this.capabilities.reasoningControl=false;}
+    }
     const models = available ? await this.discoverModels(signal) : this.fallbackModels();
     return [{
       agentId: "copilot" as AgentDescriptor["agentId"],
@@ -336,7 +428,7 @@ export class CopilotAdapter implements AgentAdapter {
       ...(available ? {} : { unavailableReason: "copilot CLI not found" }),
       ...(version ? { version } : {}),
       models,
-      capabilities: CAPABILITIES,
+      capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
   }
@@ -352,6 +444,7 @@ export class CopilotAdapter implements AgentAdapter {
       this.env,
       params.initialContext,
       params.reattach,
+      this.capabilities.reasoningControl,
     );
   }
 
@@ -361,8 +454,22 @@ export class CopilotAdapter implements AgentAdapter {
   }
 
   private async discoverModels(signal?: AbortSignal): Promise<ModelInfo[]> {
-    if (this.env.models?.length) return this.env.models;
-    const out = await discoveryProbe(this.env.binPath ?? "copilot", ["help", "config"], signal);
+    let native:ModelInfo[]=[];
+    try{native=await discoverCopilotNativeModels({bin:this.env.binPath??"copilot",...(signal?{signal}:{}),env:buildChildProcessEnvironment()});}
+    catch{/* Optional model discovery must not prevent the original CLI path. */}
+    if (this.env.models?.length)return this.env.models.map(model=>{
+      const id=model.id==="default"?(this.env.defaultModel&&this.env.defaultModel!=="default"?this.env.defaultModel:configuredModel()):model.id;
+      const levels=native.find(row=>row.id===id)?.reasoningLevels;
+      return model.reasoningLevels||!levels?model:{...model,reasoningLevels:levels};
+    });
+    if(native.length){
+      const preferred=this.fallbackModels().map(model=>{
+        const id=model.id==="default"?configuredModel():model.id,found=native.find(row=>row.id===id);
+        return {...model,...(found?.reasoningLevels?{reasoningLevels:found.reasoningLevels}:{})};
+      });
+      return [...preferred,...native.filter(model=>!preferred.some(row=>row.id===model.id))];
+    }
+    const out = await discoveryProbe(this.env.binPath ?? "copilot", ["--no-auto-update", "help", "config"], signal);
     // Static help is not the authenticated user's model availability.
     const parsed = parseCopilotModelsHelp(out ?? "").map((model) => ({ ...model, available: false }));
     const configured = configuredModel();
@@ -372,6 +479,7 @@ export class CopilotAdapter implements AgentAdapter {
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {
-    return (await discoveryProbe(this.env.binPath ?? "copilot", ["--version"], signal))?.split(/\r?\n/)[0] ?? null;
+    const version = await discoveryProbe(this.env.binPath ?? "copilot", ["--no-auto-update", "--version"], signal);
+    return version === null ? null : parseCopilotVersion(version) ?? null;
   }
 }

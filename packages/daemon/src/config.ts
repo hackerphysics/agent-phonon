@@ -4,7 +4,8 @@ import { z } from "zod";
 import type { ModelInfo, TenantPolicy } from "@agent-phonon/protocol";
 import { deliveryOptions, type DeliveryConfig, discoveryOptions, type DiscoveryOptions, createRescueModel, rescueProviderOptions, validateRescueEndpoint, type RescueConnectionOptions, type MaintenanceManagerConfig } from "@agent-phonon/core";
 import { homedir, hostname } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname,isAbsolute } from "node:path";
+import {readPrivateFile,replacePrivateFile,withConfigLock} from "./managed-mcp-config.js";
 
 /**
  * daemon 配置（bug-bash B4）。
@@ -13,6 +14,8 @@ import { join, dirname } from "node:path";
  * 注册若干 adapter，连接若干 server（每个 server = 一个 tenant 连接）。
  */
 export interface ServerConfig {
+  /** Local owner consent; never accepted from the remote MCP configuration RPC. */
+  managedMcp?: import("./managed-mcp.js").ManagedMcpLocalPolicy;
   /** 服务端 ws/http URL。 */
   url: string;
   /** 本地自用放宽 policy（默认 false）。 */
@@ -27,9 +30,11 @@ export interface ServerConfig {
   policy?: Partial<TenantPolicy>;
 }
 
+export const ADAPTER_TYPES = ["openclaw-gateway", "openclaw-cli", "claude-code", "codex", "hermes", "opencode", "copilot", "pi"] as const;
+
 export interface AdapterConfig {
   /** adapter 类型：openclaw-gateway | openclaw-cli。 */
-  type: "openclaw-gateway" | "openclaw-cli" | "claude-code" | "codex" | "hermes" | "opencode" | "copilot" | "herdr" | "pi";
+  type: typeof ADAPTER_TYPES[number];
   /** OpenClaw Gateway WS URL（openclaw-gateway 用）。 */
   gatewayUrl?: string;
   /** Gateway token（openclaw-gateway 用；缺省从 ~/.openclaw/openclaw.json 读）。 */
@@ -55,6 +60,8 @@ export interface AdapterConfig {
   hermesBinPath?: string;
   hermesModel?: string;
   hermesProvider?: string;
+  /** Local operator opt-in for native tools in NEW owned managed Hermes profiles. Default false. */
+  hermesManagedProfileNativeTools?: boolean;
   /** opencode：binary 路径/默认模型。 */
   opencodeBinPath?: string;
   opencodeModel?: string;
@@ -62,12 +69,8 @@ export interface AdapterConfig {
   copilotBinPath?: string;
   copilotModel?: string;
   copilotModels?: ModelInfo[];
-  /** Herdr 多 agent runtime：binary 路径/默认模型/默认 kind/轮询节奏。 */
-  herdrBinPath?: string;
-  herdrModel?: string;
-  herdrDefaultKind?: import("@agent-phonon/core").HerdrKind;
-  herdrTurnTimeoutSeconds?: number;
-  herdrPollIntervalMs?: number;
+  /** Owner opt-in only; native Copilot permission access must already be authorized. */
+  copilotPeerContext?: boolean;
   /** Pi coding agent：binary 路径/默认模型/模型清单/追加 system prompt。 */
   piBinPath?: string;
   piModel?: string;
@@ -89,6 +92,8 @@ export interface DaemonConfig {
   dbPath: string;
   /** 受控项目根。 */
   workspaceRoot: string;
+  /** Prepared local file runtime assets; never configurable by remote profile RPC. */
+  employeeProfileFileBrokerRoot?:string;
   /** 结构化日志级别。 */
   logLevel?: "debug" | "info" | "warn" | "error";
   /** Shared discovery inventory; owner-only polling and per-adapter deadline. */
@@ -164,13 +169,27 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): DaemonConfig {
   if (!existsSync(path)) {
     throw new Error(`config not found at ${path} — run 'agent-phonon init' first`);
   }
-  const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<DaemonConfig>;
+  const raw = JSON.parse(process.platform==="win32"?readPrivateFile(path,1024*1024,true)??"":readFileSync(path,"utf8")) as Partial<DaemonConfig>;
+  for (const server of raw.servers ?? []) if (server.managedMcp !== undefined) {
+    const policy = server.managedMcp;
+    if (!policy || typeof policy.allow !== "boolean" || !Array.isArray(policy.agents) || policy.agents.length > 100
+      || policy.sourceFingerprint!==undefined&&(typeof policy.sourceFingerprint!=="string"||!/^[a-f0-9]{64}$/.test(policy.sourceFingerprint))
+      || policy.agents.some(agent => typeof agent !== "string" || !/^[a-zA-Z0-9_.:*-]{1,255}$/.test(agent))
+      || (policy.configPaths !== undefined && (!policy.configPaths || typeof policy.configPaths !== "object" || Object.values(policy.configPaths).some(path => typeof path !== "string" || !path || path.length > 4096)))) throw new Error("invalid local managed MCP policy");
+  }
   validateServerConfigs(raw.servers ?? []);
+  for (const [index, adapter] of (raw.adapters ?? []).entries()) {
+    if (!ADAPTER_TYPES.includes(adapter.type)) throw new Error(`adapters[${index}].type: unsupported adapter type ${JSON.stringify(adapter.type)}; configure a supported native adapter explicitly`);
+  }
+  if(raw.employeeProfileFileBrokerRoot!==undefined&&(typeof raw.employeeProfileFileBrokerRoot!=="string"||!isAbsolute(raw.employeeProfileFileBrokerRoot)||raw.employeeProfileFileBrokerRoot.includes("\0")||raw.employeeProfileFileBrokerRoot.length>4096))throw new Error("employeeProfileFileBrokerRoot must be an absolute local runtime path");
+  for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.hermesManagedProfileNativeTools!==undefined&&typeof adapter.hermesManagedProfileNativeTools!=="boolean")throw new Error(`adapters[${index}].hermesManagedProfileNativeTools must be a boolean`);
+  for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.copilotPeerContext!==undefined&&typeof adapter.copilotPeerContext!=="boolean")throw new Error(`adapters[${index}].copilotPeerContext must be a boolean`);
   const d = defaultConfig();
   return {
     deviceId: raw.deviceId ?? d.deviceId,
     dbPath: raw.dbPath ?? d.dbPath,
     workspaceRoot: raw.workspaceRoot ?? d.workspaceRoot,
+    employeeProfileFileBrokerRoot:raw.employeeProfileFileBrokerRoot,
     discovery: discoveryOptions(raw.discovery),
     delivery: deliveryOptions(raw.delivery),
     hookBridge: { ...d.hookBridge, ...raw.hookBridge },
@@ -244,6 +263,10 @@ export function configureRescueAgent(cfg: DaemonConfig, input: RescueConnectionO
 }
 
 export function writeConfig(cfg: DaemonConfig, path = DEFAULT_CONFIG_PATH): void {
+  if(process.platform==="win32"){
+    withConfigLock(path,()=>replacePrivateFile(path,readPrivateFile(path,1024*1024,true),JSON.stringify(cfg,null,2)));
+    return;
+  }
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(cfg, null, 2), { mode: 0o600 });
   try { chmodSync(path, 0o600); } catch { /* best-effort */ } // 含 token，限制权限（bug-bash#2）

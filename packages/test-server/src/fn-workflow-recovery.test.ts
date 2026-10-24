@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync,rmSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,12 +93,14 @@ function setup(reply: Control["reply"]) {
 
 async function waitFor(tc: TestConn, workflowId: string, predicate: (status: any) => boolean, timeoutMs = 5000): Promise<any> {
   const until = Date.now() + timeoutMs;
+  let last:unknown;
   while (Date.now() < until) {
     const status = await tc.call("workflow.status", { workflowId });
+    last=status;
     if (predicate(status)) return status;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(`workflow ${workflowId} did not reach expected state`);
+  throw new Error(`workflow ${workflowId} did not reach expected state: ${JSON.stringify(last)}`);
 }
 
 async function project(tc: TestConn, name: string): Promise<string> {
@@ -115,6 +117,21 @@ async function waitRun(store: PhononStore, runId: string, status: string, timeou
   }
   throw new Error(`schedule run ${runId} did not reach ${status}`);
 }
+test('a cursor-bound resume rejects stale observations and survives duplicate submission after controller replacement',async()=>{
+  let sends=0;const fx=setup(()=>({text:'resume result',failed:++sends===1}));let tc=fx.conn();
+  try{
+    const p=await project(tc,'bound-resume'),plan={mode:'dag',nodes:[{nodeId:'a',agent:'controlled:a',model:'m1',input:'Original task'}]};
+    const first=await tc.call('workflow.run',{project:p,plan}) as {workflowId:string};await waitFor(tc,first.workflowId,value=>value.status==='failed');
+    const cursor=Number(fx.store.getWorkflow(first.workflowId,'tenant-recovery')!.seq)-1;
+    await assert.rejects(tc.call('workflow.run',{project:p,plan,clientRequestId:'stale-resume',resumeFrom:{workflowId:first.workflowId,strategy:'last_success_dependents',expectedSeq:cursor+1}}),(error:any)=>error.data?.appCode==='errWorkflowObservationChanged');
+    assert.equal(sends,1);
+    const command={project:p,plan,clientRequestId:'frozen-resume',resumeFrom:{workflowId:first.workflowId,strategy:'last_success_dependents',expectedSeq:cursor}};
+    const accepted=await tc.call('workflow.run',command);await waitFor(tc,first.workflowId,value=>value.status==='completed');assert.equal(sends,2);
+    assert.deepEqual(await tc.call('workflow.run',command),accepted);assert.equal(sends,2);
+    await tc.conn.dispose();tc=fx.conn();assert.deepEqual(await tc.call('workflow.run',command),accepted);assert.equal(sends,2);
+    await assert.rejects(tc.call('workflow.run',{...command,resumeFrom:{...command.resumeFrom,expectedSeq:cursor+1}}));assert.equal(sends,2);
+  }finally{await tc.conn.dispose();fx.store.close();rmSync(fx.root,{recursive:true,force:true});}
+});
 
 test("DAG auto-recovers after connection crash without rerunning completed nodes", async () => {
   const fx = setup((input) => input === "slow-b" ? { text: "B", delay: 500 } : { text: "A", delay: 10 });
@@ -538,6 +555,10 @@ test("Graph cursor recovery does not repeat a completed route and duplicate dire
   const done = await waitFor(second, run.workflowId, (s) => s.status === "completed");
   assert.equal(done.finalText, "graph-done");
   assert.equal(fx.control.calls.filter((x) => x === "worker-job").length, 1);
+  const history=await second.call("workflow.events.list",{workflowId:run.workflowId,fromSeq:0,limit:200}) as any;
+  const replacement=history.events.find((event:any)=>event.payload?.warn==="native_session_replaced_for_retry");
+  assert.ok(replacement,"generic retry must disclose its new Session identity");
+  assert.notEqual(replacement.sessionId,replacement.payload.previousSessionId);
 
   await assert.rejects(() => second.call("workflow.run", { project: projectId, plan: {
     mode: "graph", executor: { nodeId: "e", agent: "controlled:exec", model: "m1" },
@@ -618,17 +639,19 @@ test("cancelled workflow resume retains and reuses a dirty auto-worktree mapping
     plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "controlled:a", model: "m1", input: "make-dirty" }] },
   }) as { workflowId: string };
   await waitFor(tc, run.workflowId, (status) => status.status === "running");
-  const untilDirty = Date.now() + 2_000;
+  const untilDirty = Date.now() + 15_000;
+  let dirtyReady=false;
   while (Date.now() < untilDirty) {
     const row = fx.store.getWorkflow(run.workflowId, "tenant-recovery")!;
     const mappings = Object.values(JSON.parse(row.checkpoint_json as string).autoWorktrees) as Array<{ worktreeId: string }>;
     const worktree = mappings[0] && fx.store.loadWorktrees().find((item) => item.worktreeId === mappings[0]!.worktreeId);
-    if (worktree && existsSync(join(worktree.path, "uncommitted.txt"))) break;
+    if (worktree && existsSync(join(worktree.path, "uncommitted.txt"))) {dirtyReady=true;break;}
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  assert.ok(dirtyReady,"Native worktree must exist and be dirty before cancellation");
   await tc.call("workflow.cancel", { workflowId: run.workflowId });
   const checkpoint = fx.store.getWorkflow(run.workflowId, "tenant-recovery")!;
-  assert.ok(Object.keys(JSON.parse(checkpoint.checkpoint_json as string).autoWorktrees).length > 0);
+  assert.ok(Object.keys(JSON.parse(checkpoint.checkpoint_json as string).autoWorktrees).length > 0,JSON.stringify(checkpoint));
   await tc.call("workflow.resume", { workflowId: run.workflowId, strategy: "continue" });
   await waitFor(tc, run.workflowId, (status) => status.status === "completed");
   assert.equal(calls, 2);
@@ -647,7 +670,7 @@ test("automatic worktree cleanup preserves dirty worktrees", async () => {
     worktreeId: "dirty-key",
     plan: { mode: "dag", nodes: [{ nodeId: "a", agent: "controlled:a", model: "m1", input: "make-dirty" }] },
   }) as { workflowId: string };
-  await waitFor(tc, run.workflowId, (s) => s.status === "completed");
+  await waitFor(tc, run.workflowId, (s) => s.status === "completed",30_000);
   const worktrees = execSync(`git -C ${created.project.path} worktree list --porcelain`).toString();
   assert.match(worktrees, /phonon-wf-/, "dirty workflow worktree must be retained");
   await tc.conn.dispose();
@@ -705,7 +728,7 @@ test("Dev dispatch identity survives lost response/reconnect and rejects changed
 
 test("Dev interrupted transport pauses until explicit resume, not automatic repeated model work",async()=>{
  const fx=setup(input=>({text:"resumed:"+input,delay:200}));let tc=fx.conn();
- try{const p=await project(tc,"dev-pause");const first=await tc.call("workflow.run",{project:p,clientRequestId:"pause-key",metadata:{dev_run_id:"central-run"},plan:{mode:"dag",nodes:[{nodeId:"a",agent:"controlled:a",model:"m1",input:"pause-input"}]}}) as {workflowId:string};
+ try{const p=await project(tc,"dev-pause");const first=await tc.call("workflow.run",{project:p,clientRequestId:"pause-key",metadata:{dev_run_id:"11111111-1111-4111-8111-111111111111"},plan:{mode:"dag",nodes:[{nodeId:"a",agent:"controlled:a",model:"m1",input:"pause-input"}]}}) as {workflowId:string};
  await waitFor(tc,first.workflowId,s=>s.nodes[0].status==="running");await tc.conn.dispose();const count=fx.control.calls.length;tc=fx.conn();await new Promise(r=>setTimeout(r,300));
  const paused=await tc.call("workflow.status",{workflowId:first.workflowId}) as {status:string};assert.equal(paused.status,"paused");assert.equal(fx.control.calls.length,count);
  await tc.call("workflow.resume",{workflowId:first.workflowId,strategy:"last_success_dependents"});await waitFor(tc,first.workflowId,s=>s.status==="completed");assert.equal(fx.control.calls.length,count+1);

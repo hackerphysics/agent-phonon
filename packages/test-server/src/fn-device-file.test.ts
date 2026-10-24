@@ -26,6 +26,7 @@ test("device.info: returns OS/machine scheduling metadata", async () => {
   assert.equal(typeof res.os.platform, "string");
   assert.equal(typeof res.os.arch, "string");
   assert.ok(Array.isArray(res.capabilities));
+  assert.ok(res.capabilities.includes("session_recovery_v1"));
 });
 
 test("device.resources: returns basic CPU/memory/disk/process snapshot", async () => {
@@ -63,6 +64,18 @@ test("file.*: project round-trip on Linux; explicit denial on unsupported platfo
   const { tc } = setup();
   const p = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string; path: string } };
   const projectId = p.project.projectId;
+
+  if(process.platform==="darwin"){
+    const info=await tc.call("device.info",{}) as any;
+    if(info.capabilities.includes("secure_file_transfer_darwin_v1")){
+      await tc.call("file.write",{projectId,path:"notes/a.txt",data:"hello",overwrite:false});
+      assert.equal((await tc.call("file.read",{projectId,path:"notes/a.txt"}) as any).data,"hello");
+      await assert.rejects(tc.call("file.write",{projectId,path:"notes/a.txt",data:"changed",overwrite:false}));
+      assert.equal(await readFile(join(p.project.path,"notes/a.txt"),"utf8"),"hello");
+      for(const [method,params]of [["file.mkdir",{path:"new-directory"}],["file.stat",{path:"notes/a.txt"}],["file.list",{path:"."}]]as const)await assert.rejects(tc.call(method,{projectId,...params}),brokerUnavailable);
+      return;
+    }
+  }
 
   if (process.platform !== "linux") {
     await mkdir(join(p.project.path, "notes"));
@@ -154,7 +167,8 @@ test("file.read: Linux truncation/base64; unsupported platforms never expose byt
   const { tc } = setup();
   const p = await tc.call("project.create", { name: "p", git: false }) as { project: { projectId: string; path: string } };
   const projectId = p.project.projectId;
-  if (process.platform !== "linux") {
+  const info=await tc.call("device.info",{}) as any;
+  if (process.platform !== "linux"&&!info.capabilities.includes("secure_file_transfer_darwin_v1")) {
     await writeFile(join(p.project.path, "bin.dat"), "abcdef");
     await assert.rejects(() => tc.call("file.read", { projectId, path: "bin.dat", encoding: "base64", maxBytes: 3 }), brokerUnavailable);
     return;

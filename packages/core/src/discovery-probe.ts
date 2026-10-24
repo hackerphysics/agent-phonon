@@ -1,9 +1,10 @@
-import { spawnSupervisedAgent } from "./process-supervisor.js";
+import { spawnSupervisedAgent,type ProcessSupervisor } from "./process-supervisor.js";
 
 /** Read-only native inventory command: bounded output/deadline and owned tree. */
-export async function discoveryProbe(command: string, args: string[], signal?: AbortSignal): Promise<string | null> {
+export async function discoveryProbe(command: string, args: string[], signal?: AbortSignal, scope: { cwd?: string; env?: NodeJS.ProcessEnv;onRuntime?:(runtime:ProcessSupervisor)=>void } = {}): Promise<string | null> {
   signal?.throwIfAborted();
-  const supervisor = spawnSupervisedAgent(command, args, {}, { graceMs: 250 });
+  const {onRuntime,...spawnScope}=scope;
+  const supervisor = spawnSupervisedAgent(command, args, spawnScope, { graceMs: 250 });
   const child = supervisor.child;
   let failure: Error | undefined;
   let termination: Promise<void> | undefined;
@@ -14,6 +15,7 @@ export async function discoveryProbe(command: string, args: string[], signal?: A
   signal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(abort, 10_000);
   try {
+    onRuntime?.(supervisor);
     return await new Promise<string | null>((resolve, reject) => {
       let output = "";
       let bytes = 0;
@@ -25,6 +27,9 @@ export async function discoveryProbe(command: string, args: string[], signal?: A
         output += chunk;
       });
       child.stderr.on("data", () => { /* drain, never log native diagnostics/secrets */ });
+      // Probes have no input; some noninteractive CLIs wait for EOF before dispatch.
+      child.stdin.on("error", () => {});
+      child.stdin.end();
       child.once("error", (err: NodeJS.ErrnoException) => {
         missing = err.code === "ENOENT";
         if (!missing) failure ??= new Error("native discovery probe spawn failed");
@@ -40,5 +45,9 @@ export async function discoveryProbe(command: string, args: string[], signal?: A
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
     await termination;
+    await supervisor.terminate();
+    const deadline=Date.now()+1000;
+    while(!supervisor.hasStopped()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+    if(!supervisor.hasStopped())throw new Error("Native discovery process tree has not stopped");
   }
 }

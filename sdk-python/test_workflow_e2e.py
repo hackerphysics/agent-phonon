@@ -3,20 +3,44 @@ import asyncio
 import os
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from agent_phonon import PhononServer  # noqa: E402
+from agent_phonon import PhononServer, PhononSession  # noqa: E402
 
 REPO = str(Path(__file__).resolve().parents[1])
 
 NODE_CLIENT = r"""
 import { AdapterRegistry, PhononClient } from "%s/packages/core/dist/index.js";
 import { MockAdapter } from "%s/packages/test-server/dist/harness.js";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync } from "node:fs"; import { tmpdir } from "node:os"; import { join } from "node:path";
 const [url, deviceId] = process.argv.slice(2);
 const reg = new AdapterRegistry();
-reg.register(new MockAdapter({ name:"mock", agentIds:["mock:a","mock:b","mock:c","mock:exec"], models:["m1"], reply:(i)=>"echo:"+i.slice(0,40) }));
+class BoardAdapter extends MockAdapter {
+  async createSession(params) {
+    const session = await super.createSession(params), ordinary = session.send.bind(session);
+    session.send = async (input, options) => {
+      if (input === "PEER") {
+        const result = await options.conversationMessage({operation:"send",requestId:randomUUID(),text:"Review",mentionIDs:[randomUUID()],mode:"queue",attachmentIDs:["native-file:"+randomUUID()]});
+        options.emit({type:"result",sessionId:params.sessionId,turnId:options.turnId,seq:0,at:new Date().toISOString(),text:"message:"+result.status,status:"completed",final:true});
+        return;
+      }
+      if (input === "DELEGATE") {
+        const result = await options.conversationWorkflow({operation:"catalog"});
+        options.emit({type:"result",sessionId:params.sessionId,turnId:options.turnId,seq:0,at:new Date().toISOString(),text:"workflow:"+result.status,status:"completed",final:true});
+        return;
+      }
+      if (input !== "BOARD") return ordinary(input, options);
+      const current = await options.conversationBoard({operation:"read"});
+      const written = await options.conversationBoard({operation:"write",requestId:randomUUID(),baseRevision:current.board.revision,goal:"Python board verification",items:[]});
+      options.emit({type:"result",sessionId:params.sessionId,turnId:options.turnId,seq:0,at:new Date().toISOString(),text:"board:"+written.board.revision,status:"completed",final:true});
+    };
+    return session;
+  }
+}
+reg.register(new BoardAdapter({ name:"mock", agentIds:["mock:a","mock:b","mock:c","mock:exec"], models:["m1"], caps:{reasoningControl:true}, reasoningLevels:["low","standard","high"], reply:(i)=>"echo:"+i.slice(0,40) }));
 const cwd = mkdtempSync(join(tmpdir(),"py-wf-"));
 const client = new PhononClient({ serverUrl:url, deviceId, registry:reg, trustLocal:true, workspaceRoot:cwd });
 await client.connect();
@@ -126,6 +150,87 @@ async def main() -> None:
     completed_events = [e for e in events if e.get("type") == "workflow.status" and e.get("status") == "completed"]
     assert len(completed_events) >= 1, "should have received completed event"
     print(f"[py] ✅ received {len(events)} workflow events including {len(completed_events)} completed")
+
+    board_calls = []
+    board_id, native_id = str(uuid.uuid4()), str(uuid.uuid4())
+
+    async def on_board(params):
+        board_calls.append(params)
+        return {"status": "ok", "board": {"conversationID": board_id, "goal": params.get("goal", ""), "items": [],
+                "revision": 1 if params["operation"] == "write" else 0, "authorID": "python-agent", "updatedAt": "2026-10-17T00:00:00Z"}}
+
+    device.set_conversation_board_handler(on_board)
+    board_run = await device.workflow_run(project=project_id, metadata={"native_run_id": native_id, "native_chat": True},
+        plan={"mode": "dag", "nodes": [{"nodeId": "reply", "agent": "mock:a", "model": "m1", "input": "BOARD"}], "finalNodeId": "reply"})
+    for _ in range(50):
+        board_status = await device.workflow_status(board_run["workflowId"])
+        if board_status["status"] in ("completed", "failed", "cancelled", "timeout"):
+            break
+        await asyncio.sleep(0.1)
+    assert board_status["status"] == "completed", board_status
+    assert board_status["finalText"] == "board:1", board_status
+    assert [call["operation"] for call in board_calls] == ["read", "write"], board_calls
+    assert all(call["nativeRunId"] == native_id and call["workflowId"] == board_run["workflowId"] and call["sessionId"] and call["turnId"] for call in board_calls)
+    print("[py] Native conversation board read/write preserves controller lineage")
+    native_session = PhononSession(device, board_status["nodes"][0]["sessionId"])
+    operation = str(uuid.uuid4())
+    compressed = await native_session.compress("native", clientRequestId=operation)
+    assert compressed["state"] == "succeeded" and compressed["operationId"] == operation, compressed
+    assert "tokensAfter" not in compressed, "No token estimate should be invented by compression"
+    assert await native_session.compress("native", clientRequestId=operation) == compressed
+    assert await native_session.compression_status(operation) == compressed
+    print("[py] Native compression receipt/status/replay verified without invented usage")
+
+    reasoning_session = await device.create_session(project=project_id, agent="mock:a", model="m1")
+    for level, native in [("standard", "medium"), (None, None)]:
+        await reasoning_session.send("Native reasoning verification", reasoning={"level": level})
+        proof = None
+        async for event in reasoning_session.stream():
+            if event.get("type") == "runtime_settings":
+                proof = event
+            if event.get("final"):
+                assert event.get("status") == "completed", event
+                break
+        assert proof and proof["reasoning"]["requestedLevel"] == level and proof["reasoning"]["nativeValue"] == native, proof
+        assert proof["sessionId"] == reasoning_session.session_id and proof["agent"] == "mock:a", proof
+    print("[py] Per-turn reasoning/default and controller-owned confirmation verified")
+
+    workflow_calls = []
+    async def on_conversation_workflow(params):
+        workflow_calls.append(params)
+        return {"status": "catalog", "data": {"agents": [], "roles": []}}
+    device.set_conversation_workflow_handler(on_conversation_workflow)
+    workflow_native_id = str(uuid.uuid4())
+    delegated = await device.workflow_run(project=project_id, metadata={"native_run_id": workflow_native_id, "native_chat": True},
+        plan={"mode": "dag", "nodes": [{"nodeId": "reply", "agent": "mock:a", "model": "m1", "input": "DELEGATE"}], "finalNodeId": "reply"})
+    for _ in range(50):
+        delegated_status = await device.workflow_status(delegated["workflowId"])
+        if delegated_status["status"] in ("completed", "failed", "cancelled", "timeout"):
+            break
+        await asyncio.sleep(0.1)
+    assert delegated_status["status"] == "completed" and delegated_status["finalText"] == "workflow:catalog", delegated_status
+    assert len(workflow_calls) == 1 and workflow_calls[0]["nativeRunId"] == workflow_native_id, workflow_calls
+    assert workflow_calls[0]["workflowId"] == delegated["workflowId"] and workflow_calls[0]["sessionId"] and workflow_calls[0]["turnId"], workflow_calls
+    print("[py] Conversation workflow catalog preserves current controller lineage")
+
+    message_calls = []
+    async def on_message(params):
+        assert len(params["attachmentIDs"]) == 1 and params["attachmentIDs"][0].startswith("native-file:"), params
+        message_calls.append(params)
+        return {"status": "not_accepted", "requestId": params["requestId"], "errorCode": "de_mentions_disabled"}
+    device.set_conversation_message_handler(on_message)
+    message_native_id = str(uuid.uuid4())
+    message_run = await device.workflow_run(project=project_id, metadata={"native_run_id": message_native_id, "native_chat": True},
+        plan={"mode": "dag", "nodes": [{"nodeId": "reply", "agent": "mock:a", "model": "m1", "input": "PEER"}], "finalNodeId": "reply"})
+    for _ in range(50):
+        message_status = await device.workflow_status(message_run["workflowId"])
+        if message_status["status"] in ("completed", "failed", "cancelled", "timeout"):
+            break
+        await asyncio.sleep(0.1)
+    assert message_status["status"] == "completed" and message_status["finalText"] == "message:not_accepted", message_status
+    assert len(message_calls) == 1 and message_calls[0]["nativeRunId"] == message_native_id, message_calls
+    assert message_calls[0]["workflowId"] == message_run["workflowId"] and message_calls[0]["sessionId"] and message_calls[0]["turnId"], message_calls
+    print("[py] Conversation messages preserve current controller lineage without fabricated acceptance")
 
     # 5. v0.7 HITL —— workflow.human_review + interaction.request 反向调用 走 Python SDK
     review_received: list[dict] = []

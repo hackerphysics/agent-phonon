@@ -84,7 +84,7 @@ Phase 1 目标 = **验证「拨出→discovery→建项目→create→send→流
 
 **为什么不走 shared sessionId**（决策记录，避免反复讨论）：
 - session 是「一个 agent 的一次连续对话」——这个不变量不能动；动了 `terminat / compressNative / compressCustom / interrupt / switchModel / switch session 身份` 全部歧义。
-- adapter 的 native session（claude-code `--resume` / hermes session_id / codex thread / herdr agent name）也只属于单个 agent。
+- adapter 的 native session（claude-code `--resume` / hermes session_id / codex thread）也只属于单个 agent。
 - 「同一个 sessionId 上挂多 agent」会把这个 1:1 不变量打碎，调试/续接/audit 全部变难。
 
 **为什么不是 A2A**（同样决策记录）：

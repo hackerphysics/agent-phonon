@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { SessionId, Timestamp } from "./common.js";
+import { ReasoningConfirmation } from "./reasoning.js";
 
 /**
  * 流式事件（design §4 / §6 / 订阅模型）——phonon → server 异步推送。
@@ -27,6 +28,7 @@ export type StreamOrigin = z.infer<typeof StreamOrigin>;
 
 /** 事件种类。 */
 export const StreamEventType = z.enum([
+  "runtime_settings",
   "message", // 一条完整/增量消息文本
   "thinking", // 思考过程（trace 档）
   "tool_call", // agent 发起工具调用
@@ -48,6 +50,10 @@ const StreamEventBase = z.object({
   origin: StreamOrigin.default("solicited"),
   /** unsolicited 时的冲泡来源标签，如 "cron" / "scheduled" / "heartbeat"。 */
   source: z.string().optional(),
+  /** Native harness output identity; not a caller-selected conversation or sender. */
+  sourceEventId:z.string().min(1).max(255).optional(),
+  nativeProactive:z.object({anchorRunId:z.string().uuid(),employeeId:z.string().uuid(),employeeRevision:z.number().int().positive(),
+    upstreamId:z.string().min(1).max(255),project:z.string().min(1).max(512),agent:z.string().min(1).max(255),model:z.string().min(1).max(255)}).strict().optional(),
   /** 单调递增序号（按 session），保证调用方可排序/去重。 */
   seq: z.number().int().nonnegative(),
   at: Timestamp,
@@ -60,6 +66,8 @@ const StreamEventBase = z.object({
   workflowId: z.string().optional(),
   nodeId: z.string().optional(),
   role: z.string().optional(),
+  /** Server-generated native conversation run correlation, stamped by core. */
+  nativeRunId: z.string().uuid().optional(),
 });
 
 export const StreamMessageEvent = StreamEventBase.extend({
@@ -97,6 +105,11 @@ export const StreamToolResultEvent = StreamEventBase.extend({
 export const StreamTokenEvent = StreamEventBase.extend({
   type: z.literal("token"),
   text: z.string(),
+});
+
+export const StreamRuntimeSettingsEvent = StreamEventBase.extend({
+  type: z.literal("runtime_settings"),
+  agent: z.string(), model: z.string(), reasoning: ReasoningConfirmation,
 });
 
 export const StreamResultEvent = StreamEventBase.extend({
@@ -145,8 +158,14 @@ export const StreamAckParams = z.object({
 });
 export type StreamAckParams = z.infer<typeof StreamAckParams>;
 
+export const StreamReplayParams = z.object({ sessionId: SessionId, fromSeq: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(1000).default(200) });
+export type StreamReplayParams = z.infer<typeof StreamReplayParams>;
+export const StreamReplayResult = z.object({ sessionId: SessionId, replayed: z.number().int().nonnegative(), nextSeq: z.number().int().nonnegative().optional() });
+export type StreamReplayResult = z.infer<typeof StreamReplayResult>;
+
 /** 流式事件联合体（phonon → server，方法名 stream.event）。 */
 export const StreamEvent = z.discriminatedUnion("type", [
+  StreamRuntimeSettingsEvent,
   StreamMessageEvent,
   StreamThinkingEvent,
   StreamToolCallEvent,

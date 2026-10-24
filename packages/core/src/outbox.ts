@@ -1,4 +1,5 @@
 import type { StreamEvent } from "@agent-phonon/protocol";
+import {createHash} from "node:crypto";
 
 /**
  * 下行 outbox（design D29 / bug-bash P1）。
@@ -59,7 +60,8 @@ export class Outbox {
     if (seq <= (this.acked.get(sessionId) ?? -1)) return;
     const key = this.key(sessionId, seq);
     if (this.keys.has(key)) return;
-    if (this.store && !this.store.outboxAdd(this.tenantId ?? "", sessionId, seq, JSON.stringify(event), new Date().toISOString())) return;
+    const proactive=event.nativeProactive?{id:event.nativeProactive.upstreamId,hash:createHash("sha256").update(JSON.stringify([event.type==="message"?event.text:"",event.source??""])).digest("hex")}:undefined;
+    if (this.store && !this.store.outboxAdd(this.tenantId ?? "", sessionId, seq, JSON.stringify(event), new Date().toISOString(),proactive)) return;
     this.buffer.push({ sessionId, seq, event });
     this.keys.add(key);
   }

@@ -8,6 +8,8 @@ import type {
   Schedule,
   ScheduleTrigger,
   ScheduleTarget,
+  ScheduleDispatch,
+  RunResolveParams,
   ScheduleConsent,
   SchedulePolicy,
   SchedulePushConsent,
@@ -51,6 +53,7 @@ interface RunRuntime {
   retryHistory: RetryAudit[];
   retryAt?: number;
   ownerEpoch: number;
+  dispatch?: ScheduleDispatch;
 }
 
 export interface SchedulerEngineOptions {
@@ -139,7 +142,7 @@ export class SchedulerEngine {
       // A workflow and its schedule run are device-authoritative, not bound to
       // one websocket. Leave the run active so the replacement scheduler can
       // reattach before WorkflowEngine emits recovery events.
-      if ((rt.workflowId || rt.phase === "retry_wait") && !TERMINAL.has(rt.status)) {
+      if ((rt.dispatch || rt.workflowId || rt.phase === "retry_wait") && !TERMINAL.has(rt.status)) {
         this.clearRunTimer(rt);
         this.opts.store.releaseRun(rt.runId, this.opts.tenantId, this.ownerId, rt.ownerEpoch);
         continue;
@@ -311,7 +314,31 @@ export class SchedulerEngine {
     return { run: this.rowToRun(row) };
   }
 
-  runsList(scheduleId: string, opts?: { status?: string; limit?: number }): { runs: Run[] } {
+  resolve(params: RunResolveParams): { run: Run } {
+    const { run } = this.runGet(params.runId);
+    const binding = run.dispatch;
+    if (!binding || binding.key !== params.dispatch.key || binding.revision !== params.dispatch.revision
+      || binding.contentHash !== params.dispatch.contentHash || binding.expiresAt !== params.dispatch.expiresAt) {
+      throw new PhononError("errPolicyDenied", "dispatch identity mismatch");
+    }
+    if (TERMINAL.has(run.status)) {
+      if (run.status !== params.status || (run.resultText ?? "") !== (params.resultText ?? "")
+        || (run.exitReason ?? "") !== (params.error ?? params.status)) {
+        throw new PhononError("errInvalidParams", "dispatch already resolved with a different outcome");
+      }
+      return { run };
+    }
+    const rt = this.runtimes.get(params.runId);
+    if (!rt || !this.assertRunOwner(rt)) throw new PhononError("errSessionBusy", "dispatch owner is not ready");
+    if (rt.phase === "queued" && !["cancelled", "skipped"].includes(params.status)) {
+      throw new PhononError("errInvalidParams", "queued dispatch has not been handed off");
+    }
+    rt.resultText = params.resultText ?? "";
+    this.finishRun(rt, params.status, params.error ?? params.status);
+    return this.runGet(params.runId);
+  }
+
+  runsList(scheduleId: string, opts?: { status?: string; limit?: number; unackedOnly?: boolean }): { runs: Run[] } {
     if (!this.opts.store.getSchedule(scheduleId, this.opts.tenantId)) {
       throw new PhononError("errInvalidParams", `schedule ${scheduleId} not found`);
     }
@@ -434,10 +461,17 @@ export class SchedulerEngine {
 
   private async launchRun(schedule: Schedule, source: RunTriggerSource, input?: TriggerInput, cronNextRunAt?: string): Promise<string> {
     if (this.disposed) throw new Error("scheduler disposed");
+    if (schedule.target.dispatch?.expiresAt && Date.parse(schedule.target.dispatch.expiresAt) <= this.now()) {
+      this.setEnabled(schedule.id, false);
+      throw new PhononError("errPolicyDenied", "dispatch authorization expired");
+    }
     this.opts.store.delivery.assertNewWork();
     this.opts.assertRunAllowed?.(schedule, source);
     const overlap = schedule.policy?.overlap ?? "skip";
     const active = this.hasActive(schedule.id);
+    if (schedule.target.dispatch && this.opts.store.listActiveRuns(this.opts.tenantId).filter(run => run.schedule_id === schedule.id).length >= 32) {
+      return this.persistSkipped(schedule, source, cronNextRunAt);
+    }
     if (active && overlap === "skip") return this.persistSkipped(schedule, source, cronNextRunAt);
 
     const rt = this.createRuntime(schedule, source, input, active && overlap === "queue" ? "queued" : "launching", cronNextRunAt);
@@ -471,6 +505,7 @@ export class SchedulerEngine {
       maxAttempts: 1 + (schedule.policy?.maxRetries ?? 0),
       retryHistory: [],
       ownerEpoch: 0,
+      dispatch: schedule.target.dispatch ? structuredClone(schedule.target.dispatch) : undefined,
     };
     if (cronNextRunAt !== undefined) this.opts.store.acceptCronRun(this.runtimeRecord(rt), cronNextRunAt);
     else {
@@ -514,7 +549,19 @@ export class SchedulerEngine {
     this.persistRuntime(rt);
 
     try {
-      if (schedule.target.runKind === "workflow") {
+      if (rt.dispatch) {
+        if (schedule.target.runKind !== "dispatch" || !schedule.target.dispatch
+          || JSON.stringify(rt.dispatch) !== JSON.stringify(schedule.target.dispatch)) {
+          throw new PhononError("errPolicyDenied", "dispatch definition changed before handoff");
+        }
+        // The controller authorizes and executes this occurrence through its
+        // existing pipeline. A clock tick must never grant model authority.
+        rt.phase = "running";
+        rt.status = "running";
+        this.persistRuntime(rt);
+        this.safeEmit("run.started", { run: this.shapeRunForPush(this.runtimeToRun(rt), rt.consent) });
+        return;
+      } else if (schedule.target.runKind === "workflow") {
         const workflows = this.opts.workflows?.();
         if (!workflows) throw new PhononError("errCapabilityUnsupported", "workflow engine unavailable");
         if (!schedule.target.plan) throw new PhononError("errInvalidParams", "runKind=workflow requires target.plan");
@@ -649,6 +696,7 @@ export class SchedulerEngine {
       maxAttempts: rt.maxAttempts,
       retryHistoryJson: JSON.stringify(rt.retryHistory),
       inputJson: rt.input === undefined ? undefined : JSON.stringify(rt.input),
+      dispatchJson: rt.dispatch ? JSON.stringify(rt.dispatch) : undefined,
       phase: rt.phase,
       ownerId: this.ownerId,
       ownerEpoch: rt.ownerEpoch,
@@ -702,6 +750,8 @@ export class SchedulerEngine {
       attempt: 0,
       maxAttempts: 1 + (schedule.policy?.maxRetries ?? 0),
       retryHistory: [],
+      dispatch: schedule.target.dispatch,
+      controllerDispatch: schedule.target.dispatch ? true : undefined,
     } as unknown as Run;
     const record: Parameters<PhononStore["upsertRun"]>[0] = {
       id: runId,
@@ -716,6 +766,7 @@ export class SchedulerEngine {
       attempt: 0,
       maxAttempts: 1 + (schedule.policy?.maxRetries ?? 0),
       retryHistoryJson: "[]",
+      dispatchJson: schedule.target.dispatch ? JSON.stringify(schedule.target.dispatch) : undefined,
     };
     if (cronNextRunAt !== undefined) this.opts.store.acceptCronRun(record, cronNextRunAt);
     else this.opts.store.upsertRun(record);
@@ -922,6 +973,7 @@ export class SchedulerEngine {
       maxAttempts: rt.maxAttempts,
       retryHistoryJson: JSON.stringify(rt.retryHistory),
       inputJson: rt.input === undefined ? undefined : JSON.stringify(rt.input),
+      dispatchJson: rt.dispatch ? JSON.stringify(rt.dispatch) : undefined,
       phase: rt.phase,
       retryAt: rt.retryAt,
       ownerId: this.ownerId,
@@ -937,6 +989,9 @@ export class SchedulerEngine {
       tenantId: this.opts.tenantId as Run["tenantId"],
       triggerSource: rt.triggerSource,
       status: rt.status,
+      controllerDispatch: rt.dispatch ? true : undefined,
+      dispatch: rt.dispatch,
+      input: rt.dispatch ? rt.input : undefined,
       sessionId: rt.sessionId as Run["sessionId"] | undefined,
       workflowId: rt.workflowId as Run["workflowId"] | undefined,
       startedAt: rt.startedAt ? new Date(rt.startedAt).toISOString() : undefined,
@@ -951,7 +1006,7 @@ export class SchedulerEngine {
 
   private shapeRunForPush(run: Run, push: SchedulePushConsent): Run {
     if (push === "full") return run;
-    if (push === "summary") return { ...run, transcriptPath: undefined };
+    if (push === "summary") return { ...run, transcriptPath: undefined, input: undefined };
     return {
       id: run.id,
       scheduleId: run.scheduleId,
@@ -960,6 +1015,7 @@ export class SchedulerEngine {
       status: run.status,
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
+      ...(run.controllerDispatch ? { controllerDispatch: true as const } : {}),
     };
   }
 
@@ -1044,7 +1100,23 @@ export class SchedulerEngine {
           retryHistory: row.retry_history_json ? JSON.parse(row.retry_history_json as string) as RetryAudit[] : [],
           retryAt: row.retry_at == null ? undefined : Number(row.retry_at),
           ownerEpoch,
+          dispatch: row.dispatch_json ? JSON.parse(row.dispatch_json as string) as ScheduleDispatch : undefined,
         });
+
+        if (row.dispatch_json) {
+          const queued = row.phase === "queued";
+          const rt = baseRuntime(queued ? "queued" : "running", queued ? "pending" : "running");
+          this.runtimes.set(runId, rt);
+          this.persistRuntime(rt);
+          if (queued) {
+            const queue = this.queues.get(rt.scheduleId) ?? [];
+            queue.push(runId);
+            this.queues.set(rt.scheduleId, queue);
+          } else {
+            this.safeEmit("run.started", { run: this.shapeRunForPush(this.runtimeToRun(rt), rt.consent) });
+          }
+          continue;
+        }
 
         if (row.phase === "retry_wait") {
           const rt = baseRuntime("retry_wait", "pending");
@@ -1142,6 +1214,7 @@ export class SchedulerEngine {
           this.emitStoredFinished(runId);
         }
       }
+      for (const scheduleId of this.queues.keys()) this.drainQueue(scheduleId);
     } finally {
       this.reconciling = false;
     }
@@ -1224,6 +1297,9 @@ export class SchedulerEngine {
       tenantId: row.tenant_id as Run["tenantId"],
       triggerSource: row.trigger_source as RunTriggerSource,
       status: row.status as RunStatus,
+      controllerDispatch: row.dispatch_json ? true : undefined,
+      dispatch: row.dispatch_json ? JSON.parse(row.dispatch_json as string) as ScheduleDispatch : undefined,
+      input: row.dispatch_json && row.input_json ? JSON.parse(row.input_json as string) as TriggerInput : undefined,
       sessionId: ((row.session_id as string) ?? undefined) as Run["sessionId"] | undefined,
       workflowId: ((row.workflow_id as string) ?? undefined) as Run["workflowId"] | undefined,
       startedAt: (row.started_at as string) ?? undefined,

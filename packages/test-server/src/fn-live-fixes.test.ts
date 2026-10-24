@@ -29,17 +29,24 @@ test("D02/D07: Gateway abort settles send, inject reaches input, controls surfac
   const events: any[] = [];
   const controller = new AbortController();
   const sending = session.send("input", { turnId: "t1", verbosity: "tools", emit: (e) => events.push(e), signal: controller.signal });
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  try {
   const request = calls.find((c) => c.method === "chat.send")!;
   assert.match(request.params.message, /INJECTED/);
+  const tool = (data: Record<string, unknown>) => (session as any).handleEvent("agent", {stream: "tool", runId: request.params.idempotencyKey, data: {name: "read", toolCallId: "tool-full", ...data}});
+  tool({phase: "start", args: {path: "proof.txt"}});
+  tool({phase: "result", result: {content: "verified bytes"}, isError: false});
+  (session as any).handleEvent("agent", {stream: "item", runId: request.params.idempotencyKey, data: {kind: "tool", phase: "end", name: "read", toolCallId: "tool-full", status: "completed"}});
   for (const phase of ["start", "end", "end"]) (session as any).handleEvent("agent", { stream: "item", runId: request.params.idempotencyKey, data: { kind: "tool", phase, name: "read", toolCallId: "tool-1", status: phase === "start" ? "running" : "completed" } });
-  assert.equal(events.filter((e) => e.type === "tool_call").length, 1);
-  assert.equal(events.filter((e) => e.type === "tool_result").length, 1);
-  controller.abort();
-  await sending;
+  assert.equal(events.filter((e) => e.type === "tool_call").length, 2);
+  assert.equal(events.filter((e) => e.type === "tool_result").length, 2);
+  assert.deepEqual(events.find(e => e.type === "tool_call" && e.toolCallId === "tool-full").args, {path: "proof.txt"});
+  assert.deepEqual(events.find(e => e.type === "tool_result" && e.toolCallId === "tool-full").output, {content: "verified bytes"});
+  } finally { controller.abort(); await sending; }
   assert.equal(events.at(-1).status, "interrupted");
   await assert.rejects(session.switchModel!("m2"), /native model rejected/);
   assert.equal(session.model, "m1");
-  await assert.rejects(session.compressNative!(), /did not compact/);
+  assert.equal((await session.compressNative!()).applied,false);
   await session.terminate();
 });
 

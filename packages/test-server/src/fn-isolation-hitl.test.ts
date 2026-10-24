@@ -28,8 +28,9 @@ test("registered project namespace prevents cross-connection access, legacy unsc
   const visible=await b.call("project.list",{}) as {projects:unknown[]};assert.equal(visible.projects.length,0);
   const legacy={projectId:"legacy-unmapped",name:"Legacy",path:created.project.path,git:false,createdAt:new Date().toISOString()};
   sharedStore.upsertProject(legacy);
-  const preserved=await b.call("project.get",{projectId:legacy.projectId}) as {project:{path:string;namespace?:string}};
-  assert.equal(preserved.project.path,legacy.path);assert.equal(preserved.project.namespace,undefined);
+  await assert.rejects(()=>b.call("project.get",{projectId:legacy.projectId}), (e:any)=>e.data?.appCode==="errProjectNotFound");
+  const preserved=sharedStore.loadProjects().find(row=>row.projectId===legacy.projectId)!;
+  assert.equal(preserved.path,legacy.path);assert.equal(preserved.namespace,undefined);
 
   sharedStore.close();
 });

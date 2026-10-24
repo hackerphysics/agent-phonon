@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { AgentId, ProjectId, SessionId, Timestamp, Verbosity } from "./common.js";
+import { SessionCompressionControls, CompressionReceipt } from "./compression.js";
+import { TurnReasoning } from "./reasoning.js";
+import { NativeStopTarget } from "./native-stop.js";
+import { SkillSelection } from "./skill.js";
 
 /**
  * L1 Session 协议原语（design §4）。
@@ -82,6 +86,7 @@ export type WhenBusy = z.infer<typeof WhenBusy>;
 
 export const SessionSendParams = z.object({
   sessionId: SessionId,
+  reasoning: TurnReasoning.optional(),
   /** 用户输入 / 任务内容。 */
   input: z.string(),
   /**
@@ -95,19 +100,7 @@ export const SessionSendParams = z.object({
    * phonon 保证：(1) skill 在 agent 能访问到的位置；(2) 上下文注入强制加载指令。
    * 优先级：send 指定 > project skill > global skill。
    */
-  skills: z
-    .array(
-      z.union([
-        z.string(),
-        z.object({
-          name: z.string().min(1),
-          version: z.string().optional(),
-          scope: z.enum(["global", "project"]).optional(),
-          force: z.boolean().optional(),
-        }),
-      ]),
-    )
-    .optional(),
+  skills: z.array(SkillSelection).max(16).optional(),
   /** 可选：覆盖本轮详细度。 */
   verbosity: Verbosity.optional(),
   /**
@@ -123,6 +116,7 @@ export const SessionSendParams = z.object({
   /**
    * 可选：本轮关联 id。phonon 会把该轮所有 stream.event 标上同一 turnId，
    * 调用方据此聚合流式输出。缺省由 phonon 生成并在 ack 中返回。
+   * whenBusy=inject 不创建新轮；如显式提供 turnId，必须等于当前 turn。
    */
   turnId: z.string().optional(),
 });
@@ -138,7 +132,8 @@ export const SessionSendAck = z.object({
    * - started   ：立即开始执行（session 空闲）
    * - queued    ：已排队（whenBusy=queue 且正忙）
    * - interrupted：已中断上一轮并开始本轮（whenBusy=interrupt）
-   * - injected  ：将在下一 tool call 边界插入（whenBusy=inject）
+   * - injected  ：已在当前 turn 的工具边界应用输入（whenBusy=inject），turnId 是当前 turn，不创建新轮。
+   *              未应用前不回 injected；窗口关闭必须拒绝，不能自动排队。
    */
   disposition: z.enum(["started", "queued", "interrupted", "injected"]),
   /** queued 时的队列位置（从 1 起）。 */
@@ -160,6 +155,7 @@ export const SessionInterruptParams = z.object({
 export type SessionInterruptParams = z.infer<typeof SessionInterruptParams>;
 
 export const SessionInterruptResult = z.object({
+  nativeStop:NativeStopTarget.optional(),
   sessionId: SessionId,
   /** 被中断的 turn（若当时有在跑的）。 */
   interruptedTurnId: z.string().optional(),
@@ -191,6 +187,8 @@ export type CompressMode = z.infer<typeof CompressMode>;
 
 export const SessionCompressParams = z.object({
   sessionId: SessionId,
+  clientRequestId: z.string().min(1).max(512).optional(),
+  background: z.boolean().optional(),
   /** native = 透传 agent 原生压缩；custom = phonon 自有压缩引擎。 */
   mode: CompressMode,
   /**
@@ -203,12 +201,11 @@ export const SessionCompressParams = z.object({
 });
 export type SessionCompressParams = z.infer<typeof SessionCompressParams>;
 
-export const SessionCompressResult = z.object({
+// Older devices return only sessionId/mode; receipt-capable devices retain the
+// complete proof through schema parsing, including identity and change counts.
+export const SessionCompressResult = CompressionReceipt.partial().extend({
   sessionId: SessionId,
   mode: CompressMode,
-  /** 压缩前后的 token 估算（若可得）。 */
-  tokensBefore: z.number().int().nonnegative().optional(),
-  tokensAfter: z.number().int().nonnegative().optional(),
   /** 简短摘要/说明。 */
   summary: z.string().optional(),
 });
@@ -273,9 +270,18 @@ export type SessionSwitchModelResult = z.infer<typeof SessionSwitchModelResult>;
 // session.status / session.list  —— 始终携带 agent 身份
 // ---------------------------------------------------------------------------
 export const SessionMeta = z.object({
+  nativeStop:NativeStopTarget.optional(),
+  recovery:z.object({detached:z.boolean(),canAttempt:z.boolean(),reason:z.string().optional()}).strict().optional(),
+  streamNextSeq:z.number().int().nonnegative().safe().optional(),
+  proactive:z.object({supported:z.boolean(),ready:z.boolean(),errorCode:z.string().optional()}).strict().optional(),
+  compression: SessionCompressionControls.optional(),
+  employeeId:z.string().uuid().optional(),
+  employeeRevision:z.number().int().positive().optional(),
   sessionId: SessionId,
   /** 绑定的项目（一等身份，D23）。 */
   project: ProjectId,
+  /** Original worktree binding, retained through status/list/recover parsing. */
+  worktreeId: z.string().optional(),
   /** 绑定的 agent 身份，全程携带。 */
   agent: AgentId,
   model: z.string(),
@@ -315,6 +321,12 @@ export type SessionStatusParams = z.infer<typeof SessionStatusParams>;
 
 export const SessionStatusResult = SessionMeta;
 export type SessionStatusResult = z.infer<typeof SessionStatusResult>;
+
+/** Reopen a verified, settled native Session. Never sends input or resumes a workflow. */
+export const SessionRecoverParams = z.object({sessionId:SessionId,project:ProjectId,agent:AgentId,model:z.string().min(1)}).strict();
+export type SessionRecoverParams = z.infer<typeof SessionRecoverParams>;
+export const SessionRecoverResult = SessionMeta;
+export type SessionRecoverResult = z.infer<typeof SessionRecoverResult>;
 
 export const SessionListParams = z.object({
   /** 可选：按项目过滤。 */

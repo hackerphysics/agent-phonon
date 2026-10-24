@@ -60,6 +60,8 @@ Three integration paths exist; phonon uses **Gateway WebSocket as primary** with
   tool / hook.
 - phonon ships an **OpenClaw plugin** (`packages/openclaw-plugin`) that hooks
   `before_tool_call` and bridges to phonon-core's HookBridge for HITL.
+- The same plugin has separate opt-in, fail-closed native human-input tools;
+  see [Native Agent Interactions](NATIVE_INTERACTIONS.md#openclaw-native-tools).
 - Tool-level interception **must** go through plugin hooks (`before_tool_call`);
   internal hooks can't do it.
 
@@ -78,18 +80,26 @@ Three integration paths exist; phonon uses **Gateway WebSocket as primary** with
   adjudicates sessions phonon actually owns.
 
 ### Plugin install / update
+Prepare locally or in CI, never on a deployment server:
 ```bash
-cd packages/openclaw-plugin && pnpm build
-openclaw plugins install <path-to-built-plugin>
+pnpm --filter @agent-phonon/openclaw-plugin... -r build
+pnpm --filter @agent-phonon/openclaw-plugin artifact /absolute/new/prepared-plugin
+```
+Transfer only that ready-to-run folder and its adjacent checksum sidecar. The
+install-only helper verifies checksums and rejects dependencies/extra files
+without installing a package manager. On the
+target host, installing an already prepared artifact is a separate explicit step:
+```bash
+bash scripts/update-plugin.sh /absolute/path/to/prepared-plugin
 ```
 - Configure `bridgeUrl` (default `http://127.0.0.1:4318`) and `interceptTools`
   (empty = intercept all).
-- Note: pnpm workspace `node_modules` may contain symlinks pointing outside the
-  monorepo (e.g. typescript), which OpenClaw's install-time security scan
-  rejects (`node_modules symlink target outside install root`). The plugin has
-  zero runtime deps, so export a clean artifact (dist + package.json without
-  devDeps + manifest, no node_modules) and `install --force` from there.
-  `scripts/update-plugin.sh` automates build → export → force-install.
+- The build bundles the matching protocol, Zod and schema conversion code. The
+  artifact has no runtime npm dependencies, node_modules, symlinks, tests, source
+  maps or development tools. It requires only Node and the installed OpenClaw SDK.
+  It does not install, start or reconfigure a user's Gateway during preparation.
+- The exporter refuses to overwrite an existing directory. The install-only
+  helper propagates installation failures and never restarts the Gateway itself.
 
 ---
 
@@ -140,12 +150,23 @@ Single-agent runtime; `discoverAgents` returns one `claude-code`.
 
 Single-agent runtime (`discoverAgents` returns one `codex`).
 
+Native mobile turns additionally use the authenticated, invocation-only
+[Phonon MCP channel](NATIVE_MCP.md). Its six controller-tool grants do not change
+the command sandbox, global approval policy or actual human decisions. Do not
+enable general command networking merely to publish a file or request input.
+
 ### Invocation
-1. **CLI**: `codex exec - --json -c model_provider=<id>
+1. **CLI**: `codex exec - --json -c sandbox_mode="workspace-write" -c model_provider=<id>
    -c model_providers.<id>.base_url=... -c model_providers.<id>.wire_api=responses
    -c model_providers.<id>.env_key=OPENAI_API_KEY --model <m>`
    - Prompt on **stdin** (argv uses `-` as placeholder).
    - Resume: `codex exec resume <thread_id> - --json ...`
+   - Pass `-c sandbox_mode="workspace-write"` on every turn, including resume
+     and recovery. Otherwise noninteractive execution can default to read-only
+     even when the project directory is authorized. Use `-c` because native
+     `exec resume` does not accept `--sandbox`.
+   - Keep native approval policy, command-network restrictions and writable-root
+     settings unchanged. Do not add bypass/full-auto flags or rewrite user config.
 2. **Provider override via `-c`** so you don't touch `~/.codex/config.toml`.
    - If your endpoint's model only speaks the Responses protocol
      (`/v1/responses`, not chat/completions), set `wire_api=responses`.
@@ -154,6 +175,30 @@ Single-agent runtime (`discoverAgents` returns one `codex`).
    `turn.started` → `item.completed` (item.type: `agent_message` /
    `command_execution` / …) → `turn.completed` (usage).
    - session_id = thread_id (captured from `thread.started`, not pre-assigned).
+
+### Context observations
+
+`session.status` can report Codex's latest native inference token count and
+context window from the original rollout, through the existing optional context
+fields. It uses `last_token_usage.total_tokens`, not cumulative billing usage or
+text-length estimates, and verifies the original native thread, working directory
+and model. This is a native inference observation, not exact tokenization of
+additional unsent user input, memory or the next turn's full assembled prompt.
+
+Discovery is bounded to10,000 entries/four nested directories; body reads are
+bounded to a1MiB tail and a64KiB metadata header. Missing/invalid/incomplete,
+changed-file, foreign or unavailable observations remain unknown. No model or
+native command is started by a status read. A fresh turn/model selection
+invalidates earlier counts, with the fence preserved in the optional checkpoint
+field; old checkpoints still decode. Native compaction/new-turn markers also
+withdraw the preceding observation.
+
+When Codex custom compression actually rewrites tool history, its now-stale
+`token_count` records are removed in the same backed-up rewrite. It does not
+invent an after-count or a reduction percentage; the next valid native inference
+must supply it. No-op compression leaves the unchanged count intact. This
+invalidation option is Codex-only; other harness compression defaults are
+unchanged. Source-level tests do not establish deployed or three-OS acceptance.
 
 ---
 
@@ -217,15 +262,21 @@ by that stable name; it does not rely on the inaccurate UUID behavior.
   error. Neither is a safe success oracle. Completion requires exit 0, an explicit
   `completed:true`, no failed/partial/error/interrupted flags, and nonempty final
   text. No structured result is a failure; ordinary prose mentioning HTTP 404 is
-  not a failure. Windows/non-console-script Hermes launchers require a validated
-  structured integration; the adapter fails closed rather than falling back to
-  exit-code-only success.
+  not a failure. Native Windows Python console `.exe` launchers are recognized
+  from their embedded interpreter shebang and Hermes main entry. Configure
+  `hermesBinPath` to that installed executable, not a `.cmd` wrapper: wrapper
+  environment changes are not guessed or silently skipped. The interpreter must
+  exist; the adapter never substitutes an unrelated Python from PATH or falls
+  back to exit-code-only success. Launcher recognition alone does not certify
+  Windows managed-profile provisioning, native tools or recovery.
 - Native tool approval policy is preserved; no automatic yolo/accept-hooks flags.
   A failed **turn** emits error/status=failed, making workflow/run retry paths
   fail. The reusable session lifecycle returns to `idle` by the existing protocol;
   SessionStatus has no `failed` member. Timeout/cancel remain non-success terminals.
-- Custom `dropToolIO` uses the observed session id, retaining native SQLite backup
-  behavior. Native compression and mid-turn injection remain unsupported.
+- Custom `dropToolIO` uses the observed session id and verified native profile
+  home (or isolated DE home), retaining native SQLite backup behavior. No default
+  DB or title fallback is used. Native compression and mid-turn injection remain
+  unsupported. See [verified compression](SESSION_COMPRESSION.md).
 
 ## OpenCode adapter
 

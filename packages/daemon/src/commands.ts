@@ -4,8 +4,8 @@ import { existsSync, cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, chm
 import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, HerdrAdapter, PiAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
-import { loadConfig, writeConfig, readOpenClawGatewayToken, DEFAULT_CONFIG_PATH, type AdapterConfig, type DaemonConfig } from "./config.js";
+import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, PiAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
+import { ADAPTER_TYPES, loadConfig, writeConfig, readOpenClawGatewayToken, DEFAULT_CONFIG_PATH, type AdapterConfig, type DaemonConfig } from "./config.js";
 import { LaunchdService } from "./launchd.js";
 
 /**
@@ -98,6 +98,9 @@ function openCodeBin(): string {
 }
 
 export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
+  for (const adapter of adapters) {
+    if (!ADAPTER_TYPES.includes(adapter.type)) throw new Error(`unsupported adapter type ${JSON.stringify(adapter.type)}`);
+  }
   const out = [...adapters];
   const has = (type: AdapterConfig["type"]): boolean => out.some((a) => a.type === type);
 
@@ -114,14 +117,10 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
     if (copilotPath && probe(copilotPath).ok) out.push({ type: "copilot", copilotBinPath: copilotPath });
   }
 
-  if (!has("herdr")) {
-    const herdrPath = commandPath("herdr");
-    if (herdrPath && probe(herdrPath).ok) out.push({ type: "herdr", herdrBinPath: herdrPath });
-  }
-
   if (!has("pi")) {
     const piPath = commandPath("pi");
-    if (piPath && probe(piPath).ok) out.push({ type: "pi", piBinPath: piPath });
+    // Discovery can report temporary unavailability and retry on its next scan.
+    if (piPath) out.push({ type: "pi", piBinPath: piPath });
   }
 
   for (const a of out) {
@@ -129,7 +128,6 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
     if (a.type === "claude-code" && !a.claudeBinPath) a.claudeBinPath = commandPath("claude");
     if (a.type === "codex" && !a.codexBinPath) a.codexBinPath = commandPath("codex");
     if (a.type === "copilot" && !a.copilotBinPath) a.copilotBinPath = commandPath("copilot");
-    if (a.type === "herdr" && !a.herdrBinPath) a.herdrBinPath = commandPath("herdr");
     if (a.type === "pi" && !a.piBinPath) a.piBinPath = commandPath("pi");
   }
 
@@ -158,7 +156,7 @@ export async function cmdDoctor(): Promise<void> {
   console.log(`OpenClaw HITL plugin: ${existsSync(pluginDir) ? "✓ installed" : "✗ not installed (run: agent-phonon plugin install openclaw)"}`);
   // CLI agents
   console.log("\nCLI agents:");
-  for (const [name, bin] of [["Claude Code", "claude"], ["Codex", "codex"], ["GitHub Copilot CLI", "copilot"], ["Herdr", "herdr"], ["Hermes", "hermes"], ["Pi", "pi"]] as const) {
+  for (const [name, bin] of [["Claude Code", "claude"], ["Codex", "codex"], ["GitHub Copilot CLI", "copilot"], ["Hermes", "hermes"], ["Pi", "pi"]] as const) {
     const p = probe(bin);
     console.log(`  ${name} (${bin}): ${p.ok ? "✓ " + p.out : "✗ not found"}`);
   }
@@ -219,9 +217,7 @@ export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["
     } else if (a.type === "opencode") {
       reg.register(new OpenCodeAdapter({ env: { binPath: a.opencodeBinPath, defaultModel: a.opencodeModel } }));
     } else if (a.type === "copilot") {
-      reg.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels } }));
-    } else if (a.type === "herdr") {
-      reg.register(new HerdrAdapter({ env: { binPath: a.herdrBinPath, defaultModel: a.herdrModel, defaultKind: a.herdrDefaultKind, turnTimeoutSeconds: a.herdrTurnTimeoutSeconds, pollIntervalMs: a.herdrPollIntervalMs } }));
+      reg.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels, peerContext: a.copilotPeerContext } }));
     } else if (a.type === "pi") {
       reg.register(new PiAdapter({ env: { binPath: a.piBinPath, defaultModel: a.piModel, models: a.piModels, appendSystemPrompt: a.piAppendSystemPrompt } }));
     }
@@ -253,14 +249,11 @@ export function cmdAdapterAdd(type: string, opts: Record<string, string | undefi
     case "copilot":
       a = { type: "copilot", copilotBinPath: opts.bin, copilotModel: opts.model ?? "default" };
       break;
-    case "herdr":
-      a = { type: "herdr", herdrBinPath: opts.bin, herdrModel: opts.model };
-      break;
     case "pi":
       a = { type: "pi", piBinPath: opts.bin, piModel: opts.model };
       break;
     default:
-      return fail(`unknown adapter type: ${type} (openclaw|claude-code|codex|copilot|herdr|pi|hermes|opencode)`);
+      return fail(`unknown adapter type: ${type} (openclaw|claude-code|codex|copilot|pi|hermes|opencode)`);
   }
   // 去重：同 type 覆盖
   cfg.adapters = cfg.adapters.filter((x) => x.type !== a.type);

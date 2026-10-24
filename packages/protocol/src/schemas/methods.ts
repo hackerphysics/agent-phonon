@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { RunResolveParams, RunResolveResult } from "./schedule.js";
+import { ManagedMcpConfigureParams, ManagedMcpStatusParams, ManagedMcpStatusResult } from "./managed-mcp.js";
 import {
   ConnectHelloParams,
   ConnectWelcomeResult,
@@ -27,18 +29,30 @@ import {
   SessionTerminateResult,
   SessionStatusParams,
   SessionStatusResult,
+  SessionRecoverParams,
+  SessionRecoverResult,
   SessionListParams,
   SessionListResult,
 } from "./session.js";
-import { StreamEvent, StreamAckParams } from "./stream.js";import {
+import { StreamEvent, StreamAckParams, StreamReplayParams, StreamReplayResult } from "./stream.js";import {
   HookFiredParams,
   HookResolveParams,
   HookResolveResult,
 } from "./hook.js";
+import { EmployeeProfileApplyParams,EmployeeProfileStatusParams,EmployeeProfileStatusResult } from "./employee.js";
+import { ConversationBoardParams, ConversationBoardResult } from "./conversation-board.js";
+import { ConversationWorkflowParams, ConversationWorkflowResult } from "./conversation-workflow.js";
+import { ConversationMessageParams, ConversationMessageResult } from "./conversation-message.js";
+import { ProjectCoordinationParams, ProjectCoordinationResult, ProjectCoordinationEvidenceParams, ProjectCoordinationEvidenceResult } from "./project-coordination.js";
+import { ConversationArchiveAppendParams, ConversationArchiveAppendResult, ConversationArchiveReadParams, ConversationArchiveReadResult, ConversationArchiveStatusParams, ConversationArchiveStatusResult, ConversationArchiveEntitiesParams, ConversationArchiveEntitiesResult } from "./conversation-archive.js";
+import { ConversationArchiveBlob, ConversationArchiveBlobWriteParams, ConversationArchiveBlobStatusResult, ConversationArchiveBlobReadParams, ConversationArchiveBlobReadResult } from "./conversation-archive.js";
+import { CompressionStatusParams, CompressionReceipt } from "./compression.js";
 import { DocumentSendParams, DocumentSendResult, DocumentPrepareUploadParams, DocumentPrepareUploadResult } from "./document.js";
 import {
   InteractionRequestParams,
   InteractionRequestResult,
+  InteractionStatusParams,
+  InteractionStatusResult,
   InteractionResponseParams,
   InteractionCancelParams,
   InteractionCancelResult,
@@ -46,6 +60,7 @@ import {
 import {
   ProjectCreateParams,
   ProjectCreateResult,
+  ProjectProvisionParams,ProjectProvisionStatusParams,ProjectProvisionStatusResult,
   ProjectListParams,
   ProjectListResult,
   ProjectGetParams,
@@ -71,6 +86,13 @@ import {
 import {
   SkillInstallParams,
   SkillInstallResult,
+  SkillInstallStatusParams,
+  SkillInstallStatusResult,
+  SkillInstallFenceParams,
+  SkillInstallFenceResult,
+  SkillPublishParams,
+  SkillUnpublishParams,
+  SkillUnpublishResult,
   SkillUninstallParams,
   SkillUninstallResult,
   SkillListParams,
@@ -97,7 +119,12 @@ import {
   WorkflowRunResult,
   WorkflowStatusParams,
   WorkflowStatusResult,
+  WorkflowInputParams,WorkflowInputReceipt,WorkflowInputStatusParams,WorkflowInputStatusResult,
+  WorkflowResultParams,
+  WorkflowResultPage,
   WorkflowCancelParams,
+  WorkflowDispatchCancelParams,
+  WorkflowDispatchCancelResult,
   WorkflowCancelResult,
   WorkflowPauseParams,
   WorkflowPauseResult,
@@ -172,6 +199,8 @@ import {
 const z_void = z.undefined();
 
 export const METHODS = {
+  "mcp.configure": { direction: "s2p", kind: "request", params: ManagedMcpConfigureParams, result: ManagedMcpStatusResult },
+  "mcp.status": { direction: "s2p", kind: "request", params: ManagedMcpStatusParams, result: ManagedMcpStatusResult },
   // --- 握手（phonon 拨出后先发）---
   "connect.hello": {
     direction: "p2s",
@@ -265,6 +294,30 @@ export const METHODS = {
   },
 
   // --- session 原语（server 下发）---
+  "conversation.archive.append": {
+    direction: "s2p", kind: "request",
+    params: ConversationArchiveAppendParams, result: ConversationArchiveAppendResult,
+  },
+  "conversation.archive.read": {
+    direction: "s2p", kind: "request",
+    params: ConversationArchiveReadParams, result: ConversationArchiveReadResult,
+  },
+  "conversation.archive.status": {
+    direction: "s2p", kind: "request",
+    params: ConversationArchiveStatusParams, result: ConversationArchiveStatusResult,
+  },
+  "conversation.archive.entities": {
+    direction: "s2p", kind: "request", params: ConversationArchiveEntitiesParams, result: ConversationArchiveEntitiesResult,
+  },
+  "conversation.archive.blob.write": {
+    direction: "s2p", kind: "request", params: ConversationArchiveBlobWriteParams, result: ConversationArchiveBlobStatusResult,
+  },
+  "conversation.archive.blob.status": {
+    direction: "s2p", kind: "request", params: ConversationArchiveBlob, result: ConversationArchiveBlobStatusResult,
+  },
+  "conversation.archive.blob.read": {
+    direction: "s2p", kind: "request", params: ConversationArchiveBlobReadParams, result: ConversationArchiveBlobReadResult,
+  },
   "session.create": {
     direction: "s2p",
     kind: "request",
@@ -288,6 +341,9 @@ export const METHODS = {
     kind: "request",
     params: SessionCompressParams,
     result: SessionCompressResult,
+  },
+  "session.compression.status": {
+    direction: "s2p", kind: "request", params: CompressionStatusParams, result: CompressionReceipt,
   },
   "session.switchModel": {
     direction: "s2p",
@@ -313,6 +369,10 @@ export const METHODS = {
     params: SessionStatusParams,
     result: SessionStatusResult,
   },
+  "session.recover": {
+    direction: "s2p", kind: "request",
+    params: SessionRecoverParams, result: SessionRecoverResult,
+  },
   "session.list": {
     direction: "s2p",
     kind: "request",
@@ -333,6 +393,12 @@ export const METHODS = {
     kind: "notification",
     params: StreamAckParams,
     result: z_void,
+  },
+  "stream.replay": {
+    direction: "s2p",
+    kind: "request",
+    params: StreamReplayParams,
+    result: StreamReplayResult,
   },
 
   // --- hook / HITL ---
@@ -370,6 +436,21 @@ export const METHODS = {
     params: InteractionRequestParams,
     result: InteractionRequestResult,
   },
+  "conversation.board": {
+    direction: "p2s", kind: "request", params: ConversationBoardParams, result: ConversationBoardResult,
+  },
+  "conversation.workflow": {
+    direction:"p2s",kind:"request",params:ConversationWorkflowParams,result:ConversationWorkflowResult,
+  },
+  "conversation.message": {
+    direction: "p2s", kind: "request", params: ConversationMessageParams, result: ConversationMessageResult,
+  },
+  "project.coordination": {
+    direction: "p2s", kind: "request", params: ProjectCoordinationParams, result: ProjectCoordinationResult,
+  },
+  "project.coordination.evidence": {
+    direction:"p2s",kind:"request",params:ProjectCoordinationEvidenceParams,result:ProjectCoordinationEvidenceResult,
+  },
   "interaction.response": {
     direction: "s2p",
     kind: "notification", // 异步/非阻塞回填走这条
@@ -381,6 +462,15 @@ export const METHODS = {
     kind: "request", // 主动取消一个 pending 交互（P1-5）
     params: InteractionCancelParams,
     result: InteractionCancelResult,
+  },
+  "interaction.status": {
+    direction: "s2p", kind: "request", params: InteractionStatusParams, result: InteractionStatusResult,
+  },
+  "employee.profile.apply": {
+    direction:"s2p",kind:"request",params:EmployeeProfileApplyParams,result:EmployeeProfileStatusResult,
+  },
+  "employee.profile.status": {
+    direction:"s2p",kind:"request",params:EmployeeProfileStatusParams,result:EmployeeProfileStatusResult,
   },
 
   // --- 项目管理（目录 + Git；server 下发，D23）---
@@ -395,6 +485,12 @@ export const METHODS = {
     kind: "request",
     params: ProjectListParams,
     result: ProjectListResult,
+  },
+  "project.provision": {
+    direction:"s2p",kind:"request",params:ProjectProvisionParams,result:ProjectProvisionStatusResult,
+  },
+  "project.provision.status": {
+    direction:"s2p",kind:"request",params:ProjectProvisionStatusParams,result:ProjectProvisionStatusResult,
   },
   "project.get": {
     direction: "s2p",
@@ -522,6 +618,30 @@ export const METHODS = {
     params: SkillInstallParams,
     result: SkillInstallResult,
   },
+  "skill.install.status": {
+    direction: "s2p",
+    kind: "request",
+    params: SkillInstallStatusParams,
+    result: SkillInstallStatusResult,
+  },
+  "skill.install.fence": {
+    direction:"s2p",
+    kind:"request",
+    params:SkillInstallFenceParams,
+    result:SkillInstallFenceResult,
+  },
+  "skill.publish": {
+    direction: "s2p",
+    kind: "request",
+    params: SkillPublishParams,
+    result: SkillInstallResult,
+  },
+  "skill.unpublish": {
+    direction: "s2p",
+    kind: "request",
+    params: SkillUnpublishParams,
+    result: SkillUnpublishResult,
+  },
   "skill.uninstall": {
     direction: "s2p",
     kind: "request",
@@ -554,11 +674,25 @@ export const METHODS = {
     params: WorkflowStatusParams,
     result: WorkflowStatusResult,
   },
+  "workflow.input": {direction:"s2p",kind:"request",params:WorkflowInputParams,result:WorkflowInputReceipt},
+  "workflow.input.status": {direction:"s2p",kind:"request",params:WorkflowInputStatusParams,result:WorkflowInputStatusResult},
+  "workflow.result": {
+    direction: "s2p",
+    kind: "request",
+    params: WorkflowResultParams,
+    result: WorkflowResultPage,
+  },
   "workflow.cancel": {
     direction: "s2p",
     kind: "request",
     params: WorkflowCancelParams,
     result: WorkflowCancelResult,
+  },
+  "workflow.dispatch.cancel": {
+    direction:"s2p",
+    kind:"request",
+    params:WorkflowDispatchCancelParams,
+    result:WorkflowDispatchCancelResult,
   },
   "workflow.pause": {
     direction: "s2p",
@@ -671,6 +805,12 @@ export const METHODS = {
     kind: "request",
     params: RunGetParams,
     result: RunGetResult,
+  },
+  "run.resolve": {
+    direction: "s2p",
+    kind: "request",
+    params: RunResolveParams,
+    result: RunResolveResult,
   },
   "run.events.subscribe": {
     direction: "s2p",

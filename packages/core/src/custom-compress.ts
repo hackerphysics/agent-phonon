@@ -10,6 +10,8 @@ export interface DropToolIOResult {
 }
 
 export interface DropToolIOOptions {
+  /** A rewritten Codex history needs fresh native inference before reporting usage. */
+  invalidateCodexTokenUsage?: boolean;
   /** 保留最近 N 个 tool call 及其对应 result/中间块；默认 3。 */
   keepRecentToolCalls?: number;
   /**
@@ -161,6 +163,12 @@ export async function dropToolIOFromJsonlFiles(files: string[], options: DropToo
         result.blocksRemoved += r.removed;
       }
       out.push(JSON.stringify(r.value));
+    }
+    if(fileChanged&&options.invalidateCodexTokenUsage){
+      for(let i=out.length-1;i>=0;i--){
+        let row;try{row=JSON.parse(out[i]!);}catch{continue;}
+        if(row?.type==="event_msg"&&row.payload?.type==="token_count"){out.splice(i,1);result.recordsChanged++;}
+      }
     }
     const after = out.join("\n");
     result.bytesAfter += Buffer.byteLength(after);

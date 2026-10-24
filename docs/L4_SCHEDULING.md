@@ -12,6 +12,47 @@ L1 session（或 L3 workflow）执行，因此**复用现有 session 事件流�
 
 ---
 
+## Application-Authorized Dispatch (2026-10-21)
+
+Devices advertising `schedule_dispatch_v1` also accept
+`target: {runKind: "dispatch", project, dispatch: {key, revision, contentHash}}`.
+This target records a durable occurrence, freezes its dispatch identity and
+trigger input, and emits `run.started` **without creating a Session or model**.
+`run.get` / `schedule.runs.list` expose the frozen `dispatch` and `input`.
+Disconnect/restart preserves handed-off and queued dispatches for reconciliation.
+
+A controller must validate its own current user authorization, target identity,
+workspace, enabled revision, budget and event provenance, then execute through
+its normal authorized Session / Workflow path. A durable occurrence is not an
+authorization grant, a human message, or a successful execution.
+
+After observing the actual execution outcome, call
+`run.resolve({runId, dispatch, status, resultText?, error?, clientRequestId?})`.
+The method only settles controller-dispatch runs in the same tenant; a mismatched
+identity, ordinary model run, or conflicting terminal outcome is rejected.
+Identical terminal resolution is idempotent. Queued runs cannot resolve as
+successful before handoff. `run.resolve` does not launch or retry any work.
+
+Dispatch identities may include a finite `expiresAt`; the device disables an
+expired schedule before accepting another occurrence. At most 32 dispatches per
+schedule may remain active. `schedule.runs.list({scheduleId, unackedOnly:true,
+limit:100})` drains the oldest unacknowledged records, including offline backlog;
+`schedule.ack({runId,finished:true})` is sent only after durable ingestion.
+Both SDKs preserve controller-dispatch completions without an automatic ACK when
+no durable run-finished handler is registered. Polling controllers acknowledge
+manually. Status-only pushes retain only a non-sensitive `controllerDispatch`
+kind marker, never the dispatch identity or trigger input. Python handlers may
+return any awaitable, including Futures, and are awaited before acknowledgement.
+
+For this target the controller owns model timeout, retry and cancellation;
+it must not resolve an uncertain/accepted execution as failed and release overlap
+protection while the actual work may still be running. Device disconnection may
+delay authorization/execution; dispatch support does not claim offline model
+execution without an available controller and valid application authority.
+
+TypeScript: `device.run.resolve(params)`. Python:
+`await device.run_resolve(run_id, dispatch, status, result_text=...)`.
+
 ## 设计原则
 
 1. **调度真相源在 device，不在 server。**

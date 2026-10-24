@@ -1,4 +1,5 @@
 import { z } from "zod";
+import {SkillSelection} from "./skill.js";
 import { AgentId, ProjectId, SessionId, TenantId } from "./common.js";
 import { WorkflowId, WorkflowPlan } from "./workflow.js";
 
@@ -72,9 +73,17 @@ export type ScheduleTrigger = z.infer<typeof ScheduleTrigger>;
 // Target（到点后要发起的 run 的「配方」）
 // ---------------------------------------------------------------------------
 
+export const ScheduleDispatch = z.object({
+  key: z.string().min(1).max(255),
+  revision: z.number().int().positive(),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/),
+  expiresAt: z.string().datetime({ offset: true }).optional(),
+});
+export type ScheduleDispatch = z.infer<typeof ScheduleDispatch>;
+
 export const ScheduleTarget = z.object({
   /** 复用 L1 session 还是 L3 workflow。 */
-  runKind: z.enum(["session", "workflow"]).default("session"),
+  runKind: z.enum(["session", "workflow", "dispatch"]).default("session"),
   /** 必须绑定 project（与 session.create 一致）。 */
   project: ProjectId,
   /** runKind=session：用哪个 agent。 */
@@ -85,8 +94,11 @@ export const ScheduleTarget = z.object({
   /** runKind=workflow：L3 plan。 */
   plan: WorkflowPlan.optional(),
   agentConfig: z.record(z.unknown()).optional(),
-  skills: z.array(z.string()).optional(),
-});
+  skills: z.array(SkillSelection).max(16).optional(),
+  /** A durable handoff to an authorizing controller; never launches a model. */
+  dispatch: ScheduleDispatch.optional(),
+}).refine(value => value.runKind === "dispatch" ? !!value.dispatch && !value.agent && !value.plan && !value.agentConfig : !value.dispatch,
+  { message: "dispatch targets require a dispatch identity and cannot contain executable agent configuration" });
 export type ScheduleTarget = z.infer<typeof ScheduleTarget>;
 
 // ---------------------------------------------------------------------------
@@ -176,6 +188,11 @@ export const Run = z.object({
   tenantId: TenantId,
   triggerSource: RunTriggerSource,
   status: RunStatus,
+  /** Non-sensitive execution-kind marker, retained even in status-only pushes. */
+  controllerDispatch: z.literal(true).optional(),
+  dispatch: ScheduleDispatch.optional(),
+  /** Frozen trigger data for controller dispatch; never an instruction/approval. */
+  input: z.union([z.string(), z.record(z.unknown())]).optional(),
   /** runKind=session：对应的 L1 session。 */
   sessionId: SessionId.optional(),
   /** runKind=workflow：对应的 L3 workflow。 */
@@ -311,6 +328,8 @@ export const ScheduleRunsListParams = z.object({
   scheduleId: ScheduleId,
   status: RunStatus.optional(),
   limit: z.number().int().positive().optional(),
+  /** Drain oldest unacknowledged occurrences without losing an offline backlog. */
+  unackedOnly: z.boolean().optional(),
 });
 export type ScheduleRunsListParams = z.infer<typeof ScheduleRunsListParams>;
 
@@ -327,6 +346,18 @@ export type RunGetParams = z.infer<typeof RunGetParams>;
 
 export const RunGetResult = z.object({ run: Run });
 export type RunGetResult = z.infer<typeof RunGetResult>;
+
+export const RunResolveParams = z.object({
+  runId: RunId,
+  dispatch: ScheduleDispatch,
+  status: z.enum(["success", "failed", "cancelled", "skipped", "timeout"]),
+  resultText: z.string().max(65536).optional(),
+  error: z.string().max(4000).optional(),
+  clientRequestId: z.string().optional(),
+});
+export type RunResolveParams = z.infer<typeof RunResolveParams>;
+export const RunResolveResult = z.object({ run: Run });
+export type RunResolveResult = z.infer<typeof RunResolveResult>;
 
 // ---- run.events.subscribe / unsubscribe ----
 export const RunEventsSubscribeParams = z.object({

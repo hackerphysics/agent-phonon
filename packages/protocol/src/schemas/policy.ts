@@ -25,6 +25,8 @@ export const TenantPolicy = z.object({
   allowUrlSkillInstall: z.boolean().default(false),
   /** 是否允许从本地任意路径安装 skill（localPath 源，可复制任意目录 → 任意读）。默认 false。 */
   allowLocalPathSkillInstall: z.boolean().default(false),
+  /** Explicit human-owned recovery permission; never implied by trustLocal. */
+  allowSkillRecovery:z.boolean().default(false),
   /** 是否允许物理删盘（project.remove deleteFiles / worktree force 等）。默认 false。 */
   allowDeleteFiles: z.boolean().default(false),
   /** document.send 是否允许发送项目/worktree 目录之外的文件。默认 false（project-scoped）。 */
@@ -39,6 +41,14 @@ export const TenantPolicy = z.object({
    * 不能只靠 allowedMethods。trustLocal（单机自用）下默认开。
    */
   allowExec: z.boolean().default(false),
+  /** Host-level creation/editing of isolated employee profiles. Never implied by trustLocal. */
+  allowEmployeeProfiles:z.boolean().default(false),
+  /** Explicit host consent for new controlled-root workspaces, never arbitrary path adoption. */
+  allowProjectProvision:z.boolean().default(false),
+  /** Separate durable Phonon history; never implied by project or filesystem access. */
+  allowConversationArchives: z.boolean().default(false),
+  /** Per configured server authority and tenant; no automatic history eviction. */
+  maxConversationArchiveBytes: z.number().int().positive().safe().default(10 * 1024 * 1024 * 1024),
   /**
    * 是否允许 device.fs.* 浏览整个文件系统（A4）。默认 true（保留能力）。
    * 设为 false 可把 device.fs.list/roots 锁到 allowedProjectRoots；需要锁定的部署可关。

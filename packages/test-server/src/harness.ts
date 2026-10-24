@@ -1,5 +1,6 @@
 import { PhononConnection, type RpcTransport, type AgentAdapter, type AdapterSession, formatInitialContextLines } from "@agent-phonon/core";
-import type { StreamEvent, ContextItem } from "@agent-phonon/protocol";
+import type { StreamEvent, ContextItem, ReasoningLevel } from "@agent-phonon/protocol";
+import type { SendOptions } from "@agent-phonon/core";
 
 /**
  * 功能测试 harness（bug-bash#2 测试补全）。
@@ -15,6 +16,7 @@ export interface MockAdapterOpts {
   agentIds?: string[];
   /** 每个 agent 的可用模型。 */
   models?: string[];
+  reasoningLevels?: ReasoningLevel[];
   /** send 时回显的文本（默认回显 input）。 */
   reply?: (input: string) => string;
   /** capabilities 覆盖。 */
@@ -49,7 +51,7 @@ export class MockAdapter implements AgentAdapter {
 
   async discoverAgents() {
     const ids = this.opts.agentIds ?? [`${this.name}:default`];
-    const models = (this.opts.models ?? ["m1", "m2"]).map((id) => ({ id, available: true }));
+    const models = (this.opts.models ?? ["m1", "m2"]).map((id) => ({ id, available: true, ...(this.opts.reasoningLevels?{reasoningLevels:this.opts.reasoningLevels}:{}) }));
     return ids.map((agentId) => ({
       agentId: agentId as never,
       displayName: agentId,
@@ -67,12 +69,22 @@ export class MockAdapter implements AgentAdapter {
     return s;
   }
 
+  async recoverSession(params: {sessionId:string;model:string}, checkpoint:Record<string,unknown>): Promise<AdapterSession> {
+    if (checkpoint.sessionId !== params.sessionId) throw new Error("mock native identity changed");
+    const session = new MockSession(params.sessionId, params.model, this.opts);
+    this.lastSession = session;
+    return session;
+  }
+
   globalSkillDir(agentId: string): string | undefined {
     return this.opts.globalSkillDir?.(agentId);
   }
 }
 
 export class MockSession implements AdapterSession {
+  private nativeTurns=new Map<string,boolean>();
+  async observeNativeStop(turnId:string){return this.nativeTurns.get(turnId)===false?"native_terminal" as const:undefined;}
+  recoveryCheckpoint() { return {sessionId:this.sessionId}; }
   readonly sessionId: string;
   model: string;
   private opts: MockAdapterOpts;
@@ -93,7 +105,10 @@ export class MockSession implements AdapterSession {
   /** 暂存的注入上下文（首轮 send 拼进 input，与真实 adapter 一致）。 */
   private pendingInject: string[] = [];
 
-  async send(input: string, o: { turnId: string; verbosity: string; skills?: string[]; environment?: Record<string, string>; emit: (e: StreamEvent) => void; signal?: AbortSignal }): Promise<void> {
+  async send(input: string, o: SendOptions): Promise<void> {
+    this.nativeTurns.set(o.turnId,true);
+    try {
+    if(o.reasoning&&this.opts.caps?.reasoningControl)o.acknowledgeReasoning?.(o.reasoning.level==="standard"?"medium":o.reasoning.level);
     if (this.opts.sendDelayMs) {
       await new Promise<void>((r) => {
         const t = setTimeout(r, this.opts.sendDelayMs);
@@ -115,12 +130,13 @@ export class MockSession implements AdapterSession {
     const text = (this.opts.reply ?? ((i: string) => i))(effectiveInput);
     o.emit({ type: "message", sessionId: this.sessionId, turnId: o.turnId, seq: 0, at: new Date().toISOString(), role: "assistant", text, delta: true } as StreamEvent);
     o.emit({ type: "result", sessionId: this.sessionId, turnId: o.turnId, seq: 0, at: new Date().toISOString(), text, status: "completed", final: true } as StreamEvent);
+    }finally{this.nativeTurns.set(o.turnId,false);}
   }
 
   async interrupt(): Promise<void> { /* mock: nothing to kill */ }
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return { warnings: ["mock switch"] }; }
   async inject(ctx: ContextItem[]): Promise<void> { this.injected.push(...(ctx as Array<{ role: string; content: string }>)); }
-  async compressNative(): Promise<{ summary?: string }> { this.compressed++; return { summary: "mock compacted" }; }
+  async compressNative(): Promise<{ applied: boolean; summary?: string }> { this.compressed++; return { applied:true,summary: "mock compacted" }; }
   async terminate(): Promise<void> { /* mock */ }
   setUnsolicitedSink(sink: (e: StreamEvent) => void): void { this.unsolicited = sink as (e: unknown) => void; }
 
@@ -140,7 +156,7 @@ export class TestConn {
   private hookDecider?: (fired: Record<string, unknown>) => Record<string, unknown>;
   private requestResponders = new Map<string, (params: unknown) => unknown>();
 
-  constructor(opts: { registry: ConstructorParameters<typeof PhononConnection>[0]["registry"]; tenantId?: string; trustLocal?: boolean; workspaceRoot?: string; store?: ConstructorParameters<typeof PhononConnection>[0]["store"]; policy?: ConstructorParameters<typeof PhononConnection>[0]["policy"]; maintenance?: ConstructorParameters<typeof PhononConnection>[0]["maintenance"] }) {
+  constructor(opts: { registry: ConstructorParameters<typeof PhononConnection>[0]["registry"]; nativeFileBroker?:ConstructorParameters<typeof PhononConnection>[0]["nativeFileBroker"]; tenantId?: string; trustLocal?: boolean; workspaceRoot?: string; store?: ConstructorParameters<typeof PhononConnection>[0]["store"]; policy?: ConstructorParameters<typeof PhononConnection>[0]["policy"]; maintenance?: ConstructorParameters<typeof PhononConnection>[0]["maintenance"]; archiveAuthority?: string }) {
     const transport: RpcTransport = {
       send: (data: string) => this.onServerInbound(data),
       close: () => {},
@@ -149,9 +165,11 @@ export class TestConn {
       tenantId: opts.tenantId ?? "tenant-test",
       transport,
       registry: opts.registry,
+      nativeFileBroker:opts.nativeFileBroker,
       trustLocal: opts.trustLocal ?? true,
       workspaceRoot: opts.workspaceRoot,
       store: opts.store,
+      archiveAuthority: opts.archiveAuthority,
       policy: opts.policy,
       maintenance: opts.maintenance,
     });

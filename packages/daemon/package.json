@@ -17,7 +17,7 @@
     "build": "tsup",
     "build:test": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm build:test && node --test dist-test/config.test.js dist-test/security.test.js dist-test/launchd.test.js",
+    "test": "pnpm build:test && node --test --test-concurrency=1 dist-test/config.test.js dist-test/security.test.js dist-test/launchd.test.js dist-test/pi-registration.test.js dist-test/managed-mcp.test.js dist-test/managed-mcp-source.test.js dist-test/managed-mcp-security.test.js dist-test/mcp-request-budget.test.js",
     "test:e2e": "pnpm test:e2e:local",
     "test:e2e:local": "pnpm build:test && node --test dist-test/obs.test.js",
     "test:launchd": "pnpm build:test && node --test dist-test/launchd.integration.test.js",
@@ -25,6 +25,7 @@
     "test:all": "pnpm test && pnpm test:e2e:local"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@ai-sdk/anthropic": "4.0.41",
     "@ai-sdk/google": "4.0.50",
     "@ai-sdk/openai": "4.0.43",
@@ -32,9 +33,11 @@
     "ai": "^7.0.58",
     "jsonc-parser": "3.3.1",
     "smol-toml": "1.8.0",
+    "tar": "7.5.22",
     "ws": "^8.18.0",
     "yaml": "2.9.0",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
     "@agent-phonon/core": "workspace:*",

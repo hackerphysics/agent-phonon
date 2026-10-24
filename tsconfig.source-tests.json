@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@agent-phonon/protocol": ["packages/protocol/src/index.ts"],
+      "@agent-phonon/core": ["packages/core/src/index.ts"],
+      "@agent-phonon/server-sdk": ["packages/sdk-server-ts/src/index.ts"]
+    }
+  }
+}

@@ -5,7 +5,7 @@ import { defineConfig } from "tsup";
 // published `agent-phonon` package does not depend on unpublished workspace
 // packages. Real third-party deps (ws, zod, node:*) stay external.
 export default defineConfig({
-  entry: ["src/cli.ts", "src/daemon.ts"],
+  entry: ["src/cli.ts", "src/daemon.ts", "src/managed-mcp-worker.ts"],
   format: ["esm"],
   target: "es2022",
   outDir: "dist",
@@ -15,7 +15,7 @@ export default defineConfig({
   splitting: false,
   // Inline workspace packages; keep third-party + node builtins external.
   noExternal: [/@agent-phonon\//],
-  external: ["ws", "zod"],
+  external: ["ws", "zod", "zod-to-json-schema", "@modelcontextprotocol/sdk"],
   platform: "node",
   // esbuild strips the `node:` prefix from builtin imports. Most builtins work
   // either way, but prefix-only ones (e.g. `node:sqlite`) break. Restore the
@@ -32,6 +32,14 @@ export default defineConfig({
       const src = readFileSync(p, "utf8");
       const fixed = src.replace(re, (_m, pre, mod) => `${pre}"node:${mod}"`);
       if (fixed !== src) writeFileSync(p, fixed);
+    }
+    if(process.env.PHONON_FS_BROKER_ARTIFACT_ROOT){
+      const {copyNativeFileBroker}=await import("./scripts/copy-native-fs-broker.mjs");
+      await copyNativeFileBroker(process.env.PHONON_FS_BROKER_ARTIFACT_ROOT,join(process.cwd(),"dist/native"));
+    }
+    if(process.env.PHONON_PROCESS_JOB_ARTIFACT_ROOT){
+      const {copyProcessJob}=await import('./scripts/copy-process-job.mjs');
+      await copyProcessJob(process.env.PHONON_PROCESS_JOB_ARTIFACT_ROOT,join(process.cwd(),'dist/native-process'));
     }
   },
   // Tests are run from src via tsc separately; tsup only builds shippable code.

@@ -1,6 +1,7 @@
 import { PhononError } from "./rpc.js";
 import type { PhononStore } from "./store.js";
 import { isDangerousChildEnvName, sanitizeRemoteEnvironment } from "./child-env.js";
+import type {SkillSelection} from "@agent-phonon/protocol";
 
 type Scope = "global" | "project" | "skill";
 
@@ -47,12 +48,13 @@ export class EnvManager {
   }
 
   /** 返回本次执行应该注入的环境变量：global < project < skill。 */
-  resolveForExecution(params: { projectId?: string; agent?: string; skills?: string[] }): Record<string, string> {
+  resolveForExecution(params: { projectId?: string; agent?: string; skills?: SkillSelection[] }): Record<string, string> {
     const env: Record<string, string> = {};
     for (const r of this.store.envList(this.tenantId, { scope: "global" })) env[r.name] = r.value;
     if (params.projectId) for (const r of this.store.envList(this.tenantId, { scope: "project", projectId: params.projectId })) env[r.name] = r.value;
     if (params.projectId && params.agent && params.skills) {
-      for (const skillName of params.skills) {
+      for (const selected of params.skills) {
+        const skillName=typeof selected==="string"?selected:selected.name;
         for (const r of this.store.envList(this.tenantId, { scope: "skill", projectId: params.projectId, agent: params.agent, skillName })) env[r.name] = r.value;
       }
     }

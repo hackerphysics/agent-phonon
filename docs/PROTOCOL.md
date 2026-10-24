@@ -1,13 +1,13 @@
 # agent-phonon 协议总览（一页速读）
 
 > 自动对照 `packages/protocol` 源码的人话版总览。字段级看 `src/schemas/*.ts`，决策看 `docs/design.md`。
-> 当前 90 个方法，协议版本 `0.1.0`。新增方法保持向后兼容。
+> 当前 105 个方法，协议版本 `0.1.0`。新增方法保持向后兼容。
 
 ## 一句话
 
 phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 JSON-RPC 2.0。服务端下发 session 操作，phonon 上推流式结果 / 自发输出 / hook 请求。
 
-## 90 个方法
+## 方法摘要
 
 | 方法 | 方向 | 类型 | 干啥 |
 |------|------|------|------|
@@ -15,7 +15,7 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `device.info` | server→phonon | request | 查 OS/机器信息与调度标签：平台、架构、hostname、capabilities（如 ios-development/windows-desktop-development） |
 | `device.resources` | server→phonon | request | 查设备资源快照：CPU/内存/磁盘/进程/GPU best-effort（仅监控，不调度） |
 | `device.fs.roots` | server→phonon | request | 返回设备可浏览根：workspaceRoot/home，以及 Linux/macOS `/` 或 Windows 盘符 |
-| `device.fs.list` | server→phonon | request | 设备级目录浏览：按 root+相对路径或 absolutePath 列目录项元数据，不读取文件内容 |
+| `device.fs.list` | server→phonon | request | 设备级目录浏览；`projectCandidates` 模式按本机路径前缀返回可导航/可选目录与身份，不读取文件内容。见 [WORKSPACE_DIRECTORIES.md](WORKSPACE_DIRECTORIES.md)。 |
 | `maintenance.targets` | server→phonon | request | 列设备本地预注册的维护 target/config/service 及当前权限 |
 | `maintenance.diagnose` | server→phonon | request | 确定性诊断 executable、已注册文本配置和用户服务，不依赖 LLM/外部 Agent |
 | `maintenance.config.get` | server→phonon | request | 读取预注册 JSON/JSONC/YAML/TOML/text，secret 字段递归脱敏，并返回 SHA-256 乐观锁 |
@@ -32,21 +32,33 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `session.send` | server→phonon | request | 发任务＝对话；ack 回 turnId，内容走 stream；可传 `skills` 指定本轮技能 |
 | `session.inject` | server→phonon | request | 注入上下文 |
 | `session.compress` | server→phonon | request | 压缩，native \| custom 双模；custom `dropToolIO` 仅适用于 adapter 可安全操作的存储。OpenClaw SQLite Gateway 无对应自定义 API 时返回 `errCapabilityUnsupported`，不编辑其私有数据库；native 必须确认实际 compacted，不能吞错伪成功。 |
+| `session.compression.status` | server→phonon | request | 按 Session/operation 查询持久压缩回执；区分 running/succeeded/noop/failed/unknown，未知结果不自动重做。 |
 | `session.switchModel` | server→phonon | request | 中途换模型（agent 不变） |
 | `session.interrupt` | server→phonon | request | **打断当前 turn，session 存活** |
 | `session.terminate` | server→phonon | request | 销毁整个 session |
 | `session.status` | server→phonon | request | 查单个 session（带状态/绑定/正在跑哪轮） |
+| `session.recover` | server→phonon | request | 校验保留的 project/agent/model 和设备原生检查点，接回原 Session；不发送输入、不恢复队列、不重跑 workflow。 |
 | `session.list` | server→phonon | request | 列 session（可按 agent 筛） |
 | `stream.event` | phonon→server | notify | 流式结果（含自发输出；终态 status） |
 | `stream.ack` | server→phonon | notify | 确认已收 seq≤N，phonon 清 outbox（P0-4） |
+| `stream.replay` | server→phonon | request | 按 Session 重发尚未 ACK 的持久输出，最多 1000 条；不启动模型、不代替 ACK |
 | `hook.fired` | phonon→server | request | 到 hook 点抛事件，阻塞等裁决 |
 | `hook.resolve` | server→phonon | request | 裁决：continue/inject/modify/abort |
-| `document.send` | phonon→server | request | 发本地文档（agent emit 路径，phonon 读盘上传；project-scoped） |
+| `document.send` | phonon→server | request | 发本地文档（agent emit 路径，phonon 读盘上传；project-scoped）；原生会话来源及文件传输见 [NATIVE_DOCUMENTS.md](NATIVE_DOCUMENTS.md) |
 | `document.prepare_upload` | phonon→server | request | 大文件凭证上传（预签名 URL，P1-6） |
 | `interaction.request` | phonon→server | request | 发可交互表单/卡片给人填（timeout/cancel） |
 | `interaction.response` | server→phonon | notify | 人填完的值回填（异步路径） |
 | `interaction.cancel` | server→phonon | request | 主动取消 pending 交互（P1-5） |
-| `project.create` | server→phonon | request | 建项目（目录 + Git） |
+| `interaction.status` | server→phonon | request | 查询 tenant 隔离的持久交互回执、请求/回应哈希和可信运行归属；区分已送达与执行方已确认消费 |
+| `conversation.board` | phonon→server | request | 当前原生轮次读写自己的会话状态板；控制器标记来源，服务端校验权限、版本及幂等回执。 |
+| `conversation.workflow` | phonon→server | request | DE 读取显式 Agent / Role / 工作副本目录、提交跨设备 DAG 并按来源选择请求审批；返回真实子任务结果，不把工作 Agent 加入群。 |
+| `conversation.message` | phonon→server | request | 当前项目群 DE 的成员查询、显式定向消息及只读回执；身份由控制器标记，权限、预算及真实投递状态由服务端维护。 |
+| `project.coordination` | phonon→server | request | 独立项目协作目录、活动声明、跨设备信箱与回执；不写人类聊天、不自动启动任务。详见 `PROJECT_COORDINATION.md`。 |
+| `conversation.archive.append/read/status` | server→phonon | request | 独立持久化 Phonon 规范会话记录、固定水位分页和查询归档检查点；默认关闭，不启动 Agent、不替代附件归档或安全回收。见 [CONVERSATION_ARCHIVE.md](CONVERSATION_ARCHIVE.md)。 |
+| `conversation.archive.entities` | server→phonon | request | 固定归档水位下按实体逻辑顺序倒序分页或按 key 查询完整版本引用；需 `conversation_archive_entities_v1`，保留十进制字符串和分片校验，不启动 Agent。 |
+| `conversation.archive.blob.write/status/read` | server→phonon | request | 独立附件二进制分块持久化、续传和读取；需 `conversation_archive_blobs_v1`，复用归档作用域和额度，完整 SHA-256 校验后才确认完成，不启动 Agent 或自动删除源文件。 |
+| `employee.profile.apply/status` | server→phonon | request | 按显式设备策略安装独立 DE 配置、真实私聊目录；校验版本，保留原生记忆 |
+| `project.create` | server→phonon | request | 建项目；可用 `existingDirectoryIdentity` + `git:false` 严格登记既有目录，不建目录或 Git。见 [WORKSPACE_DIRECTORIES.md](WORKSPACE_DIRECTORIES.md)。 |
 | `project.list/get` | server→phonon | request | 查项目 |
 | `project.remove` | server→phonon | request | 删项目（默认只解绑不删盘） |
 | `project.worktree.create` | server→phonon | request | 基于 branch 建 worktree |
@@ -64,12 +76,17 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `env.list` | server→phonon | request | 查询环境变量配置；默认脱敏，reveal 需本地 policy 允许 |
 | `env.delete` | server→phonon | request | 删除环境变量配置 |
 | `skill.install` | server→phonon | request | 给 agent 装 skill（global\|project）；source 支持 inline files / archive tar.gz / localPath / url 预留 |
+| `skill.install.status` | server→phonon | request | Read the exact owned install receipt without replaying writes. Optional `includeReceiverIdentity:true` proves only an originally captured persistent namespace receiver; legacy/missing proof stays absent. Unknown/not_found is not proof of no effects. See NATIVE_SKILL_INSTALL_RECEIPTS.md. |
+| `skill.install.fence` | server→phonon | request | Explicit local-policy recovery CAS prevents late confirmation of the exact unconfirmed Project transaction; result remains unknown, files are not deleted and the target stays locked. Never a default Agent MCP tool or an unlock. See NATIVE_SKILL_FENCES.md. |
+| `skill.publish` | server→phonon | request | Project-only immutable version publication with original nonce and explicit base revision. Optional `expectedReceiverID` is checked before cached receipt replay, mutation and commit; never a legacy-mode fallback. |
+| `skill.unpublish` | server→phonon | request | Revision-checked deactivation and queued-version revocation; files and history are preserved. |
 | `skill.uninstall` | server→phonon | request | 卸 skill |
 | `skill.list` | server→phonon | request | 列 skill |
 | `skill.dirs` | server→phonon | request | 查询某 agent global skill 目录、某 project `.agent/skills` 下 skill 名称与真实本机路径 |
 | `workflow.run` | server→phonon | request | L3 编排：提交 DAG 或 executor graph 执行计划；policy.timeout/maxParallel/onNodeFailure 可选 |
 | `workflow.status` | server→phonon | request | 查询 workflow 与各 node/session 状态；节点 result 带 text/status/usage；finalText 可选 |
 | `workflow.cancel` | server→phonon | request | 取消 workflow（幂等） |
+| `workflow.dispatch.cancel` | server→phonon | request | 按 tenant/project/dispatchKey 写入持久取消记录，处理尚未拿到 workflowId 的取消；已完成结果不改写 |
 | `workflow.pause` | server→phonon | request | 暂停 workflow 并 fence 迟到事件 |
 | `workflow.resume` | server→phonon | request | 按持久化 checkpoint 和指定策略恢复 |
 | `workflow.list` | server→phonon | request | 列 workflow run（可按 status/projectId/since/until 筛） |
@@ -104,6 +121,10 @@ create ──▶ idle ──send──▶ running ──turn结束/interrupt─�
 
 **L3 归属字段（2026-06-23 合并 P0-1）**：由 workflow node 创建的 session 的所有 `stream.event` 都会被 phonon 自动加上 `workflowId / nodeId / role` 三字段。服务端只需设一个 `streamEvent` 监听器，按 `workflowId` 筛、按 `nodeId/role` 区分来源即可；**不需要另外订阅 workflow.event 里的 session 输出**（原 `node.stream` 事件已删除）。普通 session 原样返回，不带额外字段。
 
+原生聊天还会在发送 stream 前标注 `nativeRunId`，即使 dispatch ACK 尚未到达也能归属。
+`native_chat_workflow_v1` 保留跨轮 Session，断连/重启后暂停而非自动重复执行。
+能力要求、最终回复节点和 SDK 调用见 [NATIVE_CHAT.md](NATIVE_CHAT.md)。
+
 ## 忙碌时新消息怎么办（D18，双向不丢）
 
 `session.send` 的 `whenBusy`：
@@ -130,6 +151,33 @@ create ──▶ idle ──send──▶ running ──turn结束/interrupt─�
 - **文档交换**：agent 只 emit 本地 path，phonon 读盘 + 上传（`document.send`）
 - **人机交互**：agent emit 抽象表单 → server 自由渲染（飞书卡片/网页/TG）→ 人填完原路返回注入（`interaction.request/response`）。表单只定义抽象字段，不绑定渲染
 
+原生聊天的当前轮专属交互入口、显式审批提示、无自动批准的超时/停止规则和
+`native_interaction_receipts_v1` 见 [NATIVE_INTERACTIONS.md](NATIVE_INTERACTIONS.md)。
+
+DE 的原生 profile、会话身份和私聊目录见 [EMPLOYEE_PROFILES.md](EMPLOYEE_PROFILES.md)。
+
+会话状态板的当前轮读写使用 `conversation.board`（p2s request），包含控制器标记的
+会话来源、版本冲突、幂等写入和真实作者；`native_conversation_board_v1` 及两端 SDK
+入口见 [NATIVE_BOARDS.md](NATIVE_BOARDS.md)。
+
+手动压缩的后台接收、真实结果回执、并发互斥和未知状态恢复限制见
+[SESSION_COMPRESSION.md](SESSION_COMPRESSION.md)。`session_compression_receipts_v1`
+不表示每个 adapter 或每个 Session 都支持原生/自定义压缩。
+
+重启后的原生会话恢复、检查点与兼容性边界见
+[SESSION_RECOVERY.md](SESSION_RECOVERY.md)。`session_recovery_v1` 表示提供恢复接口，
+不表示所有 Session 都能恢复；`session.status.recovery.canAttempt` 仅表示可尝试验证，
+成功必须以 `session.recover` 返回的原会话身份为准。
+
+逐轮思考级别使用 `session.send.reasoning` / workflow node `reasoning`，由
+`turn_reasoning_v1` 和当前模型能力共同约束。保存偏好不等于生效；控制器确认的
+`runtime_settings` 事件才是 Harness 设置回执，不证明模型内部预算或任务完成。
+原生参数、默认值恢复与两套 SDK 示例见 [TURN_REASONING.md](TURN_REASONING.md)。
+
+DE 发起的计划、版本化审阅、跨设备委派、真实执行者与原会话汇报见
+[NATIVE_WORKFLOWS.md](NATIVE_WORKFLOWS.md)。能力 `native_workflow_delegation_v1`
+不等同于任意 RPC 转发，也不默认替 Agent 决定审批政策。
+
 ## v0.2 收口（四家 review 采纳，2026-06-20）
 
 多家 AI 模型 review 后，补齐工程化可靠性与安全边界：
@@ -144,7 +192,7 @@ create ──▶ idle ──send──▶ running ──turn结束/interrupt─�
 - worktree/branch 删除前查 active session，force 返回 affected
 - worktree GC（terminate cleanWorktree）；project.remove cascade
 - switchModel `whenRunning`（默认 reject）+ warnings
-- whenBusy `fallback` 自动降级
+- whenBusy `fallback` 仅在显式指定时降级；未指定时不把插入悄悄改为排队或打断
 - interaction `timeout`/`cancel`/状态 + pending 持久化
 - 大文件 `document.prepare_upload`（预签名 URL 断点续传）
 
@@ -263,3 +311,30 @@ Rescue 四协议均提供 `edit_config` array-of-objects schema；Gemini 原 pat
 edit 没有任意 additionalProperties，使用正常 array schema，经相同本地 Zod 与 policy 校验。
 新默认注册 Hermes `~/.hermes/config.yaml` 和 Codex `~/.codex/config.toml` **只读、text hidden**。
 已有持久注册不会自动扩权，Agent/maintenance/policy 自身仍不可由 Rescue 重写。
+
+## Workflow Skill Selection
+
+`WorkflowNode.skills` now carries the bounded `SkillSelection[]` used by
+`session.send`, including optional exact `revision` and `installationId` pins.
+The receiver validates pins before model invocation; they cannot change tenant,
+Project ownership, policy or human decisions. All workflow modes and workflow
+schedule persistence retain node selectors. Changed retries retain normal
+request-hash rejection rather than adopting another installation.
+
+Check `device.info` flags `workflow_skill_selection_v1` and
+`pinned_skill_selection_v1` before using these fields with older receivers.
+Current SDK helpers fail closed and snapshot new-feature packets before their
+capability read. Critical commit-to-send controllers must prepare that read
+before their dispatch claim. Details and evidence: `WORKFLOW_SKILLS.md`.
+# Controlled Workspace Provisioning
+
+`project.provision` and `project.provision.status` provide native controlled-root
+directory preparation and original-receipt observation, not a general filesystem
+path or account administration API. The mutator accepts exactly UUID retry key,
+display name and expected receiver UUID; status accepts the two identities.
+`device.info` advertises `project_provision_v1` / `projectProvisionReceiverID`
+only when explicitly host-enabled and a qualified exclusive-creation helper is
+available. Both SDKs preserve the new contract; raw controllers must prepare
+capabilities before their own durable claims. Unknown filesystem outcomes never
+auto-replay. See `PROJECT_PROVISIONING.md` for lifecycle, metadata-only status
+repair, default-off policy, Windows refusal and incomplete release/device gates.

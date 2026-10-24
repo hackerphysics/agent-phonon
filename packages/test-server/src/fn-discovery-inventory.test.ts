@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AdapterRegistry, DiscoveryInventory, ObsBus, OpenCodeAdapter, PhononStore } from "@agent-phonon/core";
@@ -8,6 +8,14 @@ import { type AgentDescriptor, DiscoveryChangedParams } from "@agent-phonon/prot
 import { MockAdapter, TestConn } from "./harness.js";
 
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+test("read-only native probes close stdin for CLIs that wait for EOF",async()=>{
+  const root=mkdtempSync(join(tmpdir(),"phonon-probe-eof-")),bin=join(root,"probe");
+  writeFileSync(bin,`#!${process.execPath}\nprocess.stdin.resume();process.stdin.on('end',()=>process.stdout.write(process.argv.includes('--version')?'1.0.0\\n':'local/model\\n'));\n`,{mode:0o700});
+  try{
+    const rows=await new OpenCodeAdapter({env:{binPath:bin,defaultModel:"local/model"}}).discoverAgents();
+    assert.equal(rows[0]?.available,true);
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
 class InventoryAdapter extends MockAdapter {
   rows?: AgentDescriptor[];
   calls = 0;
@@ -124,7 +132,7 @@ test("optional native catalog failure retains last-good models and native-config
   });
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   const baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-  const a = new CodexAdapter({ env: { binPath: process.execPath, baseUrl, defaultModel: "native-model" } });
+  const a = new CodexAdapter({ env: { binPath: process.execPath, baseUrl, apiKey:"synthetic", defaultModel: "native-model" } });
   const inventory = new DiscoveryInventory(() => [a]); const events: unknown[] = [];
   const release = inventory.acquire(e => events.push(e));
   try {
@@ -133,7 +141,7 @@ test("optional native catalog failure retains last-good models and native-config
     status = 503; await inventory.refresh();
     assert.deepEqual((await inventory.list())[0]?.models, first[0]?.models);
     assert.equal(events.length, 0, "optional failure must not fabricate models_changed");
-    const fresh = new CodexAdapter({ env: { binPath: process.execPath, baseUrl, defaultModel: "native-model" } });
+    const fresh = new CodexAdapter({ env: { binPath: process.execPath, baseUrl, apiKey:"synthetic", defaultModel: "native-model" } });
     const initialFailure = await fresh.discoverAgents();
     assert.equal(initialFailure[0]?.available, true);
     assert.equal(initialFailure[0]?.models[0]?.id, "native-model");

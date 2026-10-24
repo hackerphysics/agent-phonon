@@ -2,11 +2,14 @@
 
 [中文说明](./README.zh-CN.md)
 
-> Orchestrate many agents as one — run them on your device, command them from anywhere.
+> From your personal AI assistant to the digital team you lead.
 
 **agent-phonon** is a device-side daemon that discovers local AI coding agents
-(Claude Code, Codex, GitHub Copilot CLI, Pi, Herdr multi-agent, OpenCode, OpenClaw, Hermes, and more) and exposes them to a
+(Claude Code, Codex, GitHub Copilot CLI, Pi, OpenCode, OpenClaw, Hermes, and more) and exposes them to a
 server through one uniform WebSocket/JSON protocol.
+
+Herdr is not supported. There is no compatibility or automatic session migration;
+use a supported native adapter. See the [runtime-scope decision](docs/decisions/2026-10-24-native-agents-only.md).
 
 The name comes from the **phonon** in condensed-matter physics: a collective
 quasiparticle that emerges when many atoms vibrate together. Individual agents
@@ -15,6 +18,30 @@ act alone; orchestrated together they become one system. *More is different.*
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 ---
+
+## Product positioning
+
+**One system for your personal assistant and your team of digital employees.**
+The experience depends on the devices and agents you connect, not on choosing
+between two separate products.
+
+- **Personal assistant:** Create a dedicated OpenClaw agent on your own computer
+  and let it handle personal tasks on that computer, using the tools and
+  permissions available to it.
+- **Digital employee team:** Give multiple agents distinct responsibilities and
+  let the connected application or server coordinate their work. They can run on
+  the same device or across several devices; a team does not require one device
+  per employee.
+
+**Devices determine where tasks run; agents determine who does the work and how
+they collaborate.** Start with one useful assistant and add collaborators as
+needed, without an upfront choice between an assistant and a team.
+
+agent-phonon provides the shared device-side execution foundation; the connected
+application or server provides the user experience and cross-device coordination.
+Agent creation and task execution remain subject to each adapter's declared
+capabilities and the device owner's local authorization. See the
+[product design](docs/design.md#11-产品定位私人助手与数字员工团队).
 
 ## What it does
 
@@ -31,6 +58,9 @@ puts a small daemon in front of them so a server can:
 
 Adapters declare their real capabilities; agent-phonon does **not** pretend every
 agent works the same way.
+
+Native mobile chat transports, retained Sessions, bounded stream repair and
+durable dispatch cancellation are described in [Native Chat](docs/NATIVE_CHAT.md).
 
 ## Architecture
 
@@ -69,7 +99,6 @@ for development and integration testing.
   - Claude Code: `claude`
   - Codex CLI: `codex`
   - GitHub Copilot CLI: `copilot`
-  - Herdr (multi-agent runtime): `herdr` — delegates to whichever kind you select (`herdr:codex`, `herdr:claude`, …)
   - OpenCode: `opencode`
   - Hermes: `hermes`
   - Pi: `pi` — install with `curl -fsSL https://pi.dev/install.sh | sh`
@@ -240,11 +269,6 @@ Adapter auto-detection is conservative:
   (`GET <base_url>/models`) when available, with safe fallback models.
 - GitHub Copilot CLI models are parsed from `copilot help config`; the adapter
   uses JSONL streaming and native named-session resume.
-- Herdr is delegated through the CLI (`herdr workspace create` + `herdr agent start --kind <kind>`),
-  polling lifecycle state and reading recent pane output. Structured tool events are not
-  available; the adapter honestly declares `streaming:false` / `hooks:[]` and is meant for
-  OS-consistent agent control and reuse of Herdr's pane/state detection rather than for
-  deep telemetry.
 - Hermes models are discovered from Hermes profile/config/catalog information
   with provider fallbacks when the catalog is incomplete.
 - No user-specific provider names, endpoints, or local machine paths are
@@ -400,6 +424,9 @@ agent-phonon adapter add openclaw --agent main
 
 ## Server SDKs
 
+Current-turn input is capability-gated and never silently becomes a queue or
+interrupt. See [tool-gap insertion and acknowledgement semantics](docs/MID_TURN_INPUT.md).
+
 ### TypeScript / Node
 
 ```bash
@@ -489,6 +516,14 @@ prove authentication or bind-address parity.
 
 
 ## Local session history
+
+Verified recovery is separate from retained history. Devices exposing
+`session_recovery_v1` support identity-bound `session.recover`, which never
+sends input or resumes a workflow. Only settled, adapter-verifiable native
+checkpoints can be reopened; unsupported/legacy/interrupted retained Sessions
+are not silently recreated. Codex is the first production adapter path. See
+[Verified Native Session Recovery](docs/SESSION_RECOVERY.md), including the
+distinct generic workflow retry behavior and current integration gaps.
 
 Session transcript files are retained by default for all sessions, including Dev workflows. Completing or terminating a session, acknowledging delivery, restarting the daemon, or writing another session does not rotate, truncate or expire that history. Existing transcript files and earlier `.jsonl.1` archives are left untouched.
 

@@ -10,6 +10,7 @@ import {
   HermesAdapter,
   OpenCodeAdapter,
   CopilotAdapter,
+  PiAdapter,
   RescueAdapter,
   ObsBus,
   StructuredLogger,
@@ -21,6 +22,10 @@ import {
 import { type DaemonConfig, readOpenClawGatewayToken, validateServerConfigs } from "./config.js";
 import { autoDetectAdapters } from "./commands.js";
 import { ObsServer, unavailableDeliveryMeasurement } from "./obs-server.js";
+import { ManagedMcpManager, managedMcpStateDir,managedMcpSourceFingerprint } from "./managed-mcp.js";
+import {existsSync} from "node:fs";
+import {fileURLToPath} from "node:url";
+import {isAbsolute,join} from "node:path";
 
 /**
  * PhononDaemon（bug-bash B4）：设备侧常驻服务。
@@ -31,11 +36,13 @@ import { ObsServer, unavailableDeliveryMeasurement } from "./obs-server.js";
  * HookBridge 跨所有连接路由：sessionKey → 找到 owns 该 session 的连接。
  */
 export interface PhononDaemonDeps {
+  configPath?: string;
   /** Deterministic adapter injection for embedded use/tests. When provided, configured auto-detection is skipped. */
   adapters?: AgentAdapter[];
 }
 
 export class PhononDaemon {
+  private readonly configPath?: string;
   private cfg: DaemonConfig;
   private store: PhononStore;
   private registry: AdapterRegistry;
@@ -50,10 +57,16 @@ export class PhononDaemon {
   private stopped = false;
   private startPromise?: Promise<void>;
   private stopPromise?: Promise<void>;
+  private readonly employeeProfileFileBrokerRoot?:string;
 
   constructor(cfg: DaemonConfig, deps: PhononDaemonDeps = {}) {
+    this.configPath = deps.configPath;
     validateServerConfigs(cfg.servers);
     this.cfg = cfg;
+    const bundled=["./native-fs/","./native/"].map(path=>fileURLToPath(new URL(path,import.meta.url)))
+      .find(path=>existsSync(join(path,"manifest.json")));
+    this.employeeProfileFileBrokerRoot=cfg.employeeProfileFileBrokerRoot??bundled;
+    if(this.employeeProfileFileBrokerRoot&&(!isAbsolute(this.employeeProfileFileBrokerRoot)||this.employeeProfileFileBrokerRoot.includes("\0")))throw new Error("employeeProfileFileBrokerRoot must be an absolute local runtime path");
     this.registry = new AdapterRegistry(cfg.discovery, this.obs);
     this.store = new PhononStore(cfg.dbPath, { delivery: cfg.delivery });
     // 可观测堆栈：结构化日志 + 指标 + audit 落库，都从同一 ObsBus 消费
@@ -100,11 +113,13 @@ export class PhononDaemon {
       } else if (a.type === "codex") {
         this.registry.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
       } else if (a.type === "hermes") {
-        this.registry.register(new HermesAdapter({ env: { binPath: a.hermesBinPath, defaultModel: a.hermesModel, provider: a.hermesProvider } }));
+        this.registry.register(new HermesAdapter({ env: { binPath: a.hermesBinPath, defaultModel: a.hermesModel, provider: a.hermesProvider, managedProfileNativeTools: a.hermesManagedProfileNativeTools,profileFileBrokerRoot:this.employeeProfileFileBrokerRoot } }));
       } else if (a.type === "opencode") {
         this.registry.register(new OpenCodeAdapter({ env: { binPath: a.opencodeBinPath, defaultModel: a.opencodeModel } }));
       } else if (a.type === "copilot") {
-        this.registry.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels } }));
+        this.registry.register(new CopilotAdapter({ env: { binPath: a.copilotBinPath, defaultModel: a.copilotModel, models: a.copilotModels, peerContext: a.copilotPeerContext } }));
+      } else if (a.type === "pi") {
+        this.registry.register(new PiAdapter({ env: { binPath: a.piBinPath, defaultModel: a.piModel, models: a.piModels, appendSystemPrompt: a.piAppendSystemPrompt } }));
       } else if (a.type === "openclaw-cli") {
         this.registry.register(new OpenClawAdapter({ defaultAgent: a.defaultAgent ?? "main" }));
       }
@@ -170,7 +185,10 @@ export class PhononDaemon {
       console.warn("[daemon] no servers configured — idle. Add servers to config and restart.");
     }
     for (const s of this.cfg.servers) {
+      const managedMcp = new ManagedMcpManager({ server: s.url, configPath: this.configPath,
+        sourceFingerprint:managedMcpSourceFingerprint(s),stateDir: managedMcpStateDir(this.cfg), inventory: () => this.registry.inventory.list() });
       const client = new PhononClient({
+        managedMcp: { configure: raw => managedMcp.configure(raw), status: () => managedMcp.statusAsync() },
         serverUrl: s.url,
         deviceId: this.cfg.deviceId,
         registry: this.registry,
@@ -178,6 +196,7 @@ export class PhononDaemon {
         obs: this.obs,
         trustLocal: s.trustLocal,
         workspaceRoot: this.cfg.workspaceRoot,
+        employeeProfileFileBrokerRoot:this.employeeProfileFileBrokerRoot,
         deviceKey: s.deviceKey,
         expectedTenantId: s.expectedTenantId,
         allowInsecure: s.allowInsecure,

@@ -23,10 +23,13 @@ export type HookType = z.infer<typeof HookType>;
  * 这份能力随 discovery 一起暴露给服务端，服务端先知能力再决定怎么用。
  */
 export const AgentCapabilities = z.object({
+  employeeProfiles:z.boolean().optional(),
+  reasoningControl: z.boolean().optional(),
   /** 原生 session / resume（无则由 core 用注册表模拟）。 */
   nativeSession: z.boolean(),
   /** 原生上下文压缩（决定 session.compress mode=native 是否可用）。 */
   nativeCompression: z.boolean(),
+  customCompression: z.boolean().optional(),
   /** 原生上下文注入。 */
   contextInjection: z.boolean(),
   /**

@@ -11,11 +11,14 @@
  *       ← decision { action: continue|abort|inject|modify }
  *     → 转成 OpenClaw 的 allow / block / 改参
  *
- * bridge 不可达 / 超时 → 默认放行（fail-open），不卡死 agent。
+ * The legacy hook below remains fail-open. Native human-input tools use a
+ * separate, opt-in, fail-closed current-run binding.
  */
 
 // @ts-expect-error — SDK 由 OpenClaw 运行时提供，构建期可能不可解析
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { NativeInteractionTools, NATIVE_TOOLS, type NativeInteractionApi } from "./native-interactions.js";
+import { NativePeerContexts, type NativePeerApi } from "./peer-context.js";
 
 export const DEFAULT_BRIDGE = "http://127.0.0.1:4318";
 
@@ -23,6 +26,8 @@ export interface PluginConfig {
   bridgeUrl?: string;
   interceptTools?: string[];
   bridgeToken?: string;
+  nativeInteractions?: boolean;
+  peerContext?: boolean;
 }
 
 export interface ToolCallEvent {
@@ -92,24 +97,37 @@ export function decisionToResult(
   }
 }
 
+// Startup and model-tool registry loads may register the same module separately.
+const nativeInteractionTools = new NativeInteractionTools();
+const nativePeerContexts = new NativePeerContexts({loadRuntimeResolver:async()=>{
+  // Load the qualified host API only for opted-in peers, preserving older HITL-only hosts.
+  // @ts-expect-error -- this SDK subpath is supplied by the qualified native host.
+  const {resolveEffectiveAgentRuntime}=await import("openclaw/plugin-sdk/command-auth-native");
+  return ({config,sessionKey,model,sessionEntry})=>{
+    const separator=model.indexOf("/");if(separator<1||separator===model.length-1)return;
+    return resolveEffectiveAgentRuntime({cfg:config,provider:model.slice(0,separator),modelId:model.slice(separator+1),agentId:sessionKey.split(":")[1],sessionKey,sessionEntry});
+  };
+}});
+
 export default definePluginEntry({
   id: "agent-phonon-hitl",
   name: "agent-phonon HITL Bridge",
   description: "Routes tool calls to agent-phonon for human-in-the-loop approval.",
-  register(api: { on: (name: string, handler: (e: ToolCallEvent, ctx: ToolCtx) => unknown, opts?: unknown) => void }) {
-    console.log("[agent-phonon-hitl] register() called, wiring before_tool_call");
+  register(api: NativeInteractionApi & NativePeerApi & { pluginConfig?: PluginConfig }) {
+    if (api.pluginConfig?.nativeInteractions === true||api.pluginConfig?.peerContext===true)
+      nativeInteractionTools.register(api,{coordinationOnly:api.pluginConfig?.nativeInteractions!==true});
+    if (api.pluginConfig?.peerContext === true) nativePeerContexts.register(api);
     api.on(
       "before_tool_call",
       async (event: ToolCallEvent, ctx: ToolCtx) => {
-        // 注意：sessionKey/pluginConfig 在第二个参数 ctx 里（不是 event）
-        const cfg = ctx?.pluginConfig ?? {};
+        // Native tools own their run-proof hook and never enter the legacy bridge.
+        if (NATIVE_TOOLS.includes(event.toolName)) return;
+        const cfg = api.pluginConfig ?? ctx?.pluginConfig ?? {};
         const bridgeUrl = cfg.bridgeUrl ?? DEFAULT_BRIDGE;
         const intercept = cfg.interceptTools ?? [];
         const sessionKey = ctx?.sessionKey;
-        console.log(`[agent-phonon-hitl] before_tool_call tool=${event.toolName} sessionKey=${sessionKey ?? "(none)"} ctxKeys=${Object.keys(ctx ?? {}).join(",")}`);
         if (intercept.length > 0 && !intercept.includes(event.toolName)) return;
         if (!sessionKey) {
-          console.log("[agent-phonon-hitl]   no sessionKey in ctx → pass");
           return;
         }
         const decision = await askBridge(bridgeUrl, {
@@ -117,7 +135,6 @@ export default definePluginEntry({
           toolName: event.toolName,
           params: event.params,
         }, 120000, cfg.bridgeToken);
-        console.log(`[agent-phonon-hitl]   bridge decision=${JSON.stringify(decision)}`);
         return decisionToResult(decision, event.params);
       },
       { priority: 50 },

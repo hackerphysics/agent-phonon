@@ -23,6 +23,7 @@ export class RpcPeer {
   private handler: RpcHandler;
   private pending = new Map<string | number, Pending>();
   private nextId = 1;
+  private closedReason?: string;
 
   constructor(transport: Transport, handler: RpcHandler) {
     this.transport = transport;
@@ -30,19 +31,23 @@ export class RpcPeer {
   }
 
   request(method: string, params: unknown, timeoutMs = 600000): Promise<unknown> {
+    if (this.closedReason !== undefined) return Promise.reject(new Error(this.closedReason));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = timeoutMs > 0 ? setTimeout(() => { this.pending.delete(id); reject(new Error(`rpc timeout: ${method}`)); }, timeoutMs) : undefined;
       this.pending.set(id, { resolve, reject, timer });
-      this.transport.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      try { this.transport.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); }
+      catch (error) { this.pending.delete(id); if (timer) clearTimeout(timer); reject(error); }
     });
   }
 
   notify(method: string, params: unknown): void {
+    if (this.closedReason !== undefined) throw new Error(this.closedReason);
     this.transport.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
   }
 
   async handle(data: string): Promise<void> {
+    if (this.closedReason !== undefined) return;
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(data); } catch { return; }
 
@@ -62,9 +67,9 @@ export class RpcPeer {
       const isNotification = !("id" in msg) || msg.id === undefined || msg.id === null;
       try {
         const result = await this.handler(msg.method, msg.params);
-        if (!isNotification) this.transport.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: result ?? null }));
+        if (!isNotification && this.closedReason === undefined) this.transport.send(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: result ?? null }));
       } catch (err) {
-        if (!isNotification) {
+        if (!isNotification && this.closedReason === undefined) {
           this.transport.send(JSON.stringify({
             jsonrpc: "2.0", id: msg.id,
             error: { code: -32000, message: (err as Error)?.message ?? "error" },
@@ -77,6 +82,7 @@ export class RpcPeer {
   disconnect():void { this.rejectAll("device disconnected");this.transport.close(); }
 
   rejectAll(reason: string): void {
+    this.closedReason ??= reason;
     for (const [, p] of this.pending) { if (p.timer) clearTimeout(p.timer); p.reject(new Error(reason)); }
     this.pending.clear();
   }

@@ -63,6 +63,12 @@ export const InteractionForm = z.object({
 });
 export type InteractionForm = z.infer<typeof InteractionForm>;
 
+export const InteractionPresentation = z.object({
+  kind: z.literal("approval"),
+  decisionField: z.string().min(1),
+  feedbackField: z.string().min(1).optional(),
+});
+
 /**
  * agent emit 的指令（skill 教）——和 interaction.request 结构基本一致，
  * 但不带 requestId（由 phonon 生成）。
@@ -82,9 +88,15 @@ export const InteractionRequestParams = z.object({
   requestId: z.string().min(1),
   /** Trusted workflow attribution supplied by the device controller, not parsed from form prose. */
   workflowId: z.string().optional(),
+  /** Stamped by the controller from the current native Session/Workflow. */
+  nativeRunId: z.string().uuid().optional(),
+  /** Canonical Dev Run identity; mutually exclusive with nativeRunId. */
+  devRunId: z.string().uuid().optional(),
   sessionId: SessionId.optional(),
   turnId: z.string().optional(),
   form: InteractionForm,
+  /** Agent-selected rendering hint; never an app-selected approval policy. */
+  presentation: InteractionPresentation.optional(),
   blocking: z.boolean().default(true),
   /** 关联 hookId（HITL 场景）。 */
   hookId: z.string().optional(),
@@ -94,7 +106,7 @@ export const InteractionRequestParams = z.object({
    */
   timeoutSeconds: z.number().int().nonnegative().optional(),
   at: Timestamp,
-});
+}).refine(value=>!(value.nativeRunId&&value.devRunId),"interaction source domains cannot be mixed");
 export type InteractionRequestParams = z.infer<typeof InteractionRequestParams>;
 
 /** 人机交互的生命周期状态（P1-5）：pending → submitted | cancelled | timeout。 */
@@ -110,6 +122,23 @@ export const InteractionRequestResult = z.object({
   values: z.record(z.union([z.string(), z.array(z.string()), z.boolean(), z.number()])).optional(),
 });
 export type InteractionRequestResult = z.infer<typeof InteractionRequestResult>;
+
+export const InteractionReceiptState = z.enum(["pending", "delivered", "applied", "cancelled", "timeout", "failed", "unknown"]);
+export const InteractionStatusParams = z.object({ requestId: z.string().min(1).max(512) });
+export const InteractionStatusResult = z.object({
+  requestId: z.string(), requestHash: z.string().regex(/^[a-f0-9]{64}$/), state: InteractionReceiptState,
+  nativeRunId: z.string().uuid().optional(), workflowId: z.string().optional(), sessionId: SessionId.optional(), turnId: z.string().optional(),
+  devRunId:z.string().uuid().optional(),
+  decisionHash: z.string().regex(/^[a-f0-9]{64}$/).optional(), updatedAt: Timestamp,
+}).refine(value=>!(value.nativeRunId&&value.devRunId),"interaction source domains cannot be mixed");
+export type InteractionStatusResult = z.infer<typeof InteractionStatusResult>;
+
+/** Timestamp-independent identity shared by durable request/replay consumers. */
+export function interactionRequestIdentity(params: InteractionRequestParams) {
+  return { requestId: params.requestId, nativeRunId: params.nativeRunId, devRunId:params.devRunId, workflowId: params.workflowId,
+    sessionId: params.sessionId, turnId: params.turnId, form: params.form, presentation: params.presentation,
+    blocking: params.blocking, timeoutSeconds: params.timeoutSeconds, hookId: params.hookId };
+}
 
 // --- interaction.cancel（server → phonon 或 phonon 内部）：主动取消一个 pending 交互 ---
 export const InteractionCancelParams = z.object({

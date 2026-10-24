@@ -15,22 +15,33 @@ class RpcPeer:
         self._handler = handler
         self._pending: dict[Any, asyncio.Future] = {}
         self._next_id = 1
+        self._closed_reason: str | None = None
 
     async def request(self, method: str, params: Any, timeout: float = 600.0) -> Any:
+        if self._closed_reason is not None:
+            raise ConnectionError(self._closed_reason)
         rid = self._next_id
         self._next_id += 1
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[rid] = fut
-        await self._send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
         try:
+            await self._send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
             return await asyncio.wait_for(fut, timeout)
         finally:
             self._pending.pop(rid, None)
+            if not fut.done():
+                fut.cancel()
+            elif not fut.cancelled():
+                fut.exception()
 
     async def notify(self, method: str, params: Any) -> None:
+        if self._closed_reason is not None:
+            raise ConnectionError(self._closed_reason)
         await self._send(json.dumps({"jsonrpc": "2.0", "method": method, "params": params}))
 
     async def handle(self, data: str) -> None:
+        if self._closed_reason is not None:
+            return
         try:
             msg = json.loads(data)
         except json.JSONDecodeError:
@@ -50,13 +61,15 @@ class RpcPeer:
             is_notification = "id" not in msg or msg.get("id") is None
             try:
                 result = await self._handler(method, msg.get("params"))
-                if not is_notification:
+                if not is_notification and self._closed_reason is None:
                     await self._send(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result if result is not None else None}))
             except Exception as e:  # noqa: BLE001
-                if not is_notification:
+                if not is_notification and self._closed_reason is None:
                     await self._send(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32000, "message": str(e)}}))
 
     def reject_all(self, reason: str) -> None:
+        if self._closed_reason is None:
+            self._closed_reason = reason
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(ConnectionError(reason))

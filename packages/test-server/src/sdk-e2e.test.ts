@@ -72,7 +72,7 @@ test("server-sdk: orchestrate a device via clean SDK API", { timeout: 20000 }, a
   const envs = await device.env.list() as { variables: Array<{ name: string; redacted: boolean }> };
   assert.ok(envs.variables.some((v) => v.name === "SDK_TOKEN" && v.redacted));
   const proj = await device.project.create({ name: "p", git: false });
-  if (info.os.platform === "linux") {
+  if (info.capabilities.some(flag=>["secure_file_broker_linux_v1","secure_file_transfer_darwin_v1"].includes(flag))) {
     await device.file.write({ projectId: proj.project.projectId, path: "hello.txt", data: "from-sdk" });
     const fileRead = await device.file.read({ projectId: proj.project.projectId, path: "hello.txt" }) as { data: string };
     assert.equal(fileRead.data, "from-sdk");
@@ -224,7 +224,7 @@ test("SDK close shuts down its owned live authenticated sockets",{timeout:5000},
 });
 
 test("SDK stream consumer persists before ACK and leaves failed consumers unacknowledged",async()=>{
- const {PhononDevice}=await import("@agent-phonon/server-sdk");const {RpcPeer}=await import("../../sdk-server-ts/dist/rpc.js");const messages:string[]=[];
+ const {PhononDevice,RpcPeer}=await import("@agent-phonon/server-sdk");const messages:string[]=[];
  const peer=new RpcPeer({send:s=>messages.push(s),close:()=>{}},()=>null);const device=new PhononDevice("d","tenant",peer);
  let commit=false;device.setStreamEventHandler(async()=>{await new Promise(r=>setTimeout(r,10));commit=true;return true;});
  const pending=device._handleInbound("stream.event",{sessionId:"s",seq:0,type:"message",text:"bounded"});assert.equal(messages.length,0);await pending;assert.equal(commit,true);assert.equal(JSON.parse(messages[0]!).method,"stream.ack");
@@ -241,4 +241,26 @@ test("server-sdk: invalid cumulative cursor never produces an ACK", async()=>{
   const acks:unknown[]=[];const device=new PhononDevice("owned","tenant",{notify:(...args:unknown[])=>acks.push(args)} as never);
   for(const ackSeq of [-1,0,1.5,Number.NaN]){device.setStreamEventHandler(()=>({ackSeq}));await assert.rejects(device._handleInbound("stream.event",{sessionId:"s",seq:1}),/invalid cumulative/);}
   assert.deepEqual(acks,[]);
+});
+test("native proactive frames require a reliable consumer even when a Session object is registered",async()=>{
+  const sent:unknown[]=[],device=new PhononDevice("device","tenant",{notify:(...args:unknown[])=>sent.push(args)} as never);
+  (device as unknown as {sessions:Map<string,unknown>}).sessions.set("retained",{_onStream:()=>{throw new Error("must not reach ordinary Session routing");},_lastSeq:5});
+  await device._handleInbound("stream.event",{sessionId:"retained",seq:5,nativeProactive:{}});assert.deepEqual(sent,[]);
+});
+
+test("server-sdk: a closed peer rejects retained calls and late inbound work without transport writes",async()=>{
+  const {RpcPeer}=await import("@agent-phonon/server-sdk");const sent:string[]=[];let calls=0;
+  const peer=new RpcPeer({send:value=>sent.push(value),close:()=>{}},()=>{calls++;return null;});
+  const pending=peer.request("info",{});peer.rejectAll("device disconnected");
+  await assert.rejects(pending,/disconnected/);await assert.rejects(peer.request("info",{}),/disconnected/);
+  assert.throws(()=>peer.notify("stream.ack",{}),/disconnected/);
+  await peer.handle(JSON.stringify({jsonrpc:"2.0",id:999,method:"execute",params:{}}));assert.equal(calls,0);assert.equal(sent.length,1);
+});
+test("server-sdk: send failures clean pending state and a handler cannot reply after its peer closes",async()=>{
+  const {RpcPeer}=await import("@agent-phonon/server-sdk");
+  const failing=new RpcPeer({send:()=>{throw new Error("send failed");},close:()=>{}},()=>null);
+  try{await assert.rejects(failing.request("info",{}),/send failed/);assert.equal((failing as unknown as {pending:Map<unknown,unknown>}).pending.size,0);}finally{failing.rejectAll("cleanup");}
+  const sent:string[]=[];let release!:(value:unknown)=>void;
+  const peer=new RpcPeer({send:value=>sent.push(value),close:()=>{}},()=>new Promise(resolve=>{release=resolve;}));
+  const active=peer.handle(JSON.stringify({jsonrpc:"2.0",id:1,method:"execute"}));peer.rejectAll("closed");release({ok:true});await active;assert.equal(sent.length,0);
 });

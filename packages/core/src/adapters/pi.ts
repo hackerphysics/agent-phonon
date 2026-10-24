@@ -1,8 +1,9 @@
 import type { ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { spawnAgent, spawnSyncAgent } from "../proc.js";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { spawnSyncAgent } from "../proc.js";
+import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
 import type {
@@ -14,6 +15,10 @@ import type {
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
 import { materializePiHitlExtension, piHitlStateDir } from "../pi-hitl-extension.js";
+import { PiCheckpoint, materializePiRecoveryGuard, observePiRpcSession, piRecoveryFailure, piSessionLocation, verifyPiSession, type PiNativeObservation } from "./pi-recovery.js";
+import { preparePiNativeTools } from "./pi-native-tools.js";
+import { PiRpcChannel } from "./pi-rpc.js";
+import { discoverPiNativeModels } from "./pi-models.js";
 import type {
   AgentCapabilities,
   AgentDescriptor,
@@ -25,9 +30,10 @@ import type {
 /**
  * Pi coding agent adapter（https://pi.dev，github.com/earendil-works/pi）。
  *
- * 驱动方式（全部来自 Pi 官方 docs/cli.md + docs/json.md，不靠猜）：
+ * Transport follows the installed Pi CLI/RPC contract:
  *
- *   pi --mode json --session-id <id>      # JSONL 事件流，跑完退出
+ *   pi --mode rpc --session-id <id>       # verified >=0.84.1 lifecycle
+ *   pi --mode json --session-id <id>      # older/unknown versions, no steering
  *
  * 关键约定（踩过坑的照抄官方文档）：
  *  - **严格 JSONL，只按 LF 切**。官方明确说 Node.js `readline` 不适用——它会把
@@ -37,6 +43,8 @@ import type {
  *    （与 copilot adapter 同一理由）。
  *  - `--session-id` 可确定性续接同一 project 会话（比 `--resume` 交互选择器好用）。
  *    Pi 要求 session id 首尾为字母数字，可含 `A-Za-z0-9._-`，故需 sanitize。
+ *  - RPC steering resolves only after queue acceptance AND a matching native
+ *    user message. agent_settled closes stdin; actual process exit settles a turn.
  */
 
 /** Pi 不暴露「按需触发压缩」的 CLI flag（它只在自己超阈值时自动 compact），故不谎报 nativeCompression。 */
@@ -67,6 +75,15 @@ export interface PiEnv {
   appendSystemPrompt?: string;
   /** Device HITL gate. When present, the blocking tool_call extension is loaded. */
   hitl?: AdapterHitlContext;
+  /** 单轮硬超时（毫秒）。默认 2 小时；可用 AGENT_PHONON_PI_TURN_TIMEOUT_MS 覆盖。 */
+  turnTimeoutMs?: number;
+}
+
+/** A killed turn is recoverable now, but a long test suite still needs headroom. */
+const DEFAULT_TURN_TIMEOUT_MS = 7_200_000;
+function turnTimeoutMs(env: PiEnv): number {
+  const raw = env.turnTimeoutMs ?? Number(process.env.AGENT_PHONON_PI_TURN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 60_000 ? Math.min(raw, 86_400_000) : DEFAULT_TURN_TIMEOUT_MS;
 }
 
 /** 解析后的 Pi JSONL 事件子集（本 adapter 关心的部分）。 */
@@ -77,6 +94,8 @@ export type ParsedPiEvent =
   | { kind: "tool_call"; toolCallId: string; toolName: string; args?: unknown }
   | { kind: "tool_result"; toolCallId: string; toolName?: string; ok: boolean; output?: unknown }
   | { kind: "turn_end"; text?: string }
+  | { kind: "assistant_message"; text: string; stopReason?: string; errorMessage?: string }
+  | { kind: "user_message"; text: string }
   | { kind: "settled"; aborted: boolean }
   | { kind: "stream_error"; message: string }
   | { kind: "ignore" };
@@ -100,8 +119,10 @@ export function parsePiEvent(value: unknown): ParsedPiEvent {
       if (inner.type === "thinking_delta" && typeof inner.delta === "string") {
         return { kind: "thinking_delta", text: inner.delta };
       }
-      if (inner.type === "error" && typeof inner.error === "string") {
-        return { kind: "stream_error", message: inner.error };
+      if (inner.type === "error") {
+        const error = inner.error as Record<string, unknown> | string | undefined;
+        const message = typeof error === "string" ? error : error?.errorMessage;
+        if (typeof message === "string") return { kind: "stream_error", message };
       }
       return { kind: "ignore" };
     }
@@ -130,6 +151,22 @@ export function parsePiEvent(value: unknown): ParsedPiEvent {
       const msg = ev.message as Record<string, unknown> | undefined;
       const text = typeof msg?.content === "string" ? msg.content : undefined;
       return text ? { kind: "turn_end", text } : { kind: "turn_end" };
+    }
+
+    case "message_end": {
+      const message = ev.message as Record<string, unknown> | undefined;
+      if (message?.role === "user" && Array.isArray(message.content)) {
+        const blocks = message.content as Array<Record<string, unknown>>;
+        if (blocks.every(block => block?.type === "text" && typeof block.text === "string")) {
+          return { kind: "user_message", text: blocks.map(block => block.text).join("") };
+        }
+        return { kind: "ignore" };
+      }
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) return { kind: "ignore" };
+      const text = (message.content as Array<Record<string, unknown>>)
+        .filter(block => block && typeof block === "object" && block.type === "text" && typeof block.text === "string").map(block => block.text).join("");
+      return { kind: "assistant_message", text, ...(typeof message.stopReason === "string" ? { stopReason: message.stopReason } : {}),
+        ...(typeof message.errorMessage === "string" ? { errorMessage: message.errorMessage } : {}) };
     }
 
     case "agent_settled":
@@ -169,6 +206,7 @@ export interface PiSessionFlags {
   name: boolean;
   session: boolean;
   continueFlag: boolean;
+  rpc: boolean;
 }
 
 export function parsePiSessionFlags(help: string): PiSessionFlags {
@@ -177,6 +215,7 @@ export function parsePiSessionFlags(help: string): PiSessionFlags {
     name: /(?:^|\s)-n,\s*--name\b|--name\b/.test(help),
     session: /--session\s+<|--session\s+[a-z]/i.test(help),
     continueFlag: /--continue\b/.test(help),
+    rpc: /--mode[^\n]*\brpc\b/.test(help),
   };
 }
 
@@ -184,10 +223,10 @@ export function parsePiSessionFlags(help: string): PiSessionFlags {
 export function probePiSessionFlags(binPath = "pi"): PiSessionFlags {
   try {
     const r = spawnSyncAgent(binPath, ["--help"], { timeout: 10_000, encoding: "utf8" });
-    if (r.status !== 0) return { sessionId: false, name: false, session: false, continueFlag: false };
+    if (r.status !== 0) return { sessionId: false, name: false, session: false, continueFlag: false, rpc: false };
     return parsePiSessionFlags(`${r.stdout ?? ""}\n${r.stderr ?? ""}`);
   } catch {
-    return { sessionId: false, name: false, session: false, continueFlag: false };
+    return { sessionId: false, name: false, session: false, continueFlag: false, rpc: false };
   }
 }
 
@@ -204,6 +243,20 @@ function probePi(bin: string, args: string[]): string | null {
 }
 
 /** `pi --list-models` 是表格输出（实测）→ ModelInfo[]，id 用 Pi 自己的 `provider/model` 形式。 */
+/** Catalog rows whose `thinking` column is yes; the same row feed as parsePiModels. */
+export function parsePiThinkingModels(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of text.replace(/\u001b\[[0-9;]*m/g, "").split(/\r?\n/)) {
+    const cols = raw.trim().split(/\s{2,}|\t/).map(c => c.trim()).filter(Boolean);
+    if (cols.length < 5) continue;
+    const [provider, model] = cols;
+    if (!provider || !model || /^provider$/i.test(provider)) continue;
+    if (!/^[a-z0-9_-]+$/i.test(provider) || !/^[a-z0-9._:-]+$/i.test(model)) continue;
+    if (/^y/i.test(cols[cols.length - 2] ?? "")) out.add(`${provider}/${model}`);
+  }
+  return out;
+}
+
 export function parsePiModels(text: string): ModelInfo[] {
   const seen = new Set<string>();
   const out: ModelInfo[] = [];
@@ -235,23 +288,42 @@ class PiSession implements AdapterSession {
   private readonly piSessionId: string;
   /** Session flags accepted by the installed Pi build; probed, never assumed. */
   private readonly sessionFlags: PiSessionFlags;
-  /** True after the first completed turn, so --continue/--session only apply from turn 2. */
+  /** Once attempted, a turn may only continue its verified native file. */
   private started = false;
   private pendingInject: string[] = [];
-  private nativeSessionId?: string;
+  private native?: PiNativeObservation;
+  private continuationTarget?: { id: string; path: string };
+  /** Last provider-exact context reading; pi exits after each turn, so this is cached. */
+  private usage?: { contextWindow?: number; usedTokens?: number };
+  private modelSwitchPending = false;
+  private modelRevision = 0;
   private current?: ChildProcess;
+  private stopCurrent?: () => void;
+  /** Supervised tree of the most recent turn; passive stop evidence for the engine. */
+  private lastNative?: { turnId: string; supervisor: ProcessSupervisor };
+  private rpcCurrent?: { turnId: string; channel: PiRpcChannel };
 
-  constructor(sessionId: string, model: string, cwd: string, env: PiEnv, initialContext: ContextItem[] | undefined, sessionFlags: PiSessionFlags) {
+  constructor(sessionId: string, model: string, cwd: string, env: PiEnv, initialContext: ContextItem[] | undefined, sessionFlags: PiSessionFlags, recovered?: PiCheckpoint) {
     this.sessionId = sessionId;
     this.model = model;
-    this.cwd = cwd;
+    this.cwd = realpathSync(cwd);
     this.env = env;
     this.sessionFlags = sessionFlags;
     this.piSessionId = toPiSessionId(sessionId);
     this.pendingInject.push(...formatInitialContextLines(initialContext));
+    if (recovered) {
+      this.native = recovered.native;
+      this.pendingInject = [...recovered.pendingInject];
+      this.started = true;
+      this.modelSwitchPending = recovered.modelSwitchPending;
+    }
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    if (this.current || opts.signal?.aborted) throw piRecoveryFailure();
+    this.captureContinuation();
+    if (this.native) this.native = verifyPiSession(this.native, this.cwd);
+    else if (this.started && this.sessionFlags.session) throw piRecoveryFailure();
     let prompt = input;
     if (this.pendingInject.length > 0) {
       prompt = `${this.pendingInject.join("\n")}\n\n${prompt}`;
@@ -263,21 +335,54 @@ class PiSession implements AdapterSession {
     await this.run(prompt, opts);
   }
 
+  peerContextCapability() {
+    if (!this.sessionFlags.rpc || !this.sessionFlags.session || !this.sessionFlags.sessionId) return undefined;
+    return { mode: "context_hook", boundary: "before_model", visibility: "hidden", evidence: "provider_payload",
+      budget:"native_estimate",nativeSessionId: this.native?.sessionId ?? this.piSessionId } as const;
+  }
+
   private run(prompt: string, opts: SendOptions): Promise<void> {
-    return new Promise((resolve) => {
+    const nativeTools = preparePiNativeTools(opts);
+    return new Promise<void>((resolve) => {
       const { turnId, emit } = opts;
-      const args = ["--mode", "json"];
+      const rpcMode = this.sessionFlags.rpc;
+      const args = ["--mode", rpcMode ? "rpc" : "json"];
       // Only pass session flags this Pi build actually accepts; older builds abort
       // on an unknown option instead of ignoring it.
-      if (this.sessionFlags.sessionId) args.push("--session-id", this.piSessionId);
-      else if (this.sessionFlags.name) args.push("--name", this.piSessionId);
-      else if (this.sessionFlags.session && this.started) args.push("--session", this.piSessionId);
-      else if (this.sessionFlags.continueFlag && this.started) args.push("--continue");
-      if (this.model && this.model !== "default") args.push("--model", this.model);
+      const previous = this.native;
+      const modelRevision = this.modelRevision;
+      // An unqualified model name must not drift to a different provider after
+      // config changes. Only an explicit live switch may choose a new model.
+      const launchModel = previous && !this.modelSwitchPending ? previous.nativeModel : this.model;
+      const recoveryGuard = previous ? materializePiRecoveryGuard(previous, launchModel) : undefined;
+      if (previous) args.push("--session", previous.path, "--extension", recoveryGuard!.path);
+      // A known CLI without an exact path selector remains stateless, including
+      // ordinary second sends. Never label those calls as native continuation.
+      else if (this.sessionFlags.session && this.sessionFlags.sessionId) args.push("--session-id", this.piSessionId);
+      else if (this.sessionFlags.session && this.sessionFlags.name) args.push("--name", this.piSessionId);
+      const reasoningLevel = opts.reasoning?.level;
+      const nativeReasoning = reasoningLevel
+        ? ({ low: "low", standard: "medium", high: "high", xhigh: "xhigh", max: "max" } as const)[reasoningLevel] : undefined;
+      if (launchModel && launchModel !== "default") args.push("--model", launchModel);
+      if (nativeReasoning) args.push("--thinking", nativeReasoning);
       if (this.env.appendSystemPrompt) args.push("--append-system-prompt", this.env.appendSystemPrompt);
 
       const hitl = this.env.hitl;
       const childEnv: NodeJS.ProcessEnv = buildChildProcessEnvironment(opts.environment);
+      // Remote/inherited environment alone cannot enable a runtime checkpoint capability.
+      childEnv.AGENT_PHONON_PEER_CONTEXT_URL = opts.peerContext ? opts.environment?.AGENT_PHONON_PEER_CONTEXT_URL : "";
+      childEnv.AGENT_PHONON_PEER_CONTEXT_TOKEN = opts.peerContext ? opts.environment?.AGENT_PHONON_PEER_CONTEXT_TOKEN : "";
+      if (!nativeTools?.names.length) childEnv.AGENT_PHONON_MCP_URL = "";
+      if (nativeTools) {
+        args.push("--extension", nativeTools.path);
+        childEnv.AGENT_PHONON_PI_NATIVE_NONCE = nativeTools.nonce;
+        childEnv.AGENT_PHONON_PI_NATIVE_TOOL_NAMES = JSON.stringify(nativeTools.names);
+      }
+      // Pi's native directories are device configuration, never a remote turn override.
+      for (const key of ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_CODING_AGENT_HOME"]) {
+        delete childEnv[key];
+        if (process.env[key] !== undefined) childEnv[key] = process.env[key];
+      }
       if (hitl?.bridgeUrl) {
         // Load the blocking tool_call extension so a human decision actually gates tools.
         args.push("--extension", materializePiHitlExtension(piHitlStateDir()));
@@ -288,23 +393,73 @@ class PiSession implements AdapterSession {
         if (hitl.token) childEnv.AGENT_PHONON_HITL_TOKEN = hitl.token;
       }
 
-      const child = spawnAgent(this.env.binPath ?? "pi", args, {
-        cwd: this.cwd,
-        env: childEnv,
-      });
+      // A process-group leader is what makes "the tree stopped" observable later:
+      // the engine asks this adapter for passive proof instead of trusting a signal.
+      const supervisor = spawnSupervisedAgent(this.env.binPath ?? "pi", args, { cwd: this.cwd, env: childEnv }, { graceMs: 1_000 });
+      const child = supervisor.child;
+      this.lastNative = { turnId, supervisor };
       this.current = child;
+      this.started = true;
+      this.native = undefined;
+      this.continuationTarget = undefined;
 
       let buf = "";
       let stderr = "";
       let acc = "";
+      let finalMessage: string | undefined;
+      let assistantOutcome: "completed" | "failed" | undefined;
       let toolNames = new Map<string, string>();
       let settled = false;
+      let recoveryReady = !recoveryGuard, nativeToolsReady = !nativeTools;
+      let terminal: "completed" | "failed" | "interrupted" | "timeout" | undefined;
+      let failure: string | undefined;
+      let nativeHeader: { id: string; timestamp: string; cwd: string } | undefined;
+      let promptSent = false;
+      let promptAccepted = false, inputObserved = false, inputReceiptEmitted = false;
+      const confirmInput = (): void => {
+        if (!rpcMode || settled || !promptAccepted || !inputObserved || inputReceiptEmitted) return;
+        inputReceiptEmitted = true;
+        emit({ type: "message", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(),
+          role: "user", source: "native_input_accepted", text: "", delta: false } as StreamEvent);
+      };
+      let stderrLines = "";
+      let shutdownGuard: ReturnType<typeof setTimeout> | undefined;
+      let rpcIdentity: { id: string; path: string } | undefined;
+      const rpc = rpcMode ? new PiRpcChannel(value => {
+        if (child.stdin.destroyed || child.stdin.writableEnded) throw piRecoveryFailure();
+        child.stdin.write(JSON.stringify(value) + "\n");
+      }) : undefined;
+      if (rpc) this.rpcCurrent = {turnId, channel: rpc};
+      const stop = (): void => {
+        rpc?.close();
+        // Graceful, then forced after the supervisor's grace window.
+        void supervisor.terminate();
+      };
 
       const finish = (status: "completed" | "failed" | "interrupted" | "timeout", message?: string): void => {
         if (settled) return;
         settled = true;
         clearTimeout(guard);
-        if (this.current === child) this.current = undefined;
+        clearTimeout(startupGuard);
+        clearTimeout(shutdownGuard);
+        rpc?.close();
+        opts.signal?.removeEventListener("abort", abort);
+        recoveryGuard?.cleanup();
+        if (this.current === child) { this.current = undefined; this.stopCurrent = undefined; }
+        if (this.rpcCurrent?.channel === rpc) this.rpcCurrent = undefined;
+        // Task failure does not invalidate the conversation. Snapshot the exact
+        // native file once its supervised tree stops, without changing history.
+        if (promptSent && this.sessionFlags.session && (nativeHeader || rpcIdentity)) {
+          this.continuationTarget = rpcIdentity ?? { id: nativeHeader!.id, path: join(piSessionLocation(this.cwd).sessionDir,
+            nativeHeader!.timestamp.replace(/[:.]/g, "-") + "_" + nativeHeader!.id + ".jsonl") };
+          this.captureContinuation();
+          if (this.native && modelRevision === this.modelRevision) this.modelSwitchPending = false;
+        } else if (!promptSent) {
+          try {
+            if (previous) this.native = verifyPiSession(previous, this.cwd);
+            else if (!rpcIdentity && !nativeHeader) this.started = false;
+          } catch { this.native = undefined; }
+        }
         const at = new Date().toISOString();
         if (status === "failed") {
           emit({
@@ -312,23 +467,29 @@ class PiSession implements AdapterSession {
             message: adapterDiagnostic(message ?? "pi failed"), status: "failed", final: true,
           } as StreamEvent);
         } else {
-          // A completed turn means the next one may address the same native
-          // session; --continue/--session are only meaningful from turn 2 on.
-          this.started = true;
-          emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at, text: acc, status, final: true } as StreamEvent);
+          emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at, text: status === "completed" ? (finalMessage ?? acc) : acc, status, final: true } as StreamEvent);
         }
         resolve();
       };
 
       const guard = setTimeout(() => {
-        child.kill("SIGTERM");
-        finish("timeout", "pi turn timed out");
-      }, 1_800_000);
+        terminal = "timeout";
+        stop();
+      }, turnTimeoutMs(this.env));
+      const startupGuard = setTimeout(() => {
+        if ((rpcMode || recoveryGuard || nativeTools) && !promptSent) {
+          terminal = "failed";
+          failure = nativeTools && !nativeToolsReady ? "Pi native tools did not register; input was not sent"
+            : !recoveryReady ? "Pi native recovery guard did not register; input was not sent" : "Pi native RPC identity was not confirmed; input was not sent";
+          stop();
+        }
+      }, 10_000);
 
       const abort = (): void => {
-        child.kill("SIGTERM");
-        finish("interrupted");
+        terminal = "interrupted";
+        stop();
       };
+      this.stopCurrent = abort;
       if (opts.signal?.aborted) abort();
       else opts.signal?.addEventListener("abort", abort, { once: true });
 
@@ -338,12 +499,24 @@ class PiSession implements AdapterSession {
         if (!clean.trim()) return;
         let raw: unknown;
         try { raw = JSON.parse(clean); } catch { return; }
+        rpc?.observe(raw);
+        if (rpcMode && raw && typeof raw === "object" && (raw as Record<string, unknown>).type === "extension_error") {
+          terminal = "failed"; failure = "Pi extension failed; native execution is unconfirmed"; stop(); return;
+        }
         const parsed = parsePiEvent(raw);
         const at = new Date().toISOString();
 
         switch (parsed.kind) {
+          case "user_message":
+            if (promptSent && parsed.text === prompt) { inputObserved = true; confirmInput(); }
+            break;
           case "session":
-            this.nativeSessionId = parsed.nativeSessionId;
+            if (nativeHeader || parsed.cwd !== this.cwd || typeof (raw as Record<string, unknown>).timestamp !== "string"
+              || (previous && parsed.nativeSessionId !== previous.sessionId)) {
+              terminal = "failed";
+              failure = "Pi returned a different native session; continuation rejected";
+              stop();
+            } else nativeHeader = { id: parsed.nativeSessionId, cwd: parsed.cwd, timestamp: (raw as { timestamp: string }).timestamp };
             break;
           case "text_delta":
             acc += parsed.text;
@@ -367,12 +540,40 @@ class PiSession implements AdapterSession {
           case "turn_end":
             // 最终权威文本优先于累加的 delta（message_end 才是 authoritative）。
             if (parsed.text && parsed.text.length > acc.length) acc = parsed.text;
+            // Usage is provider-exact only after a response; pi exits at settlement, so read it now.
+            if (rpc) void rpc.usage().then(value => this.captureUsage(value)).catch(() => {});
+            break;
+          case "assistant_message":
+            if (parsed.stopReason === "aborted") {
+              terminal = "interrupted";
+              failure = "Pi assistant execution did not complete";
+              stop();
+            } else if (parsed.stopReason === "error") {
+              assistantOutcome = "failed"; finalMessage = undefined;
+              failure = parsed.errorMessage ?? "Pi assistant execution did not complete";
+              // Qualified RPC can recover this attempt through native retry or
+              // compaction. Only agent_settled declares its final outcome.
+              if (!rpc) { terminal = "failed"; stop(); }
+            } else if (parsed.stopReason === "stop" || parsed.stopReason === "length") {
+              assistantOutcome = "completed"; finalMessage = parsed.text;
+              if (!terminal) failure = undefined;
+            } else {
+              assistantOutcome = undefined; finalMessage = undefined;
+            }
             break;
           case "stream_error":
-            finish("failed", parsed.message);
+            assistantOutcome = "failed"; finalMessage = undefined;
+            failure = parsed.message;
+            if (!rpc) { terminal = "failed"; stop(); }
             break;
           case "settled":
-            finish(parsed.aborted ? "interrupted" : "completed");
+            terminal ??= parsed.aborted ? "interrupted" : rpc ? assistantOutcome ?? "failed" : "completed";
+            if (rpc) {
+              child.stdin.end();
+              shutdownGuard ??= setTimeout(() => {
+                terminal = "failed"; failure = "Pi native RPC did not close after settlement"; stop();
+              }, 10_000);
+            }
             break;
           case "ignore":
             break;
@@ -390,32 +591,107 @@ class PiSession implements AdapterSession {
         }
       });
       child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-16_000); });
+      const sendPrompt = (): void => {
+        if (promptSent || settled || terminal === "failed" || opts.signal?.aborted) return;
+        if (rpc && !rpcIdentity) return;
+        promptSent = true;
+        clearTimeout(startupGuard);
+        if (rpc) void rpc.prompt(prompt).then(() => { promptAccepted = true; confirmInput(); }).catch(() => {
+          if (settled || terminal) return;
+          terminal = "failed"; failure = "Pi did not accept the original native prompt"; stop();
+        });
+        else child.stdin.end(prompt + "\n");
+      };
+      let stateRequested = false;
+      const ready = (): void => {
+        if (!recoveryReady || !nativeToolsReady || settled || terminal || opts.signal?.aborted) return;
+        if (!rpc) { sendPrompt(); return; }
+        if (stateRequested) return;
+        stateRequested = true;
+        void rpc.state().then(value => {
+          if (settled || terminal || opts.signal?.aborted) return;
+          const state = value as Record<string, unknown> | undefined;
+          const model = state?.model as Record<string, unknown> | undefined;
+          if (!state || typeof state.sessionId !== "string" || typeof state.sessionFile !== "string"
+            || !isAbsolute(state.sessionFile)
+            || state.isStreaming !== false || state.isCompacting !== false || state.pendingMessageCount !== 0
+            || !model || typeof model.provider !== "string" || typeof model.id !== "string"
+            || (launchModel !== "default" && launchModel !== model.id && launchModel !== `${model.provider}/${model.id}`)
+            || (!previous && this.sessionFlags.sessionId && state.sessionId !== this.piSessionId)) throw piRecoveryFailure();
+          // A new native file need not exist yet. Resolve its existing parent
+          // so device-configured aliases cannot change the frozen file identity.
+          const path = join(realpathSync(dirname(state.sessionFile)), basename(state.sessionFile));
+          if (dirname(path) !== piSessionLocation(this.cwd).sessionDir || !basename(path).endsWith(`_${state.sessionId}.jsonl`)
+            || (previous && (state.sessionId !== previous.sessionId || path !== previous.path))) throw piRecoveryFailure();
+          rpcIdentity = {id: state.sessionId, path};
+          const window = model.contextWindow ?? model.contextTokens;
+          if (typeof window === "number" && Number.isSafeInteger(window) && window > 0) {
+            this.usage = { ...this.usage, contextWindow: window };
+          }
+          if (nativeReasoning) {
+            const applied = typeof state.thinkingLevel === "string" ? state.thinkingLevel : "";
+            // Report only native evidence. A clamped/missing optional setting must not drop input.
+            if (applied) try { opts.acknowledgeReasoning?.(applied); } catch { /* Setting remains unconfirmed. */ }
+          }
+          sendPrompt();
+        }).catch(() => {
+          if (settled || terminal) return;
+          terminal = "failed"; failure = "Pi native RPC identity was not confirmed; input was not sent"; stop();
+        });
+      };
+      child.stdin.on("error", () => { /* Process close supplies the authoritative failure. */ });
+      child.stderr.on("data", (chunk: string) => {
+        stderr = (stderr + chunk).slice(-16_000);
+        if ((!recoveryGuard && !nativeTools) || promptSent) return;
+        stderrLines += chunk;
+        let nl: number;
+        while ((nl = stderrLines.indexOf("\n")) >= 0) {
+          const line = stderrLines.slice(0, nl);
+          stderrLines = stderrLines.slice(nl + 1);
+          if (line === recoveryGuard?.acknowledgement) recoveryReady = true;
+          if (line === nativeTools?.acknowledgement) nativeToolsReady = true;
+          if (recoveryReady && nativeToolsReady) ready();
+        }
+        stderrLines = stderrLines.slice(-16_000);
+      });
       child.on("error", (err) => finish("failed", err.message));
       child.on("close", (code) => {
         if (settled) return;
         if (buf.trim()) handleLine(buf);
-        if (code === 0) finish("completed");
-        else finish("failed", stderr.trim() || `pi exited ${code}`);
+        if (terminal === "interrupted" || terminal === "timeout") finish(terminal);
+        else if (code === 0 && terminal !== "failed" && promptSent && toolNames.size === 0
+          && (!rpc || terminal === "completed" && !!finalMessage?.trim())) finish("completed");
+        else finish("failed", failure || stderr.trim() || `pi exited ${code} without settled tools`);
       });
 
-      if (!settled) {
+      if (!settled && !recoveryGuard && !nativeTools) {
         // prompt 走 stdin：不出现在进程列表里。
-        child.stdin.write(prompt + "\n");
-        child.stdin.end();
+        ready();
       }
-    });
+    }).finally(() => nativeTools?.cleanup());
   }
 
   async interrupt(): Promise<void> {
-    if (this.current) {
-      this.current.kill("SIGTERM");
-      this.current = undefined;
-    }
+    this.stopCurrent?.();
+  }
+
+  /** Passive evidence: a sent signal is not proof, only an ended tree is. */
+  async observeNativeStop(turnId: string): Promise<"process_tree_exit" | undefined> {
+    const native = this.lastNative;
+    if (!native || native.turnId !== turnId) return undefined;
+    return native.supervisor.hasStopped() ? "process_tree_exit" : undefined;
+  }
+
+  async insertAtToolGap(input: string, options: {turnId: string; signal: AbortSignal}): Promise<void> {
+    const rpc = this.rpcCurrent;
+    if (!rpc || rpc.turnId !== options.turnId || !this.current || options.signal.aborted) throw piRecoveryFailure();
+    await rpc.channel.insert(input, options.signal);
   }
 
   async switchModel(model: string): Promise<{ warnings?: string[] }> {
     this.model = model;
+    this.modelSwitchPending = true;
+    this.modelRevision++;
     return {};
   }
 
@@ -425,6 +701,41 @@ class PiSession implements AdapterSession {
 
   async terminate(): Promise<void> {
     await this.interrupt();
+  }
+
+  private captureContinuation(): void {
+    if (this.native || !this.continuationTarget || !this.lastNative?.supervisor.hasStopped()) return;
+    const target = this.continuationTarget;
+    this.continuationTarget = undefined;
+    try {
+      this.native = observePiRpcSession(this.cwd, target.id, target.path, true);
+    } catch { /* Never replace a changed or damaged identity with a fresh conversation. */ }
+  }
+
+  private captureUsage(value: unknown): void {
+    const usage = (value as Record<string, unknown> | undefined)?.contextUsage as Record<string, unknown> | undefined;
+    const used = usage?.tokens, window = usage?.contextWindow;
+    if (typeof used === "number" && Number.isSafeInteger(used) && used >= 0) this.usage = { ...this.usage, usedTokens: used };
+    if (typeof window === "number" && Number.isSafeInteger(window) && window > 0) this.usage = { ...this.usage, contextWindow: window };
+  }
+
+  /** Real context reading for the client; omits what pi has not reported yet. */
+  async describe(): Promise<{ contextWindow?: number; usedTokens?: number }> {
+    return { ...this.usage };
+  }
+
+  /** Session metadata is assembled synchronously; report the last provider-exact reading. */
+  contextSnapshot(): { contextWindow?: number; usedTokens?: number } | undefined {
+    return this.usage ? { ...this.usage } : undefined;
+  }
+
+  recoveryCheckpoint(): Record<string, unknown> | undefined {
+    this.captureContinuation();
+    if (this.current || !this.native) return undefined;
+    try {
+      verifyPiSession(this.native, this.cwd);
+      return PiCheckpoint.parse({ phononSessionId: this.sessionId, model: this.model, native: { ...this.native }, pendingInject: [...this.pendingInject], modelSwitchPending: this.modelSwitchPending });
+    } catch { return undefined; }
   }
 }
 
@@ -436,6 +747,8 @@ export class PiAdapter implements AgentAdapter {
   private env: PiEnv;
   /** Cached Pi session-flag probe; undefined until first use. */
   private sessionFlags: PiSessionFlags | undefined;
+  private rpcAvailable: boolean | undefined;
+  private capabilityVersion?: string;
 
   constructor(opts: { env?: PiEnv } = {}) {
     this.env = opts.env ?? {};
@@ -447,6 +760,23 @@ export class PiAdapter implements AgentAdapter {
   private flags(): PiSessionFlags {
     this.sessionFlags ??= probePiSessionFlags(this.env.binPath ?? "pi");
     return this.sessionFlags;
+  }
+
+  private thinkingProbe: boolean | undefined;
+  /** `--thinking` exists in builds from the same era as the RPC steering contract. */
+  private thinkingSupported(): boolean {
+    this.thinkingProbe ??= !!probePi(this.env.binPath ?? "pi", ["--help"])?.includes("--thinking");
+    return this.thinkingProbe;
+  }
+
+  private rpcSupported(): boolean {
+    if (this.rpcAvailable === undefined) {
+      const version = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"])?.match(/^v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/) : undefined;
+      // This is the first verified lifecycle with agent_settled and exact
+      // user-message delivery events. Older RPC versions remain JSON-only.
+      this.rpcAvailable = !!version && (+version[1]! > 0 || +version[2]! > 84 || +version[2]! === 84 && +version[3]! >= 1);
+    }
+    return this.rpcAvailable;
   }
 
   /**
@@ -465,7 +795,10 @@ export class PiAdapter implements AgentAdapter {
     return {
       ...BASE_CAPABILITIES,
       // Deterministic cross-turn resume needs a create-if-absent selector.
-      nativeSession: flags.sessionId || flags.name,
+      nativeSession: flags.session && (flags.sessionId || flags.name),
+      injectMidTurn: this.rpcSupported(),
+      // Settings controls need both native flag and RPC evidence. Plain sends remain available.
+      reasoningControl: this.thinkingSupported() && this.rpcSupported(),
       hooks: this.env.hitl?.bridgeUrl ? ["pre_tool"] : [],
     };
   }
@@ -486,6 +819,13 @@ export class PiAdapter implements AgentAdapter {
         scannedAt: new Date().toISOString(),
       }];
     }
+    if (version !== this.capabilityVersion) {
+      this.sessionFlags = undefined;
+      this.rpcAvailable = undefined;
+      this.thinkingProbe = undefined;
+      this.capabilities = this.deriveCapabilities();
+      this.capabilityVersion = version;
+    }
     return [{
       agentId: "pi" as AgentDescriptor["agentId"],
       displayName: "Pi",
@@ -499,17 +839,55 @@ export class PiAdapter implements AgentAdapter {
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
+    if (params.reattach) throw piRecoveryFailure();
     const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "default");
-    return new PiSession(params.sessionId, model, params.cwd, this.env, params.initialContext, this.flags());
+    return new PiSession(params.sessionId, model, params.cwd, this.env, params.initialContext, {...this.flags(), rpc: this.rpcSupported()});
+  }
+
+  async recoverSession(params: CreateSessionParams, checkpoint: Record<string, unknown>): Promise<AdapterSession> {
+    try {
+      const saved = PiCheckpoint.parse(checkpoint);
+      const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "default");
+      if (params.agentId !== "pi" || params.employee || !this.flags().session || saved.phononSessionId !== params.sessionId || saved.model !== model) throw piRecoveryFailure();
+      const cwd = realpathSync(params.cwd);
+      verifyPiSession(saved.native, cwd);
+      return new PiSession(params.sessionId, saved.model, params.cwd, this.env, undefined, {...this.flags(), rpc: this.rpcSupported()}, saved);
+    } catch { throw piRecoveryFailure(); }
+  }
+
+  async observeSessionCheckpoint(params: CreateSessionParams): Promise<Record<string, unknown> | undefined> {
+    if (params.agentId !== "pi" || params.employee || !this.flags().session) return undefined;
+    try {
+      const id = toPiSessionId(params.sessionId), location = piSessionLocation(params.cwd);
+      const matches = readdirSync(location.sessionDir).filter(name => name.endsWith("_" + id + ".jsonl"));
+      if (matches.length !== 1) return undefined;
+      const native = observePiRpcSession(location.cwd, id, join(location.sessionDir, matches[0]!), true);
+      const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "default");
+      if (model !== "default" && model !== native.nativeModel && model !== native.nativeModel.slice(native.nativeModel.indexOf("/") + 1)) return undefined;
+      return PiCheckpoint.parse({ phononSessionId: params.sessionId, model, native, pendingInject: [], modelSwitchPending: false });
+    } catch { return undefined; }
   }
 
   private async resolveModels(signal?: AbortSignal): Promise<ModelInfo[]> {
     signal?.throwIfAborted();
-    if (this.env.models?.length) return this.env.models;
+    if (this.env.models?.length && this.env.models.every(model => model.reasoningLevels !== undefined)) return this.env.models;
     const out = probePi(this.env.binPath ?? "pi", ["--list-models"]);
-    const parsed = out ? parsePiModels(out) : [];
+    const parsed = this.env.models?.length ? this.env.models.map(model => ({ ...model })) : out ? parsePiModels(out) : [];
     const preferred = this.env.defaultModel ?? this.configuredModel();
     if (preferred && !parsed.some((m) => m.id === preferred)) parsed.unshift({ id: preferred, available: true });
+    if (this.thinkingSupported() && this.rpcSupported()) {
+      try {
+        const native = await discoverPiNativeModels({ bin: this.env.binPath ?? "pi", env: buildChildProcessEnvironment(), ...(signal ? { signal } : {}) });
+        const observed = new Map(native.models.map(model => [model.id, model]));
+        const values = parsed.length ? parsed : native.models;
+        return values.map(model => {
+          const selected = native.selectedID && (model.id === "default" || model.id === preferred && native.selectedID.endsWith("/" + model.id)) ? native.selectedID : model.id;
+          const known = observed.get(selected);
+          return known ? { ...known, ...model, ...(model.reasoningLevels === undefined && known.reasoningLevels !== undefined ? { reasoningLevels: known.reasoningLevels } : {}) } : model;
+        });
+      } catch { signal?.throwIfAborted(); }
+    }
+    // A reasoning boolean/table column is not model-specific effort evidence.
     return parsed.length ? parsed : [{ id: preferred ?? "default", available: true }];
   }
 

@@ -13,7 +13,7 @@ import { MockAdapter } from "./harness.js";
 // ============ B2: deviceKey 握手 ============
 test("security: deviceKey sent in connect.hello", async () => {
   let receivedAuth: { deviceKey?: string } | undefined;
-  const wss = new WebSocketServer({ port: 0 });
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   const port = await new Promise<number>((r) => wss.on("listening", () => r((wss.address() as { port: number }).port)));
   wss.on("connection", (ws) => {
     ws.on("message", (raw: Buffer) => {
@@ -27,16 +27,19 @@ test("security: deviceKey sent in connect.hello", async () => {
   const reg = new AdapterRegistry();
   reg.register(new MockAdapter());
   const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "dev1", registry: reg, deviceKey: "secret-key-123" });
-  await client.connect();
-  assert.ok(receivedAuth, "server should receive auth");
-  assert.equal(receivedAuth!.deviceKey, "secret-key-123");
-  client.close();
-  await new Promise<void>((r) => wss.close(() => r()));
+  try {
+    await client.connect();
+    assert.ok(receivedAuth, "server should receive auth");
+    assert.equal(receivedAuth!.deviceKey, "secret-key-123");
+  } finally {
+    client.close(); for (const socket of wss.clients) socket.terminate();
+    await new Promise<void>((r) => wss.close(() => r()));
+  }
 });
 
 test("security: no deviceKey → no auth field", async () => {
   let sawAuth: unknown = "unset";
-  const wss = new WebSocketServer({ port: 0 });
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   const port = await new Promise<number>((r) => wss.on("listening", () => r((wss.address() as { port: number }).port)));
   wss.on("connection", (ws) => {
     ws.on("message", (raw: Buffer) => {
@@ -50,10 +53,13 @@ test("security: no deviceKey → no auth field", async () => {
   const reg = new AdapterRegistry();
   reg.register(new MockAdapter());
   const client = new PhononClient({ serverUrl: `ws://127.0.0.1:${port}`, deviceId: "dev1", registry: reg });
-  await client.connect();
-  assert.equal(sawAuth, undefined);
-  client.close();
-  await new Promise<void>((r) => wss.close(() => r()));
+  try {
+    await client.connect();
+    assert.equal(sawAuth, undefined);
+  } finally {
+    client.close(); for (const socket of wss.clients) socket.terminate();
+    await new Promise<void>((r) => wss.close(() => r()));
+  }
 });
 
 // ============ HookBridge token 鉴权 ============

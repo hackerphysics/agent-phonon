@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AgentId, Timestamp } from "./common.js";
 import { AgentCapabilities } from "./capabilities.js";
+import { ReasoningLevel } from "./reasoning.js";
 
 /**
  * Agent / 模型发现（design §5 / D14）。
@@ -20,6 +21,7 @@ export const ModelInfo = z.object({
   contextWindow: z.number().int().positive().optional(),
   /** 该模型当前是否可用（如鉴权过期会变 false）。 */
   available: z.boolean().default(true),
+  reasoningLevels: z.array(ReasoningLevel).max(5).optional(),
 });
 export type ModelInfo = z.infer<typeof ModelInfo>;
 

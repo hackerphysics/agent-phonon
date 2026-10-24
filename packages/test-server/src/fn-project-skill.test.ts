@@ -141,7 +141,7 @@ test("worktree: create → list → remove + branch delete", { skip: !hasGit() ?
 // ============ skill ============
 function makeTarGz(dir: string): { contentBase64: string; sha256: string } {
   const archive = join(dir, "skill.tar.gz");
-  execFileSync("tar", ["-czf", archive, "-C", join(dir, "src"), "."]);
+  execFileSync("tar", ["-czf", archive, "-C", join(dir, "src"), "."], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
   const buf = readFileSync(archive);
   return { contentBase64: buf.toString("base64"), sha256: createHash("sha256").update(buf).digest("hex") };
 }
