@@ -128,6 +128,8 @@ test("stop evidence arriving after the disposal window cannot mutate the release
 test("Gateway stop needs the matching native terminal, not a chat.abort acknowledgement or another run",async()=>{
   const adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:"ws://127.0.0.1:1",token:"fixture"}});let runId:string|undefined;
   (adapter as any).gw={connect:async()=>{},close:()=>{},isConnected:()=>true,connectionEpoch:()=>1,rpc:async(method:string,params:any)=>{if(method==="chat.send")runId=params.idempotencyKey;return {};}};
+  const {qualifyOpenClawTestGateway}=await import("./openclaw-policy-fixture.js");
+  qualifyOpenClawTestGateway((adapter as any).gw,{cwd:tmpdir(),model:"m1",agent:"main"});
   const session=await adapter.createSession({sessionId:"retained",agentId:"openclaw:main",model:"m1",cwd:tmpdir()}),abort=new AbortController();
   try{
     const sent=session.send("work",{turnId:"turn",verbosity:"final",emit:()=>{},signal:abort.signal});await until(()=>!!runId);

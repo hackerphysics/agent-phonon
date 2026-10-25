@@ -11,7 +11,7 @@ if (!output || process.argv.length !== 3 || !isAbsolute(output)) throw new Error
 const code = await readFile(join(root, "dist/index.js"), "utf8");
 const builtins = new Set([...builtinModules, ...builtinModules.map(name => "node:" + name)]);
 const validate = specifier => {
-  if (!["openclaw/plugin-sdk/plugin-entry", "openclaw/plugin-sdk/command-auth-native"].includes(specifier) && !builtins.has(specifier)) throw new Error("Unbundled runtime dependency: " + specifier);
+  if (!["openclaw/plugin-sdk/plugin-entry", "openclaw/plugin-sdk/command-auth-native", "openclaw/plugin-sdk/agent-harness-runtime"].includes(specifier) && !builtins.has(specifier)) throw new Error("Unbundled runtime dependency: " + specifier);
 };
 const source = ts.createSourceFile("index.js", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 const visit = node => {

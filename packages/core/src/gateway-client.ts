@@ -1,5 +1,6 @@
 import { WebSocket } from "ws";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { z } from "zod";
 
 /**
  * OpenClaw Gateway WebSocket 客户端（传输层）。
@@ -52,6 +53,40 @@ export class GatewayClient {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  /** Inventory is read as this caller; neither the catalog nor this receipt grants native tools. */
+  async bindNoninteractivePolicy(input:{sessionKey:string;sessionId:string;runId:string;agentId:string;model:string}):Promise<{
+    epoch:number;confirm:()=>Promise<void>;release:(options?:{dispatched:boolean})=>Promise<void>;
+  }> {
+    const gateway=new URL(this.config.baseUrl);
+    if(!["127.0.0.1","[::1]","localhost"].includes(gateway.hostname))throw new Error("Phonon noninteractive policy requires a local Gateway");
+    await this.connect();
+    const epoch=this.epoch,policyId=randomUUID();
+    let params:Record<string,unknown>|undefined;
+    const release=async(options={dispatched:true})=>{if(params&&this.isConnected()&&this.epoch===epoch)await this.rpcOnConnection(epoch,"phonon.policy.release",{...params,dispatched:options.dispatched},5000).catch(()=>{});};
+    try{
+      const inventory=await this.rpcOnConnection(epoch,"tools.catalog",{agentId:input.agentId,includePlugins:true},5000);
+      const effective=await this.rpcOnConnection(epoch,"tools.effective",{agentId:input.agentId,sessionKey:input.sessionKey},10000);
+      const catalog:Record<string,unknown>={...inventory,effective};
+      if(catalog.agentId!==input.agentId||!Array.isArray(catalog.groups)||Buffer.byteLength(JSON.stringify(catalog))>524288)throw new Error("unsupported catalog");
+      params={...input,version:1,policyId,expiresAt:Date.now()+1799000,catalog};
+      const receiptSchema=z.object({version:z.literal(1),bound:z.literal(true),policy:z.literal("phonon-noninteractive-v1"),nativeVersion:z.literal("2026.10.7"),
+        policyId:z.literal(policyId),sessionKey:z.literal(input.sessionKey),sessionId:z.literal(input.sessionId),runId:z.literal(input.runId),
+        catalogHash:z.literal(createHash("sha256").update(JSON.stringify(catalog)).digest("hex")),executionFence:z.literal("native-controller-v1")}).strict();
+      receiptSchema.parse(await this.rpcOnConnection(epoch,"phonon.policy.bind",params,5000));
+      const confirm=async()=>{
+        receiptSchema.parse(await this.rpcOnConnection(epoch,"phonon.policy.confirm",params!,5000));
+        if(!this.isConnected()||this.epoch!==epoch)throw new Error("Phonon policy connection changed");
+      };
+      await confirm();return {epoch,confirm,release};
+    }catch{await release({dispatched:false});throw new Error("OpenClaw Phonon noninteractive policy was not confirmed; no chat dispatched. Requires the qualified plugin, current native authority and catalog/effective inventory");}
+  }
+
+  /** A policy-bound dispatch must never reconnect and silently acquire a different transport. */
+  rpcOnConnection(epoch:number,method:string,params:unknown,timeoutMs=120000):Promise<Record<string,unknown>>{
+    if(!this.connected||this.epoch!==epoch)return Promise.reject(new Error("OpenClaw policy connection is no longer current"));
+    return this.rpc(method,params,timeoutMs);
   }
 
   /** Loopback capabilities must never be forwarded to a remote Gateway host. */

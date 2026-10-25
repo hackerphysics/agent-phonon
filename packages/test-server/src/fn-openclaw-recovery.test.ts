@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { mkdtempSync,realpathSync,mkdirSync,readFileSync,writeFileSync,existsSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,9 +14,12 @@ type Native={key:string;id:string;agent:string;cwd:string;createdAt:number;messa
 async function until(check:()=>boolean|Promise<boolean>){for(let n=0;n<500;n++){if(await check())return;await new Promise(resolve=>setTimeout(resolve,10));}throw new Error("OpenClaw fixture condition not observed");}
 async function fixture(){
   const root=realpathSync(mkdtempSync(join(tmpdir(),"phonon-gateway-recovery-"))),base=join(root,"base");mkdirSync(base);
+  writeFileSync(join(root,"resource-owner.json"),JSON.stringify({workflow:"fn-openclaw-recovery",pid:process.pid,root}));
   const records=new Map<string,Native>(),agents=new Map<string,string>([["base",base]]),calls:Array<{method:string;params:any}>=[],inferences:any[]=[];
+  const policyReceipts=new Map<string,unknown>();
   let capabilities=true,changeBeforeSend=false,holdHistory=false,historyWaiting=false,releaseHistory:(()=>void)|undefined;
-  const server=new WebSocketServer({host:"127.0.0.1",port:0});await new Promise<void>(resolve=>server.once("listening",resolve));
+  const server=new WebSocketServer({host:"127.0.0.1",port:0});
+  await new Promise<void>((resolve,reject)=>{server.once("listening",resolve);server.once("error",reject);}).catch(error=>{server.close();rmSync(root,{recursive:true,force:true});throw error;});
   const history=(row:Native)=>({sessionKey:row.key,sessionId:row.id,messages:row.messages.slice(-4).map((text,index)=>({id:String(index),role:"assistant",content:[{type:"text",text}]})),totalMessages:row.messages.length,
     pendingInputs:{items:row.pending?[{}]:[],total:row.pending},sessionInfo:{key:row.key,sessionId:row.id,createdAt:row.createdAt,model:row.model.slice(6),modelProvider:"local",spawnedCwd:row.cwd,
       hasActiveRun:row.active,activeRunIds:row.active?[randomUUID()]:[],activeLeafEntryId:row.leaf,archived:row.archived,status:row.status,endedAt:row.endedAt}});
@@ -30,6 +33,14 @@ async function fixture(){
       try{
         if(method==="agents.list"){respond({agents:[...agents].map(([id,workspace])=>({id,workspace,model}))});return;}
         if(method==="models.list"){respond({models:["m1","m2"].map(id=>({id,provider:"local",available:true,thinkingLevels:[{value:"high"}]}))});return;}
+        if(method==="tools.catalog"){respond({agentId:p.agentId,profiles:[],groups:[{source:"core",tools:["read","write","exec","ask_user","message","secrets","sessions_spawn"].map(id=>({id}))}]});return;}
+        if(method==="tools.effective"){respond({agentId:p.agentId,groups:[]});return;}
+        if(method==="phonon.policy.bind"){
+          const receipt={version:1,bound:true,policy:"phonon-noninteractive-v1",nativeVersion:"2026.10.7",policyId:p.policyId,sessionKey:p.sessionKey,sessionId:p.sessionId,runId:p.runId,catalogHash:createHash("sha256").update(JSON.stringify(p.catalog)).digest("hex"),executionFence:"native-controller-v1"};
+          policyReceipts.set(p.policyId,receipt);respond(receipt);return;
+        }
+        if(method==="phonon.policy.confirm"){assert.ok(policyReceipts.has(p.policyId));respond(policyReceipts.get(p.policyId));return;}
+        if(method==="phonon.policy.release"){policyReceipts.delete(p.policyId);respond({version:1,released:true});return;}
         if(method==="agents.create"){agents.set(p.name,p.workspace);respond({agentId:p.name,workspace:p.workspace});return;}
         if(method==="agents.update"){respond({ok:true});return;}
         if(method==="config.get"){respond({valid:true,hash:"fixture-config",config:{}});return;}
@@ -59,6 +70,7 @@ async function fixture(){
           setImmediate(()=>socket.send(JSON.stringify({type:"event",event:"chat",payload:{sessionKey:row.key,runId:p.idempotencyKey,state:"final",finalText:row.messages.at(-1)}})));return;
         }
         if(method==="chat.abort"){respond({ok:true});return;}
+        if(method==="agent.wait"){respond({status:"ok"});return;}
         if(method==="sessions.patch"){const row=records.get(p.key)!;if(p.model)row.model=p.model;respond({key:p.key,entry:{thinkingLevel:p.thinkingLevel},resolved:{model:row.model.slice(6),modelProvider:"local"}});return;}
         if(method==="sessions.compact"){const row=records.get(p.key)!;row.messages=["Retained compacted native history"];row.leaf=randomUUID();respond({ok:true,compacted:true});return;}
         throw new Error("Unexpected fixture method "+method);

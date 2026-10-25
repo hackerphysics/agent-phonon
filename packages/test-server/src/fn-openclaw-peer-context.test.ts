@@ -28,7 +28,7 @@ class Host {
   middleware!:any;
   cleanup!:any;
   current=true;
-  constructor(version="2026.9.3"){
+  constructor(version="2026.10.7"){
     const api:NativePeerApi={id:"agent-phonon-hitl",config:this.config,runtime:{version,config:{current:()=>this.config},agent:{session:{getSessionEntry:input=>this.rows.get(input.sessionKey)}}},
       registerGatewayMethod:(name,handler,options)=>{assert.equal(options.scope,"operator.admin");this.methods.set(name,handler);},
       registerAgentToolResultMiddleware:(handler,options)=>{assert.deepEqual(options.runtimes,["openclaw"]);this.middleware=handler;},
@@ -270,8 +270,8 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
   const reservation=createServer();f.scope.defer(()=>closePeerServer(reservation));await new Promise<void>(resolve=>reservation.listen(0,"127.0.0.1",resolve));
   const port=(reservation.address()as{port:number}).port;await closePeerServer(reservation);
   const configPath=join(stateDir,"openclaw.json"),token="isolated-gateway-"+randomUUID();
-  const config={gateway:{mode:"local",port,bind:"loopback",auth:{mode:"token",token}},browser:{enabled:false},canvasHost:{enabled:false},
-    discovery:{mdns:{mode:"off"}},cron:{enabled:false},tools:{allow:phase==="engine_send"?["read","phonon_project_coordination"]:["read"]},
+  const config={gateway:{mode:"local",port,bind:"loopback",auth:{mode:"token",token}},browser:{enabled:false},logging:{file:join(stateDir,"gateway.log")},
+    discovery:{mdns:{mode:"off"}},cron:{enabled:false},tools:{codeMode:false,toolSearch:false,allow:phase==="engine_send"?["read","phonon_project_coordination"]:["read"]},
     agents:{defaults:{workspace,model:"phonon-fixture/m1"},entries:{worker:{workspace,model:"phonon-fixture/m1"}}},
     models:{mode:"merge",providers:{"phonon-fixture":{baseUrl:`http://127.0.0.1:${(provider.address()as{port:number}).port}/v1`,apiKey:"controlled-local-key",api:"openai-completions",
       agentRuntime:{id:"openclaw"},models:[{id:"m1",name:"Controlled local fixture",reasoning:false,input:["text"],contextWindow:128000,maxTokens:phase==="headroom"?60000:2000,...(phase==="unknown_budget"?{params:{maxTokens:0}}:{})}]}}},
@@ -336,7 +336,12 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
     }});
   if(phase==="resume"){
     const original=session.peerContextCapability?.()?.nativeSessionId;f.message.id=randomUUID();f.message.text="OPENCLAW_RESUME_"+randomUUID();f.state.pending=false;
-    await session.preparePeerContext?.(f.environment,AbortSignal.timeout(10000));assert.equal(session.peerContextCapability?.()?.nativeSessionId,original);
+    await session.preparePeerContext?.(f.environment,AbortSignal.timeout(10000));
+    if(!session.peerContextCapability?.()){
+      const history=await probe.rpc("chat.history",{sessionKey:"agent:worker:phonon-owned",agentId:"worker",limit:4,offset:0,maxBytes:32768,maxChars:512},5000);
+      assert.fail(JSON.stringify({history,logs}).replaceAll(token,"[redacted]").replaceAll(f.input.token,"[redacted]"));
+    }
+    assert.equal(session.peerContextCapability?.()?.nativeSessionId,original);
     await session.send("Continue the original session; read input.txt once and finish.",{turnId:"resumed",verbosity:"tools",peerContext:f.receiver,environment:f.environment,
       signal:AbortSignal.any([abort.signal,AbortSignal.timeout(25000)]),emit:event=>events.push(event)});
     assert.equal(session.peerContextCapability?.()?.nativeSessionId,original);assert.equal(f.journal.records("owner","owned").length,2);

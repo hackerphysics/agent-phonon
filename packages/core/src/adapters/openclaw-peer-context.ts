@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const OpenClawPeerCapabilities=z.object({version:z.literal(1),available:z.literal(true),nativeVersion:z.literal("2026.9.3"),
+export const OpenClawPeerCapabilities=z.object({version:z.literal(1),available:z.literal(true),nativeVersion:z.enum(["2026.9.3","2026.10.7"]),
   selectedRuntime:z.literal("openclaw"),runtimes:z.tuple([z.literal("openclaw")]),boundary:z.literal("after_tools"),visibility:z.literal("collapsed"),evidence:z.literal("context_hook"),budget:z.literal("native_estimate")}).strict();
 
 /** Strip only this run's explicitly attributed peer carrier, never arbitrary tool text. */

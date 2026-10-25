@@ -83,7 +83,7 @@ export class NativePeerContexts {
         const config=z.object({plugins:z.object({enabled:z.boolean().optional(),entries:z.record(z.unknown())}).passthrough()}).parse(raw);
         const entry=z.object({enabled:z.boolean().optional(),config:z.object({peerContext:z.boolean().optional()}).passthrough().optional(),
           hooks:z.object({allowPromptInjection:z.boolean().optional(),allowConversationAccess:z.boolean().optional()}).passthrough().optional()}).parse(config.plugins.entries[api.id??"agent-phonon-hitl"]);
-        return api.runtime?.version==="2026.9.3"&&typeof api.registerAgentToolResultMiddleware==="function"&&config.plugins.enabled!==false
+        return ["2026.9.3","2026.10.7"].includes(api.runtime?.version??"")&&typeof api.registerAgentToolResultMiddleware==="function"&&config.plugins.enabled!==false
           &&entry?.enabled===true&&entry.config?.peerContext===true&&entry.hooks?.allowPromptInjection===true&&entry.hooks.allowConversationAccess===true;
       }catch{return false;}
     };

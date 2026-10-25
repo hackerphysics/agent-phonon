@@ -6,6 +6,7 @@ import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {AdapterRegistry,PhononStore,OpenClawGatewayAdapter,type EmployeeProfileTarget,type CreateSessionParams} from "@agent-phonon/core";
 import {MockAdapter,TestConn} from "./harness.js";
+import {qualifyOpenClawTestGateway} from "./openclaw-policy-fixture.js";
 
 const hash=(text:string)=>createHash("sha256").update(text).digest("hex");
 class ProactiveAdapter extends MockAdapter{
@@ -35,6 +36,7 @@ test("native proactive output is controller-scoped, independently journaled and 
 test("Gateway reports have stable native identities and late solicited finals cannot become proactive",async()=>{
   const adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:"ws://127.0.0.1:1",token:"synthetic"}}),owned=new Set<string>();let session:any,epoch=1;
   (adapter as any).gw={connect:async()=>{},isConnected:()=>true,connectionEpoch:()=>epoch,rpc:async(method:string,params:any)=>{if(method==="chat.send")queueMicrotask(()=>session.handleEvent("chat",{state:"final",runId:params.idempotencyKey,finalText:"reply"}));return {};}};
+  qualifyOpenClawTestGateway((adapter as any).gw,{cwd:tmpdir(),model:"m1",agent:"main"});
   session=await adapter.createSession({sessionId:"session",agentId:"openclaw:main",model:"m1",cwd:tmpdir(),upstreamRuns:{remember:id=>owned.add(id),owns:id=>owned.has(id)}});
   const outputs:any[]=[];session.setUnsolicitedSink((event:any)=>outputs.push(event));
   await session.send("Task",{turnId:"turn",verbosity:"final",emit:()=>{}});

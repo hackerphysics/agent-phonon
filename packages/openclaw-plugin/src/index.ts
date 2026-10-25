@@ -19,6 +19,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { NativeInteractionTools, NATIVE_TOOLS, type NativeInteractionApi } from "./native-interactions.js";
 import { NativePeerContexts, type NativePeerApi } from "./peer-context.js";
+import { NativeToolPolicy, type NativePolicyApi } from "./tool-policy.js";
 
 export const DEFAULT_BRIDGE = "http://127.0.0.1:4318";
 
@@ -99,6 +100,18 @@ export function decisionToResult(
 
 // Startup and model-tool registry loads may register the same module separately.
 const nativeInteractionTools = new NativeInteractionTools();
+const nativeToolPolicy = new NativeToolPolicy({loadMessagingClassifier:async()=>{
+  // @ts-expect-error -- supplied only by the qualified native host.
+  const {isMessagingTool}=await import("openclaw/plugin-sdk/agent-harness-runtime");
+  return isMessagingTool;
+},loadRuntimeResolver:async()=>{
+  // @ts-expect-error -- supplied only by the qualified native host.
+  const {resolveEffectiveAgentRuntime}=await import("openclaw/plugin-sdk/command-auth-native");
+  return ({config,sessionKey,model,sessionEntry})=>{
+    const separator=model.indexOf("/");if(separator<1)return;
+    return resolveEffectiveAgentRuntime({cfg:config,provider:model.slice(0,separator),modelId:model.slice(separator+1),agentId:sessionKey.split(":")[1],sessionKey,sessionEntry});
+  };
+}});
 const nativePeerContexts = new NativePeerContexts({loadRuntimeResolver:async()=>{
   // Load the qualified host API only for opted-in peers, preserving older HITL-only hosts.
   // @ts-expect-error -- this SDK subpath is supplied by the qualified native host.
@@ -113,7 +126,8 @@ export default definePluginEntry({
   id: "agent-phonon-hitl",
   name: "agent-phonon HITL Bridge",
   description: "Routes tool calls to agent-phonon for human-in-the-loop approval.",
-  register(api: NativeInteractionApi & NativePeerApi & { pluginConfig?: PluginConfig }) {
+  register(api: NativeInteractionApi & NativePeerApi & NativePolicyApi & { pluginConfig?: PluginConfig }) {
+    nativeToolPolicy.register(api);
     if (api.pluginConfig?.nativeInteractions === true||api.pluginConfig?.peerContext===true)
       nativeInteractionTools.register(api,{coordinationOnly:api.pluginConfig?.nativeInteractions!==true});
     if (api.pluginConfig?.peerContext === true) nativePeerContexts.register(api);

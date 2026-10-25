@@ -25,7 +25,7 @@ class Host {
   cleanup!: (ctx: { sessionKey?: string; runId?: string }) => void;
   constructor(register?: (api: NativeInteractionApi) => void,coordinationOnly=false) {
     const api: NativeInteractionApi = {
-      registerGatewayMethod: (name, handler, opts) => { assert.equal(opts.scope, "operator.admin"); this.methods.set(name, handler); },
+      registerGatewayMethod: (name, handler, opts) => { assert.equal(opts.scope, name.startsWith("phonon.policy.")?"operator.write":"operator.admin"); this.methods.set(name, handler); },
       registerTool: (factory, opts) => { assert.equal(opts.optional, true); assert.deepEqual(opts.names,coordinationOnly?[COORDINATION_TOOL]:NATIVE_TOOLS); this.factory = factory; },
       on: (name, handler) => this.hooks.set(name, [...(this.hooks.get(name) ?? []), handler]),
       lifecycle: { registerRuntimeLifecycle: value => { this.cleanup = value.cleanup; } },
@@ -239,7 +239,7 @@ test("native group message tools preserve rejection and identity and never infer
   }finally{host.close();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
 });
 
-test("Gateway refuses remote native binding, requires plugin proof and preserves ordinary chat without it", async () => {
+test("Gateway refuses remote native binding and requires policy proof for native and ordinary Phonon chat", async () => {
   const remote = new GatewayClient({ baseUrl: "ws://remote.invalid", token: "secret" });
   await assert.rejects(remote.bindNativeInteractions("s", randomUUID(), {}), /local/);
   const client = new GatewayClient({ baseUrl: "ws://127.0.0.1:12345", token: "secret" });
@@ -249,6 +249,7 @@ test("Gateway refuses remote native binding, requires plugin proof and preserves
   assert.deepEqual(calls, [BIND_METHOD]);
   const adapter = new OpenClawGatewayAdapter({ gateway: { baseUrl: "ws://127.0.0.1:12345", token: "secret" } });
   const fake = { async connect() {}, async bindNativeInteractions() { throw new Error("plugin disabled"); },
+    async bindNoninteractivePolicy(){throw new Error("policy unconfirmed");},
     supportsCapability:()=>true,
     async rpc(method: string, params: any) {
       calls.push(method);
@@ -259,17 +260,19 @@ test("Gateway refuses remote native binding, requires plugin proof and preserves
   (adapter as any).gw = fake;
   const session = await adapter.createSession({ sessionId: "ordinary", agentId: "openclaw:main", model: "m1", cwd: "/tmp" });
   const count = calls.filter(method => method === "chat.send").length;
-  await assert.rejects(session.send("native", { turnId: "native", verbosity: "final", emit() {}, environment: { AGENT_PHONON_INTERACTION_TOKEN: "secret" } }), /plugin disabled/);
+  await assert.rejects(session.send("native", { turnId: "native", verbosity: "final", emit() {}, environment: { AGENT_PHONON_INTERACTION_TOKEN: "secret" } }), /policy unconfirmed/);
   assert.equal(calls.filter(method => method === "chat.send").length, count);
-  const events: any[] = [];
-  await session.send("ordinary", { turnId: "ordinary", verbosity: "final", emit: event => events.push(event) });
-  assert.equal(events.at(-1).text, "ordinary");
+  await assert.rejects(session.send("ordinary", { turnId: "ordinary", verbosity: "final", emit(){} }),/policy unconfirmed/);
+  assert.equal(calls.filter(method=>method==="chat.send").length,count);
 });
 
 test("native controller, Gateway transport and plugin tools preserve human response lineage and explicit acknowledgement", { timeout: 15000 }, async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "phonon-gateway-tools-"))), store = new PhononStore(join(root, "state.db"));
+  writeFileSync(join(root,"resource-owner.json"),JSON.stringify({workflow:"fn-openclaw-native-controller",pid:process.pid,root}));
   const host = new Host(), wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-  await new Promise<void>(resolve => wss.once("listening", resolve));
+  await new Promise<void>((resolve,reject) => {wss.once("listening", resolve);wss.once("error",reject);}).catch(error=>{
+    host.close();wss.close();store.close();rmSync(root,{recursive:true,force:true});throw error;
+  });
   const adapter = new OpenClawGatewayAdapter({ gateway: { baseUrl: `ws://127.0.0.1:${wss.address() && (wss.address() as any).port}`, token: "test" } });
   const registry = new AdapterRegistry(); registry.register(adapter);
   const tc = new TestConn({ registry, store, tenantId: "owner", workspaceRoot: root });
@@ -277,6 +280,7 @@ test("native controller, Gateway transport and plugin tools preserve human respo
   let captured: any, priorTool: any, session: any, count = 0;
   const sentBodies: any[] = [];
   const nativeSessions=new Map<string,{id:string;cwd:string;createdAt:number;leaf:string|null;count:number;endedAt?:number}>();
+  const policyReceipts=new Map<string,unknown>();
   const deadline=setTimeout(()=>failure.resolve(new Error("Gateway native tool fixture did not complete")),10000);
   tc.setRequestResponder("interaction.request", async raw => {
     captured = raw as any;
@@ -297,6 +301,14 @@ test("native controller, Gateway transport and plugin tools preserve human respo
         }
         if(frame.method==="agents.list"){send({agents:[{id:"employee",workspace:root,model:"m1"}]});return;}
         if(frame.method==="models.list"){send({models:[{id:"m1",available:true}]});return;}
+        if(frame.method==="tools.catalog"){send({agentId:params.agentId,profiles:[],groups:[{source:"core",tools:["read","write","exec","ask_user","message","secrets","sessions_spawn"].map(id=>({id}))}]});return;}
+        if(frame.method==="tools.effective"){send({agentId:params.agentId,groups:[]});return;}
+        if(frame.method==="phonon.policy.bind"){
+          const receipt={version:1,bound:true,policy:"phonon-noninteractive-v1",nativeVersion:"2026.10.7",policyId:params.policyId,sessionKey:params.sessionKey,sessionId:params.sessionId,runId:params.runId,catalogHash:createHash("sha256").update(JSON.stringify(params.catalog)).digest("hex"),executionFence:"native-controller-v1"};
+          policyReceipts.set(params.policyId,receipt);send(receipt);return;
+        }
+        if(frame.method==="phonon.policy.confirm"){assert.ok(policyReceipts.has(params.policyId));send(policyReceipts.get(params.policyId));return;}
+        if(frame.method==="phonon.policy.release"){policyReceipts.delete(params.policyId);send({version:1,released:true});return;}
         if(frame.method==="sessions.create"){const row={id:randomUUID(),cwd:realpathSync(params.cwd),createdAt:Date.now(),leaf:null,count:0};nativeSessions.set(params.key,row);send({key:params.key,sessionId:row.id});return;}
         if(frame.method==="chat.history"){
           const row=nativeSessions.get(params.sessionKey)!;
@@ -353,7 +365,7 @@ test("native controller, Gateway transport and plugin tools preserve human respo
   }
 });
 
-test("installed OpenClaw SDK runs the native before-tool hook and revokes retained tools without inference", {
+test("installed OpenClaw SDK runs the interaction primitive before-tool hook and revokes retained tools without inference", {
   skip: !process.env.PHONON_TEST_OPENCLAW_SDK,
 }, async () => {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "phonon-native-plugin-sdk-"))), previousHome = process.env.HOME;
@@ -388,9 +400,12 @@ test("installed OpenClaw SDK runs the native before-tool hook and revokes retain
     let entry: any;
     try { entry = await import(pathToFileURL(join(artifact, "dist/index.js")).href); } finally { alias.deregister(); }
     const disabled = new Host(api => entry.default.register({ ...api, pluginConfig: { nativeInteractions: false } }));
-    assert.equal(disabled.methods.size, 0); assert.equal(disabled.factory, undefined); disabled.close();
-    host = new Host(api => entry.default.register({ ...api, pluginConfig: { nativeInteractions: true } }));
-    runtimeHost = new Host(api => entry.default.register({ ...api, pluginConfig: { nativeInteractions: true } }));
+    assert.deepEqual([...disabled.methods.keys()].sort(),["phonon.policy.bind","phonon.policy.confirm","phonon.policy.release"]);
+    assert.equal(disabled.factory, undefined); disabled.close();
+    // Primitive interaction semantics; fn-openclaw-policy separately exercises mandatory run policy.
+    const sharedInteractions = new NativeInteractionTools();
+    host = new Host(api => sharedInteractions.register(api));
+    runtimeHost = new Host(api => sharedInteractions.register(api));
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as { port: number }).port;
     const input = host.input({ interactionUrl: `http://127.0.0.1:${port}/interaction`, receiptUrl: `http://127.0.0.1:${port}/applied`, boardUrl: `http://127.0.0.1:${port}/board`, workflowUrl: `http://127.0.0.1:${port}/workflow`, messageUrl:`http://127.0.0.1:${port}/message` });

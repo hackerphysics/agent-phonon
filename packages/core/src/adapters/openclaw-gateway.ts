@@ -86,6 +86,7 @@ class GatewaySession implements AdapterSession {
   private historyStarted=false;
   private strictIdentity=false;
   private closed=false;
+  private policyRelease?:()=>Promise<void>;
   private peerReady?:{epoch:number;native:OpenClawNativeObservation};
   async preparePeerContext(_environment?:Record<string,string>,signal?:AbortSignal):Promise<void>{
     this.peerReady=undefined;
@@ -237,7 +238,8 @@ class GatewaySession implements AdapterSession {
     const native = opts.environment?.AGENT_PHONON_INTERACTION_TOKEN !== undefined;
     const coordinationOnly=!!opts.projectCoordination&&!(opts.requestInteraction||opts.conversationBoard||opts.conversationWorkflow||opts.conversationMessage||opts.publishDocument);
     if(native&&!this.gatewayIdentity)throw new PhononError("errPolicyDenied","Native interactions require a local OpenClaw Gateway");
-    const observed=this.strictIdentity||this.native||native||opts.peerContext?await this.verifyNative(!this.historyStarted):undefined;
+    if(!this.gatewayIdentity)throw new PhononError("errPolicyDenied","Phonon noninteractive policy requires a local OpenClaw Gateway");
+    const observed=await this.verifyNative(!this.historyStarted);
     this.native=undefined;
     if(!this.proactiveOutputReady())await this.subscribe().catch(()=>{});
     const runId = randomUUID();
@@ -248,10 +250,15 @@ class GatewaySession implements AdapterSession {
       emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), text: "", status: "interrupted", final: true } as StreamEvent);
       return;
     }
-    const release = native ? await this.gw.bindNativeInteractions(this.sessionKey, runId, opts.environment!,{coordinationOnly}) : undefined;
+    const policy=await this.gw.bindNoninteractivePolicy({sessionKey:this.sessionKey,sessionId:observed.sessionId,runId,agentId:this.openclawAgent,model:this.model});
+    let dispatched=false;
+    const releasePolicy=()=>policy.release({dispatched});
+    this.policyRelease=releasePolicy;
+    let release:(()=>Promise<void>)|undefined;
     let releasePeer:(()=>Promise<void>)|undefined,peerProjection:{projectionId:string;runId:string;sessionId:string}|undefined;
     let confirmedThinking: string | null | undefined;
     try {
+      if(native)release=await this.gw.bindNativeInteractions(this.sessionKey, runId, opts.environment!,{coordinationOnly});
       if(opts.peerContext&&observed&&this.peerContextCapability()){
         const projectionId=randomUUID();
         try{releasePeer=await this.gw.bindPeerContext({sessionKey:this.sessionKey,sessionId:observed.sessionId,runId,workspaceDir:observed.cwd,model:observed.model,projectionId},opts.environment??{});
@@ -284,6 +291,15 @@ class GatewaySession implements AdapterSession {
         message = `[必须本轮加载并使用这些 skill: ${opts.skills.join(", ")}]\n\n${message}`;
       }
 
+      // Optional setting/peer awaits cannot retain stale mandatory execution authority.
+      const current=await this.verifyNative(!this.historyStarted);
+      if(current.sessionId!==observed.sessionId||current.leafId!==observed.leafId)throw new PhononError("errSessionBusy","OpenClaw native Session changed before dispatch");
+      await policy.confirm();
+      if(this.closed||opts.signal?.aborted){
+        emit({type:"result",sessionId:this.sessionId,turnId,seq:0,at:new Date().toISOString(),text:"",status:"interrupted",final:true} as StreamEvent);
+        return;
+      }
+
       await new Promise<void>((resolve) => {
         let settled = false;
         let guard: ReturnType<typeof setTimeout> | undefined;
@@ -304,11 +320,12 @@ class GatewaySession implements AdapterSession {
           if (settled) return;
           emit({ type: "result", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), text: "", status: "timeout", final: true } as StreamEvent);
           finish();
-          void this.gw.rpc("chat.abort", { sessionKey: this.sessionKey }, 5000).catch(() => {});
+          void this.gw.rpcOnConnection(policy.epoch,"chat.abort", { sessionKey: this.sessionKey,runId }, 5000).catch(() => {});
         }, 1800000);
         if (opts.signal?.aborted) { abort(); return; }
         opts.signal?.addEventListener("abort", abort, { once: true });
-        this.gw.rpc("chat.send", {
+        dispatched=true;
+        this.gw.rpcOnConnection(policy.epoch,"chat.send", {
           sessionKey: this.sessionKey, message, deliver: false, idempotencyKey: runId,
           ...(observed?{sessionId:observed.sessionId,expectedLeafEntryId:observed.leafId}:{}),
           ...(confirmedThinking ? {thinking:confirmedThinking} : {}),
@@ -320,12 +337,19 @@ class GatewaySession implements AdapterSession {
         });
       });
       if(this.nativeTurns.get(turnId)?.ended&&!opts.signal?.aborted){
+        // Visible final text can precede native run settlement and terminal replay publication.
+        // Join only this accepted run; a wait timeout never authorizes a replacement execution.
+        try{await this.gw.rpcOnConnection(policy.epoch,"agent.wait",{runId,timeoutMs:5000},6000);}catch{ /* Fresh native history still decides readiness. */ }
         try{this.native=await this.verifyNative();this.historyStarted=true;}catch{this.native=undefined;}
       }
-    } finally { await releasePeer?.();await release?.(); }
+    } finally {
+      if(this.policyRelease===releasePolicy)this.policyRelease=undefined;
+      await releasePolicy();await releasePeer?.();await release?.();
+    }
   }
 
   async interrupt(): Promise<void> {
+    await this.policyRelease?.();
     const turn = this.activeTurn;
     const runId=turn?.runId??[...this.nativeTurns.values()].reverse().find(value=>!value.ended)?.runId;
     if(!runId)return;

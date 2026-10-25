@@ -5,8 +5,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
-import {nativeReasoning} from "../reasoning.js";
 import {parseOpenClawNativeModels} from "./openclaw-models.js";
+import { PhononError } from "../rpc.js";
 import type {
   AgentAdapter,
   AdapterSession,
@@ -76,69 +76,8 @@ class OpenClawSession implements AdapterSession {
     this.pendingInject.push(...formatInitialContextLines(initialContext));
   }
 
-  async send(input: string, opts: SendOptions): Promise<void> {
-    const { turnId, emit } = opts;
-
-    let message = input;
-    // 暂存的注入先拼进本轮（避免单独 turn，P0#13）
-    if (this.pendingInject.length > 0) {
-      message = this.pendingInject.join("\n") + "\n\n" + message;
-      this.pendingInject = [];
-    }
-    // 若指定了 skill，在 message 前注入强制加载指令（D26 方式2）
-    if (opts.skills && opts.skills.length > 0) {
-      message = `[必须本轮加载并使用这些 skill: ${opts.skills.join(", ")}]\n\n${message}`;
-    }
-
-    const args = [
-      "agent",
-      "--local",
-      "--agent",
-      this.openclawAgent,
-      "--json",
-      "--session-key",
-      this.sessionKey,
-      "--message",
-      message,
-    ];
-    if(this.model&&this.model!=="default")args.push("--model",this.model);
-    if(this.reasoningFlag&&opts.reasoning?.level)args.push("--thinking",nativeReasoning(opts.reasoning.level)!);
-
-    const stdout = await this.run(args, opts.signal, opts.environment,turnId);
-    if (stdout === null) {
-      // 被 interrupt
-      emit({
-        type: "result",
-        sessionId: this.sessionId,
-        turnId,
-        seq: 0,
-        at: new Date().toISOString(),
-        text: "",
-        status: "interrupted",
-        final: true,
-      } as StreamEvent);
-      return;
-    }
-
-    let parsed: OpenClawJson | undefined;
-    try {
-      parsed = JSON.parse(stdout) as OpenClawJson;
-    } catch {
-      // 解析失败也要给终态
-    }
-    const text =
-      parsed?.meta?.finalAssistantVisibleText ?? parsed?.payloads?.[0]?.text ?? stdout.slice(0, 2000);
-
-    emit({
-      type: "result",
-      sessionId: this.sessionId,
-      turnId,
-      seq: 0,
-      at: new Date().toISOString(),
-      text,
-      status: parsed?.meta?.aborted ? "aborted" : "completed",
-      final: true,
-    } as StreamEvent);
+  async send(_input: string, _opts: SendOptions): Promise<void> {
+    throw new PhononError("errCapabilityUnsupported","OpenClaw local CLI cannot confirm a Phonon noninteractive current-run tool policy; use the qualified Gateway integration");
   }
 
   async interrupt(): Promise<void> {
@@ -171,13 +110,7 @@ class OpenClawSession implements AdapterSession {
   }
 
   async compressNative(): Promise<{ summary?: string }> {
-    await this.run([
-      "agent", "--local", "--agent", this.openclawAgent, "--json",
-      "--session-key", this.sessionKey,
-      "--message", "/compact",
-      ...(this.model&&this.model!=="default"?["--model",this.model]:[]),
-    ]);
-    return { summary: "compacted via OpenClaw /compact" };
+    throw new PhononError("errCapabilityUnsupported","OpenClaw local CLI compression cannot confirm a Phonon current-run tool policy");
   }
 
   async terminate(): Promise<void> {

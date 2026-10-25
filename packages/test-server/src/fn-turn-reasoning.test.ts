@@ -8,6 +8,7 @@ import type { SendOptions } from "@agent-phonon/core";
 import { PhononDevice,PhononSession } from "@agent-phonon/server-sdk";
 import { MockAdapter,TestConn } from "./harness.js";
 import {PeerFixture} from "../../core/dist/testing/peer-fixture.js";
+import {qualifyOpenClawTestGateway} from "./openclaw-policy-fixture.js";
 
 async function setup(send?: (input:string,opts:SendOptions)=>Promise<void>,reasoningControl=true){
   const scope=new PeerFixture("turn-reasoning"),root=scope.root,store=new PhononStore(join(root,"state.db")),registry=new AdapterRegistry();
@@ -178,6 +179,7 @@ test("OpenClaw attempts the original chat even when its optional settings patch 
     if(method==="chat.send"){if(params.message==="actual native failure")throw Error("native send failed");queueMicrotask(()=>((adapter as any).sessions.get(params.sessionKey)).handleEvent("chat",{sessionKey:params.sessionKey,runId:params.idempotencyKey,state:"final",finalText:"native final"}));}
     return {};
   };
+  qualifyOpenClawTestGateway(gw,{cwd:tmpdir(),model:"model",agent:"base"});
   const session=await adapter.createSession({sessionId:"test",agentId:"openclaw:base",model:"model",cwd:tmpdir()});
   try{
     await session.send("task",{turnId:"first",verbosity:"final",reasoning:{level:"high"},acknowledgeReasoning:value=>values.push(value),emit:()=>{}});
@@ -196,6 +198,7 @@ test("cancelling during optional OpenClaw settings does not send or abort anothe
   let entered!:()=>void,release!:(value:unknown)=>void;const started=new Promise<void>(resolve=>{entered=resolve;}),patch=new Promise(resolve=>{release=resolve;});
   const calls:string[]=[],events:any[]=[],values:any[]=[],controller=new AbortController();
   gw.connect=async()=>{};gw.rpc=async(method:string)=>{calls.push(method);if(method==="sessions.patch"){entered();return patch;}return {};};
+  qualifyOpenClawTestGateway(gw,{cwd:tmpdir(),model:"model",agent:"base"});
   const session=await adapter.createSession({sessionId:"test",agentId:"openclaw:base",model:"model",cwd:tmpdir()});
   const sending=session.send("cancel before chat",{turnId:"original",verbosity:"final",reasoning:{level:"high"},signal:controller.signal,acknowledgeReasoning:value=>values.push(value),emit:event=>events.push(event)});
   try{await started;controller.abort();release({entry:{thinkingLevel:"high"}});await sending;assert.equal(events.at(-1)?.status,"interrupted");assert.deepEqual(values,[]);assert.equal(calls.includes("chat.send"),false);assert.equal(calls.includes("chat.abort"),false);}

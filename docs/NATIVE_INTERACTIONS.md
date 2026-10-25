@@ -130,7 +130,8 @@ Bindings are in memory only, connection-owned and limited to 64 Sessions. Only
 canonical numeric-loopback `/interaction` and same-origin `/applied` endpoints
 are accepted. The response never contains the bearer capability. Successful
 versioned registration is required before dispatch; an absent/disabled plugin
-fails native chat clearly, while ordinary non-native Gateway chat is unchanged.
+fails native chat clearly. Ordinary Phonon Gateway turns also require the
+noninteractive policy described below; personal non-Phonon sessions are unchanged.
 
 Tool factories capture that binding generation. The real `before_tool_call`
 hook must prove the matching host-supplied agent, Session, run and tool-call ID;
@@ -156,3 +157,70 @@ in an isolated home and checks valid calls, wrong-run blocking and disconnect
 revocation. It does not start inference, activate a plugin in the user's Gateway,
 or establish that every provider has called a tool. Live Gateway/plugin policy
 activation and real-model end-to-end verification remain separate release work.
+
+### OpenClaw Noninteractive Policy
+
+All Phonon Gateway turns, including ordinary sessions, DE turns and retained or
+reconnected sessions, now require `phonon.policy.bind` and a fresh
+`phonon.policy.confirm` receipt before `chat.send`. These private plugin RPCs
+register under the native `operator.write` session-resource contract, additionally
+require a current `operator.admin` connection in the handler, and retain the
+public Gateway `sessionAccess: {mode: "write"}` participation authority. A receipt binds the exact
+native session UUID, run UUID, policy generation and caller-read catalog digest.
+The client pins its connection epoch; a policy-bound send cannot reconnect.
+Optional reasoning failures remain best-effort, but mandatory identity and policy
+are rechecked after optional asynchronous work. Nothing retries the input.
+
+The qualified contract is OpenClaw **2026.10.7**, native `openclaw` runtime,
+explicitly enabled plugin, manifest-declared trusted policy, and explicit
+`allowPromptInjection` and `allowConversationAccess` hook grants. Code Mode, Tool
+Search and configured personal channels do not require global configuration
+changes. The public `tools.effective({sessionKey, agentId})` inventory supplements
+the catalog with session-owned plugin/channel/MCP tools. The host's public
+`isMessagingTool` classifier removes native channel messaging tools while retaining
+ordinary channel tools. Configuration is never rewritten by this policy. Old or
+unqualified hosts and the local spawn CLI
+refuse execution rather than fall back to unprotected inference.
+
+The existing authenticated client reads public
+`tools.catalog({agentId, includePlugins: true})` and session `tools.effective`. The plugin validates the selected
+agent, bounded inventory, canonical exact names and duplicates, then derives a
+per-turn `toolsAllow` from core, declared/instantiated plugin and effective tool IDs. Only the
+qualified `*__*` MCP and `lsp_*` namespaces are added; `*`, plugin groups and
+model-supplied policy overrides are never accepted. Inventory does not grant
+tools: OpenClaw intersects the cap with existing native policy and approvals.
+Unknown inventory sources or unrepresentable names cause explicit refusal.
+
+The cap removes `ask_user` (including Web Control UI questions), `message`,
+`secrets`, `conversations_send`, `conversations_turn`, `sessions_send`,
+`sessions_spawn`, `sessions`, `subagents`, `automations`/`cron`, `openclaw`,
+`gateway` and `plugins`. The latter native control/delegation mechanisms cannot
+start an uncapped child or remove the policy. Code Mode and Tool Search control
+tools remain available, and their nested targets retain the same trusted policy
+and native approvals. Ordinary file/Web tools, unrelated catalogued
+plugins, namespaced MCP/LSP, Phonon-native HITL/group tools and ordinary final
+text remain available under their original native permissions and approvals.
+
+An ordinary `before_prompt_build` hook submits the cap, and a native trusted
+pre-tool policy independently refuses effects without the matching live grant.
+Only an authenticated binding classifies a run as Phonon-owned; the session key
+prefix alone neither grants nor denies authority to unrelated personal runs.
+Release, agent end,
+disconnect, expiry, native incarnation changes, configuration changes and host
+lifecycle cleanup retire the binding. Old-owner/generation release and old-run
+end events cannot retire a newer binding.
+
+Receipts also attest `executionFence: "native-controller-v1"`. The policy captures
+the public Gateway controller for the exact native run, session, agent and caller
+connection. A retained native session-access borrow is also checked and released
+with the binding; sharing or original-actor revocation cannot leave a live grant.
+Revocation synchronously aborts that original signal so an already
+pending native approval cannot execute after a later allow decision. Replacing a
+registry entry cannot redirect cancellation to another execution. Retired run
+provenance is bounded; active native executions are not evicted to admit new work.
+
+`fn-openclaw-policy.test.ts` includes negative and lifecycle tests plus an opt-in
+latest-SDK fixture using actual tool filtering, pre-tool wrappers and the host's
+67-core-tool inventory without inference. This is not evidence of an active
+Gateway deployment. Isolated Gateway/provider verification, independent full
+commit gates and activation remain supervisor-owned work.

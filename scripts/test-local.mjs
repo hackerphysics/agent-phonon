@@ -13,6 +13,8 @@ const mode = process.argv[2];
 if (!['default', 'e2e', 'python', 'compat','focused'].includes(mode)) throw new Error('expected default, e2e, python, compat or focused');
 const codexBin=process.env.PHONON_TEST_CODEX_BIN;
 if(codexBin&&(!isAbsolute(codexBin)||/[\x00-\x1f\x7f]/.test(codexBin)))throw new Error('An explicit absolute native Codex executable is required');
+const openclawSDK=process.env.PHONON_TEST_OPENCLAW_SDK;
+if(openclawSDK&&(!isAbsolute(openclawSDK)||/[\x00-\x1f\x7f]/.test(openclawSDK)))throw new Error('An explicit absolute OpenClaw SDK path is required');
 const sandbox = mkdtempSync(join(tmpdir(), 'phonon-local-tests-'));
 const marker=join(sandbox,'resources.json'),nonce=randomUUID();
 let child,interrupted=false,settled=true;
@@ -33,8 +35,10 @@ const env = {
   GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(sandbox, 'no-global-gitconfig'), GIT_TERMINAL_PROMPT: '0',
   LITELLM_LOCAL_MODEL_COST_MAP: 'True',
   pnpm_config_verify_deps_before_run:'false',
+  pnpm_config_workspace_concurrency:'1',
   PHONON_TEST_OWNER:process.env.PHONON_TEST_OWNER??'local-'+process.pid,
   ...(codexBin?{PHONON_TEST_CODEX_BIN:codexBin}:{}),
+  ...(openclawSDK?{PHONON_TEST_OPENCLAW_SDK:openclawSDK}:{}),
 };
 // Required OS process-launch metadata only, not arbitrary inherited provider/proxy env.
 for (const name of ['SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT']) if (process.env[name]) env[name] = process.env[name];

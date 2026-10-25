@@ -7,6 +7,10 @@
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./tool-policy": {
+      "types": "./dist/tool-policy.d.ts",
+      "import": "./dist/tool-policy.js"
+    },
     "./native-interactions": {
       "types": "./dist/native-interactions.d.ts",
       "import": "./dist/native-interactions.js"
@@ -25,7 +29,7 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.3.0"
+      "pluginApi": ">=2026.10.7"
     }
   },
   "scripts": {
