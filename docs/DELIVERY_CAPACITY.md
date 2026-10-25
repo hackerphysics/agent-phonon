@@ -34,6 +34,31 @@ Count the **UTF-8 bytes of stored serialized payloads**, including JSON structur
 
 SQLite triggers maintain a payload-free pending-entry ledger and three channel counters in the same transaction as source inserts, deletes and ACK changes. Store open reconciles from existing durable records without trimming them. Steady-state token/health reads use those three rows, not repeated `SUM(payload)` scans. ACK costs scale with its acknowledged entry range, not payload rereads. Stream ACK commits watermark plus deletion atomically. Stream/workflow/scheduler in-memory watermarks advance **only after persistence succeeds**, so a failed ACK cannot forget an existing durable replay promise.
 
+### Connected workflow ACK convergence
+
+After authenticated transport publication, the connection retries durable unACKed
+workflow events every 5 seconds, without reconnecting or invoking execution/input,
+recovery or scheduler completion handlers. It sends the original stored JSON bytes
+(including sequence and timestamp), after JSON and workflow/sequence identity
+validation; only a real tenant-scoped cumulative ACK advances
+the existing bounded watermark. Reliable server handlers still persist before ACK;
+rejection never manufactures an ACK.
+
+Each startup/retry pass reads at most 32 events and sends at most 256 KiB of event
+payloads, except that one oversized persisted event may progress alone. Subsequent
+passes rotate past the last sent workflow ID before wrapping to the earliest
+unACKed events, so an unresponsive workflow cannot monopolize every retry. Periodic
+replay checks the original socket's identity, OPEN state and buffered bytes before
+each send, pausing at 256 KiB of socket buffering. There is no in-memory retry queue
+or catch-up burst. Replacement/disposal cancels the connection-owned timer; a new
+connection resumes from durable watermarks. These are pacing limits, not event-size,
+database-growth or delivery-latency guarantees; large backlogs drain gradually.
+Malformed or wrong-identity stored events remain pending. Replay skips the rest
+of that workflow for the pass, preserving its gap and ACK watermark, while other
+valid metadata can drain. The existing bounded persistence-failure reporter marks
+the journal unhealthy; new work remains subject to its admission guard until the
+store is inspected and reopened. Replay never invents an ACK to hide damaged data.
+
 ### Idempotency and background failure reporting
 
 Identical accepted-request retries return their original cached identity/result; changed payload with the same new-execution key fails. Generic request fingerprints are stored in a **separate nullable `idempotency.request_hash` column**, never synthetic request-key rows: legal NUL-containing request IDs remain independent in either acceptance order and after reopening. Old result/ambiguous sidecar rows are preserved without guessing hashes; unverifiable legacy new-execution retries are rejected rather than expanded.

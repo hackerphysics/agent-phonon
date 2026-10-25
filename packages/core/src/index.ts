@@ -107,6 +107,7 @@ export class PhononConnection {
   private workflows?: WorkflowEngine;
   private scheduler?: SchedulerEngine;
   private disposed = false;
+  private workflowRetryTimer?: ReturnType<typeof setTimeout>;
   private disposePromise?: Promise<void>;
   private releaseInventory: () => void;
   constructor(opts: {
@@ -262,6 +263,11 @@ export class PhononConnection {
         this.scheduler?.onWorkflowEvent(event);
         this.peer.notifyRaw("workflow.event", event);
       },
+      replay: (payload) => {
+        if (this.disposed) return;
+        // Preserve the persisted event bytes, not a regenerated status/envelope payload.
+        opts.transport.send(`{"jsonrpc":"2.0","method":"workflow.event","params":${payload}}`);
+      },
       requestInteraction: (params: unknown) => this.requestInteraction(params),
       acknowledgeInteraction:(id,response)=>this.interactionReceipts.applied(id,interactionHash(response)),
     });
@@ -280,7 +286,7 @@ export class PhononConnection {
     });
     this.scheduler.start();
     this.scheduler.replayUnacked();
-    this.workflows.replayUnacked();
+    this.replayWorkflowEvents();
     // Workflow ownership is tenant-scoped and persisted. Recovery runs only
     // after scheduler/event wiring is complete so resumed events reach the
     // current connection and no replaced connection keeps an executor alive.
@@ -313,6 +319,8 @@ export class PhononConnection {
     this.peerReporter?.close();
     if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
+    clearTimeout(this.workflowRetryTimer);
+    this.workflowRetryTimer = undefined;
     const skillSettlement=this.skillInstalls.dispose();
     const projectSettlement=this.projectProvision.dispose();
     this.releaseInventory();
@@ -330,6 +338,24 @@ export class PhononConnection {
 
   get isDisposed(): boolean {
     return this.disposed;
+  }
+
+  /** @internal Start only after authenticated transport publication. Disposal owns the timer. */
+  startWorkflowEventRetry(canSend: () => boolean): void {
+    if (this.disposed || this.workflowRetryTimer) return;
+    this.workflowRetryTimer = setTimeout(() => {
+      this.workflowRetryTimer = undefined;
+      if (this.disposed) return;
+      try { this.replayWorkflowEvents(canSend); }
+      catch { this.store.delivery.backgroundFailed("workflow"); }
+      this.startWorkflowEventRetry(canSend);
+    }, 5_000);
+    this.workflowRetryTimer.unref?.();
+  }
+
+  private replayWorkflowEvents(canSend?: () => boolean): number {
+    if (this.disposed) return 0;
+    return this.workflows?.replayUnacked(canSend) ?? 0;
   }
 
   /** 下行可靠投递：必须先落 outbox；transport 失败只延迟投递，不回滚事件。 */

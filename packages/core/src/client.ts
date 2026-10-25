@@ -17,6 +17,8 @@ const CONNECTION_TIMING = {
   reconnectMaxMs: 30_000,
 };
 
+const WORKFLOW_REPLAY_BUFFER_LIMIT = 256 * 1024;
+
 /**
  * A5: 校验 server URL 的传输安全。
  * 非 loopback 地址必须 wss://（否则 deviceKey 明文传输 + 可被中间人/DNS 劫持冲充 server）。
@@ -331,6 +333,8 @@ export class PhononClient {
           this.dialing.delete(ws);
           this.stopActive = reason => stop(new Error(reason));
           clearTimeout(deadline);
+          conn.startWorkflowEventRetry(() => !stopped && this.ws === ws && this.conn === conn && !conn.isDisposed
+            && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < WORKFLOW_REPLAY_BUFFER_LIMIT);
           armPing();
           stableTimer = setTimeout(() => {
             stable = true;

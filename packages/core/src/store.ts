@@ -1175,6 +1175,16 @@ export class PhononStore {
     ).all(tenantId) as Array<{ workflowId: string; seq: number; payload: string }>;
   }
 
+  /** Bounded replay page; callers rotate past its last workflow before wrapping. */
+  workflowReplayPage(tenantId: string, afterWorkflowId: string, limit: number): Array<{ workflowId: string; seq: number; bytes: number }> {
+    return this.db.prepare(
+      `SELECT p.entity_id AS workflowId,p.seq,p.bytes
+         FROM delivery_pending p JOIN workflows w ON w.workflow_id=p.entity_id AND w.tenant_id=p.tenant_id
+        WHERE p.channel='workflow' AND p.tenant_id=? AND p.entity_id>? AND p.seq>w.acked_seq
+        ORDER BY p.entity_id,p.seq LIMIT ?`,
+    ).all(tenantId, afterWorkflowId, limit) as Array<{ workflowId: string; seq: number; bytes: number }>;
+  }
+
   /** Atomically acquire the single executor lease for a tenant/workflow. */
   claimWorkflow(workflowId: string, tenantId: string, ownerId: string, leaseMs = 30_000): number | undefined {
     const now = Date.now();

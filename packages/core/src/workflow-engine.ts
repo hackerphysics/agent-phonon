@@ -240,6 +240,7 @@ export class WorkflowEngine {
   private turnResultCache = new Map<string, WorkflowNodeResult>();
   private turnWaiters = new Map<string, (r: WorkflowNodeResult) => void>();
   private workflowEvents = new Map<string, WorkflowEvent[]>();
+  private replayAfterWorkflowId = "";
   private artifacts = new Map<string, WorkflowArtifact[]>();
   private idSeq = 1;
   private disposed = false;
@@ -284,6 +285,8 @@ export class WorkflowEngine {
     /** 可选：sqlite store。提供则 checkpoint 落盘 + 支持 resumeFrom。 */
     store?: PhononStore;
     emit: (event: WorkflowEvent) => void;
+    /** Delivery only: retransmission must not repeat scheduler/execution effects. */
+    replay?: (payload: string) => void;
     /** v0.7: 反向请求 server 做 HITL（用于 workflow.human_review directive） */
     requestInteraction?: (params: unknown) => Promise<unknown>;
     acknowledgeInteraction?: (requestId: string, response: unknown) => void;
@@ -868,14 +871,48 @@ export class WorkflowEngine {
     return { events, ...(hasMore && last !== undefined ? { nextSeq: last } : {}) };
   }
 
-  /** Replay durable workflow events not yet acknowledged by the server. */
-  replayUnacked(): number {
-    if (!this.opts.store || this.disposed) return 0;
+  /** Replay one bounded durable page, fairly rotating past workflows each pass. */
+  replayUnacked(canSend: () => boolean = () => true): number {
+    if (!this.opts.store || this.disposed || !canSend()) return 0;
+    let rows = this.opts.store.workflowReplayPage(this.opts.tenantId, this.replayAfterWorkflowId, 32);
+    if (!rows.length && this.replayAfterWorkflowId) {
+      this.replayAfterWorkflowId = "";
+      rows = this.opts.store.workflowReplayPage(this.opts.tenantId, "", 32);
+    }
     let sent = 0;
-    for (const row of this.opts.store.unackedWorkflowEvents(this.opts.tenantId)) {
+    let bytes = 0;
+    let rejectedWorkflowId: string | undefined;
+    for (const row of rows) {
+      if (this.disposed || !canSend()) break;
+      if (row.workflowId === rejectedWorkflowId) continue;
+      // Permit one oversized persisted event to make progress, never a second.
+      if (sent > 0 && bytes + row.bytes > 256 * 1024) break;
+      const event = this.opts.store.workflowEvents(row.workflowId, this.opts.tenantId, row.seq - 1, 1)[0];
+      if (!event || event.seq !== row.seq) {
+        rejectedWorkflowId = row.workflowId;
+        this.replayAfterWorkflowId = row.workflowId;
+        continue;
+      }
+      let original: WorkflowEvent;
       try {
-        this.opts.emit(JSON.parse(row.payload) as WorkflowEvent);
+        // Validate the stored JSON before preserving its bytes in a replay envelope.
+        const parsed = JSON.parse(event.payload) as { workflowId?: unknown; seq?: unknown } | null;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+          || parsed.workflowId !== row.workflowId || parsed.seq !== row.seq) throw new Error("workflow replay identity mismatch");
+        original = parsed as WorkflowEvent;
+      } catch {
+        // Never send later sequences across a damaged gap or stall other workflows.
+        rejectedWorkflowId = row.workflowId;
+        this.replayAfterWorkflowId = row.workflowId;
+        this.opts.store.delivery.backgroundFailed("workflow");
+        continue;
+      }
+      try {
+        if (this.opts.replay) this.opts.replay(event.payload);
+        else this.opts.emit(original);
         sent++;
+        bytes += row.bytes;
+        this.replayAfterWorkflowId = row.workflowId;
       } catch {
         break;
       }
@@ -2321,7 +2358,7 @@ export class WorkflowEngine {
     try {
       this.opts.emit(ev);
     } catch {
-      // Event/checkpoint are already durable; reconnect replay handles delivery.
+      // Event/checkpoint are already durable; connection retry handles delivery.
     }
   }
 }
