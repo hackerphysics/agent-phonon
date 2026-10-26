@@ -39,6 +39,11 @@ test("SessionEngine exposes the actual coordination-only MCP catalog without ins
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
       const catalog = await (await post("tools/list", {})).json() as any;
       assert.deepEqual(catalog.result.tools.map((tool: any) => tool.name), ["phonon_project_coordination"]);
+      assert.ok(catalog.result.tools[0].inputSchema.properties.operation.enum.includes("peers"));
+      const malformed = await (await post("tools/call", {name:"phonon_project_coordination", arguments:{}})).json() as any;
+      assert.equal(malformed.result.isError, true);
+      const forged = await (await post("tools/call", {name:"phonon_project_coordination", arguments:{operation:"presence",senderId:randomUUID()}})).json() as any;
+      assert.equal(forged.result.isError, true);
       const result = await (await post("tools/call", { name: "phonon_project_coordination", arguments: { operation: "presence" } })).json() as any;
       assert.notEqual(result.result.isError, true);
       const denied = await (await post("tools/call", { name: "phonon_request_interaction", arguments: {} })).json() as any;
@@ -132,6 +137,12 @@ test("installed Pi invokes project coordination without any human/group tool or 
     assert.ok(requests.length <= 2, "Native coordination fixture must not create a loop");
     const names = payload.tools.map((tool: any) => tool.function?.name);
     assert.ok(names.includes("phonon_project_coordination")); assert.equal(names.some((name: string) => /phonon_(request_interaction|acknowledge_interaction|conversation_message)/.test(name)), false);
+    const schema=payload.tools.find((tool:any)=>tool.function?.name==="phonon_project_coordination").function.parameters;
+    assert.deepEqual(schema.required,["operation"]);
+    assert.equal(schema.properties.operation.type,"string");
+    assert.ok(schema.properties.operation.enum.includes("send"));
+    assert.equal(schema.properties.activity.properties.summary.type,"string");
+    assert.equal(schema.anyOf.length,8,"native provider receives original branch validation as well as visible properties");
     if (requests.length === 2) assert.ok(body.includes(participantId), "The native tool's confirmed result must reach the original provider continuation");
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     const send = (delta: unknown, finish_reason: string | null) => res.write("data: " + JSON.stringify({ id: "controlled", object: "chat.completion.chunk", created: 1,
