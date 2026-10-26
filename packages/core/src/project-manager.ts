@@ -8,7 +8,8 @@ import { PhononError } from "./rpc.js";
 import { buildChildProcessEnvironment } from "./child-env.js";
 import { randomUUID,createHash } from "node:crypto";
 import {canonicalWorkspacePath,workspacePathKey,workspacePathsOverlap,assertNamespacePathAvailable,assertProcessPathAvailable,assertNamespaceBrowsePath,assertProcessBrowsePath,rememberProcessPath,type NamespacePath} from "./workspace-paths.js";
-import {assertDirectoryIdentity} from "./directory-identity.js";
+import {assertDirectoryIdentity,directoryIdentity} from "./directory-identity.js";
+import {observeWorkspaceGit} from "./workspace-git-observation.js";
 
 /**
  * 项目管理（design §8c / D23 + D25）。
@@ -558,30 +559,13 @@ export class ProjectManager {
     return { pushed: true, remote, branch: params.branch, remoteHead };
   }
 
-  async gitStatus(params: { projectId: string; worktreeId?: string }): Promise<{ branch: string; isClean: boolean; ahead?: number; behind?: number; upstream?: string; files: Array<{ path: string; index: string; worktree: string }> }> {
+  async gitStatus(params: { projectId: string; worktreeId?: string }) {
     const cwd = this.cwdFor(params.projectId, params.worktreeId);
-    const branch = (await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
-    let upstream: string | undefined; let ahead: number | undefined; let behind: number | undefined;
-    try {
-      upstream = (await runGit(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])).trim();
-      const ab = await runGit(cwd, ["rev-list", "--left-right", "--count", `${upstream}...HEAD`]);
-      const [b, a] = ab.trim().split(/\s+/).map(Number);
-      behind = b; ahead = a;
-    } catch { /* 无上游 */ }
-    const porcelain = await runGit(cwd, ["status", "--porcelain"]);
-    const codeMap: Record<string, string> = {
-      " ": "unmodified", "M": "modified", "A": "added", "D": "deleted",
-      "R": "renamed", "C": "copied", "?": "untracked",
-    };
-    const files = porcelain.split("\n").filter(Boolean).map((l) => {
-      const c0 = l[0] ?? " ";
-      const c1 = l[1] ?? " ";
-      const idx = c0 === "?" ? "untracked" : (codeMap[c0] ?? "unmodified");
-      const wt = c0 === "?" ? "untracked" : (codeMap[c1] ?? "unmodified");
-      const path = l.slice(3);
-      return { path, index: idx, worktree: wt };
+    const identity=directoryIdentity(cwd);
+    return observeWorkspaceGit(cwd,params,()=>{
+      if(this.cwdFor(params.projectId,params.worktreeId)!==cwd)throw new PhononError('errPolicyDenied','Workspace identity changed');
+      assertDirectoryIdentity(cwd,identity);
     });
-    return { branch, isClean: files.length === 0, ahead, behind, upstream, files };
   }
 
   async exec(params: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number }): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; truncated: boolean }> {

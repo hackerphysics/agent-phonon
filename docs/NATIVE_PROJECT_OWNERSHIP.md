@@ -1,5 +1,26 @@
 # Native Project Directory Ownership
 
+## Live Git Observation
+
+`project.git.status` retains its existing parameters and result fields and adds
+an optional `workspace` observation. The TypeScript SDK infers this result from
+the protocol catalog; Python's existing `git_status` returns the same dictionary.
+Older peers may omit the observation; absence never proves a clean workspace.
+
+The observation identifies the canonical execution directory, repository root,
+live branch/HEAD, linked-worktree status and timestamp. Counts include each
+tracked changed file once plus individual untracked files, exclude ignored
+files, and count a rename once at its destination. Conflict and type changes
+are `unmerged` and `typeChanged`, not silently unmodified. NUL-delimited status
+preserves Unicode, whitespace and newline filenames.
+
+Read commands have a shared ten-second deadline and one-MiB output bound. They
+disable optional Git locks and filesystem-monitor hooks. Ownership, directory
+identity, checkout identity and Git metadata roots are rechecked before returning.
+Non-Git directories, parent repositories outside the registered root, malformed
+or oversized output and changed authority return errors, never fabricated zero
+counts. This read neither creates nor migrates sessions or worktrees.
+
 ## Contract
 
 Project IDs and namespace labels alone do not isolate physical files. Remote

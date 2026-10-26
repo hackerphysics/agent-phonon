@@ -364,6 +364,7 @@ class PhononDevice:
         return await self._peer.request("project.git.push", {"projectId": project_id, "branch": branch, **opts})
 
     async def git_status(self, project_id: str, **opts: Any) -> dict:
+        """Return live Git files and optional device-observed workspace identity/counts."""
         return await self._peer.request("project.git.status", {"projectId": project_id, **opts})
 
     async def project_exec(self, project_id: str, command: str, args: list[str] | None = None, **opts: Any) -> dict:

@@ -361,11 +361,26 @@ export const GitFileStatus = z.object({
   /** 文件路径（相对 cwd） */
   path: z.string(),
   /** 索引区状态（git status --porcelain 第 1 位） */
-  index: z.enum(["unmodified", "modified", "added", "deleted", "renamed", "copied", "untracked"]),
+  index: z.enum(["unmodified", "modified", "added", "deleted", "renamed", "copied", "untracked", "unmerged", "typeChanged"]),
   /** 工作区状态（第 2 位） */
-  worktree: z.enum(["unmodified", "modified", "added", "deleted", "renamed", "copied", "untracked"]),
+  worktree: z.enum(["unmodified", "modified", "added", "deleted", "renamed", "copied", "untracked", "unmerged", "typeChanged"]),
 });
 export type GitFileStatus = z.infer<typeof GitFileStatus>;
+
+export const GitWorkspaceObservation = z.object({
+  projectId: ProjectId,
+  worktreeId: z.string().min(1).optional(),
+  path: z.string().min(1).max(4096),
+  repositoryRoot: z.string().min(1).max(4096),
+  isWorktree: z.boolean(),
+  detached: z.boolean(),
+  head: z.string().regex(/^[a-f0-9]{40,64}$/).optional(),
+  observedAt: Timestamp,
+  changedFileCount: z.number().int().nonnegative(),
+  trackedChangedFileCount: z.number().int().nonnegative(),
+  untrackedFileCount: z.number().int().nonnegative(),
+}).strict().refine(value => value.changedFileCount === value.trackedChangedFileCount + value.untrackedFileCount);
+export type GitWorkspaceObservation = z.infer<typeof GitWorkspaceObservation>;
 
 export const GitStatusResult = z.object({
   branch: z.string(),
@@ -376,6 +391,8 @@ export const GitStatusResult = z.object({
   behind: z.number().int().nonnegative().optional(),
   upstream: z.string().optional(),
   files: z.array(GitFileStatus),
+  /** Live, bounded device observation. Older peers may omit it. */
+  workspace: GitWorkspaceObservation.optional(),
 });
 export type GitStatusResult = z.infer<typeof GitStatusResult>;
 
