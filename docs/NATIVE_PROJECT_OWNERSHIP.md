@@ -19,7 +19,9 @@ disable optional Git locks and filesystem-monitor hooks. Ownership, directory
 identity, checkout identity and Git metadata roots are rechecked before returning.
 Non-Git directories, parent repositories outside the registered root, malformed
 or oversized output and changed authority return errors, never fabricated zero
-counts. This read neither creates nor migrates sessions or worktrees.
+counts. A no-repository diagnostic returns `errNotGitRepo`; other Git failures
+stay errors and must not be inferred as a non-Git or clean directory. This read
+neither creates nor migrates sessions or worktrees.
 
 ## Contract
 

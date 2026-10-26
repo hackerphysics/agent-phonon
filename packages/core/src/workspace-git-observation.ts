@@ -10,24 +10,24 @@ type Status = 'unmodified'|'modified'|'added'|'deleted'|'renamed'|'copied'|'untr
 export interface ObservedGitFile {path:string;index:Status;worktree:Status}
 const invalid = () => new PhononError('errInternal','Git observation is unavailable');
 
-async function readGit(cwd:string,args:string[],deadline:number):Promise<{code:number;output:string}> {
+async function readGit(cwd:string,args:string[],deadline:number):Promise<{code:number;output:string;error:string}> {
   const remaining = deadline-Date.now();
   if(remaining<=0)throw invalid();
   const env=buildChildProcessEnvironment();
   for(const key of Object.keys(env))if(key.toUpperCase().startsWith('GIT_'))delete env[key];
-  Object.assign(env,{GIT_OPTIONAL_LOCKS:'0',GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:process.platform==='win32'?'NUL':'/dev/null'});
+  Object.assign(env,{LC_ALL:'C',GIT_OPTIONAL_LOCKS:'0',GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:process.platform==='win32'?'NUL':'/dev/null'});
   const supervisor=spawnSupervised('git',['--no-optional-locks','-c','core.fsmonitor=false','-c','core.untrackedCache=false',...args],{cwd,env,stdio:['pipe','pipe','pipe'],windowsHide:true});
   const child=supervisor.child;child.stdin.end();
-  let bytes=0,failed=false,spawnError:Error|undefined;const chunks:Buffer[]=[];
+  let bytes=0,failed=false,spawnError:Error|undefined;const chunks:Buffer[]=[],errors:Buffer[]=[];
   const timer=setTimeout(()=>{failed=true;void supervisor.terminate();},remaining);
   child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>outputLimit){failed=true;void supervisor.terminate();}else chunks.push(chunk);});
-  child.stderr.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>outputLimit){failed=true;void supervisor.terminate();}});
+  child.stderr.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>outputLimit){failed=true;void supervisor.terminate();}else errors.push(chunk);});
   child.once('error',error=>{spawnError=error;});
   try {
     const code=await new Promise<number>(done=>child.once('close',value=>done(value??-1)));
     if(failed||spawnError)throw invalid();
-    let output:string;try{output=new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks));}catch{throw invalid();}
-    return {code,output};
+    let output:string,error:string;try{const decoder=new TextDecoder('utf-8',{fatal:true});output=decoder.decode(Buffer.concat(chunks));error=decoder.decode(Buffer.concat(errors));}catch{throw invalid();}
+    return {code,output,error};
   } finally {clearTimeout(timer);if(!supervisor.hasStopped())await supervisor.terminate();}
 }
 
@@ -52,7 +52,14 @@ export async function observeWorkspaceGit(cwd:string,scope:{projectId:string;wor
   const deadline=Date.now()+10000;
   const required=async(args:string[])=>{revalidate();const result=await readGit(cwd,args,deadline);revalidate();if(result.code!==0)throw invalid();return result.output;};
   const line=(value:string)=>value.endsWith('\n')?value.slice(0,-1):value;
-  const root=realpathSync(line(await required(['rev-parse','--show-toplevel'])));
+  revalidate();
+  const top=await readGit(cwd,['rev-parse','--show-toplevel'],deadline);revalidate();
+  // Only Git's exact C-locale no-repository diagnostic proves this state. Other
+  // failures (ownership, permissions, corruption or transport) remain unavailable.
+  if(top.code===128&&top.output===''&&top.error==='fatal: not a git repository (or any of the parent directories): .git\n')
+    throw new PhononError('errNotGitRepo','The registered directory is not a Git repository');
+  if(top.code!==0)throw invalid();
+  const root=realpathSync(line(top.output));
   if(root!==cwd)throw new PhononError('errPolicyDenied','Git repository root differs from the registered workspace');
   const gitDir=realpathSync(resolve(cwd,line(await required(['rev-parse','--absolute-git-dir']))));
   const commonDir=realpathSync(resolve(cwd,line(await required(['rev-parse','--git-common-dir']))));

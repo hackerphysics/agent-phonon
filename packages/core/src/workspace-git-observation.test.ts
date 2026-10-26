@@ -60,7 +60,7 @@ test('Git observation reports live worktree branch, clean state and detached HEA
 test('Git observation supports an unborn branch but never invents clean facts for non-Git or parent repositories',async()=>{
   const f=await fixture();try{
     const unborn=await f.manager.gitStatus({projectId:f.project.projectId});assert.equal(unborn.workspace.detached,false);assert.equal(unborn.workspace.head,undefined);assert.equal(unborn.workspace.changedFileCount,0);
-    const plain=await f.manager.create({name:'Plain',path:join(f.root,'plain'),git:false});await assert.rejects(f.manager.gitStatus({projectId:plain.projectId}));
+    const plain=await f.manager.create({name:'Plain',path:join(f.root,'plain'),git:false});await assert.rejects(f.manager.gitStatus({projectId:plain.projectId}),{appCode:'errNotGitRepo'});
     mkdirSync(join(f.project.path,'child'));await assert.rejects(observeWorkspaceGit(join(f.project.path,'child'),{projectId:'child'},()=>{}),/repository root/);
     let checks=0;await assert.rejects(observeWorkspaceGit(f.project.path,{projectId:f.project.projectId},()=>{if(++checks>2)throw Error('source changed');}),/source changed/);
   }finally{f.close();}
