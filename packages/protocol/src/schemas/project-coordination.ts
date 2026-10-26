@@ -36,13 +36,28 @@ export const ProjectCoordinationParams = z.object({ sourceKind: z.enum(["native"
   workflowId: z.string().min(1).max(512), sessionId: z.string().min(1).max(512), turnId: z.string().min(1).max(512), action: AgentCoordinationInput,
   receive: CoordinationReceiveReport.optional(),
   evidenceVersion: z.literal(1).optional(),
+  workspaceVersion: z.literal(1).optional(),
 }).strict();
 export type ProjectCoordinationParams = z.infer<typeof ProjectCoordinationParams>;
+const workspaceText = (limit: number) => z.string().min(1).max(limit).refine(value =>
+  new TextEncoder().encode(value).length <= limit && !/[\x00-\x1f\x7f-\x9f]/.test(value));
+export const CoordinationWorkspace = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("current"), deviceId: id, runtimeWorkspaceId: workspaceText(4096),
+    path: workspaceText(4096), repositoryRoot: workspaceText(4096), branch: workspaceText(1024),
+    isWorktree: z.boolean(), worktreeId: workspaceText(512).optional(), detached: z.boolean(),
+    head: z.string().regex(/^[a-f0-9]{40,64}$/).optional(), observedAt: z.string().datetime(), checkedAt: z.string().datetime(),
+  }).strict(),
+  z.object({ state: z.enum(["unavailable", "unsupported", "notGit"]), deviceId: id.nullable(), checkedAt: z.string().datetime(),
+    reasonCode: z.string().regex(/^[a-z0-9_]{1,64}$/).optional(),
+  }).strict(),
+]);
+export type CoordinationWorkspace = z.infer<typeof CoordinationWorkspace>;
 const Participant = z.object({ id, position, projectId: id, ownerId: z.string(), deviceId: id.nullable(), agentId: z.string(),
   agentKind: z.enum(["agent", "de"]), sourceKind: z.enum(["native", "dev", "mcp"]), sessionId: z.string(), label: z.string(),
   activity: CoordinationActivity, activityRevision: z.number().int().nonnegative(), lastSeenAt: z.string().nullable(),
   deviceName: z.string().nullable().optional(), runtimeState: z.string().nullable().optional(),
   receive: CoordinationReceiveState.optional(),
+  workspace: CoordinationWorkspace.optional(),
   presence: z.enum(["active", "stale", "offline", "ended"]),
 }).strict();
 const Message = z.object({ id, position, senderId: id, recipientId: id, kind: z.enum(["intent", "question", "notice", "request", "result"]),
@@ -53,6 +68,7 @@ const Message = z.object({ id, position, senderId: id, recipientId: id, kind: z.
 export const ProjectCoordinationResult = z.object({ self: Participant.optional(), participants: z.array(Participant).max(32).optional(),
   receiveReporting: z.literal(1).optional(),
   evidenceVersion: z.literal(1).optional(),
+  workspaceVersion: z.literal(1).optional(),
   deliveryOffers: z.array(z.object({messageId:id,deliveryId:id}).strict()).max(32).optional(),
   messages: z.array(Message).max(32).optional(), message: Message.optional(), next: position.nullable().optional(),
   status: z.enum(["recorded", "not_found", "left"]).optional(), requestId: id.optional(), participantId: id.optional(), replayed: z.boolean().optional(),

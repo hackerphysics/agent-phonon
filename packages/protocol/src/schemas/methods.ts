@@ -81,6 +81,7 @@ import {
   GitLogParams, GitLogResult,
   GitPushParams, GitPushResult,
   GitStatusParams, GitStatusResult,
+  GitOriginParams,GitOriginResult,
   ProjectExecParams, ProjectExecResult,
 } from "./project.js";
 import {
@@ -554,6 +555,7 @@ export const METHODS = {
     direction: "s2p", kind: "request",
     params: GitStatusParams, result: GitStatusResult,
   },
+  "project.git.origin": {direction:"s2p",kind:"request",params:GitOriginParams,result:GitOriginResult},
   "project.exec": {
     direction: "s2p", kind: "request",
     params: ProjectExecParams, result: ProjectExecResult,

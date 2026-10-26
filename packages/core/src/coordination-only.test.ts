@@ -56,10 +56,44 @@ test("SessionEngine exposes the actual coordination-only MCP catalog without ins
   await engine.send("owner", session.sessionId, "Original assigned task", {});
   for (let n = 0; n < 100 && !events.some(event => event.final); n++) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(events.at(-1)?.status, "completed", JSON.stringify(events));
-  assert.deepEqual(calls.map(call => call.action.operation), ["presence", "peers", "inbox", "presence"]);
+  assert.deepEqual(calls.map(call => call.action.operation), ["presence", "presence", "peers", "inbox", "presence"]);
   assert.ok(calls.every(call => call.workflowId === "owned-workflow" && call.sessionId === session.sessionId));
-  assert.ok(calls.slice(1).every(call => !call.receive));
+  assert.equal(calls[0].workspaceVersion,1);assert.equal(calls[1].workspaceVersion,undefined);
+  assert.ok(calls.slice(2).every(call => !call.receive&&!call.workspaceVersion));
   await engine.dispose(); await assert.rejects(fetch(endpoint, { method: "POST", headers: { authorization: "Bearer " + token }, body: "{}" }));
+}));
+
+for(const legacy of [false,true])test(`SessionEngine preserves receive negotiation and original work with workspace legacy=${legacy}`,()=>withPeerFixture("workspace-context",async scope=>{
+  const registry=new AdapterRegistry(),events:any[]=[],calls:any[]=[];let prompt="";
+  const device=randomUUID(),peerID=randomUUID(),project=randomUUID();
+  const workspace={state:"current" as const,deviceId:device,runtimeWorkspaceId:"runtime-project",path:"/owned/side",repositoryRoot:"/owned/side",
+    branch:"feature/peer",isWorktree:true,worktreeId:"side",detached:false,observedAt:new Date().toISOString(),checkedAt:new Date().toISOString()};
+  registry.register({name:"controlled",capabilities:{nativeSession:false,nativeCompression:false,contextInjection:false,proactiveOutput:false,
+    modelSwitch:false,interrupt:false,injectMidTurn:false,skillManagement:false,hooks:[],streaming:true,workflowRoles:["worker"]},discoverAgents:async()=>[],
+    createSession:async(params:CreateSessionParams)=>({sessionId:params.sessionId,model:params.model,terminate:async()=>{},send:async(input:string,options:SendOptions)=>{
+      prompt=input;assert.ok(options.projectCoordination);
+      const peers=await options.projectCoordination({operation:"peers",after:"0"});
+      assert.equal(peers.participants?.[0]?.workspace?.state,legacy?undefined:"current");
+      options.emit({type:"result",sessionId:SessionId.parse(params.sessionId),turnId:options.turnId,seq:0,at:new Date().toISOString(),origin:"solicited",
+        text:"Original work",status:"completed",final:true});
+    }})} as AgentAdapter);
+  const engine=new SessionEngine(registry,event=>events.push(event),undefined,undefined,{projectCoordination:async request=>{
+    calls.push(request);if(legacy&&request.workspaceVersion)throw Error("Old strict host");
+    const self={id:randomUUID(),position:"1",projectId:project,ownerId:"owner",deviceId:device,agentId:"controlled",agentKind:"agent" as const,sourceKind:"native" as const,
+      sessionId:request.sessionId,label:"Worker",activity:{summary:"",phase:"working" as const,impact:[],dependencies:""},activityRevision:0,lastSeenAt:null,presence:"active" as const};
+    const peer={...self,id:peerID,sessionId:"peer-session",label:"Peer",deviceName:"Peer device",...(request.workspaceVersion?{workspace}: {})};
+    return {self,receiveReporting:1 as const,...(request.workspaceVersion?{workspaceVersion:1 as const}:{}),
+      ...(request.action.operation==="peers"?{participants:[peer],next:null}:request.action.operation==="inbox"?{messages:[],next:null}:{})};
+  }},"owner");scope.defer(()=>engine.dispose());
+  const created=await engine.create({tenantId:"owner",project:"owned",cwd:scope.root,agent:"controlled",model:"m1",verbosity:"tools",
+    workflowAttr:{workflowId:"workflow",nodeId:"reply",nativeRunId:randomUUID()}});
+  await engine.send("owner",created.sessionId,"Original assigned input",{});
+  for(let n=0;n<100&&!events.some(e=>e.final);n++)await new Promise(resolve=>setTimeout(resolve,10));
+  assert.equal(events.at(-1)?.status,"completed",JSON.stringify(events));
+  assert.match(prompt,/Original assigned input$/);assert.match(prompt,/do not establish no conflict/);
+  assert.equal(prompt.includes('"path":"/owned/side"'),!legacy);assert.equal(prompt.includes('"deviceName":"Peer device"'),true);
+  assert.ok(calls.filter(c=>c.action.operation==="peers").every(c=>c.receive&&c.workspaceVersion===(legacy?undefined:1)));
+  assert.equal(calls.filter(c=>c.action.operation==="presence").length,legacy?2:1);
 }));
 
 test("Pi's existing Phonon extension registers only project coordination in a coordination-only execution", () => withPeerFixture("pi-coordination-only", async scope => {

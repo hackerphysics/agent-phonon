@@ -350,6 +350,16 @@ export const GitPushResult = z.object({
 });
 export type GitPushResult = z.infer<typeof GitPushResult>;
 
+// --- project.git.origin ---
+export const GitOriginParams=z.object({projectId:ProjectId}).strict();
+export const GitOriginResult=z.object({projectId:ProjectId,path:z.string().min(1).max(4096),repositoryRoot:z.string().min(1).max(4096),observedAt:Timestamp,
+  origin:z.discriminatedUnion('state',[
+    z.object({state:z.literal('configured'),url:z.string().min(1).max(2048)}).strict(),
+    z.object({state:z.enum(['missing','unsupported'])}).strict(),
+  ]),
+}).strict();
+export type GitOriginResult=z.infer<typeof GitOriginResult>;
+
 // --- project.git.status ---
 export const GitStatusParams = z.object({
   projectId: ProjectId,

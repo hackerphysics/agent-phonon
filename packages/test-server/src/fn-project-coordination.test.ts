@@ -59,14 +59,20 @@ for(const sourceKind of ["native","dev"] as const)test(`${sourceKind} coordinati
       plan:{mode:"dag",nodes:[{nodeId:"reply",agent:"mock:default",model:"m1",input:"Complete the assigned task"}],finalNodeId:"reply"}}) as any;
     let done=false;
     for(let i=0;i<200;i++){const state=await tc.call("workflow.status",{workflowId:run.workflowId}) as any;if(state.status==="completed"){done=true;break;}await new Promise(resolve=>setTimeout(resolve,10));}
-    assert.ok(done);assert.equal(calls.length,5);
+    const probes=sourceKind==="native"?2:1,expectedCalls=probes+4;
+    assert.ok(done);assert.equal(calls.length,expectedCalls);
     assert.ok(calls.every(call=>call.sourceKind===sourceKind&&call.runId===runId&&call.workflowId===run.workflowId&&call.sessionId&&call.turnId));
-    assert.deepEqual(calls.map(c=>c.action.operation),["presence","peers","inbox","inbox","inbox"]);
+    assert.deepEqual(calls.map(c=>c.action.operation),[...Array(probes).fill("presence"),"peers","inbox","inbox","inbox"]);
     assert.deepEqual(calls[0].receive,{version:1,mode:"tool_polling"});
-    assert.ok(calls.slice(1).every(call=>call.receive===undefined),"legacy server did not negotiate receive reporting");
+    assert.equal(calls[0].workspaceVersion,1);
+    if(sourceKind==="native"){
+      assert.deepEqual(calls[1].receive,{version:1,mode:"tool_polling"});
+      assert.equal(calls[1].workspaceVersion,undefined,"only the read-only negotiation may fall back");
+    }
+    assert.ok(calls.slice(probes).every(call=>call.receive===undefined&&call.workspaceVersion===undefined),"legacy server did not negotiate receive/workspace reporting");
     await assert.rejects(retained({operation:"inbox"}));
     await assert.rejects(fetch(channel,{method:"POST",headers,body:'{"operation":"inbox"}'}));
-    assert.equal(calls.length,5);
+    assert.equal(calls.length,expectedCalls);
     assert.ok(tc.streamEvents.filter(event=>event.type==="message"||event.type==="result").every(event=>!JSON.stringify(event).includes("coordination")));
   }finally{await tc.conn.dispose();}
 }));

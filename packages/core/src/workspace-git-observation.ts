@@ -10,6 +10,47 @@ type Status = 'unmodified'|'modified'|'added'|'deleted'|'renamed'|'copied'|'untr
 export interface ObservedGitFile {path:string;index:Status;worktree:Status}
 const invalid = () => new PhononError('errInternal','Git observation is unavailable');
 
+export function displayGitOrigin(raw:string):{state:'configured';url:string}|{state:'unsupported'} {
+  if(!raw||Buffer.byteLength(raw)>4096||/[\x00-\x20\x7f-\x9f]/.test(raw)||/^[A-Za-z]:[\\/]/.test(raw)||/^[A-Za-z][A-Za-z0-9+.-]*::/.test(raw))return {state:'unsupported'};
+  try {
+    let url:URL;
+    if(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw))url=new URL(raw);
+    else {
+      const scp=/^(?:[^/@:]+@)?([A-Za-z0-9.-]+):(.+)$/.exec(raw);
+      if(!scp||!scp[2]||scp[2].startsWith('/'))return {state:'unsupported'};
+      url=new URL('ssh://'+scp[1]+'/'+scp[2]);
+    }
+    if(!['https:','http:','ssh:','git:'].includes(url.protocol)||!url.hostname||!url.pathname||url.pathname==='/')return {state:'unsupported'};
+    url.username='';url.password='';url.search='';url.hash='';
+    const value=url.href;
+    if(Buffer.byteLength(value)>2048||/[\x00-\x20\x7f-\x9f]/.test(decodeURIComponent(url.pathname)))return {state:'unsupported'};
+    return {state:'configured',url:value};
+  }catch{return {state:'unsupported'};}
+}
+
+export async function observeWorkspaceGitOrigin(cwd:string,scope:{projectId:string},revalidate:()=>void) {
+  const deadline=Date.now()+5000;
+  const read=async(args:string[])=>{revalidate();const result=await readGit(cwd,args,deadline);revalidate();return result;};
+  const top=await read(['rev-parse','--show-toplevel']);
+  if(top.code===128&&top.output===''&&top.error==='fatal: not a git repository (or any of the parent directories): .git\n')
+    throw new PhononError('errNotGitRepo','The registered directory is not a Git repository');
+  if(top.code!==0)throw invalid();
+  const root=realpathSync(top.output.replace(/\n$/,''));
+  if(root!==cwd)throw new PhononError('errPolicyDenied','Git repository root differs from the registered workspace');
+  const git=await read(['rev-parse','--absolute-git-dir']);if(git.code!==0)throw invalid();
+  const gitDir=realpathSync(git.output.replace(/\n$/,''));
+  const config=await read(['config','--null','--get-all','remote.origin.url']);
+  if(config.code!==0&&config.code!==1)throw invalid();
+  const origins=config.code===1?[]:config.output.split('\0');
+  if(config.code===0){if(origins.pop()!==''||!origins.length)throw invalid();}
+  const origin=origins.length===0?{state:'missing' as const}:origins.length===1?displayGitOrigin(origins[0]!):{state:'unsupported' as const};
+  const lastTop=await read(['rev-parse','--show-toplevel']),lastGit=await read(['rev-parse','--absolute-git-dir']);
+  if(lastTop.code!==0||lastGit.code!==0||realpathSync(lastTop.output.replace(/\n$/,''))!==root||realpathSync(lastGit.output.replace(/\n$/,''))!==gitDir)throw invalid();
+  const lastConfig=await read(['config','--null','--get-all','remote.origin.url']);
+  if(lastConfig.code!==config.code||lastConfig.output!==config.output)throw new PhononError('errProjectProvisionChanged','Git origin changed during observation');
+  return {...scope,path:cwd,repositoryRoot:root,observedAt:new Date().toISOString(),origin};
+}
+
 async function readGit(cwd:string,args:string[],deadline:number):Promise<{code:number;output:string;error:string}> {
   const remaining = deadline-Date.now();
   if(remaining<=0)throw invalid();

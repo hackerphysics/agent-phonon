@@ -93,6 +93,27 @@ fabricating successful delivery. TypeScript uses
 `device.setProjectCoordinationHandler(handler)`; Python uses
 `device.set_project_coordination_handler(handler)`, including awaitable results.
 
+### Workspace Provenance
+
+The controller negotiates `workspaceVersion: 1` with a read-only presence probe.
+Only a matching self/session/source response enables the field on later calls.
+An old host may reject the new probe; a second presence-only probe preserves its
+existing receive negotiation. No model action or message is replayed to probe.
+Both SDKs preserve the negotiated envelope and optional participant `workspace`.
+
+Workspace data is host/device-confirmed, never supplied in an activity action.
+It identifies the device, registered runtime project, actual session worktree
+directory, branch/HEAD and observation time. Unavailable, unsupported or non-Git
+states do not invent directories or clean counts. The host bounds observation
+work and rechecks current owner/project/session/turn authority. MCP participants
+without a verified runtime source remain unsupported.
+
+The initial peer context carries workspace/device metadata. Models must inspect
+it before judging conflicts. Same-device, same-directory evidence indicates
+potential overlap; different directories, devices or worktrees do not prove no
+conflict because repositories, branches, mounts and dependencies may be shared.
+Activity summaries remain model-authored claims, not directory ownership proof.
+
 ### Device Receive Reports
 
 The optional envelope `receive` is controller-owned, never an agent action.

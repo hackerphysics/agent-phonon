@@ -9,7 +9,7 @@ import { buildChildProcessEnvironment } from "./child-env.js";
 import { randomUUID,createHash } from "node:crypto";
 import {canonicalWorkspacePath,workspacePathKey,workspacePathsOverlap,assertNamespacePathAvailable,assertProcessPathAvailable,assertNamespaceBrowsePath,assertProcessBrowsePath,rememberProcessPath,type NamespacePath} from "./workspace-paths.js";
 import {assertDirectoryIdentity,directoryIdentity} from "./directory-identity.js";
-import {observeWorkspaceGit} from "./workspace-git-observation.js";
+import {observeWorkspaceGit,observeWorkspaceGitOrigin} from "./workspace-git-observation.js";
 
 /**
  * 项目管理（design §8c / D23 + D25）。
@@ -564,6 +564,14 @@ export class ProjectManager {
     const identity=directoryIdentity(cwd);
     return observeWorkspaceGit(cwd,params,()=>{
       if(this.cwdFor(params.projectId,params.worktreeId)!==cwd)throw new PhononError('errPolicyDenied','Workspace identity changed');
+      assertDirectoryIdentity(cwd,identity);
+    });
+  }
+
+  async gitOrigin(params:{projectId:string}) {
+    const cwd=this.cwdFor(params.projectId),identity=directoryIdentity(cwd);
+    return observeWorkspaceGitOrigin(cwd,params,()=>{
+      if(this.cwdFor(params.projectId)!==cwd)throw new PhononError('errPolicyDenied','Workspace identity changed');
       assertDirectoryIdentity(cwd,identity);
     });
   }

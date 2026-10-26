@@ -367,6 +367,10 @@ class PhononDevice:
         """Return live Git files and optional device-observed workspace identity/counts."""
         return await self._peer.request("project.git.status", {"projectId": project_id, **opts})
 
+    async def git_origin(self, project_id: str) -> dict:
+        """Read a registered directory's credential-free origin without network access."""
+        return await self._peer.request("project.git.origin", {"projectId": project_id})
+
     async def project_exec(self, project_id: str, command: str, args: list[str] | None = None, **opts: Any) -> dict:
         return await self._peer.request("project.exec", {"projectId": project_id, "command": command, "args": args or [], **opts})
 
@@ -716,6 +720,8 @@ class PhononDevice:
         """Handle private coordination, preserving device-owned receive outside action.
 
         Only a host accepting receive reports returns receiveReporting: 1.
+        workspaceVersion: 1 is negotiated by a read-only presence probe; peer
+        workspace metadata is runtime-confirmed, never an agent activity claim.
         """
         self._project_coordination_handler = fn
 

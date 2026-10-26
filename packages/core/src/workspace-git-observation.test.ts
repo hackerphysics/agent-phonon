@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {ProjectManager} from './project-manager.js';
-import {parseGitPorcelain,observeWorkspaceGit} from './workspace-git-observation.js';
+import {parseGitPorcelain,observeWorkspaceGit,displayGitOrigin} from './workspace-git-observation.js';
 import {GitStatusResult} from '@agent-phonon/protocol';
 
 async function fixture() {
@@ -69,4 +69,32 @@ test('Git observation supports an unborn branch but never invents clean facts fo
 test('Porcelain parser rejects incomplete/unknown records and preserves conflict/type changes',()=>{
   for(const value of [' M missing terminator','?? \0','R  new\0','Z  unknown\0','   unchanged\0'])assert.throws(()=>parseGitPorcelain(value));
   assert.deepEqual(parseGitPorcelain('UU conflict\0 T type\0'),[{path:'conflict',index:'unmerged',worktree:'unmerged'},{path:'type',index:'unmodified',worktree:'typeChanged'}]);
+});
+
+test('Each independent directory observes its own origin without network or configuration changes',async()=>{
+  const f=await fixture();try{
+    const other=await f.manager.create({name:'Other',path:join(f.root,'other'),git:true});
+    f.git('remote','add','origin','https://username:secret@example.com/org/first.git?token=private#secret');
+    execFileSync('git',['-C',other.path,'remote','add','origin','git@github.com:team/second.git']);
+    const first=await f.manager.gitOrigin({projectId:f.project.projectId}),second=await f.manager.gitOrigin({projectId:other.projectId});
+    assert.deepEqual(first.origin,{state:'configured',url:'https://example.com/org/first.git'});
+    assert.deepEqual(second.origin,{state:'configured',url:'ssh://github.com/team/second.git'});
+    assert.equal(first.path,f.project.path);assert.equal(second.path,other.path);
+    assert.equal(f.git('config','--get','remote.origin.url'),'https://username:secret@example.com/org/first.git?token=private#secret');
+    f.git('remote','remove','origin');assert.deepEqual((await f.manager.gitOrigin({projectId:f.project.projectId})).origin,{state:'missing'});
+    f.git('config','remote.origin.url','ext::malicious-helper');assert.deepEqual((await f.manager.gitOrigin({projectId:f.project.projectId})).origin,{state:'unsupported'});
+    const plain=await f.manager.create({name:'Plain',path:join(f.root,'plain'),git:false});
+    await assert.rejects(f.manager.gitOrigin({projectId:plain.projectId}),{appCode:'errNotGitRepo'});
+    await assert.rejects(f.manager.gitOrigin({projectId:'foreign'}));
+  }finally{f.close();}
+});
+
+test('Git origin display removes credentials and refuses unsafe or ambiguous text',()=>{
+  for(const [raw,url]of [
+    ['ssh://user:secret@example.com:2222/team/repo.git','ssh://example.com:2222/team/repo.git'],
+    ['user@git.example.com:team/repo.git','ssh://git.example.com/team/repo.git'],
+    ['https://token@example.com/team/repo?auth=secret#fragment','https://example.com/team/repo'],
+  ])assert.deepEqual(displayGitOrigin(raw!),{state:'configured',url});
+  for(const raw of ['','ext::run helper','file:///private/secrets','/local/repo','C:/local/repo','https://example.com/repo\nspoof','https://example.com/%0Aprivate'])
+    assert.deepEqual(displayGitOrigin(raw),{state:'unsupported'});
 });

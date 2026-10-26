@@ -66,6 +66,7 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `project.worktree.remove` | server→phonon | request | 清理 worktree |
 | `project.git.deleteBranch` | server→phonon | request | 删合并分支 |
 | `project.git.commit/merge/diff/log/push/status` | server→phonon | request | 底层 Git 操作：提交、合并、diff、日志、推送、状态 |
+| `project.git.origin` | server→phonon | request | 只读检测已注册目录的 origin；按 projectId 隔离，返回去除凭据的地址或 missing/unsupported，不 fetch |
 | `project.exec` | server→phonon | request | 在 project/worktree sandbox 内受控执行非 shell 命令，返回 exitCode/stdout/stderr/duration |
 | `file.read` | server→phonon | request | 读取 project/worktree 内文件（utf8/base64，可 maxBytes 截断） |
 | `file.write` | server→phonon | request | 写 project/worktree 内文件（可建父目录、可幂等） |

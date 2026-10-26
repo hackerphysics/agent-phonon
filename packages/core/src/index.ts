@@ -764,6 +764,8 @@ export class PhononConnection {
         return this.projects.gitPush(p as { projectId: string; worktreeId?: string; branch: string; remote?: string; force?: boolean; setUpstream?: boolean });
       case "project.git.status":
         return this.projects.gitStatus(p as { projectId: string; worktreeId?: string });
+      case "project.git.origin":
+        return this.projects.gitOrigin(p as {projectId:string});
       case "project.exec":
         this.policy.assertExec(); // A2/A3: exec 需独立 gate（默认禁；trustLocal 开）
         return this.projects.exec(p as { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number });

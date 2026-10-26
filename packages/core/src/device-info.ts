@@ -46,6 +46,7 @@ async function inferCapabilities(): Promise<string[]> {
   caps.add("schedule_dispatch_v1");
   caps.add("skill_namespace_identity_v1");
   caps.add("project_path_ownership_v1");
+  caps.add("workspace_git_origin_v1");
   if(platform()==="linux")caps.add("secure_file_broker_linux_v1");
   if(await darwinFileBrokerAvailable())caps.add("secure_file_transfer_darwin_v1");
   if(platform()==="linux"||await darwinFileBrokerAvailable())caps.add("native_document_publish_v1");

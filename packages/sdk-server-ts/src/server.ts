@@ -364,6 +364,7 @@ export class PhononDevice extends EventEmitter {
       log: (p: { projectId: string; worktreeId?: string; branch?: string; limit?: number; since?: string; until?: string; paths?: string[] }) => this.peer.request("project.git.log", p),
       push: (p: { projectId: string; worktreeId?: string; branch: string; remote?: string; force?: boolean; setUpstream?: boolean }) => this.peer.request("project.git.push", p),
       status: (p: { projectId: string; worktreeId?: string }) => this.peer.request("project.git.status", p),
+      origin: (p:{projectId:string})=>this.peer.request("project.git.origin",p),
       deleteBranch: (p: { projectId: string; branch: string; force?: boolean }) => this.peer.request("project.git.deleteBranch", p),
     },
     exec: (p: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number }) => this.peer.request("project.exec", p),
@@ -585,7 +586,7 @@ export class PhononDevice extends EventEmitter {
   /** Controller-owned group messages, including explicit immutable attachmentIDs.
    * Recorded receipts do not establish verified recipient file delivery. */
   setConversationMessageHandler(fn: (params: unknown) => Promise<unknown> | unknown): void { this.conversationMessageHandler = fn; }
-  /** Preserve device-owned receive metadata outside action; only an accepting host returns receiveReporting: 1. */
+  /** Preserve device-owned receive/workspaceVersion negotiation outside action; old hosts omit runtime workspace facts. */
   setProjectCoordinationHandler(fn: (params: unknown) => Promise<unknown> | unknown): void { this.projectCoordinationHandler = fn; }
   /** Device-only historical runtime observations; absent handlers never fabricate receipts. */
   setProjectCoordinationEvidenceHandler(fn:(params:unknown)=>Promise<unknown>|unknown):void{this.projectCoordinationEvidenceHandler=fn;}
