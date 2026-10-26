@@ -12,6 +12,7 @@ import { PolicyEnforcer } from "./policy.js";
 import { IdempotencyStore } from "./idempotency.js";
 import {SkillInstallOperations} from "./skill-install-operations.js";
 import {ProjectProvisioner} from "./project-provision.js";
+import {WorktreeProvisioner} from './worktree-provision.js';
 import {PeerContextReporter} from "./peer-context-reporter.js";
 import type {DeviceInfoResult,SkillInstallParams,SkillInstallStatusParams,SkillInstallFenceParams,SkillPublishParams,SkillUnpublishParams} from "@agent-phonon/protocol";
 import { Outbox } from "./outbox.js";
@@ -93,6 +94,7 @@ export class PhononConnection {
   private registry: AdapterRegistry;
   private projects: ProjectManager;
   private projectProvision:ProjectProvisioner;
+  private worktreeProvision:WorktreeProvisioner;
   private skills: SkillManager;
   private skillInstalls:SkillInstallOperations;
   private policy: PolicyEnforcer;
@@ -218,7 +220,8 @@ export class PhononConnection {
     );
     this.engine.resolveCwdForReattach = (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId);
     this.projectProvision=new ProjectProvisioner(this.tenantId,this.store.projectProvisionPath(),this.policy,this.projects,opts.nativeFileBroker);
-    this.projects.setPreparedIdentityGuard((id,path)=>this.projectProvision.assertProject(id,path));
+    this.worktreeProvision=new WorktreeProvisioner(this.tenantId,this.store.worktreeProvisionPath(),this.policy,this.projects);
+    this.projects.setPreparedIdentityGuard((id,path)=>{this.projectProvision.assertProject(id,path);this.worktreeProvision.assertWorkspace(id,path);});
     this.employees=new EmployeeProfiles(this.tenantId,this.store,this.registry,this.policy,this.projects,opts.employeeProfileFileBrokerRoot);
     this.skills = new SkillManager(
       opts.registry,
@@ -323,6 +326,7 @@ export class PhononConnection {
     this.workflowRetryTimer = undefined;
     const skillSettlement=this.skillInstalls.dispose();
     const projectSettlement=this.projectProvision.dispose();
+    const worktreeSettlement=this.worktreeProvision.dispose();
     this.releaseInventory();
     this.peer.dispose(reason);
     this.scheduler?.dispose(reason);
@@ -332,6 +336,7 @@ export class PhononConnection {
       await this.engine.dispose();
       await skillSettlement;
       await projectSettlement;
+      await worktreeSettlement;
     })();
     return this.disposePromise;
   }
@@ -585,6 +590,8 @@ export class PhononConnection {
         const info:DeviceInfoResult = await collectDeviceInfo();
         const provisionReceiver=await this.projectProvision.capability();
         if(provisionReceiver){info.projectProvisionReceiverID=provisionReceiver;info.capabilities.push("project_provision_v1");}
+        const worktreeReceiver=this.worktreeProvision.capability();
+        if(worktreeReceiver){info.worktreeProvisionReceiverID=worktreeReceiver;info.capabilities.push('worktree_provision_v1');}
         info.capabilities.push("pinned_skill_selection_v1","workflow_skill_selection_v1","native_workflow_skill_selection_v1","native_workflow_canvas_skill_v1");
         if(this.store.supportsDurableSkillInstalls)info.capabilities.push("skill_install_receipts_v1","skill_install_fence_v1");
         const receiverID=this.store.skillReceiverIdentity(this.tenantId);
@@ -716,6 +723,8 @@ export class PhononConnection {
       // ---- project (D23/D25) ----
       case "project.provision": return this.projectProvision.provision(p);
       case "project.provision.status": return this.projectProvision.status(p);
+      case "project.worktree.provision": return this.worktreeProvision.provision(p);
+      case "project.worktree.provision.status": return this.worktreeProvision.status(p);
       case "project.create": {
         const r = await this.projects.create({ name: p.name as string, path: p.path as string | undefined, git: p.git as boolean | undefined, remote: p.remote as string | undefined,existingDirectoryIdentity:p.existingDirectoryIdentity as string|undefined },()=>{
           if(this.disposed)throw new PhononError("errPolicyDenied","connection is closed");this.policy.assertMethodAllowed("project.create");

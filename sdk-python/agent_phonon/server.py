@@ -371,6 +371,16 @@ class PhononDevice:
         """Read a registered directory's credential-free origin without network access."""
         return await self._peer.request("project.git.origin", {"projectId": project_id})
 
+    async def worktree_provision(self, project_id: str, client_request_id: str, expected_receiver_id: str, name: str, base_branch: str, new_branch: str) -> dict:
+        """Create one durable linked checkout without caller-selected paths or replay."""
+        return await self._peer.request("project.worktree.provision", {"projectId": project_id, "clientRequestId": client_request_id,
+            "expectedReceiverID": expected_receiver_id, "name": name, "baseBranch": base_branch, "newBranch": new_branch})
+
+    async def worktree_provision_status(self, project_id: str, client_request_id: str, expected_receiver_id: str) -> dict:
+        """Observe the original creation operation without creating another checkout."""
+        return await self._peer.request("project.worktree.provision.status", {"projectId": project_id,
+            "clientRequestId": client_request_id, "expectedReceiverID": expected_receiver_id})
+
     async def project_exec(self, project_id: str, command: str, args: list[str] | None = None, **opts: Any) -> dict:
         return await self._peer.request("project.exec", {"projectId": project_id, "command": command, "args": args or [], **opts})
 

@@ -70,6 +70,24 @@ export const ProjectProvisionStatusResult=z.discriminatedUnion("state",[
 ]);
 export type ProjectProvisionStatusResult=z.infer<typeof ProjectProvisionStatusResult>;
 
+// A durable, controller-owned linked checkout registered as an independent workspace.
+const worktreeProvisionScope={clientRequestId:z.string().uuid(),expectedReceiverID:z.string().uuid(),projectId:ProjectId};
+export const WorktreeProvisionParams=z.object({...worktreeProvisionScope,name:z.string().min(1).max(120),
+  baseBranch:z.string().min(1).max(255),newBranch:z.string().min(1).max(255)}).strict();
+export type WorktreeProvisionParams=z.infer<typeof WorktreeProvisionParams>;
+export const WorktreeProvisionStatusParams=z.object(worktreeProvisionScope).strict();
+export type WorktreeProvisionStatusParams=z.infer<typeof WorktreeProvisionStatusParams>;
+const worktreeProvisionReply={clientRequestId:z.string().uuid(),receiverID:z.string().uuid(),projectId:ProjectId};
+export const WorktreeProvisionStatusResult=z.discriminatedUnion('state',[
+  z.object({...worktreeProvisionReply,state:z.literal('not_found'),found:z.literal(false),outcomeKnown:z.literal(false)}).strict(),
+  z.object({...worktreeProvisionReply,state:z.literal('prepared'),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(false)}).strict(),
+  z.object({...worktreeProvisionReply,state:z.enum(['dispatched','unknown']),found:z.literal(true),outcomeKnown:z.literal(false),dispatchClaimed:z.literal(true)}).strict(),
+  z.object({...worktreeProvisionReply,state:z.literal('failed'),found:z.literal(true),outcomeKnown:z.literal(true),dispatchClaimed:z.literal(true),reasonCode:z.literal('creation_refused')}).strict(),
+  z.object({...worktreeProvisionReply,state:z.literal('confirmed'),found:z.literal(true),outcomeKnown:z.literal(true),dispatchClaimed:z.literal(true),
+    workspace:ProjectDescriptor,directoryIdentity:z.string().regex(/^dir:[a-f0-9]+:[a-f0-9]+$/),baseCommit:z.string().regex(/^[a-f0-9]{40,64}$/),branch:z.string().min(1).max(255)}).strict(),
+]);
+export type WorktreeProvisionStatusResult=z.infer<typeof WorktreeProvisionStatusResult>;
+
 // --- project.list ---
 export const ProjectListParams = z.object({}).default({});
 export type ProjectListParams = z.infer<typeof ProjectListParams>;

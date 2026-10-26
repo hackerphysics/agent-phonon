@@ -351,6 +351,8 @@ export class PhononDevice extends EventEmitter {
     get: (projectId: string) => this.peer.request("project.get", { projectId }),
     remove: (projectId: string, opts?: { deleteFiles?: boolean; whenActiveSessions?: "reject" | "cascade" }) => this.peer.request("project.remove", { projectId, ...opts }),
     worktree: {
+      provision: (p:import('@agent-phonon/protocol').WorktreeProvisionParams)=>this.peer.request("project.worktree.provision",p),
+      provisionStatus: (p:import('@agent-phonon/protocol').WorktreeProvisionStatusParams)=>this.peer.request("project.worktree.provision.status",p),
       create: (p: { projectId: string; baseBranch: string; newBranch?: string; path?: string }) => this.peer.request("project.worktree.create", p),
       list: (projectId: string) => this.peer.request("project.worktree.list", { projectId }),
       remove: (p: { projectId: string; worktreeId: string; force?: boolean }) => this.peer.request("project.worktree.remove", p),

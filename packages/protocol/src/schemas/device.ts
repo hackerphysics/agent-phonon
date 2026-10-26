@@ -44,6 +44,7 @@ export const DeviceInfoResult = z.object({
   /** Persistent namespace-scoped receiver identity, not a credential or grant. */
   skillReceiverID:z.string().uuid().optional(),
   projectProvisionReceiverID:z.string().uuid().optional(),
+  worktreeProvisionReceiverID:z.string().uuid().optional(),
   /** 便于 server 做粗粒度任务路由：ios-development/windows-desktop-development/nvidia-gpu 等。 */
   /** current_turn_input_v1 confirms strict no-fallback and applied-input ACK semantics;
    * the selected adapter must additionally advertise injectMidTurn.

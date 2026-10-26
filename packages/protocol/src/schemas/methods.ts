@@ -82,6 +82,7 @@ import {
   GitPushParams, GitPushResult,
   GitStatusParams, GitStatusResult,
   GitOriginParams,GitOriginResult,
+  WorktreeProvisionParams,WorktreeProvisionStatusParams,WorktreeProvisionStatusResult,
   ProjectExecParams, ProjectExecResult,
 } from "./project.js";
 import {
@@ -556,6 +557,12 @@ export const METHODS = {
     params: GitStatusParams, result: GitStatusResult,
   },
   "project.git.origin": {direction:"s2p",kind:"request",params:GitOriginParams,result:GitOriginResult},
+  "project.worktree.provision": {
+    direction: "s2p", kind: "request", params: WorktreeProvisionParams, result: WorktreeProvisionStatusResult,
+  },
+  "project.worktree.provision.status": {
+    direction: "s2p", kind: "request", params: WorktreeProvisionStatusParams, result: WorktreeProvisionStatusResult,
+  },
   "project.exec": {
     direction: "s2p", kind: "request",
     params: ProjectExecParams, result: ProjectExecResult,

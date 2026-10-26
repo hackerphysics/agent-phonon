@@ -74,6 +74,7 @@ export class PhononStore {
   hasPeerContextJournal():boolean{return !!this.peers||this.dbPath!==":memory:"&&existsSync(this.dbPath+".peers.sqlite");}
   get supportsDurableSkillInstalls():boolean{return this.dbPath!==":memory:";}
   projectProvisionPath():string|undefined{return this.dbPath===":memory:"?undefined:this.dbPath+".projects.sqlite";}
+  worktreeProvisionPath():string|undefined{return this.dbPath===":memory:"?undefined:this.dbPath+".worktrees.sqlite";}
   conversationArchives(): ConversationArchive {
     if (!this.supportsConversationArchives) throw new PhononError("errArchiveUnavailable", "conversation archives require a persistent device database");
     try { return this.archives ??= new ConversationArchive(this.dbPath + ".conversations.sqlite"); }

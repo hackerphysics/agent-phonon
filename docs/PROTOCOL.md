@@ -62,6 +62,8 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `project.list/get` | server→phonon | request | 查项目 |
 | `project.remove` | server→phonon | request | 删项目（默认只解绑不删盘） |
 | `project.worktree.create` | server→phonon | request | 基于 branch 建 worktree |
+| `project.worktree.provision` | server→phonon | request | 持久化、单次派发地创建并注册独立 linked checkout；需本机 allowProjectProvision 与 receiverID，不接受调用方路径 |
+| `project.worktree.provision.status` | server→phonon | request | 读取原创建凭据，不重试不确定的 Git 操作 |
 | `project.worktree.list` | server→phonon | request | 列 worktree |
 | `project.worktree.remove` | server→phonon | request | 清理 worktree |
 | `project.git.deleteBranch` | server→phonon | request | 删合并分支 |

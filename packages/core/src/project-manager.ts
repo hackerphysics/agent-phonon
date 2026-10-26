@@ -201,6 +201,20 @@ export class ProjectManager {
     if(this.inMemoryPaths().some(record=>workspacePathsOverlap(workspacePathKey(record.path),workspacePathKey(path))))throw new PhononError("errProjectExists","managed workspace cannot nest an existing Project or worktree");
   }
   reservePreparedPath(path:string){this.assertPreparedPathAvailable(path);this.reserveOwnership(path);}
+  assertRepositoryPath(path:string){this.refreshFromStore();this.assertProjectPath?.(path);this.assertOwnership(path);}
+  registerPreparedWorktree(record:ProjectRecord):ProjectRecord{
+    if(record.namespace!==this.namespace||!record.git||record.employeeId||!record.directoryIdentity||!record.projectId.startsWith('worktree-'))throw new PhononError('errPolicyDenied');
+    this.refreshFromStore();this.assertProjectPath?.(record.path);assertDirectoryIdentity(record.path,record.directoryIdentity);
+    if(this.reserveOwnership(record.path)!==record.path)throw new PhononError('errPolicyDenied','Worktree identity changed');
+    const previous=this.projects.get(record.projectId);
+    if(previous){
+      if(previous.path!==record.path||previous.namespace!==record.namespace||previous.directoryIdentity!==record.directoryIdentity||previous.name!==record.name||!previous.git)
+        throw new PhononError('errPolicyDenied','Worktree registration changed');
+      return this.get(record.projectId);
+    }
+    if([...this.projects.values()].some(project=>project.path===record.path))throw new PhononError('errProjectExists');
+    this.store?.upsertProject(record);this.projects.set(record.projectId,record);return this.get(record.projectId);
+  }
   registerPrepared(record:ProjectRecord):ProjectRecord{
     if(record.namespace!==this.namespace||record.git||record.employeeId)throw new PhononError("errPolicyDenied");
     this.refreshFromStore();this.assertProjectPath?.(record.path);const canonical=this.reserveOwnership(record.path);
