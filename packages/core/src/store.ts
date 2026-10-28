@@ -10,6 +10,7 @@ import { PhononError } from "./rpc.js";
 import {canonicalWorkspacePath,workspacePathKey,assertNamespacePathAvailable,assertNamespaceBrowsePath,type NamespacePath} from "./workspace-paths.js";
 import {requestFingerprint} from "./idempotency.js";
 import {SkillInstallFenceResult,type SkillInstallFenceParams,type SkillInstallRecoveryContext} from "@agent-phonon/protocol";
+import {LocalDirectoryAdmissions} from "./local-directory-admission.js";
 
 export interface StoredSkillRecord {
   agent:string;name:string;scope:"project"|"global";projectId?:string;version?:string;hash?:string;installedPath:string;installedAt:string;revision?:string;
@@ -68,6 +69,7 @@ export class PhononStore {
     return join(dirname(this.dbPath), "sessions");
   }
   get supportsConversationArchives(): boolean { return this.dbPath !== ":memory:"; }
+  localDirectoryAdmissions():LocalDirectoryAdmissions{return new LocalDirectoryAdmissions(this.dbPath);}
   peerContextJournal(): PeerContextJournal {
     return this.peers ??= new PeerContextJournal(this.dbPath === ":memory:" ? ":memory:" : this.dbPath + ".peers.sqlite");
   }
@@ -299,6 +301,7 @@ export class PhononStore {
     // Keep fingerprints out of the unrestricted request-key namespace. Legacy
     // results/ambiguous old sidecar rows are retained without guessing a hash.
     this.ensureColumn("idempotency", "request_hash", "TEXT");
+    this.ensureColumn("compression_receipts","authority_generation","TEXT");
     this.db.exec(`CREATE TABLE IF NOT EXISTS skill_install_operations(
       tenant_id TEXT NOT NULL,request_id TEXT NOT NULL,request_hash TEXT NOT NULL,
       agent_id TEXT NOT NULL,name TEXT NOT NULL,scope TEXT NOT NULL CHECK(scope IN ('project','global')),project_id TEXT,
@@ -360,6 +363,8 @@ export class PhononStore {
     this.ensureColumn("sessions", "employee_revision", "INTEGER");
     this.ensureColumn("sessions", "recovery_json", "TEXT");
     this.ensureColumn("sessions", "native_stop_json", "TEXT");
+    this.ensureColumn("sessions", "project_cwd", "TEXT");
+    this.ensureColumn("sessions", "project_cwd_identity", "TEXT");
     this.db.exec(`CREATE TABLE IF NOT EXISTS session_native_owners(
       tenant_id TEXT NOT NULL,session_id TEXT NOT NULL,owner_instance TEXT NOT NULL,
       owner_pid INTEGER NOT NULL CHECK(owner_pid>0),PRIMARY KEY(tenant_id,session_id))`);
@@ -766,18 +771,19 @@ export class PhononStore {
   }
 
   // ---- sessions（元数据，OpenClaw 原生可 resume）----
-  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string; streamSeq?: number; employeeId?:string; employeeRevision?:number; recoveryJSON?:string; ownerInstance?:string; nativeStopJSON?:string }): void {
+  upsertSession(r: { sessionId: string; tenantId: string; projectId?: string; worktreeId?: string; agent: string; model: string; status: string; verbosity: string; createdAt: string; lastActive?: string; transcriptPath?: string; streamSeq?: number; employeeId?:string; employeeRevision?:number; recoveryJSON?:string; ownerInstance?:string; nativeStopJSON?:string;cwd?:string;cwdIdentity?:string }): void {
     this.db
       .prepare(
-        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path,stream_seq,employee_id,employee_revision,recovery_json,native_stop_json)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO sessions(session_id,tenant_id,project_id,worktree_id,agent_id,model,status,verbosity,created_at,last_active,transcript_path,stream_seq,employee_id,employee_revision,recovery_json,native_stop_json,project_cwd,project_cwd_identity)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, status=excluded.status, last_active=excluded.last_active,
            transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path),
-           stream_seq=MAX(sessions.stream_seq, excluded.stream_seq),employee_revision=excluded.employee_revision,recovery_json=excluded.recovery_json,native_stop_json=excluded.native_stop_json
+           stream_seq=MAX(sessions.stream_seq, excluded.stream_seq),employee_revision=excluded.employee_revision,recovery_json=excluded.recovery_json,native_stop_json=excluded.native_stop_json,
+           project_cwd=COALESCE(sessions.project_cwd,excluded.project_cwd),project_cwd_identity=COALESCE(sessions.project_cwd_identity,excluded.project_cwd_identity)
          WHERE sessions.tenant_id=excluded.tenant_id AND (? IS NULL OR EXISTS(
            SELECT 1 FROM session_native_owners o WHERE o.tenant_id=sessions.tenant_id AND o.session_id=sessions.session_id AND o.owner_instance=?))`,
       )
-      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null, r.streamSeq ?? 0,r.employeeId??null,r.employeeRevision??null,r.recoveryJSON??null,r.nativeStopJSON??null,r.ownerInstance??null,r.ownerInstance??null);
+      .run(r.sessionId, r.tenantId, r.projectId ?? null, r.worktreeId ?? null, r.agent, r.model, r.status, r.verbosity, r.createdAt, r.lastActive ?? null, r.transcriptPath ?? null, r.streamSeq ?? 0,r.employeeId??null,r.employeeRevision??null,r.recoveryJSON??null,r.nativeStopJSON??null,r.cwd??null,r.cwdIdentity??null,r.ownerInstance??null,r.ownerInstance??null);
   }
 
   private nativeOwnerAlive(pid:number):boolean {
@@ -974,9 +980,13 @@ export class PhononStore {
   compressionBlocked(tenant:string,session:string):boolean{
     return !!this.db.prepare("SELECT 1 FROM compression_receipts WHERE tenant_id=? AND session_id=? AND state IN ('running','unknown')").get(tenant,session);
   }
-  beginCompression(tenant:string,receipt:{operationId:string;sessionId:string;state:string}):void{
-    this.db.prepare("INSERT INTO compression_receipts(tenant_id,operation_id,session_id,state,document) VALUES(?,?,?,?,?)")
-      .run(tenant,receipt.operationId,receipt.sessionId,receipt.state,JSON.stringify(receipt));
+  compressionAuthorityGeneration(tenant:string,id:string):string|undefined{
+    const row=this.db.prepare("SELECT authority_generation FROM compression_receipts WHERE tenant_id=? AND operation_id=?").get(tenant,id) as {authority_generation:string|null}|undefined;
+    return row?.authority_generation??undefined;
+  }
+  beginCompression(tenant:string,receipt:{operationId:string;sessionId:string;state:string},generation?:string):void{
+    this.db.prepare("INSERT INTO compression_receipts(tenant_id,operation_id,session_id,state,document,authority_generation) VALUES(?,?,?,?,?,?)")
+      .run(tenant,receipt.operationId,receipt.sessionId,receipt.state,JSON.stringify(receipt),generation??null);
   }
   finishCompression(tenant:string,receipt:{operationId:string;state:string}):void{
     this.db.prepare("UPDATE compression_receipts SET state=?,document=? WHERE tenant_id=? AND operation_id=?")

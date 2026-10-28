@@ -19,6 +19,20 @@ export class PolicyEnforcer {
   /** 受控工作区根（项目缺省建在这下面）。 */
   readonly workspaceRoot: string;
   private readonly projectRoots: string[];
+  localDirectoryAdmission?: (path:string)=>boolean|string;
+
+  projectAuthorityGeneration(path:string):string|undefined{
+    const grant=this.localDirectoryAdmission?.(path);
+    return typeof grant==="string"?grant:undefined;
+  }
+  captureProjectAuthority(path:string){
+    this.assertProjectPath(path);
+    const generation=this.projectAuthorityGeneration(path);
+    return {generation,assertCurrent:()=>{
+      this.assertProjectPath(path);
+      if(this.projectAuthorityGeneration(path)!==generation)throw new PhononError("errPolicyDenied","directory admission generation changed");
+    }};
+  }
 
   constructor(opts?: { policy?: Partial<TenantPolicyT>; workspaceRoot?: string; trustLocal?: boolean }) {
     // Match ProjectManager's canonical paths, including macOS /var aliases.
@@ -51,17 +65,21 @@ export class PolicyEnforcer {
   /** 项目路径是否允许（落在 allowedProjectRoots 或受控根下）。 */
   assertProjectPath(path: string): void {
     const abs = canonicalPath(path);
+    if(this.localDirectoryAdmission?.(path))return;
     if (!isPathUnderRoots(abs, this.projectRoots)) {
       throw new PhononError("errPolicyDenied", `project path outside allowed roots: ${abs}`);
     }
   }
   assertProjectDirectoryNavigation(path:string):void{
+    if(this.localDirectoryAdmission?.(path))return;
     const key=workspacePathKey(canonicalPath(path));
     if(!this.projectRoots.some(root=>workspacePathsOverlap(key,workspacePathKey(root))))throw new PhononError("errPolicyDenied","directory is outside configured workspace routes");
   }
 
   /** 文档路径是否允许（默认 project-scoped；外部需 allowExternalDocuments）。 */
   assertDocumentPath(absPath: string, projectRoot: string | undefined): void {
+    // Admission may be revoked while the file manager resolves its path.
+    this.localDirectoryAdmission?.(absPath);
     const abs = resolve(absPath);
     // deny 黑名单优先（即使在项目内也拒）
     for (const pat of this.policy.denyPathPatterns) {
