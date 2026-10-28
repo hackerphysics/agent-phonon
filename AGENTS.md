@@ -2,6 +2,16 @@
 
 These instructions apply to every coding agent working in this repository.
 
+## Timely commits and pushes
+
+Commit and push each complete, independently verified task change promptly,
+without waiting for another reminder, unless the user explicitly asks otherwise.
+Keep commits scoped to the current task; never include unrelated work from the
+shared worktree. Run required checks and hooks, preserve other tasks' changes,
+and never bypass a failing gate or force-push to meet this preference. If checks,
+permissions or remote conflicts block a commit or push, report the exact blocker
+and distinguish implemented, committed and pushed status in the handoff.
+
 ## Before every commit
 
 Install hooks once per clone, then run the project consistency gate:
