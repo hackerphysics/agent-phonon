@@ -533,7 +533,7 @@ export class PhononConnection {
     const check=()=>{
       if(this.directoryReadRevision!==revision)throw new PhononError("errInvalidParams","directory query superseded");
       if(this.disposed)throw new PhononError("errPolicyDenied","connection is closed");
-      this.policy.assertMethodAllowed("device.fs.list");if(!this.policy.allowDeviceFsBrowse())throw new PhononError("errPolicyDenied","directory browsing disabled");
+      this.policy.assertMethodAllowed("device.fs.list");
     };
     check();const operation=workspaceDirectorySuggestions(String(params.directoryInput??""),Number(params.limit??100),this.policy,this.projects,check);this.directoryRead=operation;
     try{return await operation;}finally{if(this.directoryRead===operation)this.directoryRead=undefined;}
@@ -625,8 +625,8 @@ export class PhononConnection {
         if (!this.policy.allowDeviceFsBrowse()) throw new PhononError("errPolicyDenied", "device.fs browse disabled by policy (allowDeviceFsBrowse)");
         return this.deviceFsRoots();
       case "device.fs.list":
-        if (!this.policy.allowDeviceFsBrowse()) throw new PhononError("errPolicyDenied", "device.fs browse disabled by policy (allowDeviceFsBrowse)");
         if(p.projectCandidates===true)return this.workspaceDirectories(p);
+        if (!this.policy.allowDeviceFsBrowse()) throw new PhononError("errPolicyDenied", "device.fs browse disabled by policy (allowDeviceFsBrowse)");
         return this.deviceFsList(p as { root?: string; path?: string; absolutePath?: string; includeHidden?: boolean; limit?: number });
       case "maintenance.targets":
         return this.maintenance.targets();
