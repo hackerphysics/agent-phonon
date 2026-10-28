@@ -167,6 +167,14 @@ class SessionOptions(unittest.IsolatedAsyncioTestCase):
             return {"status": "recorded", "messageID": "message"}
         device.set_conversation_message_handler(message_with_files)
         self.assertEqual(await device._handle_inbound("conversation.message", payload), {"status": "recorded", "messageID": "message"})
+        for payload in [{"operation": "history", "throughOrder": "90", "beforeOrder": "70", "limit": 10},
+                        {"operation": "read", "messageID": "public-message", "offset": 6000}]:
+            expected = {"status": "history" if payload["operation"] == "history" else "message"}
+            async def read_history(params):
+                self.assertEqual(params, payload)
+                return expected
+            device.set_conversation_message_handler(read_history)
+            self.assertIs(await device._handle_inbound("conversation.message", payload), expected)
 
     async def test_conversation_workflow_handler_is_explicit_and_awaited(self):
         device = PhononDevice("device", "tenant", object())

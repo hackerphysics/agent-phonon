@@ -780,7 +780,11 @@ export class SessionEngine {
           workflowId: rec.workflowAttr!.workflowId, sessionId: rec.sessionId as never, turnId });
         if (!active()) throw new PhononError("errSessionBusy", "message result is unconfirmed after turn end");
         const valueResult = ConversationMessageResult.parse(result);
-        if (value.operation === "members" ? valueResult.status !== "members" : !("requestId" in valueResult) || valueResult.requestId !== value.requestId) throw new PhononError("errInvalidParams", "message result identity mismatch");
+        const matches=value.operation==="members"?valueResult.status==="members"
+          :value.operation==="history"?valueResult.status==="history"&&(!value.throughOrder||valueResult.throughOrder===value.throughOrder)
+          :value.operation==="read"?valueResult.status==="message"&&valueResult.message.id===value.messageID&&valueResult.offset===(value.offset??0)
+          :"requestId" in valueResult&&valueResult.requestId===value.requestId;
+        if(!matches)throw new PhononError("errInvalidParams", "message result identity mismatch");
         return valueResult;
       } : undefined;
       const publishDocument = native && this.runtimeContext?.publishDocument ? async (raw:NativeDocumentInput) => {

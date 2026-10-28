@@ -40,6 +40,7 @@ async function inferCapabilities(): Promise<string[]> {
   caps.add("native_conversation_message_files_v1");
   caps.add("project_coordination_v1");
   caps.add("dev_native_interactions_v1");
+  caps.add("native_group_history_v1");
   caps.add('dev_idempotent_resume_v1');
   caps.add('workflow_result_pages_v1');
   caps.add('workflow_input_receipts_v1');

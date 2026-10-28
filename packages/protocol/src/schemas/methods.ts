@@ -445,6 +445,7 @@ export const METHODS = {
     direction:"p2s",kind:"request",params:ConversationWorkflowParams,result:ConversationWorkflowResult,
   },
   "conversation.message": {
+    // History/read are read-only and retain the same current-turn, controller-owned group scope.
     direction: "p2s", kind: "request", params: ConversationMessageParams, result: ConversationMessageResult,
   },
   "project.coordination": {

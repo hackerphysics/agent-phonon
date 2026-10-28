@@ -720,8 +720,9 @@ class PhononDevice:
         self._conversation_workflow_handler = fn
 
     def set_conversation_message_handler(self, fn: Callable[[dict], Any]) -> None:
-        """Handle stamped group messages with optional immutable attachmentIDs.
+        """Handle stamped group messages, history/read, and immutable attachmentIDs.
 
+        history/read preserve the active group scope and never dispatch a reply.
         Recorded receipts are not proof of verified recipient file delivery.
         """
         self._conversation_message_handler = fn

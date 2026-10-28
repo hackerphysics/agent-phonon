@@ -585,7 +585,7 @@ export class PhononDevice extends EventEmitter {
     this.conversationBoardHandler = fn;
   }
   setConversationWorkflowHandler(fn:(params:unknown)=>Promise<unknown>|unknown):void{this.conversationWorkflowHandler=fn;}
-  /** Controller-owned group messages, including explicit immutable attachmentIDs.
+  /** Controller-owned group messages, read-only history/read, and immutable attachmentIDs.
    * Recorded receipts do not establish verified recipient file delivery. */
   setConversationMessageHandler(fn: (params: unknown) => Promise<unknown> | unknown): void { this.conversationMessageHandler = fn; }
   /** Preserve device-owned receive/workspaceVersion negotiation outside action; old hosts omit runtime workspace facts. */

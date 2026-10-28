@@ -33,6 +33,15 @@ endpoint or controller lineage:
   is explicit. Mode is required: `insert`, `wait` or `queue`.
 - `{operation: "status", requestId}` reads this DE's prior message receipt in the
   current group. It neither sends a message nor triggers dispatch.
+- `{operation: "history", throughOrder?, beforeOrder?, limit?}` reads public
+  messages in this group. Pages return chronological messages, a pinned
+  `throughOrder` and optional `nextBeforeOrder`. Pass that upper order and the
+  next position as `beforeOrder` to page backwards without including newer arrivals.
+  Default limit is 20, maximum 40; byte limits can return fewer messages.
+- `{operation: "read", messageID, offset?}` reads original public text in chunks
+  of up to 6,000 Unicode characters, with optional `nextOffset`. This also resolves
+  the full response behind a long public reply's timeline excerpt. Offsets are
+  Unicode characters, not UTF-8 bytes or UTF-16 code units.
 
 Only explicit IDs trigger recipients. A plain final reply containing `@Name`
 does not start another DE, and messages do not invoke the coordinator by default.
@@ -52,6 +61,29 @@ query its prior receipt, but may not silently rebind a send to a new source.
 Tool-sent prose is already visible as a message from its actual DE. The DE should
 not repeat it verbatim as its final reply. Incoming peer content is separately
 labelled as a DE message, not a human decision or approval.
+
+## Shared Background
+
+`native_group_history_v1` advertises history/read support through all current-turn
+native tool transports. The controller supplies a fresh bounded public-history
+snapshot before each addressed group turn or insertion, without starting models
+for silent members. The current delivery is separate and excluded from its own
+background. The latest 32 messages are candidates for original text; the previous
+24 have literal 160-character excerpts. UTF-8 byte budgets may shorten these
+windows. Excerpts and earlier gaps are explicit; they are not fabricated semantic
+summaries or a claim that the model has read everything. Every delivery refreshes
+the snapshot, so a failed ACK, recovered Session or context compaction cannot
+advance a cursor and permanently skip background. Frozen requests retain the same
+snapshot and identity on reconciliation.
+
+History includes public human/DE speech and directed group messages, not private
+chats, raw tool logs, workflow worker transcripts, hidden forms or secrets. Reads
+retain the active DE's exact owner/group/project/Session/turn authority and work
+even when mutual mentions are disabled. They do not enqueue inputs, create relay
+receipts, spend relay budgets, wake another DE or grant human approval. Historical
+mentions are not new instructions. Attachment references do not install files.
+Old devices still receive background snapshots; the controller explicitly marks
+history/read unavailable until an update, without rejecting the original input.
 
 ## Explicit File Handoff
 

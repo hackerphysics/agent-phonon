@@ -23,6 +23,25 @@ async function client(environment:Record<string,string>, token=environment.AGENT
 }
 function payload(result:any) { assert.notEqual(result.isError, true); return JSON.parse(result.content[0].text); }
 
+test("native MCP exposes strict read-only group history and original-message chunks",async()=>{
+  const conversationID=randomUUID(),projectID=randomUUID(),messageID=randomUUID(),calls:unknown[]=[];
+  const message={id:messageID,historyOrder:"5",author:"assistant" as const,senderID:randomUUID(),senderName:"DE",createdAt:new Date().toISOString(),text:"Shared background",textLength:17,isExcerpt:false,mentionIDs:[],attachmentIDs:[]};
+  const bridge=new AgentInteractionBridge(undefined,undefined,undefined,undefined,async input=>{
+    calls.push(input);
+    if(input.operation==="history")return {status:"history",conversationID,projectID,throughOrder:input.throughOrder??"9",messages:[message]};
+    if(input.operation==="read")return {status:"message",conversationID,projectID,message,offset:input.offset??0};
+    throw Error("No sends in this fixture");
+  });
+  let c:Client|undefined;
+  try{
+    c=await client(await bridge.listen());const tools=await c.listTools();assert.deepEqual(tools.tools.map(tool=>tool.name),["phonon_conversation_message"]);
+    assert.match(tools.tools[0]!.description!,/read originating group history/);
+    assert.equal(payload(await c.callTool({name:"phonon_conversation_message",arguments:{operation:"history",throughOrder:"9",beforeOrder:"8",limit:2}})).status,"history");
+    assert.equal(payload(await c.callTool({name:"phonon_conversation_message",arguments:{operation:"read",messageID,offset:0}})).message.text,"Shared background");
+    assert.equal((await c.callTool({name:"phonon_conversation_message",arguments:{operation:"history",conversationID:randomUUID()}})).isError,true);assert.equal(calls.length,2);
+  }finally{await c?.close();await bridge.close();}
+});
+
 test("native MCP reuses scoped forms, explicit acknowledgement, board/workflow/message and document validation", async () => {
   const calls:Array<{route:string;input:any}>=[], applied:string[]=[], publication="native-file:"+randomUUID();
   const bridge = new AgentInteractionBridge(async input => {calls.push({route:"interaction",input}); return {requestId:input.requestId!, action:"submit", values:{approved:false}};},
