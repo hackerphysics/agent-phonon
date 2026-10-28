@@ -2,6 +2,14 @@
 
 These instructions apply to every coding agent working in this repository.
 
+## Main-branch releases
+
+Merge completed development into `main` before releasing or deploying. Build
+release artifacts only from a clean, committed and pushed `main` revision (or a
+detached checkout of that exact revision), and record its commit. Never publish
+feature-branch artifacts or mix unrelated uncommitted changes into a release.
+Preserve concurrent work and staging during integration.
+
 ## Timely commits and pushes
 
 Commit and push each complete, independently verified task change promptly,

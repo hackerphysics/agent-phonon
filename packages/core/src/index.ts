@@ -6,6 +6,8 @@ import { isAbsolute, join, relative, resolve, parse } from "node:path";
 import { SessionEngine, AdapterRegistry } from "./session-engine.js";
 import { RpcPeer, PhononError, type RpcTransport } from "./rpc.js";
 import { ProjectManager, runGit } from "./project-manager.js";
+import {assertDirectoryIdentity} from "./directory-identity.js";
+import {workspacePathsOverlap,workspacePathKey} from "./workspace-paths.js";
 import {workspaceDirectorySuggestions} from "./workspace-directories.js";
 import { SkillManager } from "./skill-manager.js";
 import { PolicyEnforcer } from "./policy.js";
@@ -127,6 +129,7 @@ export class PhononConnection {
     store?: PhononStore;
     /** Locally configured connection origin, never accepted from RPC params. */
     archiveAuthority?: string;
+    localDirectorySource?:import("./local-directory-admission.js").LocalDirectorySource;
     /** Local runtime assets for Windows employee workspace operations. */
     employeeProfileFileBrokerRoot?:string;
     /** 可观测事件总线（可选）。 */
@@ -141,6 +144,14 @@ export class PhononConnection {
     this.policy = new PolicyEnforcer({ policy: opts.policy, trustLocal: opts.trustLocal, workspaceRoot: opts.workspaceRoot });
     // 持久化（D6）：projects/skills/worktrees/outbox 落 sqlite；dbPath 缺省内存库
     this.store = opts.store ?? new PhononStore(opts.dbPath ?? ":memory:");
+    this.policy.localDirectoryAdmission=path=>{
+      const allowed=this.store.localDirectoryAdmissions().generation(path,opts.localDirectorySource,this.tenantId);
+      if(allowed){
+        this.store.assertWorkspacePath(path,this.tenantId);
+        if(this.store.loadProjects().some(row=>row.employeeId&&workspacePathsOverlap(workspacePathKey(path),workspacePathKey(row.path))))throw new PhononError("errPolicyDenied","local admission overlaps an employee home");
+      }
+      return allowed??false;
+    };
     this.archiveAuthority = conversationArchiveAuthority(opts.archiveAuthority);
     this.interactionReceipts=new InteractionReceipts(this.store,this.tenantId);
     this.store.delivery.configure(opts.delivery, opts.obs);
@@ -219,6 +230,7 @@ export class PhononConnection {
       },
     );
     this.engine.resolveCwdForReattach = (projectId, worktreeId) => this.projects.resolveCwd(projectId, worktreeId);
+    this.engine.projectAuthorityGeneration = path=>this.policy.projectAuthorityGeneration(path);
     this.projectProvision=new ProjectProvisioner(this.tenantId,this.store.projectProvisionPath(),this.policy,this.projects,opts.nativeFileBroker);
     this.worktreeProvision=new WorktreeProvisioner(this.tenantId,this.store.worktreeProvisionPath(),this.policy,this.projects);
     this.projects.setPreparedIdentityGuard((id,path)=>{this.projectProvision.assertProject(id,path);this.worktreeProvision.assertWorkspace(id,path);});
@@ -487,6 +499,25 @@ export class PhononConnection {
     }
     // 只读租户 / 方法白名单（policy）
     this.policy.assertMethodAllowed(method);
+    let authority:ReturnType<PolicyEnforcer["captureProjectAuthority"]>|undefined;
+    // Revalidate current authority before returning an idempotent success.
+    if(method==="project.create"&&typeof p.path==="string"){
+      this.policy.assertProjectPath(p.path);
+      authority=this.policy.captureProjectAuthority(p.path);
+      if(this.policy.localDirectoryAdmission?.(p.path)&&typeof p.existingDirectoryIdentity!=="string")throw new PhononError("errPolicyDenied","local admission only permits existing-directory registration");
+      if(typeof p.existingDirectoryIdentity==="string"){
+        assertDirectoryIdentity(p.path,p.existingDirectoryIdentity);
+        if(!this.projects.directoryAccess(p.path).selectable)throw new PhononError("errPolicyDenied");
+      }
+    }
+    if(method.startsWith("session.")&&! ["session.interrupt","session.terminate","session.status","session.list","session.compression.status"].includes(method)){
+      if(typeof p.sessionId==="string"){
+        const rec=this.engine.assertTenant(p.sessionId,this.tenantId);
+        if((method==="session.send"||method==="session.recover")&&rec.status==="terminated")throw new PhononError("errSessionTerminated");
+        authority=this.policy.captureProjectAuthority(this.projects.resolveCwd(rec.project,rec.worktreeId));
+      }else if(method==="session.create"&&typeof p.project==="string")authority=this.policy.captureProjectAuthority(this.projects.resolveCwd(p.project,p.worktreeId as string|undefined));
+    }
+    if(method==="project.exec"&&typeof p.projectId==="string")authority=this.policy.captureProjectAuthority(this.projects.resolveCwd(p.projectId,p.worktreeId as string|undefined));
     // Current scope also applies to cached receipts, not only fresh mutations.
     if(method.startsWith("skill.")){
       if(typeof p.agent==="string")this.policy.assertAgentAllowed(p.agent);
@@ -505,10 +536,12 @@ export class PhononConnection {
     // 幂等：改状态请求带 clientRequestId 则去重（D28 / P0#2）
     const crid = p.clientRequestId as string | undefined;
     if (crid && method!=="workflow.run" && method!=="skill.install.fence" && MUTATING_METHODS.has(method)) {
-      return this.idempotency.run(this.tenantId, method, crid, () => this.dispatchInner(method, p),
-        (method==="project.create"&&p.existingDirectoryIdentity!==undefined||["session.create", "session.send", "schedule.trigger", "run.resolve", "workflow.resume", "skill.install", "skill.uninstall","skill.publish","skill.unpublish","skill.install.fence"].includes(method)) ? p : undefined);
+      const request=(method==="project.create"&&p.existingDirectoryIdentity!==undefined||["session.create", "session.send", "schedule.trigger", "run.resolve", "workflow.resume", "skill.install", "skill.uninstall","skill.publish","skill.unpublish","skill.install.fence"].includes(method)) ? p : undefined;
+      const result=await this.idempotency.run(this.tenantId, method, crid, () => this.dispatchInner(method, p,authority?.assertCurrent),
+        authority?.generation===undefined?request:{request:p,localDirectoryGeneration:authority.generation});
+      authority?.assertCurrent();return result;
     }
-    return this.dispatchInner(method, p);
+    return this.dispatchInner(method, p,authority?.assertCurrent);
   }
 
   private deviceFsRoots(): { roots: Array<{ root: string; path: string; label?: string }> } {
@@ -562,7 +595,8 @@ export class PhononConnection {
     return { root, rootPath: rootReal, path: relPath, realPath: targetReal, entries, truncated: filtered.length > limit };
   }
 
-  private async dispatchInner(method: string, p: Record<string, unknown>): Promise<unknown> {
+  private async dispatchInner(method: string, p: Record<string, unknown>,assertCurrent?:()=>void): Promise<unknown> {
+    assertCurrent?.();
     const maintenanceMutation = method === "maintenance.config.edit" || method === "maintenance.config.patch" || method === "maintenance.rollback" || method === "maintenance.package.update" || method === "maintenance.service.restart";
     if (maintenanceMutation) {
       this.obs?.emitEvent({
@@ -681,6 +715,7 @@ export class PhononConnection {
       case "session.send": {
         this.store.delivery.assertNewWork();
         const meta = await this.engine.status(this.tenantId, p.sessionId as string);
+        assertCurrent?.();
         const r = await this.engine.send(this.tenantId, p.sessionId as string, p.input as string, {
           verbosity: p.verbosity as never,
           turnId: p.turnId as string | undefined,
@@ -727,6 +762,7 @@ export class PhononConnection {
       case "project.worktree.provision.status": return this.worktreeProvision.status(p);
       case "project.create": {
         const r = await this.projects.create({ name: p.name as string, path: p.path as string | undefined, git: p.git as boolean | undefined, remote: p.remote as string | undefined,existingDirectoryIdentity:p.existingDirectoryIdentity as string|undefined },()=>{
+          assertCurrent?.();
           if(this.disposed)throw new PhononError("errPolicyDenied","connection is closed");this.policy.assertMethodAllowed("project.create");
         });
         return { project: { projectId: r.projectId, namespace: r.namespace, name: r.name, path: r.path, git: r.git, createdAt: r.createdAt,...(r.directoryIdentity?{directoryIdentity:r.directoryIdentity}:{}) } };
@@ -777,7 +813,7 @@ export class PhononConnection {
         return this.projects.gitOrigin(p as {projectId:string});
       case "project.exec":
         this.policy.assertExec(); // A2/A3: exec 需独立 gate（默认禁；trustLocal 开）
-        return this.projects.exec(p as { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number });
+        return this.projects.exec(p as { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number },assertCurrent);
 
       // ---- file workspace IO (project/worktree scoped) ----
       case "file.read":
@@ -987,6 +1023,7 @@ export { assertSecureServerUrl } from "./client.js";
 export { HookBridge } from "./hook-bridge.js";
 export type { HookRouteResolver } from "./hook-bridge.js";
 export { ProjectManager } from "./project-manager.js";
+export {LocalDirectoryAdmissions,localDirectorySourceFingerprint,assertLocalOwnerPath,type LocalDirectorySource} from "./local-directory-admission.js";
 export { SkillManager } from "./skill-manager.js";
 export { PolicyEnforcer } from "./policy.js";
 export { IdempotencyStore } from "./idempotency.js";

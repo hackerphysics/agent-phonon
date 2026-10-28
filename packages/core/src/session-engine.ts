@@ -27,6 +27,7 @@ import { SessionCheckpoint, readSessionCheckpoint } from "./session-recovery.js"
 import { NativeStopTarget } from "@agent-phonon/protocol";
 import type {SkillSelection} from "@agent-phonon/protocol";
 import type {FrozenSkillSet,LoadedSkillSet} from "./skill-execution.js";
+import {directoryIdentity,assertDirectoryIdentity} from "./directory-identity.js";
 
 const DISPOSE_SETTLE_TIMEOUT_MS = 2_000;
 
@@ -91,6 +92,7 @@ interface SessionRecord {
   nativeStopNotDispatched?:boolean;
   adapterTurnStarted?:string;
   cwd?: string;
+  cwdIdentity?:string;
   recoveryCheckpoint?: SessionCheckpoint;
   recoverySource?: string | null;
   ownsNative?: boolean;
@@ -133,6 +135,8 @@ interface SessionRecord {
 
 /** 流式事件订阅回调（core 用它转发给对应 tenant 连接）。 */
 export type StreamSink = (event: StreamEvent) => void;
+type ProjectAuthority = {generation?:string};
+type ProjectAuthoritySubject = {project:string;worktreeId?:string;cwd?:string;cwdIdentity?:string;agent?:string;sessionId?:string;tenantId?:string;ownsNative?:boolean};
 
 /**
  * Session 引擎（L1，design §4）。
@@ -179,7 +183,8 @@ export class SessionEngine {
       try{const parsed=NativeStopTarget.parse(JSON.parse(String(row.native_stop_json)));if(parsed.sessionId===sessionId)nativeStop=parsed.state==="confirmed"?parsed:{...parsed,state:"unknown",confirmation:undefined,reasonCode:"controller_restarted"};}catch{}
       this.sessions.set(sessionId, {
         ...(nativeStop?{nativeStop}:{}),
-        cwd: checkpoint?.cwd,
+        cwd: typeof row.project_cwd==="string"?row.project_cwd:checkpoint?.cwd,
+        cwdIdentity:typeof row.project_cwd_identity==="string"?row.project_cwd_identity:undefined,
         recoveryCheckpoint: checkpoint,
         recoverySource: checkpoint ? String(row.recovery_json) : row.recovery_json === null ? null : undefined,
         sessionId,
@@ -234,6 +239,7 @@ export class SessionEngine {
       employeeId:rec.employeeId,employeeRevision:rec.employeeRevision,
       recoveryJSON,ownerInstance:this.nativeOwner,
       nativeStopJSON:rec.nativeStop?JSON.stringify(rec.nativeStop):undefined,
+      cwd:rec.cwd,cwdIdentity:rec.cwdIdentity,
     });
     rec.recoverySource=recoveryJSON;
   }
@@ -331,6 +337,8 @@ export class SessionEngine {
   }): Promise<{ sessionId: string; status: string; createdAt: string }> {
     if (this.disposed) throw new Error("session engine disposed");
     this.runtimeContext?.assertAgentAllowed?.(params.agent);
+    const operationAuthority=this.captureProjectAuthority(params);
+    const cwdIdentity=this.assertProjectAuthority(params),authority={...params,cwdIdentity};
     const adapter = this.registry.resolve(params.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${params.agent} not found`);
 
@@ -340,6 +348,7 @@ export class SessionEngine {
     try{
     const employee=selection?await this.runtimeContext?.resolveEmployee?.(params.tenantId,selection.id,selection.revision,params.agent):undefined;
     if(selection&&!employee)throw new PhononError("errCapabilityUnsupported","employee runtime binding is unavailable");
+    this.assertProjectAuthority(authority,operationAuthority);
     const adapterSession = await adapter.createSession({
       sessionId,
       agentId: params.agent,
@@ -351,6 +360,9 @@ export class SessionEngine {
       employee,
       upstreamRuns:this.upstreamRuns(params.tenantId,sessionId),
     });
+    try{this.assertProjectAuthority(authority,operationAuthority);}catch(error){
+      await Promise.resolve(adapterSession.terminate()).catch(()=>{});throw error;
+    }
     if (this.disposed) {
       await Promise.resolve(adapterSession.terminate()).catch(() => {});
       throw new Error("session engine disposed");
@@ -378,6 +390,7 @@ export class SessionEngine {
       adapterSession,
       ownsNative:true,
       cwd: params.cwd,
+      cwdIdentity,
       status: "idle",
       verbosity: params.verbosity,
       terminalTurns: new Set(),
@@ -405,24 +418,58 @@ export class SessionEngine {
 
   async refreshEmployee(tenant:string,sessionId:string,raw:unknown):Promise<void>{
     const rec=this.assertTenant(sessionId,tenant),selection=raw?EmployeeSelection.parse(raw):undefined;
+    const authority=this.captureProjectAuthority(rec);
     this.assertCompressionIdle(rec);
     if(rec.employeeId!==selection?.id)throw new PhononError("errInvalidParams","Session employee identity cannot change");
     if(!selection||rec.employeeRevision===selection.revision)return;
     if(rec.status!=="idle"||rec.detached)throw new PhononError("errSessionBusy","employee update requires an idle attached Session");
     const release=this.runtimeContext?.useEmployee?.(tenant,selection.id);
+    const revision=rec.employeeRevision;
     try{
       const binding=await this.runtimeContext?.resolveEmployee?.(tenant,selection.id,selection.revision,rec.agent);
       if(!binding||!rec.adapterSession.inject)throw new PhononError("errCapabilityUnsupported","employee update cannot be injected");
+      this.assertProjectAuthority(rec,authority);
+      if(rec.status!=="idle"||rec.detached||rec.employeeRevision!==revision)throw new PhononError("errSessionBusy","employee update Session changed during preparation");
       await rec.adapterSession.inject(binding.context);rec.employeeRevision=selection.revision;this.persist(rec);
     }finally{release?.();}
   }
 
   /** 可选：reattach 时解析 project cwd（由 connection 注入）。 */
   resolveCwdForReattach?: (projectId: string, worktreeId?: string) => string;
+  projectAuthorityGeneration?: (cwd:string)=>string|undefined;
+
+  private captureProjectAuthority(rec:ProjectAuthoritySubject):ProjectAuthority{
+    this.assertProjectAuthority(rec);
+    return {generation:rec.cwd?this.projectAuthorityGeneration?.(rec.cwd):undefined};
+  }
+
+  /** Connections always install a controller resolver; standalone fixtures do
+   * not have a project manager. An adapter is never a directory authority. */
+  private assertProjectAuthority(rec:ProjectAuthoritySubject,authority?:ProjectAuthority):string|undefined{
+    if(this.disposed)throw new Error("session engine disposed");
+    if(rec.agent)this.runtimeContext?.assertAgentAllowed?.(rec.agent);
+    if(rec.ownsNative&&rec.sessionId&&rec.tenantId&&this.store&&!this.store.ownsNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner))throw new PhononError("errSessionBusy","Session ownership changed");
+    if(!this.resolveCwdForReattach)return undefined;
+    const cwd=this.resolveCwdForReattach(rec.project,rec.worktreeId);
+    if(!cwd||!rec.cwd||cwd!==rec.cwd)throw new PhononError("errPolicyDenied","Session project workspace changed");
+    if(rec.cwdIdentity)assertDirectoryIdentity(cwd,rec.cwdIdentity);
+    if(authority&&this.projectAuthorityGeneration?.(cwd)!==authority.generation)throw new PhononError("errPolicyDenied","directory admission generation changed");
+    return rec.cwdIdentity??directoryIdentity(cwd);
+  }
+  private allowQueueDrain(rec:SessionRecord):boolean{
+    try{
+      this.assertProjectAuthority(rec);
+      rec.queue=rec.queue.filter(payload=>{
+        try{this.assertProjectAuthority(rec,(JSON.parse(payload) as {authority:ProjectAuthority}).authority);return true;}catch{return false;}
+      });
+      return true;
+    }
+    catch{rec.queue.length=0;return false;}
+  }
 
   /** 重新附着游离 session（重启恢复后首次使用）。
    * native-session adapter 重建会复用原生会话（如 OpenClaw sessionKey / Claude --resume）。 */
-  private async reattach(rec: SessionRecord): Promise<void> {
+  private async reattach(rec: SessionRecord,operationAuthority:ProjectAuthority): Promise<void> {
     this.runtimeContext?.assertAgentAllowed?.(rec.agent);
     const adapter = this.registry.resolve(rec.agent);
     if (!adapter) throw new PhononError("errAgentUnavailable", `agent ${rec.agent} unavailable for reattach`);
@@ -444,9 +491,13 @@ export class SessionEngine {
       }
     }
     const cwd = this.resolveCwdForReattach?.(rec.project, rec.worktreeId);
+    const authority={project:rec.project,worktreeId:rec.worktreeId,cwd:rec.cwd??cwd,cwdIdentity:rec.cwdIdentity,agent:rec.agent,
+      sessionId:rec.sessionId,tenantId:rec.tenantId,ownsNative:false};
+    authority.cwdIdentity=this.assertProjectAuthority(authority,operationAuthority);
     if (!checkpoint && source === null && cwd && adapter.observeSessionCheckpoint) {
       const state = await adapter.observeSessionCheckpoint({ sessionId: rec.sessionId, agentId: rec.agent,
         model: rec.model, cwd, reattach: true, runtimeContext: this.runtimeContext });
+      this.assertProjectAuthority(authority,operationAuthority);
       if (state) checkpoint = SessionCheckpoint.parse({ version: 1, adapter: adapter.name, agent: rec.agent,
         model: rec.model, project: rec.project, cwd, settled: true, state });
     }
@@ -455,6 +506,7 @@ export class SessionEngine {
     if (!cwd || cwd !== checkpoint.cwd) throw new PhononError("errSessionBusy", "Session recovery workspace identity changed");
     if(source === undefined || this.store&&!this.store.claimNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner,{checkpoint:source,nativeStopJSON,project:rec.project,agent:rec.agent,model:rec.model,employeeId:rec.employeeId,employeeRevision:rec.employeeRevision}))throw new PhononError("errSessionBusy","Session recovery checkpoint or owner changed");
     rec.ownsNative=true;
+    authority.ownsNative=true;
     let releaseEmployee:(()=>void)|undefined,adapterSession:AdapterSession|undefined;
     try {
     const current=this.store?.nativeSessionSnapshot(rec.tenantId,rec.sessionId);
@@ -462,6 +514,7 @@ export class SessionEngine {
     rec.lastActiveAt=(current?.last_active as string|undefined)??rec.lastActiveAt;
     if(rec.employeeId)releaseEmployee=this.runtimeContext?.useEmployee?.(rec.tenantId,rec.employeeId);
     const employee=rec.employeeId?await this.runtimeContext?.resolveEmployee?.(rec.tenantId,rec.employeeId,undefined,rec.agent):undefined;
+    this.assertProjectAuthority(authority,operationAuthority);
     adapterSession = await adapter.recoverSession({
       sessionId: rec.sessionId, agentId: rec.agent, model: rec.model, cwd,
       reattach: true,
@@ -472,11 +525,13 @@ export class SessionEngine {
     if(this.disposed)throw new Error("session engine disposed");
     if(employee&&employee.revision!==rec.employeeRevision){
       if(!adapterSession.inject)throw new PhononError("errCapabilityUnsupported","employee recovery cannot stage the updated profile");
+      this.assertProjectAuthority(authority,operationAuthority);
       await adapterSession.inject(employee.context);
     }
     if (this.disposed) {
       throw new Error("session engine disposed");
     }
+    this.assertProjectAuthority(authority,operationAuthority);rec.cwd=cwd;rec.cwdIdentity=authority.cwdIdentity;
     rec.adapterSession = adapterSession;
     if(employee)rec.employeeRevision=employee.revision;
     const attached=adapterSession;
@@ -498,16 +553,19 @@ export class SessionEngine {
     if (this.disposed) throw new Error("session engine disposed");
     const rec = this.assertTenant(sessionId, tenantId);
     if (rec.project !== expected.project || rec.agent !== expected.agent || rec.model !== expected.model) throw new PhononError("errInvalidParams", "Session recovery identity changed");
+    if (rec.status === "terminated") throw new PhononError("errSessionTerminated");
+    const authority=this.captureProjectAuthority(rec);
     this.runtimeContext?.assertAgentAllowed?.(rec.agent);
     this.assertCompressionIdle(rec);
-    if (rec.status === "terminated") throw new PhononError("errSessionTerminated");
     if (!rec.detached) {
+      this.assertProjectAuthority(rec);
       if (rec.status !== "idle" || rec.currentTurnId || rec.queue.length) throw new PhononError("errSessionBusy");
       if(rec.employeeId){
         this.control(rec,true);let release:(()=>void)|undefined;
         try{
           release=this.runtimeContext?.useEmployee?.(rec.tenantId,rec.employeeId);
           const employee=await this.runtimeContext?.resolveEmployee?.(rec.tenantId,rec.employeeId,undefined,rec.agent);
+          this.assertProjectAuthority(rec,authority);
           if(employee&&employee.revision!==rec.employeeRevision){
             if(!rec.adapterSession.inject)throw new PhononError("errCapabilityUnsupported","employee recovery cannot stage the updated profile");
             await rec.adapterSession.inject(employee.context);
@@ -519,7 +577,7 @@ export class SessionEngine {
       return this.toMeta(rec);
     }
     this.control(rec, true);
-    try { await this.reattach(rec); }
+    try { await this.reattach(rec,authority); }
     finally { this.control(rec, false); if (!this.disposed && !rec.detached) this.persist(rec); }
     return this.toMeta(rec);
   }
@@ -542,13 +600,14 @@ export class SessionEngine {
   ): Promise<{ turnId: string; disposition: string; queuePosition?: number }> {
     if (this.disposed) throw new Error("session engine disposed");
     const rec = this.assertTenant(sessionId, tenantId);
+    if (rec.status === "terminated")
+      throw new PhononError("errSessionTerminated", "session terminated");
+    const authority=this.captureProjectAuthority(rec);
     if(opts.whenBusy==="inject"&&(rec.detached||rec.status!=="running"||!rec.currentTurnId))throw new PhononError("errSessionBusy","insertion requires an existing active turn");
     if(opts.expectedActiveTurnId!==undefined){
       if(rec.detached||rec.status!=="running"||rec.currentTurnId!==opts.expectedActiveTurnId)throw new PhononError("errSessionBusy","the original insertion turn is no longer active");
       this.runtimeContext?.assertAgentAllowed?.(rec.agent);
     }
-    if (rec.status === "terminated")
-      throw new PhononError("errSessionTerminated", "session terminated");
     this.assertCompressionIdle(rec);
     let skillBindings:FrozenSkillSet|undefined;
     if(opts.skills?.length){
@@ -559,14 +618,14 @@ export class SessionEngine {
     // 重启恢复：游离 session 首次 send 时 reattach（重建 adapterSession）
     if (rec.detached) {
       this.control(rec,true);
-      try{await this.reattach(rec);}finally{this.control(rec,false);}
+      try{await this.reattach(rec,authority);}finally{this.control(rec,false);}
     }
     if (this.disposed) throw new Error("session engine disposed");
     this.assertCompressionIdle(rec);
 
     const turnId = opts.turnId ?? `t-${Date.now()}-${this.idSeq++}`;
     const verbosity = opts.verbosity ?? rec.verbosity;
-    const payload = JSON.stringify({ turnId, input, verbosity, skills: opts.skills, skillBindings, environment: opts.environment, reasoning });
+    const payload = JSON.stringify({ turnId, input, verbosity, skills: opts.skills, skillBindings, environment: opts.environment, reasoning,authority });
 
     if (rec.status === "running") {
       // 忙碌处理（D18）。whenBusy 不支持时走 fallback。
@@ -598,6 +657,7 @@ export class SessionEngine {
             if(signal.aborted||rec.currentTurnId!==window.turnId||rec.terminalTurns.has(window.turnId))throw new PhononError("errSessionBusy","turn closed before skill insertion was confirmed");
             this.runtimeContext?.assertAgentAllowed?.(rec.agent);
             opts.beforeInsertion?.();
+            this.assertProjectAuthority(rec,authority);
             await rec.adapterSession.insertAtToolGap!((loaded?.context??"")+input,{turnId:window.turnId,signal});
           };
           await Promise.race([insert(), ended]);
@@ -616,13 +676,14 @@ export class SessionEngine {
     }
 
     this.assertCompressionIdle(rec);
+    this.assertProjectAuthority(rec,authority);
     if(rec.nativeStop?.state==="confirmed"){rec.nativeStop=undefined;rec.nativeStopOperation=undefined;rec.nativeStopSettled=undefined;rec.nativeStopFinalPublished=undefined;}
     rec.status = "running";
     rec.currentTurnId = turnId;
     rec.lastActiveAt = new Date().toISOString();
     this.emit2("turn", "info", "turn.start", rec, { turnId, msg: `turn ${turnId} started`, data: { input: input.slice(0, 200) } });
     this.persist(rec);
-    this.startTurn(rec,input,turnId,verbosity,opts.skills,opts.environment,reasoning,skillBindings);
+    this.startTurn(rec,input,turnId,verbosity,authority,opts.skills,opts.environment,reasoning,skillBindings);
     return { turnId, disposition: "started" };
   }
 
@@ -632,11 +693,11 @@ export class SessionEngine {
     this.emit2("error", "error", "stream.persistence_failed", rec, { msg: "background turn delivery failed; inspect local storage" });
   }
 
-  private startTurn(rec:SessionRecord,input:string,turnId:string,verbosity:"final"|"messages"|"tools"|"trace",skills?:SkillSelection[],environment?:Record<string,string>,reasoning?:TurnReasoning,skillBindings?:FrozenSkillSet){
+  private startTurn(rec:SessionRecord,input:string,turnId:string,verbosity:"final"|"messages"|"tools"|"trace",authority:ProjectAuthority,skills?:SkillSelection[],environment?:Record<string,string>,reasoning?:TurnReasoning,skillBindings?:FrozenSkillSet){
     // Every turn, including an automatically drained queue item, invalidates
     // the settled checkpoint before its adapter can start model/tool work.
     this.persist(rec);
-    const promise=this.runTurn(rec,input,turnId,verbosity,skills,environment,reasoning,skillBindings).catch(()=>this.reportDeliveryFailure(rec));
+    const promise=this.runTurn(rec,input,turnId,verbosity,authority,skills,environment,reasoning,skillBindings).catch(()=>this.reportDeliveryFailure(rec));
     rec.turnSettlement={turnId,promise};
     const clear=()=>{if(rec.turnSettlement?.promise===promise)rec.turnSettlement=undefined;};
     void promise.then(clear,clear);
@@ -652,6 +713,7 @@ export class SessionEngine {
     input: string,
     turnId: string,
     verbosity: "final" | "messages" | "tools" | "trace",
+    authority:ProjectAuthority,
     skills?: SkillSelection[],
     environment?: Record<string, string>,
     reasoning?: TurnReasoning,
@@ -724,6 +786,7 @@ export class SessionEngine {
       reasoningConfirmed = true;
     };
     try {
+      this.assertProjectAuthority(rec,authority);
       if (reasoning) {
         if (this.registry.resolve(rec.agent)?.capabilities.reasoningControl !== true) nativeReasoningRequest = undefined;
         else if (reasoning.level !== null) {
@@ -831,6 +894,8 @@ export class SessionEngine {
         else abort.signal.addEventListener("abort",()=>{void interactionBridge?.close();},{once:true});
       }
       if (projectCoordination) {
+        if(abort.signal.aborted||rec.currentTurnId!==turnId||rec.terminalTurns.has(turnId))return;
+        this.assertProjectAuthority(rec,authority);
         try { await rec.adapterSession.preparePeerContext?.(runtimeEnvironment,abort.signal); }
         catch { this.emit2("session","warn","coordination.receiver_unavailable",rec,{turnId}); }
       }
@@ -842,8 +907,10 @@ export class SessionEngine {
             coordinate:action=>requestCoordination!(action,true),journal:this.store.peerContextJournal(),initialMessageIds:initialPeerMessageIds,
             ...(this.runtimeContext?.coordinationEvidenceAuthority?{reportAuthority:this.runtimeContext.coordinationEvidenceAuthority,
               reportChanged:()=>this.runtimeContext?.coordinationEvidenceChanged?.()}:{}),
-            active:()=>!this.disposed&&!abort.signal.aborted&&rec.currentTurnId===turnId&&!rec.terminalTurns.has(turnId)
-              && (!rec.ownsNative || this.store!.ownsNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner)),
+            active:()=>{
+              if(this.disposed||abort.signal.aborted||rec.currentTurnId!==turnId||rec.terminalTurns.has(turnId))return false;
+              try{this.assertProjectAuthority(rec,authority);return true;}catch{return false;}
+            },
             blocked:()=>pendingHumanInteractions>0,requireBudget:peerCapability.budget==="native_estimate"});
           peerBridge = new PeerContextBridge(peerContext);
           runtimeEnvironment = {...runtimeEnvironment,...await peerBridge.listen()};
@@ -916,6 +983,7 @@ export class SessionEngine {
       }
       if(abort.signal.aborted||rec.currentTurnId!==turnId||rec.terminalTurns.has(turnId))return;
       this.runtimeContext?.assertAgentAllowed?.(rec.agent);
+      this.assertProjectAuthority(rec,authority);
       rec.adapterTurnStarted=turnId;
       await rec.adapterSession.send(coordinationContext+(loadedSkills?.context??"")+input, { turnId, verbosity, skills:loadedSkills?.names, environment:runtimeEnvironment, emit, signal: abort.signal,
         ...(peerContext?{peerContext}:{}),
@@ -944,6 +1012,7 @@ export class SessionEngine {
       // 竞态守卫：只有本 turn 仍是当前 turn 才能收尾（避免旧 turn 覆盖新 turn 状态）
       if (!this.disposed && rec.currentTurnId === turnId && rec.status !== "terminated") {
         if(rec.nativeStop?.turnId===turnId){
+          this.allowQueueDrain(rec);
           rec.nativeStopSettled=true;rec.abort=undefined;rec.currentTurnId=undefined;rec.status=rec.nativeStop.state==="confirmed"?"idle":"paused";this.persist(rec);
           return;
         }
@@ -952,13 +1021,13 @@ export class SessionEngine {
         rec.currentTurnId = undefined;
         this.persist(rec);
         this.emit2("turn", "info", "turn.end", rec, { turnId, msg: `turn ${turnId} ended` });
-        const next = rec.queue.shift();
+        const next = this.allowQueueDrain(rec)?rec.queue.shift():undefined;
         if (next) {
-          const n = JSON.parse(next) as { turnId: string; input: string; verbosity: typeof verbosity; skills?: SkillSelection[]; skillBindings?:FrozenSkillSet; environment?: Record<string, string>; reasoning?:TurnReasoning };
+          const n = JSON.parse(next) as { turnId: string; input: string; verbosity: typeof verbosity; skills?: SkillSelection[]; skillBindings?:FrozenSkillSet; environment?: Record<string, string>; reasoning?:TurnReasoning;authority:ProjectAuthority };
           rec.status = "running";
           rec.currentTurnId = n.turnId;
           rec.lastActiveAt = new Date().toISOString();
-          this.startTurn(rec,n.input,n.turnId,n.verbosity,n.skills,n.environment,n.reasoning,n.skillBindings);
+          this.startTurn(rec,n.input,n.turnId,n.verbosity,n.authority,n.skills,n.environment,n.reasoning,n.skillBindings);
         }
       }
     }
@@ -1008,14 +1077,14 @@ export class SessionEngine {
       if (!adapterSettled || !adapterSucceeded) rec.detached = true;
       this.persist(rec);
       if (drainQueue) {
-        const next = rec.queue.shift();
+        const next = this.allowQueueDrain(rec)?rec.queue.shift():undefined;
         if (next) {
-          const n = JSON.parse(next) as { turnId: string; input: string; verbosity: "final" | "messages" | "tools" | "trace"; skills?: SkillSelection[]; skillBindings?:FrozenSkillSet; environment?: Record<string, string>; reasoning?:TurnReasoning };
-          if (rec.detached) await this.reattach(rec);
+          const n = JSON.parse(next) as { turnId: string; input: string; verbosity: "final" | "messages" | "tools" | "trace"; skills?: SkillSelection[]; skillBindings?:FrozenSkillSet; environment?: Record<string, string>; reasoning?:TurnReasoning;authority:ProjectAuthority };
+          if (rec.detached) await this.reattach(rec,n.authority);
           rec.status = "running";
           rec.currentTurnId = n.turnId;
           rec.lastActiveAt = new Date().toISOString();
-          this.startTurn(rec,n.input,n.turnId,n.verbosity,n.skills,n.environment,n.reasoning,n.skillBindings);
+          this.startTurn(rec,n.input,n.turnId,n.verbosity,n.authority,n.skills,n.environment,n.reasoning,n.skillBindings);
         }
       }
     }
@@ -1037,6 +1106,7 @@ export class SessionEngine {
 
   private confirmNativeStop(rec:SessionRecord,confirmation:"process_tree_exit"|"native_terminal"|"not_started"){
     if(this.disposed||!rec.nativeStop||rec.nativeStop.state==="confirmed")return;
+    this.allowQueueDrain(rec);
     rec.nativeStop={...rec.nativeStop,state:"confirmed",observedAt:new Date().toISOString(),confirmation,reasonCode:undefined};
     rec.status="idle";rec.currentTurnId=undefined;rec.abort=undefined;this.persist(rec);
     const turnId=rec.nativeStop.turnId;
@@ -1049,6 +1119,9 @@ export class SessionEngine {
 
   async stopNative(tenant:string,session:string,turnId?:string,reason?:string):Promise<NativeStopTarget>{
     const rec=this.assertTenant(session,tenant),target=turnId??rec.currentTurnId??rec.turnSettlement?.turnId;
+    // Stop remains available after revocation, but its settlement must never
+    // leave previously queued work available for a later re-admission.
+    this.allowQueueDrain(rec);
     if(rec.nativeStop&&rec.nativeStop.turnId===target){if(rec.nativeStopOperation)await settleWithin([rec.nativeStopOperation]);return this.nativeStopStatus(tenant,session,target);}
     const unknown=(code:string):NativeStopTarget=>({version:1,sessionId:session as never,...(target?{turnId:target}:{}),state:"unknown",observedAt:new Date().toISOString(),reasonCode:code});
     if(this.disposed||rec.detached)return unknown("native_session_unavailable");
@@ -1079,6 +1152,7 @@ export class SessionEngine {
 
   async switchModel(tenantId: string, sessionId: string, model: string): Promise<{ previousModel: string; model: string; warnings?: string[] }> {
     const rec = this.assertTenant(sessionId, tenantId);
+    this.assertProjectAuthority(rec);
     this.assertCompressionIdle(rec);
     if(rec.detached||rec.status!=="idle")throw new PhononError("errSessionBusy","model switching requires a live idle session");
     this.control(rec,true);
@@ -1102,6 +1176,7 @@ export class SessionEngine {
 
   async inject(tenantId: string, sessionId: string, context: ContextItem[]): Promise<{ injected: number }> {
     const rec = this.assertTenant(sessionId, tenantId);
+    this.assertProjectAuthority(rec);
     this.assertCompressionIdle(rec);
     if (rec.detached || rec.status === "terminated") throw new PhononError("errSessionBusy", "context injection requires an attached Session");
     this.control(rec,true);
@@ -1122,11 +1197,13 @@ export class SessionEngine {
     background = false,
   ): Promise<CompressionReceipt> {
     const rec = this.assertTenant(sessionId, tenantId);
+    const authority=this.captureProjectAuthority(rec);
     if(!this.store)throw new PhononError("errCapabilityUnsupported","compression receipts require a session store");
     const requestHash=compressionRequestHash(sessionId,mode,strategy,options?.keepRecentToolCalls);
     const prior=this.store.compressionReceipt(tenantId,requestId);
     if(prior){
       if(prior.sessionId!==sessionId||prior.requestHash!==requestHash)throw new PhononError("errInvalidParams","compression request identity changed");
+      if(this.store.compressionAuthorityGeneration(tenantId,requestId)!==authority.generation)throw new PhononError("errPolicyDenied","compression admission generation changed");
       return observedCompression(prior,this.store.activeCompressions,tenantId);
     }
     this.assertCompressionIdle(rec);
@@ -1135,15 +1212,18 @@ export class SessionEngine {
     if(!controls[mode])throw new PhononError("errCapabilityUnsupported",`${mode} compression is unavailable for this session`);
     const at=new Date().toISOString(),receipt:CompressionReceipt={operationId:requestId,sessionId:sessionId as never,requestHash,state:"running",mode,
       agent:rec.agent,model:rec.model,project:rec.project,createdAt:at,updatedAt:at};
-    try{this.store.beginCompression(tenantId,receipt);}catch{throw new PhononError("errSessionBusy","compression admission is unconfirmed");}
+    try{this.store.beginCompression(tenantId,receipt,authority.generation);}catch{throw new PhononError("errSessionBusy","compression admission is unconfirmed");}
     const active=tenantId+"\0"+requestId;this.store.activeCompressions.add(active);
     const operation=(async()=>{
       let releaseEmployee:(()=>void)|undefined;
+      let dispatched=false;
       try{
         if(rec.employeeId)releaseEmployee=this.runtimeContext?.useEmployee?.(rec.tenantId,rec.employeeId);
         const tokens=async()=>{const value=await observeContext(rec);return Number.isSafeInteger(value?.usedTokens)&&value!.usedTokens!>=0?value!.usedTokens:undefined;};
         receipt.tokensBefore=await tokens();
         if(this.disposed)throw new Error("compression connection ended before execution");
+        this.assertProjectAuthority(rec,authority);
+        dispatched=true;
         const result=mode==="native"?await rec.adapterSession.compressNative!():await rec.adapterSession.compressCustom!(strategy??"dropToolIO",options);
         const stats=result as {applied?:boolean;summary?:string;filesChanged?:number;recordsChanged?:number;blocksRemoved?:number;bytesBefore?:number;bytesAfter?:number};
         const applied=mode==="native"?stats.applied:typeof stats.filesChanged==="number"?stats.filesChanged>0:undefined;
@@ -1154,9 +1234,9 @@ export class SessionEngine {
         receipt.tokensAfter=await tokens();
         CompressionReceipt.parse(receipt);
       }catch{
-        receipt.state="unknown";receipt.errorCode="compression_outcome_unknown";
+        receipt.state=dispatched?"unknown":"failed";receipt.errorCode=dispatched?"compression_outcome_unknown":"compression_not_dispatched";
         for(const key of ["filesChanged","recordsChanged","blocksRemoved","bytesBefore","bytesAfter","tokensAfter"] as const)delete receipt[key];
-        if(!this.disposed){rec.status="paused";this.persist(rec);}
+        if(!this.disposed&&dispatched){rec.status="paused";this.persist(rec);}
       }finally{
         receipt.updatedAt=new Date().toISOString();
         try{this.store!.finishCompression(tenantId,receipt);}finally{this.store!.activeCompressions.delete(active);releaseEmployee?.();}

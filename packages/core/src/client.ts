@@ -280,10 +280,14 @@ export class PhononClient {
           assertCurrent();
           this.lastTenantId = welcome.tenantId;
           this.store.rememberConnectionTenant(this.serverUrl, welcome.tenantId, new Date().toISOString());
+          const localDirectorySource={url:this.serverUrl,deviceKey:this.deviceKey,expectedTenantId:this.expectedTenantId};
+          // Observation is not consent. Legacy non-private storage cannot grant.
+          try{this.store.localDirectoryAdmissions().observe(localDirectorySource,welcome.tenantId);}catch{}
 
           const conn = new PhononConnection({
             managedMcp: this.managedMcp,
             tenantId: welcome.tenantId,
+            localDirectorySource,
             archiveAuthority: new URL(this.serverUrl).origin,
             transport,
             registry: this.registry,
