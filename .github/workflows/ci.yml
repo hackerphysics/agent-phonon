@@ -41,10 +41,8 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run consistency
-      - run: pnpm --filter @agent-phonon/protocol build
-      - run: pnpm --filter @agent-phonon/core build
-      - run: pnpm --filter @agent-phonon/server-sdk build
-      - run: pnpm --filter @agent-phonon/test-server build
+      - name: Build test server and workspace dependencies
+        run: pnpm --filter @agent-phonon/test-server... -r build
 
       - uses: actions/setup-python@v5
         with:
@@ -72,10 +70,8 @@ jobs:
           node-version: 24.x
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @agent-phonon/protocol build
-      - run: pnpm --filter @agent-phonon/core build
-      - run: pnpm --filter @agent-phonon/server-sdk build
-      - run: pnpm --filter @agent-phonon/test-server build
+      - name: Build test server and workspace dependencies
+        run: pnpm --filter @agent-phonon/test-server... -r build
       - name: Run maintenance/rescue tests
         run: node --test packages/test-server/dist/fn-maintenance.test.js packages/test-server/dist/fn-maintenance-rpc.test.js packages/test-server/dist/fn-rescue-adapter.test.js
       - name: Build daemon service tests
