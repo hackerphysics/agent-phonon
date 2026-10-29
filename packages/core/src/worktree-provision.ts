@@ -7,7 +7,7 @@ import {WorktreeProvisionLedger,type WorktreeProvisionRecord} from './worktree-p
 import {PhononError} from './rpc.js';
 import type {PolicyEnforcer} from './policy.js';
 import type {ProjectManager} from './project-manager.js';
-import {directoryIdentity,assertDirectoryIdentity} from './directory-identity.js';
+import {directoryIdentity,assertDirectoryIdentity,assertRegisteredDirectory} from './directory-identity.js';
 import {workspacePathKey} from './workspace-paths.js';
 import {requestFingerprint} from './idempotency.js';
 import {spawnSupervised} from './process-supervisor.js';
@@ -83,10 +83,10 @@ export class WorktreeProvisioner{
     if(!this.path||!this.ledger&&!existsSync(this.path))throw unconfirmed();
     const row=this.data().workspace(this.tenant,id);
     if(!row||row.state!=='confirmed'||row.path!==path||!row.directory_identity||!row.git_directory||!row.git_identity)throw unconfirmed();
-    this.policy.assertProjectPath(row.source_path);assertDirectoryIdentity(row.source_path,row.source_identity);
+    this.policy.assertProjectPath(row.source_path);assertRegisteredDirectory(row.source_path);
     this.projects.assertRepositoryPath(row.source_common_dir);this.projects.assertRepositoryPath(row.git_directory);
-    assertDirectoryIdentity(row.source_common_dir,row.source_common_identity);
-    assertDirectoryIdentity(path,row.directory_identity);assertDirectoryIdentity(row.git_directory,row.git_identity);
+    assertRegisteredDirectory(row.source_common_dir);
+    assertRegisteredDirectory(path);assertRegisteredDirectory(row.git_directory);
     const file=join(path,'.git'),stat=lstatSync(file);
     if(!stat.isFile()||stat.isSymbolicLink()||stat.nlink!==1||stat.size>8192)throw unconfirmed();
     const pointer=/^gitdir: (.+)\n?$/.exec(readFileSync(file,'utf8'))?.[1];
@@ -101,7 +101,7 @@ export class WorktreeProvisioner{
   private rowScope(row:WorktreeProvisionRecord,projectId:string){
     if(row.project_id!==projectId)throw new PhononError('errInvalidParams','Worktree operation belongs to another project');
     const source=this.projects.get(projectId);if(source.employeeId||source.path!==row.source_path)throw unconfirmed();
-    assertDirectoryIdentity(source.path,row.source_identity);this.projects.assertRepositoryPath(row.source_common_dir);assertDirectoryIdentity(row.source_common_dir,row.source_common_identity);
+    assertRegisteredDirectory(source.path);this.projects.assertRepositoryPath(row.source_common_dir);assertRegisteredDirectory(row.source_common_dir);
     this.policy.assertProjectPath(row.path);
   }
   private view(row:WorktreeProvisionRecord):Result{

@@ -8,7 +8,7 @@ import { PhononError } from "./rpc.js";
 import { buildChildProcessEnvironment } from "./child-env.js";
 import { randomUUID,createHash } from "node:crypto";
 import {canonicalWorkspacePath,workspacePathKey,workspacePathsOverlap,assertNamespacePathAvailable,assertProcessPathAvailable,assertNamespaceBrowsePath,assertProcessBrowsePath,rememberProcessPath,type NamespacePath} from "./workspace-paths.js";
-import {assertDirectoryIdentity,directoryIdentity} from "./directory-identity.js";
+import {assertDirectoryIdentity,assertRegisteredDirectory,directoryIdentity} from "./directory-identity.js";
 import {observeWorkspaceGit,observeWorkspaceGitOrigin} from "./workspace-git-observation.js";
 
 /**
@@ -204,11 +204,11 @@ export class ProjectManager {
   assertRepositoryPath(path:string){this.refreshFromStore();this.assertProjectPath?.(path);this.assertOwnership(path);}
   registerPreparedWorktree(record:ProjectRecord):ProjectRecord{
     if(record.namespace!==this.namespace||!record.git||record.employeeId||!record.directoryIdentity||!record.projectId.startsWith('worktree-'))throw new PhononError('errPolicyDenied');
-    this.refreshFromStore();this.assertProjectPath?.(record.path);assertDirectoryIdentity(record.path,record.directoryIdentity);
+    this.refreshFromStore();this.assertProjectPath?.(record.path);assertRegisteredDirectory(record.path);
     if(this.reserveOwnership(record.path)!==record.path)throw new PhononError('errPolicyDenied','Worktree identity changed');
     const previous=this.projects.get(record.projectId);
     if(previous){
-      if(previous.path!==record.path||previous.namespace!==record.namespace||previous.directoryIdentity!==record.directoryIdentity||previous.name!==record.name||!previous.git)
+      if(previous.path!==record.path||previous.namespace!==record.namespace||previous.name!==record.name||!previous.git)
         throw new PhononError('errPolicyDenied','Worktree registration changed');
       return this.get(record.projectId);
     }
@@ -290,7 +290,7 @@ export class ProjectManager {
   list(): ProjectRecord[] {
     this.refreshFromStore();
     return [...this.projects.values()].filter(p => this.namespace===undefined||p.namespace===this.namespace)
-      .filter(p=>{try{this.assertProjectPath?.(p.path);if(p.directoryIdentity)assertDirectoryIdentity(p.path,p.directoryIdentity);return true;}catch(error){if(error instanceof PhononError&&error.appCode==="errPolicyDenied"||p.directoryIdentity)return false;throw error;}})
+      .filter(p=>{try{this.assertProjectPath?.(p.path);if(p.directoryIdentity)assertRegisteredDirectory(p.path);return true;}catch(error){if(error instanceof PhononError&&error.appCode==="errPolicyDenied"||p.directoryIdentity)return false;throw error;}})
       .map(p=>{this.assertOwnership(p.path);this.assertPreparedIdentity?.(p.projectId,p.path);return p;});
   }
 
@@ -303,7 +303,7 @@ export class ProjectManager {
     this.assertProjectPath?.(canonical);
     this.assertOwnership(canonical);
     this.assertPreparedIdentity?.(rec.projectId,canonical);
-    if(rec.directoryIdentity)assertDirectoryIdentity(rec.path,rec.directoryIdentity);
+    if(rec.directoryIdentity)assertRegisteredDirectory(rec.path);
     return rec;
   }
 

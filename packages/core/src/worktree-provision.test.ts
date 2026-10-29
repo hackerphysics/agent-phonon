@@ -92,16 +92,28 @@ test('bad local branch names and an uncommitted source refuse before any checkou
   }finally{await f.close();}
 });
 
-test('changing the directory inode or Git pointer invalidates a confirmed workspace without deleting user data',async()=>{
-  for(const corruption of ['directory','gitPointer']){
+test('registered worktrees ignore historical device and inode numbers but still reject a changed Git pointer',async()=>{
+  for(const corruption of ['historicalIdentity','gitPointer']){
     const f=fixture();try{
       const a=f.actor(),input=await a.input(),reply=await a.call('project.worktree.provision',input);assert(reply.result,JSON.stringify(reply));
       const target=reply.result.workspace.path;
-      if(corruption==='directory'){renameSync(target,target+'-retained');mkdirSync(target);writeFileSync(join(target,'keep.txt'),'new unrelated bytes');}
-      else writeFileSync(join(target,'.git'),'gitdir: '+join(f.source,'.git')+'\n');
-      assert((await a.call('project.worktree.provision.status',{projectId:input.projectId,clientRequestId:input.clientRequestId,expectedReceiverID:input.expectedReceiverID})).error);
-      assert((await a.call('project.get',{projectId:reply.result.workspace.projectId})).error);
-      if(corruption==='directory')assert.equal(readFileSync(join(target,'keep.txt'),'utf8'),'new unrelated bytes');
+      if(corruption==='historicalIdentity'){
+        const ledger=new DatabaseSync(f.database+'.worktrees.sqlite');
+        try{
+          ledger.exec('DROP TRIGGER worktree_identity_immutable');
+          ledger.prepare("UPDATE worktrees SET source_identity='dir:123:1',source_common_identity='dir:123:2',directory_identity='dir:123:3',git_identity='dir:123:4' WHERE workspace_id=?").run(reply.result.workspace.projectId);
+        }finally{ledger.close();}
+        const record=f.store.loadProjects().find(row=>row.projectId===reply.result.workspace.projectId)!;
+        f.store.upsertProject({...record,directoryIdentity:'dir:123:3'});
+        assert((await a.call('project.get',{projectId:record.projectId})).result);
+        const status=await a.call('project.git.status',{projectId:record.projectId});
+        assert(status.result,JSON.stringify(status));assert.equal(status.result.workspace.isWorktree,true);
+        assert.equal((await a.call('project.worktree.provision.status',{projectId:input.projectId,clientRequestId:input.clientRequestId,expectedReceiverID:input.expectedReceiverID})).result.state,'confirmed');
+      }else{
+        writeFileSync(join(target,'.git'),'gitdir: '+join(f.source,'.git')+'\n');
+        assert((await a.call('project.worktree.provision.status',{projectId:input.projectId,clientRequestId:input.clientRequestId,expectedReceiverID:input.expectedReceiverID})).error);
+        assert((await a.call('project.get',{projectId:reply.result.workspace.projectId})).error);
+      }
     }finally{await f.close();}
   }
 });

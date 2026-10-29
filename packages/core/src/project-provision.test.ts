@@ -126,12 +126,12 @@ localTest("competing preexisting targets fail known-refused and remain preserved
     assert.equal((await a.call("project.provision",input)).result.state,"failed");assert.equal(readFileSync(join(path,"keep.txt"),"utf8"),"Competing human directory");assert.equal(f.store.loadProjects().length,0);
   }finally{await f.close();}
 });
-localTest("confirmed directory replacement is refused by status, ordinary project reads and new project adoption",async()=>{
+localTest("registered project access follows its bound path after local directory replacement",async()=>{
   const f=fixture();try{
     const a=f.actor(),input=await a.input(),created=(await a.call("project.provision",input)).result;
     renameSync(created.project.path,created.project.path+"-original");mkdirSync(created.project.path);writeFileSync(join(created.project.path,"keep.txt"),"Replacement human tree");
     assert.ok((await a.call("project.provision.status",{clientRequestId:input.clientRequestId,expectedReceiverID:input.expectedReceiverID})).error);
-    assert.ok((await a.call("project.get",{projectId:created.project.projectId})).error);
+    assert.ok((await a.call("project.get",{projectId:created.project.projectId})).result);
     assert.ok((await a.call("project.create",{name:"Adopt replaced",path:created.project.path,git:false})).error);
     assert.equal(readFileSync(join(created.project.path,"keep.txt"),"utf8"),"Replacement human tree");
   }finally{await f.close();}
