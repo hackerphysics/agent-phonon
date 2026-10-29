@@ -65,6 +65,43 @@ test("current-turn input uses its private local bridge without a coordination ca
   await operation.promise;
 }));
 
+test("pre-effect authorization is read-only and cannot settle an insertion", () => fixture(async state => {
+  let checks=0;
+  const operation=insert(state.input,"authorized input",()=>{checks++;}),point=boundary(),batch=await state.access.prepare(point);
+  const observation={boundaryId:point.boundaryId,nativeSessionId:point.nativeSessionId,
+    messageIds:batch.messages.map(value=>value.messageId),evidence:"provider_payload" as const};
+  const url=state.options.environment!.AGENT_PHONON_PEER_CONTEXT_URL!;
+  const headers={Authorization:"Bearer "+state.options.environment!.AGENT_PHONON_PEER_CONTEXT_TOKEN!,"Content-Type":"application/json"};
+  const response=await fetch(url+"/authorize",{method:"POST",headers,body:JSON.stringify(observation)});
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{authorized:true});
+  assert.equal(checks,2);assert.equal(operation.settled(),false);
+  state.access.observe(observation);await operation.promise;
+}));
+
+test("pre-effect authorization rejects withdrawn input without an applied receipt", () => fixture(async state => {
+  let allowed=true;
+  const operation=insert(state.input,"withdrawn",()=>{if(!allowed)throw new Error("revoked");}),point=boundary(),batch=await state.access.prepare(point);
+  allowed=false;
+  assert.throws(()=>state.access.authorize!({boundaryId:point.boundaryId,nativeSessionId:point.nativeSessionId,
+    messageIds:batch.messages.map(value=>value.messageId),evidence:"provider_payload"}),/revoked/);
+  await assert.rejects(operation.promise,/revoked/);
+}));
+
+test("a weak per-request transport cannot receive or acknowledge ordinary input", () => fixture(async state => {
+  const operation=insert(state.input),point={...boundary(),inputEvidence:"context_hook" as const};
+  assert.equal((await state.access.prepare(point)).messages.length,0);
+  await assert.rejects(operation.promise,{appCode:"errCapabilityUnsupported"});
+  await assert.rejects(insert(state.input).promise,{appCode:"errCapabilityUnsupported"});
+  await state.access.prepare({...boundary(),inputEvidence:"provider_payload"});
+  const eligible=insert(state.input),next=boundary(),batch=await state.access.prepare(next);
+  state.access.authorize!({boundaryId:next.boundaryId,nativeSessionId:next.nativeSessionId,
+    messageIds:batch.messages.map(value=>value.messageId),evidence:"provider_payload"});
+  assert.equal(eligible.settled(),false);
+  state.access.observe({boundaryId:next.boundaryId,nativeSessionId:next.nativeSessionId,
+    messageIds:batch.messages.map(value=>value.messageId),evidence:"provider_payload"});
+  await eligible.promise;
+}));
+
 test("wrong native identities, turns and unoffered observations cannot acknowledge insertion", () => fixture(async state => {
   await assert.rejects(state.input.insert("wrong turn", { turnId: "other", signal: new AbortController().signal }), { appCode: "errSessionBusy" });
   const operation = insert(state.input), point = boundary();
@@ -78,6 +115,10 @@ test("wrong native identities, turns and unoffered observations cannot acknowled
   assert.equal(operation.settled(), false);
   state.access.observe(observation);
   await operation.promise;
+  state.access.authorize!(observation);
+  const next=boundary();await state.access.prepare(next);
+  assert.throws(()=>state.access.authorize!({...observation,boundaryId:next.boundaryId}),{appCode:"errSessionBusy"});
+  assert.throws(()=>state.access.observe({...observation,boundaryId:next.boundaryId}),{appCode:"errSessionBusy"});
 }));
 
 test("identical concurrent insertions keep independent native observations", () => fixture(async state => {

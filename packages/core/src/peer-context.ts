@@ -13,7 +13,9 @@ export const PeerContextBudget=z.discriminatedUnion("state",[
   z.object({state:z.literal("unknown"),source:z.literal("native_estimate")}).strict(),
 ]);
 const boundaryIdentity=z.object({ boundaryId: id, nativeSessionId: z.string().min(1).max(512) }).strict();
-export const PeerContextBoundary = boundaryIdentity.extend({budget:PeerContextBudget.optional()}).strict();
+export const PeerContextBoundary = boundaryIdentity.extend({budget:PeerContextBudget.optional(),
+  /** Per-request ceiling; a custom native transport may not expose its final payload. */
+  inputEvidence:z.enum(["context_hook","provider_payload"]).optional()}).strict();
 export const PeerContextObservation = boundaryIdentity.extend({
   messageIds: z.array(id).min(1).max(8).refine(ids => new Set(ids).size === ids.length),
   evidence: z.enum(["context_hook", "provider_payload"]),
@@ -32,6 +34,8 @@ export function peerContextHeadroom(budget:z.infer<typeof PeerContextBudget>):nu
 }
 export interface PeerContextAccess {
   prepare(boundary: PeerContextBoundary, signal?: AbortSignal): Promise<PeerContextBatch>;
+  /** Pure pre-effect authorization; never a delivery observation or ACK. */
+  authorize?(observation: PeerContextObservation): void;
   observe(observation: PeerContextObservation): void;
 }
 export interface PeerContextCapability {
@@ -97,6 +101,14 @@ export class PeerContextJournal {
       this.db.exec("COMMIT");
       return claimed;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+  assertOffered(scope: Scope, observation: PeerContextObservation): void {
+    const select=this.db.prepare(`SELECT 1 FROM peer_context WHERE tenant_id=? AND session_id=? AND turn_id=? AND run_id=?
+      AND boundary_id=? AND native_session_id=? AND message_id=?`);
+    for(const messageId of observation.messageIds){
+      if(!select.get(scope.tenantId,scope.sessionId,scope.turnId,scope.runId,observation.boundaryId,observation.nativeSessionId,messageId))
+        throw new Error("Peer context authorization does not match an offered message");
+    }
   }
   observe(scope: Scope, observation: PeerContextObservation): void {
     this.db.exec("BEGIN IMMEDIATE");
@@ -219,10 +231,16 @@ export class PeerContextReceiver implements PeerContextAccess {
     } finally { this.pending = false; }
   }
 
-  observe(raw: PeerContextObservation): void {
+  authorize(raw: PeerContextObservation): void {
     const observation = PeerContextObservation.parse(raw);
     this.assertActive(observation);
     if (this.options.evidence === "context_hook" && observation.evidence !== "context_hook") throw new Error("Peer observation exceeds the selected native evidence capability");
+    this.options.journal.assertOffered(this.options, observation);
+  }
+
+  observe(raw: PeerContextObservation): void {
+    const observation = PeerContextObservation.parse(raw);
+    this.authorize(observation);
     this.options.journal.observe(this.options, observation);
     this.options.reportChanged?.();
     // Native hook/payload observations are not ACKs or proof of model consumption.

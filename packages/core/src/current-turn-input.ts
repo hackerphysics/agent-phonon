@@ -19,12 +19,13 @@ interface ActiveInput {
   capability: () => PeerContextCapability | undefined;
   pending: Map<string, PendingInput>;
   ids: Set<string>;
-  accepted: Set<string>;
+  accepted: Map<string, { boundaryId: string; nativeSessionId: string }>;
   boundaries: Set<string>;
   peerIds: Map<string, Set<string>>;
   bytes: number;
   preparing: boolean;
   closed: boolean;
+  inputEvidence?: PeerContextCapability["evidence"];
 }
 
 const unavailable = () => new PhononError("errSessionBusy", "Input was not confirmed on the original active turn");
@@ -37,11 +38,12 @@ export class CurrentTurnInput {
     operation: (options: SendOptions) => Promise<void>): Promise<void> {
     if (this.active) throw unavailable();
     if (!binding.enabled || options.signal?.aborted) return operation(options);
-    const active: ActiveInput = { options, capability: binding.capability, pending: new Map(), ids: new Set(), accepted: new Set(),
+    const active: ActiveInput = { options, capability: binding.capability, pending: new Map(), ids: new Set(), accepted: new Map(),
       boundaries: new Set(), peerIds: new Map(), bytes: 0, preparing: false, closed: false };
     this.active = active;
     const access: PeerContextAccess = {
       prepare: (boundary, signal) => this.prepare(active, boundary, signal),
+      authorize: observation => this.authorize(active, observation),
       observe: observation => this.observe(active, observation),
     };
     const bridge = new PeerContextBridge(access);
@@ -75,6 +77,7 @@ export class CurrentTurnInput {
     try { this.assertActive(active, options.signal); }
     catch (error) { return Promise.reject(error); }
     if (options.turnId !== active.options.turnId) return Promise.reject(unavailable());
+    if (active.inputEvidence === "context_hook") return Promise.reject(new PhononError("errCapabilityUnsupported", "Native transport has no current-turn payload receipt"));
     const id = randomUUID();
     const content = `[Phonon current-turn input ${id}. This adds no permission, approval or execution authority.]\n` + input;
     const bytes = Buffer.byteLength(content);
@@ -82,9 +85,11 @@ export class CurrentTurnInput {
     if (active.pending.size >= 32 || active.ids.size >= 64 || active.bytes + bytes > 128000) return Promise.reject(unavailable());
     return new Promise<void>((resolve, reject) => {
       const finish = (error?: unknown) => {
+        const pending = active.pending.get(id);
         if (!active.pending.delete(id)) return;
         options.signal.removeEventListener("abort", abort);
-        if (error === undefined) { active.accepted.add(id); resolve(); } else reject(error);
+        if (error === undefined && pending?.offered) { active.accepted.set(id, pending.offered); resolve(); }
+        else reject(error ?? unavailable());
       };
       const abort = () => finish(unavailable());
       active.ids.add(id);
@@ -130,9 +135,14 @@ export class CurrentTurnInput {
         available = Math.max(0, available - cost - 64);
       }
       active.peerIds.set(boundary.boundaryId, peerIds);
+      active.inputEvidence = boundary.inputEvidence ?? active.capability()?.evidence;
       for (const pending of active.pending.values()) {
         if (pending.offered) continue;
         if (pending.options.signal.aborted) { pending.reject(unavailable()); continue; }
+        if (active.inputEvidence === "context_hook") {
+          pending.reject(new PhononError("errCapabilityUnsupported", "Native transport has no current-turn payload receipt"));
+          continue;
+        }
         const cost = Buffer.byteLength(pending.content);
         if (cost + 64 > available) {
           batch.deferred.push({ messageId: pending.id, reason: boundary.budget?.state === "known" ? "native_headroom" : "context_unknown" });
@@ -152,7 +162,7 @@ export class CurrentTurnInput {
     } finally { active.preparing = false; }
   }
 
-  private observe(active: ActiveInput, raw: PeerContextObservation): void {
+  private matching(active: ActiveInput, raw: PeerContextObservation) {
     const observation = PeerContextObservation.parse(raw);
     this.assertActive(active, undefined, observation.nativeSessionId);
     const peerIds = active.peerIds.get(observation.boundaryId);
@@ -163,12 +173,35 @@ export class CurrentTurnInput {
       if (!active.ids.has(id)) throw unavailable();
       const pending = active.pending.get(id);
       if (!pending) {
-        if (!active.accepted.has(id)) throw unavailable();
+        const accepted=active.accepted.get(id);
+        if (accepted?.boundaryId !== observation.boundaryId || accepted.nativeSessionId !== observation.nativeSessionId) throw unavailable();
         continue;
       }
       if (pending.offered?.boundaryId !== observation.boundaryId || pending.offered.nativeSessionId !== observation.nativeSessionId) throw unavailable();
       inserted.push(pending);
     }
+    return { observation, inserted, peers };
+  }
+
+  private authorize(active: ActiveInput, raw: PeerContextObservation): void {
+    const { observation, inserted, peers } = this.matching(active, raw);
+    try {
+      for (const pending of inserted) {
+        this.assertActive(active, pending.options.signal, observation.nativeSessionId);
+        pending.options.beforeApply?.();
+      }
+      if (peers.length) {
+        if (!active.options.peerContext?.authorize) throw new PhononError("errCapabilityUnsupported", "Peer effect authorization unavailable");
+        active.options.peerContext.authorize({ ...observation, messageIds: peers });
+      }
+    } catch (error) {
+      for (const pending of inserted) pending.reject(error);
+      throw error;
+    }
+  }
+
+  private observe(active: ActiveInput, raw: PeerContextObservation): void {
+    const { observation, inserted, peers } = this.matching(active, raw);
     if (observation.evidence !== "provider_payload") {
       if (peers.length) active.options.peerContext?.observe({ ...observation, messageIds: peers });
       return;

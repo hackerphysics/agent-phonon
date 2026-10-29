@@ -46,6 +46,19 @@ test("new peer mail enters the next runtime boundary without a model inbox tool 
   } finally { f.close(); }
 });
 
+test("peer effect authorization validates exact offers without creating delivery or consumption evidence",async()=>{
+  const f=fixture();try{
+    const receiver=f.create(),message=f.message();f.state.messages=[message];
+    const batch=await receiver.prepare(f.boundary()),observation={boundaryId:batch.boundaryId,nativeSessionId:batch.nativeSessionId,
+      messageIds:[message.id],evidence:"provider_payload" as const};
+    receiver.authorize(observation);assert.equal(f.journal.records("tenant","session")[0]!.state,"offered");
+    assert.throws(()=>receiver.authorize({...observation,messageIds:[randomUUID()]}),/offered/);
+    assert.throws(()=>receiver.authorize({...observation,boundaryId:randomUUID()}),/offered/);
+    f.state.active=false;assert.throws(()=>receiver.authorize(observation),/not active/);
+    assert.equal(f.journal.records("tenant","session")[0]!.state,"offered");
+  }finally{f.close();}
+});
+
 test("pending native admission does not reinsert mail already offered in this turn's polling bootstrap", async () => {
   const f = fixture(); try {
     const initial = f.message(), next = f.message(), initialMessageIds = new Set<string>();
