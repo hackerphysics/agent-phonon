@@ -106,6 +106,8 @@ export interface AdapterSession {
 }
 
 export interface SendOptions {
+  /** Repeatable controller guard immediately before native effects after async work. */
+  beforeNativeEffect?: () => void;
   /** Controller-owned current-turn checkpoints; never a new prompt or an approval answer. */
   peerContext?: PeerContextAccess;
   /** Best-effort native preference; settings evidence is separate from task outcome. */
