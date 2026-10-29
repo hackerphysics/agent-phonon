@@ -38,5 +38,14 @@ It is not paid-model, physical cross-device or production deployment evidence.
 The adapter uses the shared original-window/source fence independently of
 separate directory-admission changes. The transport/request handlers and the
 adapter's runtime qualification are distinct; transport presence alone must
-not enable an adapter capability. Managed-MCP end-to-end acceptance and release
-remain separate requirements.
+not enable an adapter capability.
+
+October 30 cross-session acceptance now passes through the actual public HTTP
+and managed stdio-proxy Phonon MCP paths. Two real installed Codex sessions
+verify exact-retry insertion before original receiver completion, unchanged
+original session/turn/run identity, closed-window refusal without replay and
+actual native MCP approval denial. The six native cases and 513 configured
+delivery regressions pass without skips. The fixture explicitly authorizes
+only its synthetic send tool; no personal config or production runtime is
+changed. See the [Phonon Work evidence at `56e8bd5`](https://github.com/hackerphysics/phonon-work/blob/56e8bd5df45b1c203426dc91bece81f0a60843e1/agents/NATIVE_MID_TURN_MCP_TEST_RUN_2026-10-30.md).
+This does not certify the other harnesses' complete MCP chains or a release.

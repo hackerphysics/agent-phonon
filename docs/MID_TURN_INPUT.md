@@ -49,8 +49,22 @@ not become queued input. The shared input fence freezes the original logical
 subject and revalidates the caller at each native effect. Its scoped snapshot
 builds without importing separate directory-admission changes; those existing
 working-tree guards remain preserved rather than absorbed into this feature.
-Managed-MCP cross-session end-to-end acceptance and production release are
-still open.
+The seven adapter integrations are committed and pushed as `e57cbea`. Codex
+cross-session end-to-end acceptance now passes through both public HTTP and
+the actual managed stdio proxy. Phonon Work commit `56e8bd5` contains the
+reproducible six-case matrix and 513 passing configured delivery regressions;
+see the [October 30 MCP evidence](https://github.com/hackerphysics/phonon-work/blob/56e8bd5df45b1c203426dc91bece81f0a60843e1/agents/NATIVE_MID_TURN_MCP_TEST_RUN_2026-10-30.md).
+Two actual installed Codex sessions, native tool execution, original receiver
+session/turn/run identity, exact retry, closed-window refusal and native MCP
+approval denial are verified with controlled local provider responses. The
+receiver sees inserted content before its original execution completes, not
+in a replacement task. Test-owned processes, database and fixtures are removed.
+
+That complete real-MCP matrix has not yet been run for the other six harnesses;
+their native adapter/SessionEngine tests are separate evidence, not substitute
+full-chain receipts. All-harness MCP acceptance remains open. Production
+release/activation and broader provider/version/OS acceptance are not claimed.
+For OpenClaw the qualified path is Gateway, not the unqualified one-shot CLI.
 
 Mobile waiting batches and FIFO input are separate scheduling requirements.
 This contract does not claim that durable waiting batches, pending-input
