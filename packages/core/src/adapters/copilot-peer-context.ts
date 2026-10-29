@@ -62,12 +62,12 @@ export async function readCopilotNativeBudget(session,usage,toolResult,environme
   catch{return unknownBudget();}finally{clearTimeout(timer);}
 }
 
-export function createCopilotPeerHooks({sessionId,cwd,promptHash,checkpoint,getNativeTasks,getPendingPermissions,getNativeBudget=async()=>unknownBudget(),active=()=>true,onClosed=()=>{}}) {
-  const tools=new Map(),children=new Set();
+export function createCopilotPeerHooks({sessionId,cwd,promptHash,checkpoint,getNativeTasks,getPendingPermissions,getNativeBudget=async()=>unknownBudget(),active=()=>true,onClosed=()=>{},nativeInput=false}) {
+  const tools=new Map(),children=new Set(),nativeHooks=new Map(),applications=new Map();
   let live=true,submitted=false,pending=false,childGeneration=0,lookups=0,nativeHumanPending=false;
-  let usage,usageGeneration=0,peerDebit=0,compacting=false;
+  let usage,usageGeneration=0,peerDebit=0,compacting=false,rootTurn;
   const running=()=>live&&active()&&!nativeHumanPending;
-  const deactivate=()=>{if(!live)return;live=false;tools.clear();children.clear();try{onClosed();}catch{}};
+  const deactivate=()=>{if(!live)return;live=false;tools.clear();children.clear();nativeHooks.clear();applications.clear();rootTurn=undefined;try{onClosed();}catch{}};
   const owned=(input,invocation)=>{
     if(!running()||invocation?.sessionId!==sessionId||typeof input?.workingDirectory!=="string")return false;
     try{return realpathSync(input.workingDirectory)===realpathSync(cwd);}catch{return false;}
@@ -91,10 +91,37 @@ export function createCopilotPeerHooks({sessionId,cwd,promptHash,checkpoint,getN
     if(!event.agentId&&event.type==="session.compaction_complete")compacting=false;
     if(!event.agentId&&event.type==="session.usage_info"&&!compacting){usage=data;usageGeneration++;}
     if(!event.agentId&&["session.model_change","session.compaction_start","session.compaction_complete","session.truncation","session.context_changed","abort"].includes(event.type)){
-      usage=undefined;usageGeneration++;
+      usage=undefined;usageGeneration++;nativeHooks.clear();applications.clear();rootTurn=undefined;
     }
-    if(["permission.requested","user_input.requested","elicitation.requested"].includes(event.type)){nativeHumanPending=true;return;}
+    if(["permission.requested","user_input.requested","elicitation.requested"].includes(event.type)){nativeHumanPending=true;applications.clear();return;}
     if(["permission.completed","user_input.completed","elicitation.completed"].includes(event.type)){nativeHumanPending=false;return;}
+    if(nativeInput&&!event.agentId&&!data.parentToolCallId){
+      if(event.type==="assistant.turn_start"){
+        rootTurn=typeof data.turnId==="string"&&typeof data.interactionId==="string"?{turnId:data.turnId,interactionId:data.interactionId}:undefined;
+        for(const[boundaryId,entry]of applications){
+          applications.delete(boundaryId);
+          if(!running()||!rootTurn||entry.turnId===rootTurn.turnId||entry.interactionId!==rootTurn.interactionId||!entry.hookConfirmed||!entry.toolConfirmed)continue;
+          void checkpoint("/peer-context/context-applied",entry.observation).catch(()=>{});
+        }
+      }else if(event.type==="hook.start"&&data.hookType==="postToolUse"&&typeof data.hookInvocationId==="string"){
+        const input=data.input;
+        if(input?.sessionId===sessionId&&typeof input.cwd==="string"&&Number.isSafeInteger(input.timestamp)&&nativeHooks.size<256){
+          try{if(realpathSync(input.cwd)===realpathSync(cwd))nativeHooks.set(data.hookInvocationId,input);}catch{}
+        }
+      }else if(event.type==="hook.end"&&data.hookType==="postToolUse"){
+        nativeHooks.delete(data.hookInvocationId);
+        for(const[boundaryId,entry]of applications)if(entry.hookId===data.hookInvocationId){
+          if(data.success===true&&data.output?.additionalContext===entry.context)entry.hookConfirmed=true;
+          else applications.delete(boundaryId);
+        }
+      }else if(event.type==="tool.execution_complete"){
+        for(const[boundaryId,entry]of applications)if(entry.toolId===data.toolCallId){
+          if(data.success===true&&data.turnId===entry.turnId&&data.interactionId===entry.interactionId&&data.model===entry.model
+            &&typeof data.result?.content==="string"&&data.result.content.includes(entry.context))entry.toolConfirmed=true;
+          else applications.delete(boundaryId);
+        }
+      }
+    }
     if(event.type==="subagent.started"){
       if(typeof event.agentId!=="string"||!event.agentId||children.size>=128){deactivate();return;}
       children.add(event.agentId);childGeneration++;
@@ -102,12 +129,14 @@ export function createCopilotPeerHooks({sessionId,cwd,promptHash,checkpoint,getN
       if(typeof event.agentId!=="string"||!children.delete(event.agentId))deactivate();
     }else if(event.type==="tool.execution_start"){
       if(typeof data.toolCallId!=="string"||!data.toolCallId||typeof data.toolName!=="string"||tools.has(data.toolCallId)||tools.size>=256){deactivate();return;}
-      tools.set(data.toolCallId,{id:data.toolCallId,name:data.toolName,args:data.arguments,root:!event.agentId&&!data.parentToolCallId,used:false});
+      tools.set(data.toolCallId,{id:data.toolCallId,name:data.toolName,args:data.arguments,root:!event.agentId&&!data.parentToolCallId,used:false,
+        turnId:data.turnId,interactionId:rootTurn?.interactionId,model:data.model});
     }else if(event.type==="tool.execution_complete")tools.delete(data.toolCallId);
     else if(!event.agentId&&(["session.shutdown","session.error"].includes(event.type)||submitted&&["session.idle","assistant.idle"].includes(event.type)))deactivate();
   };
-  const deliver=async(eligible=()=>children.size===0,toolResult)=>{
+  const deliver=async(eligible=()=>children.size===0,toolResult,native)=>{
     if(!running()||pending||!eligible())return;
+    if(nativeInput&&(!native||!rootTurn||native.tool.turnId!==rootTurn.turnId||native.tool.interactionId!==rootTurn.interactionId))return;
     pending=true;
     const boundaryId=randomUUID();
     try{
@@ -120,9 +149,16 @@ export function createCopilotPeerHooks({sessionId,cwd,promptHash,checkpoint,getN
         ||Buffer.byteLength(batch.messages.map(item=>item.content).join("\n\n"))>16000)return;
       const additionalContext=batch.messages.map(item=>item.content).join("\n\n");
       peerDebit+=Buffer.byteLength(additionalContext)+64*batch.messages.length;
-      try{await checkpoint("/peer-context/observe",{boundaryId,nativeSessionId:sessionId,messageIds:batch.messages.map(item=>item.messageId),evidence:"context_hook"});}
+      const observation={boundaryId,nativeSessionId:sessionId,messageIds:batch.messages.map(item=>item.messageId)};
+      if(nativeInput)await checkpoint("/peer-context/authorize",{...observation,evidence:"context_hook"});
+      else try{await checkpoint("/peer-context/observe",{...observation,evidence:"context_hook"});}
       catch{/* A native hook output is not a provider-payload or consumption receipt. */}
       if(!running()||!eligible()||generation!==usageGeneration)return;
+      if(nativeInput){
+        if(applications.size>=32||!nativeHooks.has(native.hookId))return;
+        applications.set(boundaryId,{observation,context:additionalContext,hookId:native.hookId,toolId:native.tool.id,
+          turnId:native.tool.turnId,interactionId:native.tool.interactionId,model:native.tool.model,hookConfirmed:false,toolConfirmed:false});
+      }
       return {additionalContext};
     }catch{return;}
     finally{pending=false;}
@@ -164,8 +200,15 @@ export function createCopilotPeerHooks({sessionId,cwd,promptHash,checkpoint,getN
         if(typeof childId!=="string"||linked.length!==1||linked[0].id!==childId)return;
       }else if(children.size||tasks.some(task=>task.type==="agent"&&task.status==="running"))return;
       const tool=matches[0],generation=childGeneration;tool.used=true;
+      let native;
+      if(nativeInput){
+        const hooks=[...nativeHooks].filter(([,candidate])=>candidate.timestamp===Number(new Date(input.timestamp))
+          &&candidate.toolName===input.toolName&&isDeepStrictEqual(candidate.toolArgs,input.toolArgs)&&isDeepStrictEqual(candidate.toolResult,input.toolResult));
+        if(hooks.length!==1||typeof tool.model!=="string")return;
+        native={hookId:hooks[0][0],tool};
+      }
       // Child terminal events can follow the root task's hook. Verify this exact root tool instead.
-      return deliver(()=>tools.get(tool.id)===tool&&childGeneration===generation&&matching().length===1,input.toolResult);
+      return deliver(()=>tools.get(tool.id)===tool&&childGeneration===generation&&matching().length===1,input.toolResult,native);
     },
   }};
 }
@@ -245,7 +288,7 @@ export async function installCopilotPeerContext({joinSession,channel,onReady=()=
 `.replace("__COORDINATION_SCHEMA__",JSON.stringify({type:"object",...zodToJsonSchema(AgentCoordinationInput,{$refStrategy:"none"})}));
 
 /** Prepares one Phonon plugin, without installing it or granting native permissions. */
-export function prepareCopilotPeerContext(options: SendOptions, input: { sessionId: string; cwd: string; prompt: string }): {
+export function prepareCopilotPeerContext(options: SendOptions, input: { sessionId: string; cwd: string; prompt: string; nativeInput?:boolean }): {
   path: string; modulePath: string; isReady: () => boolean; deactivate: () => void; cleanup: () => void;
 } {
   const endpoint = new URL(options.environment?.AGENT_PHONON_PEER_CONTEXT_URL ?? "");
@@ -280,7 +323,7 @@ export function prepareCopilotPeerContext(options: SendOptions, input: { session
     writeFileSync(join(directory, "plugin.json"), JSON.stringify({ name: "agent-phonon", version: "1.0.0", extensions: "extensions/" }), { mode: 0o600, flag: "wx" });
     writeFileSync(modulePath, COPILOT_PEER_CONTEXT_SOURCE, { mode: 0o600, flag: "wx" });
     writeFileSync(join(extension, "channel.json"), JSON.stringify({ url: endpoint.href, token, sessionId: input.sessionId, cwd: realpathSync(input.cwd),
-      promptHash: createHash("sha256").update(input.prompt).digest("hex"), nonce,budgetEnvironment,...(coordination?{coordination}:{}) }), { mode: 0o600, flag: "wx" });
+      promptHash: createHash("sha256").update(input.prompt).digest("hex"), nonce,budgetEnvironment,nativeInput:input.nativeInput===true,...(coordination?{coordination}:{}) }), { mode: 0o600, flag: "wx" });
     writeFileSync(join(extension, "extension.mjs"), String.raw`
 import {joinSession} from "@github/copilot-sdk/extension";
 import {readFileSync,lstatSync,unlinkSync,writeFileSync} from "node:fs";
