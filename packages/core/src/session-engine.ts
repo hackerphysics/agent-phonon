@@ -538,6 +538,7 @@ export class SessionEngine {
       reasoning?: TurnReasoning;
       expectedActiveTurnId?: string;
       beforeInsertion?: () => void;
+      assertInsertion?: () => void;
     },
   ): Promise<{ turnId: string; disposition: string; queuePosition?: number }> {
     if (this.disposed) throw new Error("session engine disposed");
@@ -585,8 +586,15 @@ export class SessionEngine {
         const window = rec.insertionWindow;
         if (!window || window.turnId !== rec.currentTurnId || rec.terminalTurns.has(window.turnId)) throw new PhononError("errSessionBusy", "active insertion window is unavailable");
         if (opts.turnId && opts.turnId !== window.turnId) throw new PhononError("errInvalidParams", "injected input belongs to the active turn");
+        const scope={sessionId:rec.sessionId,tenantId:rec.tenantId,project:rec.project,worktreeId:rec.worktreeId,cwd:rec.cwd,agent:rec.agent};
         const signal = rec.abort ? AbortSignal.any([window.controller.signal, rec.abort.signal]) : window.controller.signal;
         if (signal.aborted) throw new PhononError("errSessionBusy", "turn closed before insertion was confirmed");
+        const assertInsertionScope=()=>{
+          if(this.disposed||signal.aborted||this.assertTenant(sessionId,tenantId)!==rec||rec.insertionWindow!==window||rec.currentTurnId!==window.turnId||rec.terminalTurns.has(window.turnId))throw new PhononError("errSessionBusy","original insertion turn ended");
+          if(rec.sessionId!==scope.sessionId||rec.tenantId!==scope.tenantId||rec.project!==scope.project||rec.worktreeId!==scope.worktreeId||rec.cwd!==scope.cwd||rec.agent!==scope.agent)throw new PhononError("errPolicyDenied","original insertion scope changed");
+          this.runtimeContext?.assertAgentAllowed?.(scope.agent);
+          opts.assertInsertion?.();
+        };
         let onAbort!: () => void;
         const ended = new Promise<never>((_resolve, reject) => {
           onAbort = () => reject(new PhononError("errSessionBusy", "turn closed before insertion was confirmed"));
@@ -596,9 +604,11 @@ export class SessionEngine {
           const insert=async()=>{
             const loaded=skillBindings?await this.runtimeContext!.loadSkills!(tenantId,rec.project,rec.agent,skillBindings):undefined;
             if(signal.aborted||rec.currentTurnId!==window.turnId||rec.terminalTurns.has(window.turnId))throw new PhononError("errSessionBusy","turn closed before skill insertion was confirmed");
-            this.runtimeContext?.assertAgentAllowed?.(rec.agent);
+            assertInsertionScope();
             opts.beforeInsertion?.();
-            await rec.adapterSession.insertAtToolGap!((loaded?.context??"")+input,{turnId:window.turnId,signal});
+            await rec.adapterSession.insertAtToolGap!((loaded?.context??"")+input,{turnId:window.turnId,signal,beforeApply:()=>{
+              assertInsertionScope();
+            }});
           };
           await Promise.race([insert(), ended]);
         } finally { signal.removeEventListener("abort", onAbort); }

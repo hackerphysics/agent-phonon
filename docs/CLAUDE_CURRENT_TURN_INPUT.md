@@ -31,6 +31,7 @@ permission settings, explicit tool denial and owner-selected standalone
 settings remain authoritative.
 
 Installed tests use an isolated home and controlled local Anthropic provider,
-not paid-model or physical cross-device evidence. Adapter activation and the
-shared effect-boundary source guards remain local until the concurrent
-project-authority changes can be integrated without absorbing unrelated work.
+not paid-model or physical cross-device evidence. The adapter uses the shared
+original-window/source fence independently of the separate directory-admission
+changes. Managed-MCP cross-session acceptance and production release remain
+separate requirements.

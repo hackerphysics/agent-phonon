@@ -3,6 +3,7 @@ import type {
   AdapterSession,
   CreateSessionParams,
   SendOptions,
+  InsertionOptions,
   EmployeeProfileTarget,EmployeeProfileObservation,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
@@ -22,7 +23,8 @@ import { nativeReasoning } from "../reasoning.js";
 import {parseOpenClawNativeModels} from "./openclaw-models.js";
 import { OpenClawCheckpoint,OpenClawNativeObservation,observeOpenClawSession,recoveryGatewayIdentity,sameOpenClawSession } from "./openclaw-recovery.js";
 import { z } from "zod";
-import { OpenClawPeerCapabilities, projectOpenClawToolResult } from "./openclaw-peer-context.js";
+import { OpenClawPeerCapabilities, OpenClawInputCapabilities, projectOpenClawToolResult } from "./openclaw-peer-context.js";
+import { CurrentTurnInput } from "../current-turn-input.js";
 
 const PHONON_PLUGIN = "agent-phonon-hitl";
 const PHONON_OPTIONAL_TOOLS = ["phonon_request_interaction", "phonon_acknowledge_interaction", "phonon_conversation_board", "phonon_workflow", "phonon_conversation_message", "phonon_publish_document", "phonon_project_coordination"];
@@ -87,7 +89,8 @@ class GatewaySession implements AdapterSession {
   private strictIdentity=false;
   private closed=false;
   private policyRelease?:()=>Promise<void>;
-  private peerReady?:{epoch:number;native:OpenClawNativeObservation};
+  private peerReady?:{epoch:number;native:OpenClawNativeObservation;nativeInput:boolean};
+  private readonly currentTurnInput=new CurrentTurnInput();
   async preparePeerContext(_environment?:Record<string,string>,signal?:AbortSignal):Promise<void>{
     this.peerReady=undefined;
     if(this.closed||this.activeTurn||!this.gatewayIdentity||signal?.aborted)return;
@@ -96,13 +99,15 @@ class GatewaySession implements AdapterSession {
       const native=await this.verifyNative(!this.historyStarted);
       const capabilities=OpenClawPeerCapabilities.safeParse(await this.gw.rpc("phonon.peers.capabilities",{version:1,sessionKey:this.sessionKey,sessionId:native.sessionId,model:native.model},5000));
       if(!capabilities.success||signal?.aborted)return;
-      if(!signal?.aborted&&this.gw.isConnected()&&this.gw.connectionEpoch()===epoch)this.peerReady={epoch,native};
+      if(!signal?.aborted&&this.gw.isConnected()&&this.gw.connectionEpoch()===epoch)this.peerReady={epoch,native,nativeInput:capabilities.data.nativeVersion==="2026.10.7"&&capabilities.data.currentTurnInput==="native_context_v1"};
     }catch{this.peerReady=undefined;}
   }
   peerContextCapability(){
     return !this.closed&&this.peerReady&&this.gw.isConnected()&&this.gw.connectionEpoch()===this.peerReady.epoch
       ?{mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.peerReady.native.sessionId} as const:undefined;
   }
+  nativeInputAvailable(){return this.nativeInputEnabled&&!!this.peerContextCapability()&&this.peerReady?.nativeInput===true;}
+  insertAtToolGap(input:string,options:InsertionOptions):Promise<void>{return this.currentTurnInput.insert(input,options);}
   async observeNativeStop(turnId:string){return this.nativeTurns.get(turnId)?.ended?"native_terminal" as const:undefined;}
   proactiveOutputReady(){return this.subscribedEpoch!==undefined&&this.gw.isConnected?.()===true&&this.gw.connectionEpoch?.()===this.subscribedEpoch;}
   async subscribe(){const epoch=this.gw.connectionEpoch?.();await this.gw.rpc("sessions.messages.subscribe",{key:this.sessionKey},10000);if(epoch!==undefined&&this.gw.isConnected()&&epoch===this.gw.connectionEpoch())this.subscribedEpoch=epoch;}
@@ -111,7 +116,7 @@ class GatewaySession implements AdapterSession {
     this.unsolicitedSink = sink;
   }
 
-  constructor(gw: GatewayClient, sessionId: string, model: string, openclawAgent: string, initialContext: ContextItem[]|undefined,private upstreamRuns:CreateSessionParams["upstreamRuns"],private params:CreateSessionParams,private gatewayIdentity:string|undefined,restored?:OpenClawCheckpoint,private detach?:()=>void) {
+  constructor(gw: GatewayClient, sessionId: string, model: string, openclawAgent: string, initialContext: ContextItem[]|undefined,private upstreamRuns:CreateSessionParams["upstreamRuns"],private params:CreateSessionParams,private gatewayIdentity:string|undefined,restored?:OpenClawCheckpoint,private detach?:()=>void,private readonly nativeInputEnabled=false) {
     this.gw = gw;
     this.sessionId = sessionId;
     this.model = model;
@@ -233,6 +238,12 @@ class GatewaySession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    const enabled=this.nativeInputAvailable();
+    return this.currentTurnInput.run(opts,{enabled,capability:()=>this.peerContextCapability(),receipt:"native_context"},
+      options=>this.sendNative(input,options,enabled&&options.peerContext!==opts.peerContext));
+  }
+
+  private async sendNative(input: string, opts: SendOptions,nativeInput:boolean): Promise<void> {
     const { turnId, emit } = opts;
     if(this.closed)throw new PhononError("errSessionTerminated");
     const native = opts.environment?.AGENT_PHONON_INTERACTION_TOKEN !== undefined;
@@ -261,7 +272,7 @@ class GatewaySession implements AdapterSession {
       if(native)release=await this.gw.bindNativeInteractions(this.sessionKey, runId, opts.environment!,{coordinationOnly});
       if(opts.peerContext&&observed&&this.peerContextCapability()){
         const projectionId=randomUUID();
-        try{releasePeer=await this.gw.bindPeerContext({sessionKey:this.sessionKey,sessionId:observed.sessionId,runId,workspaceDir:observed.cwd,model:observed.model,projectionId},opts.environment??{});
+        try{releasePeer=await this.gw.bindPeerContext({sessionKey:this.sessionKey,sessionId:observed.sessionId,runId,workspaceDir:observed.cwd,model:observed.model,projectionId,...(nativeInput?{nativeInput:true as const}:{})},opts.environment??{});
           peerProjection={projectionId,runId,sessionId:observed.sessionId};
         }catch{this.peerReady=undefined;console.warn("[openclaw-gateway] coordination.receiver_unavailable; retaining assigned task");}
       }
@@ -432,7 +443,7 @@ class GatewaySession implements AdapterSession {
 
 export class OpenClawGatewayAdapter implements AgentAdapter {
   readonly name = "openclaw";
-  readonly capabilities = CAPABILITIES;
+  readonly capabilities = {...CAPABILITIES};
   private gw: GatewayClient;
   private defaultAgent: string;
   private gatewayIdentity:string|undefined;
@@ -457,6 +468,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
 
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     signal?.throwIfAborted();
+    this.capabilities.injectMidTurn=false;
     let connected = false;
     try {
       await this.gw.connect();
@@ -474,11 +486,17 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
           available: false,
           unavailableReason: "OpenClaw Gateway not reachable",
           models: [],
-          capabilities: CAPABILITIES,
+          capabilities: this.capabilities,
           scannedAt: new Date().toISOString(),
         },
       ];
     }
+
+    if(this.gatewayIdentity){
+      try{this.capabilities.injectMidTurn=OpenClawInputCapabilities.safeParse(await this.gw.rpc("phonon.peers.capabilities",{version:1},5000)).success;}
+      catch{/* Optional current-turn input must not block native inventory. */}
+    }
+    signal?.throwIfAborted();
 
     // 枚举该 Gateway 下所有 OpenClaw agent（按 workspace 分）
     let subAgents: Array<{ id: string; name?: string; workspace?: string; model?: { primary?: string } | string }> = [];
@@ -505,7 +523,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
         adapter: "openclaw",
         available: true,
         models,
-        capabilities: CAPABILITIES,
+        capabilities: this.capabilities,
         scannedAt: now,
       });
     }
@@ -529,7 +547,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     const subAgent = params.employee?.runtimeProfile??
       (params.agentConfig?.openclawAgent as string) ??
       (params.agentId.includes(":") ? params.agentId.split(":")[1]! : this.defaultAgent);
-    const session = new GatewaySession(this.gw, params.sessionId, params.model, subAgent, params.initialContext,params.upstreamRuns,params,this.gatewayIdentity,undefined,()=>{if(this.sessions.get(session.key)===session)this.sessions.delete(session.key);});
+    const session = new GatewaySession(this.gw, params.sessionId, params.model, subAgent, params.initialContext,params.upstreamRuns,params,this.gatewayIdentity,undefined,()=>{if(this.sessions.get(session.key)===session)this.sessions.delete(session.key);},this.capabilities.injectMidTurn);
     // sessions.create 失败要外显（修 P0#6），不能静默吞
     try {
       session.bindCreatedIdentity(await this.gw.rpc("sessions.create", { key: session.key, model: params.model,cwd:params.cwd,worktree:false }, 15000));
@@ -541,6 +559,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
       console.warn(`[openclaw-gateway] subscribe failed for ${session.key}: ${(e as Error)?.message}`);
     });
     this.sessions.set(session.key, session);
+    if(this.capabilities.injectMidTurn)await session.preparePeerContext();
     return session;
   }
 
@@ -554,8 +573,9 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     await this.gw.connect();
     const current=await observeOpenClawSession(this.gw,saved.native.sessionKey,agent,params.cwd,params.model);
     if(!sameOpenClawSession(saved.native,current))throw new PhononError("errSessionBusy","OpenClaw native history identity changed");
-    const session=new GatewaySession(this.gw,params.sessionId,params.model,agent,undefined,params.upstreamRuns,params,this.gatewayIdentity,{...saved,native:current},()=>{if(this.sessions.get(session.key)===session)this.sessions.delete(session.key);});
+    const session=new GatewaySession(this.gw,params.sessionId,params.model,agent,undefined,params.upstreamRuns,params,this.gatewayIdentity,{...saved,native:current},()=>{if(this.sessions.get(session.key)===session)this.sessions.delete(session.key);},this.capabilities.injectMidTurn);
     await session.subscribe().catch(()=>{});
+    if(this.capabilities.injectMidTurn)await session.preparePeerContext();
     if(generation!==this.generation){await session.terminate();throw new PhononError("errSessionBusy","OpenClaw adapter closed during recovery");}
     this.sessions.set(session.key,session);return session;
     }finally{this.recovering.delete(saved.native.sessionKey);}

@@ -15,10 +15,13 @@ import {codexTerminalInput} from "./codex-terminal-guidance.js";
 import {readCodexContext,resolveCodexContextFile} from "./codex-context.js";
 import { CodexPeerContext, qualifyCodexPeerContext, stopCodexPeerProcess } from "./codex-peer-context.js";
 import { discoverCodexNativeModels } from "./codex-models.js";
+import { CodexAppServer, type CodexNativeFrame } from "./codex-app-server.js";
+import { CodexNativeRequests } from "./codex-native-requests.js";
 import type {
   AgentAdapter,
   AdapterSession,
   CreateSessionParams,
+  InsertionOptions,
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
@@ -198,6 +201,7 @@ class CodexSession implements AdapterSession {
   private nativeToolResults = new Set<string>();
   private peerSupported = false;
   private peerAbort?: AbortController;
+  private appServer?: CodexAppServer;
   async preparePeerContext(environment?: Record<string,string>, signal?: AbortSignal): Promise<void> {
     if (this.current && !this.current.hasStopped()) throw new PhononError("errSessionBusy","Codex peer readiness cannot replace an active native runtime");
     this.peerSupported = false;
@@ -210,7 +214,7 @@ class CodexSession implements AdapterSession {
     return this.peerSupported ? {mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.threadId} as const : undefined;
   }
 
-  constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[], recovered?: {threadId:string;pendingInject:string[];contextNotBefore?:number}) {
+  constructor(sessionId: string, model: string, cwd: string, env: CodexEnv, initialContext?: ContextItem[], recovered?: {threadId:string;pendingInject:string[];contextNotBefore?:number}, private readonly nativeSteering = false) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
@@ -271,7 +275,8 @@ class CodexSession implements AdapterSession {
         emit({type:"result",sessionId:this.sessionId,turnId,seq:0,at:new Date().toISOString(),text:"",status:"interrupted",final:true} as StreamEvent);
         return;
       }
-      await this.run(args,prompt,turnId,emit,options,peer);
+      if (this.nativeSteering) await this.runAppServer(prompt, options);
+      else await this.run(args,prompt,turnId,emit,options,peer);
     } finally {
       peer?.deactivate();
       if (this.lastNative?.turnId===turnId) await stopCodexPeerProcess(this.lastNative.supervisor);
@@ -282,6 +287,89 @@ class CodexSession implements AdapterSession {
 
   private nativeEnvironment(overlay?: Record<string,string>): NodeJS.ProcessEnv {
     return codexNativeEnvironment(this.env, overlay);
+  }
+
+  insertAtToolGap(input: string, options: InsertionOptions): Promise<void> {
+    if (!this.appServer) return Promise.reject(new PhononError("errCapabilityUnsupported", "Native Codex steering is unavailable on this invocation"));
+    return this.appServer.insert(input, options);
+  }
+
+  private async runAppServer(prompt: string, opts: SendOptions): Promise<void> {
+    const tools = new CodexNativeRequests(opts);
+    opts.beforeNativeEffect?.();
+    const args = [...this.providerArgs(), "-c", 'sandbox_mode="workspace-write"', ...codexNativeToolArgs(opts)];
+    if (opts.reasoning?.level) args.push("-c", `model_reasoning_effort=${nativeReasoning(opts.reasoning.level)}`);
+    const environment = this.nativeEnvironment(opts.environment);
+    let resolve!: (value: { status: "completed" | "failed" | "interrupted" | "timeout"; message?: string }) => void;
+    let settled = false, finalMessage = "", acc = "", stderr = "", nativeEffort: string | undefined;
+    let timedOut = false;
+    const done = new Promise<{ status: "completed" | "failed" | "interrupted" | "timeout"; message?: string }>(yes => { resolve = yes; });
+    const finish = (value: Parameters<typeof resolve>[0]) => { if (!settled) { settled = true; resolve(value); } };
+    const observe = (frame: CodexNativeFrame) => {
+      tools.observe(frame);
+      if (frame.method === "turn/completed") {
+        const status = frame.params.turn?.status;
+        finish(status === "completed" && finalMessage.trim() ? { status: "completed" }
+          : status === "interrupted" ? { status: "interrupted" }
+          : { status: "failed", message: String(frame.params.turn?.error?.message ?? "Codex returned no successful final reply") });
+        return;
+      }
+      if (!["item/started", "item/completed"].includes(frame.method)) return;
+      const item = frame.params.item;
+      if (!item || typeof item.id !== "string") return;
+      let normalized: Record<string, unknown> | undefined;
+      if (item.type === "agentMessage") normalized = { type: "agent_message", id: item.id, text: item.text };
+      else if (item.type === "commandExecution") normalized = { type: "command_execution", id: item.id, command: item.command,
+        aggregated_output: item.aggregatedOutput, exit_code: item.exitCode,
+        status: item.status === "declined" ? "failed" : item.status };
+      else if (item.type === "mcpToolCall") normalized = { ...item, type: "mcp_tool_call" };
+      else if (item.type === "dynamicToolCall") normalized = { type: "mcp_tool_call", id: item.id, server: "phonon_current_turn", tool: item.tool,
+        arguments: item.arguments, status: item.status,
+        ...(Array.isArray(item.contentItems) && typeof item.success === "boolean" ? { result: {
+          isError: !item.success, content: item.contentItems.map((part: any) => part.type === "inputText" ? { type: "text", text: part.text } : part),
+        } } : {}) };
+      if (normalized) this.handleEvent({ type: frame.method === "item/started" ? "item.started" : "item.completed", item: normalized },
+        opts.turnId, opts.emit, text => { acc += text; finalMessage = text; });
+    };
+    const channel = new CodexAppServer({ bin: this.env.binPath ?? "codex", args, cwd: this.cwd, env: environment, signal: opts.signal,
+      onRuntime: runtime => { this.current = runtime; this.lastNative = { turnId: opts.turnId, supervisor: runtime }; },
+      notify: observe, request: (frame, signal) => tools.request(frame, signal), stderr: text => { stderr = (stderr + text).slice(-16000); },
+      failed: error => finish({ status: opts.signal?.aborted ? "interrupted" : "failed", message: error.message }),
+    });
+    this.appServer = channel;
+    const guard = setTimeout(() => { timedOut = true; finish({ status: "timeout" }); void channel.close(); }, 1800000);
+    let outcome: Awaited<typeof done>;
+    try {
+      await channel.initialize();
+      const model = this.model === "default" ? {} : { model: this.model };
+      const resumed = this.threadId;
+      const reply = await channel.rpc(resumed ? "thread/resume" : "thread/start", {
+        ...model, cwd: this.cwd, ...(resumed ? { threadId: resumed, excludeTurns: true } : { historyMode: "legacy" }),
+      }, opts.beforeNativeEffect);
+      this.threadId = channel.bindThread(reply?.thread, resumed);
+      nativeEffort = typeof reply?.reasoningEffort === "string" ? reply.reasoningEffort : undefined;
+      const clientUserMessageId = channel.arm(opts.turnId, prompt);
+      const started = await channel.rpc("turn/start", { threadId: this.threadId, clientUserMessageId, input: [{ type: "text", text: prompt }] }, opts.beforeNativeEffect);
+      if (!settled) channel.acceptStart(started);
+      outcome = await done;
+    } catch (error) {
+      finish({ status: timedOut ? "timeout" : opts.signal?.aborted ? "interrupted" : "failed", message: String(error) });
+      outcome = await done;
+    } finally {
+      clearTimeout(guard);
+      await channel.close();
+      if (this.appServer === channel) this.appServer = undefined;
+      if (this.current === channel.runtime) this.current = undefined;
+    }
+    const base = { sessionId: this.sessionId, turnId: opts.turnId, seq: 0, at: new Date().toISOString(), final: true };
+    if (outcome.status === "failed") opts.emit({ ...base, type: "error", status: "failed", message: adapterDiagnostic([outcome.message, stderr].filter(Boolean).join(": ") || "Codex native execution failed",
+      [this.env.apiKey, opts.environment?.AGENT_PHONON_INTERACTION_TOKEN]) } as StreamEvent);
+    else {
+      if (outcome.status === "completed" && opts.reasoning && nativeEffort !== undefined) {
+        try { opts.acknowledgeReasoning?.(nativeEffort); } catch { /* Optional evidence never overrides native completion. */ }
+      }
+      opts.emit({ ...base, type: "result", status: outcome.status, text: outcome.status === "completed" ? finalMessage : acc } as StreamEvent);
+    }
   }
 
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions, peer?: CodexPeerContext): Promise<void> {
@@ -479,7 +567,7 @@ class CodexSession implements AdapterSession {
 
 export class CodexAdapter implements AgentAdapter {
   readonly name = "codex";
-  readonly capabilities = CAPABILITIES;
+  readonly capabilities = { ...CAPABILITIES };
   private env: CodexEnv;
   private modelCatalog?: { baseUrl: string; models: ModelInfo[] };
 
@@ -490,6 +578,7 @@ export class CodexAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.injectMidTurn = version?.trim() === "codex-cli 0.165.0-alpha.1.2";
     const models = await this.discoverModels(signal, available);
     return [{
       agentId: "codex" as AgentDescriptor["agentId"],
@@ -499,14 +588,14 @@ export class CodexAdapter implements AgentAdapter {
       ...(available ? {} : { unavailableReason: "codex CLI not found" }),
       ...(version ? { version } : {}),
       models,
-      capabilities: CAPABILITIES,
+      capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     if (params.reattach) throw new PhononError("errSessionBusy", "Codex recovery requires a verified native checkpoint");
-    return new CodexSession(params.sessionId,params.model,params.cwd,this.env,params.initialContext);
+    return new CodexSession(params.sessionId,params.model,params.cwd,this.env,params.initialContext,undefined,this.capabilities.injectMidTurn);
   }
 
   async recoverSession(params: CreateSessionParams, checkpoint: Record<string, unknown>): Promise<AdapterSession> {
@@ -527,7 +616,7 @@ export class CodexAdapter implements AgentAdapter {
     } catch {
       throw new PhononError("errSessionBusy", "Codex native Session identity could not be verified");
     } finally { if (fd !== undefined) closeSync(fd); }
-    return new CodexSession(params.sessionId,params.model,params.cwd,this.env,undefined,saved.data);
+    return new CodexSession(params.sessionId,params.model,params.cwd,this.env,undefined,saved.data,this.capabilities.injectMidTurn);
   }
 
   private async discoverModels(signal?: AbortSignal, available = true): Promise<ModelInfo[]> {

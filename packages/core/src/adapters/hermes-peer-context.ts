@@ -132,6 +132,7 @@ def _phonon_register_peer_context(agent, capsule, owning_root, announce):
                         or not isinstance(item.get("content"), str) for item in messages):
                     return None
                 changed = copy.deepcopy(request)
+                rows = []
                 for message in messages:
                     content = message["content"]
                     if native_mode == "codex_responses":
@@ -139,22 +140,43 @@ def _phonon_register_peer_context(agent, capsule, owning_root, announce):
                     else:
                         row = {"role":"user","content":[{"type":"text","text":content}]}
                     changed[field].append(row)
-                pending[request_id] = {**boundary,"messages":messages}
+                    rows.append(row)
+                pending[request_id] = {**boundary,"messages":messages,"rows":rows}
                 return {"request":changed,"source":"phonon-peer-context"}
             except Exception:
                 return None
+        def withdraw(request, current):
+            # Withdraw only our exact rows; retain other native middleware changes.
+            field = "input" if native_mode == "codex_responses" else "messages"
+            if not isinstance(request, dict) or not isinstance(request.get(field), list):
+                raise ValueError("Native input withdrawal could not be confirmed")
+            clean = copy.deepcopy(request)
+            rows = list(current["rows"])
+            retained = []
+            for row in clean[field]:
+                if row in rows:
+                    rows.remove(row)
+                else:
+                    retained.append(row)
+            if rows:
+                raise ValueError("Native input withdrawal could not be confirmed")
+            clean[field] = retained
+            return clean
         def execute(request=None, next_call=None, **context):
             if not callable(next_call):
                 raise ValueError("Native execution callback unavailable")
-            current = pending.pop(context.get("api_request_id"), None) if owning(context) else None
+            current = pending.pop(context.get("api_request_id"), None)
             if current:
-                message_ids = [item["messageId"] for item in current["messages"] if contains(request, item["content"])]
-                if message_ids:
-                    try:
-                        checkpoint("/peer-context/observe", {"boundaryId":current["boundaryId"],"nativeSessionId":sid,
-                            "messageIds":message_ids,"evidence":"provider_payload"})
-                    except Exception:
-                        pass
+                if not owning(context):
+                    request = withdraw(request, current)
+                else:
+                    message_ids = [item["messageId"] for item in current["messages"] if contains(request, item["content"])]
+                    if message_ids:
+                        try:
+                            checkpoint("/peer-context/observe", {"boundaryId":current["boundaryId"],"nativeSessionId":sid,
+                                "messageIds":message_ids,"evidence":"provider_payload"})
+                        except Exception:
+                            request = withdraw(request, current)
             # Never retry the provider callback here or swallow its native exception.
             return next_call(request)
         manager = get_plugin_manager()

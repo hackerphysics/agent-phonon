@@ -69,3 +69,19 @@ test("catchable test interruption runs only owned cleanup and preserves a nonzer
   assert.ok(existsSync(root));child.kill("SIGTERM");const [code]=await closed;
   assert.equal(code,143,stderr);assert.equal(readFileSync(marker,"utf8"),"done");assert.equal(existsSync(root),false);
 }));
+
+test("shared fixture resources retire only settled owned process references without retaining old PID aliases",()=>withPeerFixture("fixture-retire",async outer=>{
+  const cache=new PeerFixture("shared-cache",join(outer.root,"scopes"));outer.defer(()=>cache.dispose());
+  const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",detached:process.platform!=="win32"}),closed=once(child,"close");
+  outer.watch(child,process.platform!=="win32");outer.defer(async()=>{
+    if(child.exitCode===null&&child.signalCode===null){if(process.platform!=="win32"&&child.pid)process.kill(-child.pid,"SIGTERM");else child.kill("SIGTERM");}
+    await closed;
+  });
+  const release=cache.watch(child,process.platform!=="win32"),other=cache.watch(child,process.platform!=="win32"),path=join(cache.root,".peer-fixture.json");
+  assert.throws(release,/live native/);assert.equal(JSON.parse(readFileSync(path,"utf8")).processes.length,2);
+  if(process.platform!=="win32"&&child.pid)process.kill(-child.pid,"SIGTERM");else child.kill("SIGTERM");await closed;
+  const original=readFileSync(path,"utf8");writeFileSync(path,JSON.stringify({...JSON.parse(original),nonce:"foreign"}));
+  assert.throws(release,/ownership changed/);writeFileSync(path,original);
+  release();release();assert.equal(JSON.parse(readFileSync(path,"utf8")).processes.length,1);
+  other();assert.equal(JSON.parse(readFileSync(path,"utf8")).processes.length,0);
+}));

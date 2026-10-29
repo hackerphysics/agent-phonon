@@ -40,7 +40,7 @@ export async function installOpenCodePeer(input,capsule,transport) {
     || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || !/^[A-Za-z0-9_-]{43}$/.test(token||""))
     || !/^[a-f0-9]{32}$/.test(nonce||"")) throw new Error("Phonon native peer checkpoint unavailable");
   let root,originalMessage,rootAgent,ended = false;
-  const calls=new Map(),nativeRequests=new Map(),wrappedProviders=new Map();
+  const calls=new Map(),nativeRequests=new Map(),wrappedProviders=new Map(),providerEvidence=new Map();
   const markerHeader="x-phonon-native-boundary";
   const own=async(sid,signal)=>{const session=(await input.client.session.get({path:{id:sid},...(signal?{signal}:{})}))?.data;
     return !ended&&(!transport||transport.active())&&sid===root&&session?.id===root&&!session.parentID&&realpathSync(session.directory)===realpathSync(input.directory)
@@ -80,19 +80,33 @@ export async function installOpenCodePeer(input,capsule,transport) {
         // At most 16KB of peer text can double in JSON escaping; reserve that expansion too.
         inputTokens:Buffer.byteLength(init.body),outputTokens:Math.max(...caps),overheadTokens:17024}:{state:"unknown",source:"native_estimate"};
       if(!valid())throw new Error("Native source ended");
-      const boundaryId=randomUUID(),batch=await checkpoint("/peer-context",{boundaryId,nativeSessionId:root,budget});
+      const boundaryId=randomUUID(),batch=await checkpoint("/peer-context",{boundaryId,nativeSessionId:root,budget,inputEvidence:binding.inputEvidence});
       if(!valid()||!await own(root,init.signal)||batch.boundaryId!==boundaryId||batch.nativeSessionId!==root||!Array.isArray(batch.messages)
         ||batch.messages.length>8||batch.messages.some(item=>typeof item.messageId!=="string"||typeof item.content!=="string"))throw new Error("Native context unconfirmed");
       if(batch.messages.length){
         // Final request copy only: native messages and authenticated transport stay owned by OpenCode.
         request.messages.push(...batch.messages.map(item=>({role:"user",content:item.content})));
-        changed=JSON.stringify(request);observation={boundaryId,nativeSessionId:root,messageIds:batch.messages.map(item=>item.messageId),evidence:"context_hook"};
+        changed=JSON.stringify(request);observation={boundaryId,nativeSessionId:root,messageIds:batch.messages.map(item=>item.messageId),evidence:binding.inputEvidence};
       }
     }catch{/* Optional receive never retries or replaces the original provider operation. */}
     if(changed&&!ended&&!init?.signal?.aborted){
-      try{await checkpoint("/peer-context/observe",observation);}catch{}
-      let current=false;try{current=valid()&&await own(root,init.signal);}catch{}
-      if(current)return next(target,{...clean,body:changed});
+      let authorized=false;
+      try{
+        // A custom fetch may rewrite the body; it retains only the original hook ceiling.
+        if(observation.evidence==="context_hook")await checkpoint("/peer-context/observe",observation);
+        if(valid()&&await own(root,init.signal)){
+          await checkpoint("/peer-context/authorize",observation);
+          authorized=valid();
+        }
+      }catch{/* A denied batch must not enter the provider request. */}
+      if(!authorized)return next(target,clean);
+      // Invoke the selected transport exactly once before claiming native submission.
+      const response=Promise.resolve(next(target,{...clean,body:changed}));
+      void response.catch(()=>{});
+      if(observation.evidence==="provider_payload"){
+        try{await checkpoint("/peer-context/observe",observation);}catch{/* Submitted input stays unconfirmed; never retry the provider. */}
+      }
+      return response;
     }
     return next(target,clean);
   }
@@ -154,6 +168,7 @@ export async function installOpenCodePeer(input,capsule,transport) {
           const exposed=transport?.bindProvider?transport.bindProvider(providerID,wrapper):wrapper;
           provider.options={...provider.options,fetch:exposed};
           wrappedProviders.set(providerID,exposed);
+          providerEvidence.set(providerID,prior===undefined?"provider_payload":"context_hook");
         }
       },
       async "chat.headers"(event,output){
@@ -161,7 +176,7 @@ export async function installOpenCodePeer(input,capsule,transport) {
         const model=event.model;
         if(model?.api?.npm!=="@ai-sdk/openai-compatible"||!wrappedProviders.has(model.providerID)||typeof model.api.id!=="string"
           ||event.provider?.options?.fetch!==wrappedProviders.get(model.providerID))return;
-        const key=randomUUID();nativeRequests.set(key,{providerID:model.providerID,model,modelKey:modelKey(model),messageID:originalMessage});
+        const key=randomUUID();nativeRequests.set(key,{providerID:model.providerID,model,modelKey:modelKey(model),messageID:originalMessage,inputEvidence:providerEvidence.get(model.providerID)});
         output.headers[markerHeader]=key;
       },
     }:{}),

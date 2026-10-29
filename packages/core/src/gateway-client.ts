@@ -115,7 +115,7 @@ export class GatewayClient {
     }
   }
 
-  async bindPeerContext(input:{sessionKey:string;sessionId:string;runId:string;workspaceDir:string;model:string;projectionId:string},env:Record<string,string>):Promise<()=>Promise<void>> {
+  async bindPeerContext(input:{sessionKey:string;sessionId:string;runId:string;workspaceDir:string;model:string;projectionId:string;nativeInput?:true},env:Record<string,string>):Promise<()=>Promise<void>> {
     const gateway=new URL(this.config.baseUrl);
     if(!["127.0.0.1","[::1]","localhost"].includes(gateway.hostname)||!["ws:","wss:","http:","https:"].includes(gateway.protocol))throw new Error("Peer checkpoints require a local Gateway");
     await this.connect();

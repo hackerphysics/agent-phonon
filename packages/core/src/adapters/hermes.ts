@@ -3,6 +3,8 @@ import { HERMES_BRIDGE } from "./hermes-bridge.js";
 import { HERMES_PROFILE_BRIDGE } from "./hermes-profile-bridge.js";
 import { hermesNativeToolEnvironment } from "./hermes-native-tools.js";
 import { hermesPeerContextEnvironment, hermesPeerContextSupported } from "./hermes-peer-context.js";
+import { CurrentTurnInput } from "../current-turn-input.js";
+import type { InsertionOptions } from "../adapter.js";
 import { hermesCommand, hermesBridgeInvocation } from "./hermes-command.js";
 import { NativeFileBroker } from "../native-file-broker.js";
 import { HermesCheckpoint,observeHermesSession,sameHermesSession,type HermesNativeObservation } from "./hermes-recovery.js";
@@ -178,6 +180,7 @@ class HermesSession implements AdapterSession {
   private employeeId?:string;
   private peerSupported = false;
   private peerNativeSession?: string;
+  private readonly currentTurnInput = new CurrentTurnInput();
 
   async qualifyPeerContext(): Promise<void> {
     this.peerSupported = await hermesPeerContextSupported(this.env.binPath ?? "hermes");
@@ -203,6 +206,15 @@ class HermesSession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    return this.currentTurnInput.run(opts, { enabled: this.peerSupported, capability: () => this.peerContextCapability() },
+      options => this.sendNative(input, options));
+  }
+
+  insertAtToolGap(input: string, options: InsertionOptions): Promise<void> {
+    return this.currentTurnInput.insert(input, options);
+  }
+
+  private async sendNative(input: string, opts: SendOptions): Promise<void> {
     const { turnId, emit } = opts;
     if(this.hermesSessionId){
       const current=await observeHermesSession(this.env.binPath??"hermes",this.profile,this.hermesSessionId,this.cwd,this.env.profileFileBrokerRoot);
@@ -460,6 +472,7 @@ export class HermesAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.injectMidTurn = available && await hermesPeerContextSupported(this.env.binPath ?? "hermes", { signal });
     if(available&&process.platform==="win32"){
       try{await this.windowsProfileRuntime();}catch{signal?.throwIfAborted();}
     }
@@ -526,6 +539,7 @@ export class HermesAdapter implements AgentAdapter {
     const model = params.model && params.model !== "default" ? params.model : (this.env.defaultModel ?? "");
     const session = new HermesSession(params.sessionId, model, params.cwd, this.env, profile, params.initialContext,params.employee?.home,undefined,params.employee);
     await session.qualifyPeerContext();
+    this.capabilities.injectMidTurn = !!session.peerContextCapability();
     return session;
   }
   async recoverSession(params:CreateSessionParams,checkpoint:Record<string,unknown>):Promise<AdapterSession>{
@@ -538,6 +552,7 @@ export class HermesAdapter implements AgentAdapter {
     if(!sameHermesSession(saved.data.native,current))throw new PhononError("errSessionBusy","Hermes native recovery identity changed");
     const session = new HermesSession(params.sessionId,model,params.cwd,this.env,profile,undefined,current.nativeHome,{...saved.data,native:current},params.employee);
     await session.qualifyPeerContext();
+    this.capabilities.injectMidTurn = !!session.peerContextCapability();
     return session;
   }
   provisionEmployee(target:EmployeeProfileTarget){return this.employeeOperation("apply",target);}

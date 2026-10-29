@@ -1,5 +1,13 @@
 # Native Input Authorization
 
+The SessionEngine insertion window freezes the original session, tenant,
+project, worktree, cwd and agent. It checks the same record/window/turn and
+current agent policy again at the native effect, including a repeatable caller
+source check. Optional model/reasoning preferences do not change that subject.
+Workflow input rechecks its source and resolved workspace without reserving the
+durable receipt again. This logical-scope fence complements, rather than replaces,
+the project manager's filesystem and provenance authority checks.
+
 This is the private native checkpoint contract, not a model tool, protocol RPC,
 human approval or replacement for the harness's own permissions.
 

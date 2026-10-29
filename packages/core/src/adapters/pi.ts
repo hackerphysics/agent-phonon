@@ -11,6 +11,7 @@ import type {
   AdapterSession,
   AdapterHitlContext,
   CreateSessionParams,
+  InsertionOptions,
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
@@ -682,9 +683,10 @@ class PiSession implements AdapterSession {
     return native.supervisor.hasStopped() ? "process_tree_exit" : undefined;
   }
 
-  async insertAtToolGap(input: string, options: {turnId: string; signal: AbortSignal}): Promise<void> {
+  async insertAtToolGap(input: string, options: InsertionOptions): Promise<void> {
     const rpc = this.rpcCurrent;
     if (!rpc || rpc.turnId !== options.turnId || !this.current || options.signal.aborted) throw piRecoveryFailure();
+    options.beforeApply?.();
     await rpc.channel.insert(input, options.signal);
   }
 

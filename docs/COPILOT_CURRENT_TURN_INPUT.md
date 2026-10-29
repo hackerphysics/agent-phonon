@@ -39,7 +39,7 @@ withdrawal, child isolation, native denial, stop and same-UUID continuation.
 Shared current-turn input, native peer receipts, Pi RPC and durable workflow
 input regressions passed in the same run.
 
-The receipt/plugin foundation is independently testable. Adapter activation and
-shared controller source checks remain local until concurrent project-authority
-work can be integrated without absorbing unrelated changes. There is no release,
-production activation or managed-MCP cross-session acceptance claim here.
+The receipt/plugin foundation and adapter use the shared original-window/source
+fence without importing separate directory-admission changes. There is no
+release, production activation or managed-MCP cross-session acceptance claim
+here.

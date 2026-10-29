@@ -45,7 +45,7 @@ export class CodexNativeRequests {
             options: q.options.map((o: any) => ({ value: String(o.label), label: String(o.label) })) } : { type: "textarea" as const }),
         })), submitLabel: "Submit" } });
       this.assertActive(signal);
-      if (reply.requestId !== requestId || approval && reply.responder) throw new Error("Native question response is unconfirmed");
+      if (reply.requestId !== requestId || approval && ("responder" in reply && reply.responder)) throw new Error("Native question response is unconfirmed");
       if (reply.action !== "submit") return { answers: {} };
       const answers: Record<string, { answers: string[] }> = {};
       for (const question of questions) {
@@ -69,7 +69,7 @@ export class CodexNativeRequests {
       submitLabel: "Confirm", cancelLabel: "Cancel",
     } });
     this.assertActive(signal);
-    if (reply.requestId !== requestId || reply.responder) throw new Error("A native permission decision requires its actual human responder");
+    if (reply.requestId !== requestId || ("responder" in reply && reply.responder)) throw new Error("A native permission decision requires its actual human responder");
     const decision = reply.action === "submit" ? reply.values?.decision : "cancel";
     if (typeof decision !== "string" || !choices.includes(decision)) throw new Error("Native approval decision is unsupported");
     this.decisions.set(input.itemId, { requestId, hash: interactionHash(reply), decision });

@@ -109,7 +109,7 @@ test("OpenClaw Gateway DE recovery retains private/group native histories, memor
       assert.equal(result.employeeRevision,2);assert.equal(result.sessionId,id);assert.equal(result.recovery.detached,false);
     }
     assert.equal(f.inferences.length,2);assert.equal(f.conn.streamEvents.length,0);
-    assert.ok(f.calls.slice(before).every(call=>["chat.history","sessions.describe","sessions.messages.subscribe","agents.list","agents.files.get","models.list"].includes(call.method)),JSON.stringify(f.calls.slice(before).map(call=>call.method)));
+    assert.ok(f.calls.slice(before).every(call=>["chat.history","sessions.describe","sessions.messages.subscribe","agents.list","agents.files.get","models.list","phonon.peers.capabilities"].includes(call.method)),JSON.stringify(f.calls.slice(before).map(call=>call.method)));
     assert.equal(readFileSync(memory,"utf8"),"Retained long-term DE memory");
     await f.turn(direct,"private next");await f.turn(group,"group next");
     assert.deepEqual(f.inferences.map(call=>call.sessionId),[privateNative.id,groupNative.id,privateNative.id,groupNative.id]);
@@ -129,7 +129,7 @@ test("OpenClaw recovery refuses changed identity, empty/active/queued/archived h
       if(variant==="empty"){row.messages=[];row.leaf=null;}if(variant==="active")row.active=true;
       if(variant==="queued")row.pending=1;if(variant==="archived")row.archived=true;if(variant==="unknown")row.status=undefined;
       const before=f.calls.length;await assert.rejects(f.conn.call("session.recover",f.expected(id)));
-      assert.equal(f.inferences.length,1);assert.ok(f.calls.slice(before).every(call=>["chat.history","agents.list","models.list","sessions.describe"].includes(call.method)),JSON.stringify(f.calls.slice(before).map(call=>call.method)));
+      assert.equal(f.inferences.length,1);assert.ok(f.calls.slice(before).every(call=>["chat.history","agents.list","models.list","sessions.describe","phonon.peers.capabilities"].includes(call.method)),JSON.stringify(f.calls.slice(before).map(call=>call.method)));
       assert.equal((await f.conn.call("session.status",{sessionId:id}) as any).recovery.detached,true);
     }finally{await f.close();}
   }

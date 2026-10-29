@@ -8,11 +8,13 @@ import { buildChildProcessEnvironment } from "../child-env.js";
 import { prepareCopilotPeerContext } from "./copilot-peer-context.js";
 import { discoverCopilotNativeModels } from "./copilot-models.js";
 import { nativeReasoning } from "../reasoning.js";
+import { CurrentTurnInput } from "../current-turn-input.js";
 import type {
   AgentAdapter,
   AdapterSession,
   CreateSessionParams,
   SendOptions,
+  InsertionOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
 import type {
@@ -159,6 +161,7 @@ class CopilotSession implements AdapterSession {
   private nativeSessionId?: string;
   private peerQualified = false;
   private peer?: ReturnType<typeof prepareCopilotPeerContext>;
+  private readonly currentTurnInput=new CurrentTurnInput();
 
   async preparePeerContext(environment?: Record<string, string>, signal?: AbortSignal): Promise<void> {
     this.peerQualified = false;
@@ -189,6 +192,7 @@ class CopilotSession implements AdapterSession {
     initialContext?: ContextItem[],
     reattach = false,
     private readonly reasoningFlag=false,
+    private readonly nativeInput=false,
   ) {
     this.sessionId = sessionId;
     this.model = model;
@@ -202,6 +206,13 @@ class CopilotSession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    return this.currentTurnInput.run(opts,{enabled:this.nativeInput&&this.peerQualified,capability:()=>this.peerContextCapability(),receipt:"native_context"},
+      options=>this.sendNative(input,options));
+  }
+
+  insertAtToolGap(input:string,options:InsertionOptions):Promise<void>{return this.currentTurnInput.insert(input,options);}
+
+  private async sendNative(input: string, opts: SendOptions): Promise<void> {
     if (this.current) throw new Error("Copilot session already has an active turn");
     if (opts.signal?.aborted) {
       opts.emit({ type: "result", sessionId: this.sessionId, turnId: opts.turnId, seq: 0, at: new Date().toISOString(),
@@ -228,7 +239,7 @@ class CopilotSession implements AdapterSession {
     ];
     if (opts.peerContext && this.peerQualified && this.nativeSessionId) {
       try {
-        this.peer = prepareCopilotPeerContext(opts, { sessionId: this.nativeSessionId, cwd: this.cwd, prompt: prompt + "\n" });
+        this.peer = prepareCopilotPeerContext(opts, { sessionId: this.nativeSessionId, cwd: this.cwd, prompt: prompt + "\n",nativeInput:this.nativeInput });
         args.push("--plugin-dir", this.peer.path);
         if (!this.started) args.push("--session-id", this.nativeSessionId);
       } catch { this.peerQualified = false; }
@@ -414,6 +425,7 @@ export class CopilotAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.injectMidTurn=available&&version==="1.0.82"&&this.env.peerContext===true;
     this.capabilities.reasoningControl=false;
     if(available){
       try{const help=await discoveryProbe(this.env.binPath??"copilot",["--no-auto-update","--help"],signal);this.capabilities.reasoningControl=/--reasoning-effort\s+<level>/.test(help??"");}
@@ -437,7 +449,7 @@ export class CopilotAdapter implements AgentAdapter {
     const model = params.model && params.model !== "default"
       ? params.model
       : (this.env.defaultModel ?? "default");
-    return new CopilotSession(
+    const session=new CopilotSession(
       params.sessionId,
       model,
       params.cwd,
@@ -445,7 +457,10 @@ export class CopilotAdapter implements AgentAdapter {
       params.initialContext,
       params.reattach,
       this.capabilities.reasoningControl,
+      this.capabilities.injectMidTurn,
     );
+    if(this.capabilities.injectMidTurn)await session.preparePeerContext();
+    return session;
   }
 
   private fallbackModels(): ModelInfo[] {

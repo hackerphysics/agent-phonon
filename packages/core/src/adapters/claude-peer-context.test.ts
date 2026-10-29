@@ -201,7 +201,8 @@ test("Claude required headroom defers initial/near-full mail and recovers once w
   const output=await invoke("recovered");assert.ok(output.hookSpecificOutput.additionalContext.includes(f.message.text));
   assert.equal(f.journal.records("owner","owned")[0]?.state,"context_hook");assert.deepEqual(await invoke("deduplicated"),{});
   assert.equal(boundaries[0].budget.state,"unknown");assert.equal(boundaries[1].budget.state,"known");
-  await hooks.PreCompact[0].hooks[0]();assert.equal(budget.budget().state,"unknown");
+  await hooks.PreCompact[0].hooks[0]({...base,session_id:"foreign-child",hook_event_name:"PreCompact"});assert.equal(budget.budget().state,"known");
+  await hooks.PreCompact[0].hooks[0]({...base,hook_event_name:"PreCompact"});assert.equal(budget.budget().state,"unknown");
 }));
 
 test("Claude parallel root tool outputs share accounting and cannot both claim the same inference headroom",()=>fixture(async f=>{

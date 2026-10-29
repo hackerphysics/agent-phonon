@@ -9,11 +9,13 @@ import { existsSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import { openCodePure, prepareOpenCodePeerContext } from "./opencode-peer-context.js";
+import { CurrentTurnInput } from "../current-turn-input.js";
 import {parseOpenCodeNativeModels} from "./opencode-models.js";
 import type {
   AgentAdapter,
   AdapterSession,
   CreateSessionParams,
+  InsertionOptions,
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
@@ -82,6 +84,7 @@ class OpenCodeSession implements AdapterSession {
   private pendingInject: string[] = [];
   private peerSupported = false;
   private peerNativeSession?: string;
+  private readonly currentTurnInput = new CurrentTurnInput();
 
   async qualifyPeerContext(): Promise<void> {
     try { this.peerSupported = (await discoveryProbe(this.bin, ["--version"]))?.trim() === "1.14.20"; }
@@ -89,7 +92,7 @@ class OpenCodeSession implements AdapterSession {
   }
   peerContextCapability(environment?: Record<string,string>) {
     return this.peerSupported && !openCodePure(environment) ? {mode:"context_hook",boundary:"before_model",visibility:"hidden",
-      evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.peerNativeSession} as const : undefined;
+      evidence:"provider_payload",budget:"native_estimate",nativeSessionId:this.peerNativeSession} as const : undefined;
   }
 
   constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[],private readonly variants=new Map<string,Map<ReasoningLevel,string>>(),private readonly defaultVariantModel?:string) {
@@ -102,6 +105,15 @@ class OpenCodeSession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    return this.currentTurnInput.run(opts, { enabled: this.peerSupported && !openCodePure(opts.environment),
+      capability: () => this.peerContextCapability(opts.environment) }, options => this.sendNative(input, options));
+  }
+
+  insertAtToolGap(input: string, options: InsertionOptions): Promise<void> {
+    return this.currentTurnInput.insert(input, options);
+  }
+
+  private async sendNative(input: string, opts: SendOptions): Promise<void> {
     const { turnId, emit } = opts;
     let message = input;
     if (this.pendingInject.length > 0) {
@@ -312,6 +324,7 @@ export class OpenCodeAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.injectMidTurn = version?.trim() === "1.14.20" && !openCodePure();
     let models:ModelInfo[]=[];
     this.capabilities.reasoningControl=false;
     if(available)try{
@@ -345,6 +358,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     const variants=this.capabilities.reasoningControl?this.variants:undefined;
     const session = new OpenCodeSession(params.sessionId, model, params.cwd, this.bin, params.initialContext,variants,this.configuredModel);
     await session.qualifyPeerContext();
+    this.capabilities.injectMidTurn = !!session.peerContextCapability();
     return session;
   }
 

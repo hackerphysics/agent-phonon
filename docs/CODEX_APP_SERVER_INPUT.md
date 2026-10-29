@@ -35,7 +35,8 @@ SessionEngine dispatch, same-session continuation, real native approval allow an
 deny, cancellation with observed process-tree exit, and refreshed MCP bindings.
 It is not paid-model, physical cross-device or production deployment evidence.
 
-Adapter integration and the shared project-authority boundary remain local until
-their concurrent source dependency can be safely integrated. The low-level
-transport and native request handlers are independently testable components;
-their presence alone must not enable an adapter capability.
+The adapter uses the shared original-window/source fence independently of
+separate directory-admission changes. The transport/request handlers and the
+adapter's runtime qualification are distinct; transport presence alone must
+not enable an adapter capability. Managed-MCP end-to-end acceptance and release
+remain separate requirements.
