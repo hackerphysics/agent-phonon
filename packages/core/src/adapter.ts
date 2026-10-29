@@ -27,6 +27,13 @@ export interface EmployeeProfileTarget {
 }
 export interface EmployeeProfileObservation {documentHashes:Record<string,string>;memoryBytes:number;home:string;nativeIdentity?:string;}
 
+export interface InsertionOptions {
+  turnId: string;
+  signal: AbortSignal;
+  /** Revalidate controller authority at the native effect, not just inbox admission. */
+  beforeApply?: () => void;
+}
+
 /**
  * Adapter 接口（design D8）。
  *
@@ -63,7 +70,7 @@ export interface AdapterSession {
   /** Resolve only after current-turn model input is applied at a tool gap.
    * Reject on abort/closed turn; never store this as next-turn context or restart.
    * Advertise injectMidTurn only when this operation is genuinely implemented. */
-  insertAtToolGap?(input: string, options: { turnId: string; signal: AbortSignal }): Promise<void>;
+  insertAtToolGap?(input: string, options: InsertionOptions): Promise<void>;
 
   /** 压缩上下文（native）。 */
   compressNative?(): Promise<{ applied?: boolean; summary?: string }>;
