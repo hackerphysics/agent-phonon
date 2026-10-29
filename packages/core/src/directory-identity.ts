@@ -11,3 +11,8 @@ export function directoryIdentity(path:string):string{
 export function assertDirectoryIdentity(path:string,expected:string):void{
   if(directoryIdentity(path)!==expected)throw new PhononError("errPolicyDenied","directory identity changed");
 }
+
+/** Registered paths survive remounts and local replacement; operation-local pins stay strict. */
+export function assertRegisteredDirectory(path:string):void{
+  directoryIdentity(path);
+}

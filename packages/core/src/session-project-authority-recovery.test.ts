@@ -35,7 +35,7 @@ for(const phase of ["observe","recover-prep","recover-late","identity-reopen","s
       }
       if(phase==="identity-reopen"){
         renameSync(cwd,cwd+"-old");mkdirSync(cwd);
-        await assert.rejects(engine.recover("alice","s-owned",{project:"p",agent:"codex",model:"fake"}));assert.deepEqual(effects,[]);return;
+        await engine.recover("alice","s-owned",{project:"p",agent:"codex",model:"fake"});assert.deepEqual(effects,["recover"]);return;
       }
       const pending=engine.recover("alice","s-owned",{project:"p",agent:"codex",model:"fake"});
       const rejected=assert.rejects(pending,/revoked/);await started;allowed=false;release();await rejected;

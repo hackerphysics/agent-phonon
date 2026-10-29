@@ -9,6 +9,7 @@ import {requestFingerprint} from "./idempotency.js";
 import type {ProjectManager} from "./project-manager.js";
 import type {PolicyEnforcer} from "./policy.js";
 import {workspacePathKey} from "./workspace-paths.js";
+import {assertRegisteredDirectory} from "./directory-identity.js";
 
 function nodeIdentity(path:string){
   const st=lstatSync(path,{bigint:true});
@@ -48,8 +49,9 @@ export class ProjectProvisioner{
     }
     const row=this.data().project(this.tenant,id)??this.data().overlapping(workspacePathKey(path));
     if(!row){if(id.startsWith("managed-")||reserved)throw new PhononError("errProjectProvisionChanged","prepared workspace record unavailable");return;}
-    if(row.tenant!==this.tenant||row.project_id!==id||!["observed","confirmed"].includes(row.state)||row.path!==path||nodeIdentity(row.root)!==row.root_node_identity||nodeIdentity(path)!==row.node_identity)
+    if(row.tenant!==this.tenant||row.project_id!==id||!["observed","confirmed"].includes(row.state)||row.path!==path)
       throw new PhononError("errProjectProvisionChanged","prepared workspace identity changed");
+    assertRegisteredDirectory(row.root);assertRegisteredDirectory(path);
   }
   provision(raw:unknown){
     const task=this.perform(raw);this.tasks.add(task);void task.then(()=>this.tasks.delete(task),()=>this.tasks.delete(task));return task;

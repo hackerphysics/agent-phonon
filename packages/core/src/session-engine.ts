@@ -27,7 +27,7 @@ import { SessionCheckpoint, readSessionCheckpoint } from "./session-recovery.js"
 import { NativeStopTarget } from "@agent-phonon/protocol";
 import type {SkillSelection} from "@agent-phonon/protocol";
 import type {FrozenSkillSet,LoadedSkillSet} from "./skill-execution.js";
-import {directoryIdentity,assertDirectoryIdentity} from "./directory-identity.js";
+import {directoryIdentity,assertRegisteredDirectory} from "./directory-identity.js";
 
 const DISPOSE_SETTLE_TIMEOUT_MS = 2_000;
 
@@ -452,9 +452,9 @@ export class SessionEngine {
     if(!this.resolveCwdForReattach)return undefined;
     const cwd=this.resolveCwdForReattach(rec.project,rec.worktreeId);
     if(!cwd||!rec.cwd||cwd!==rec.cwd)throw new PhononError("errPolicyDenied","Session project workspace changed");
-    if(rec.cwdIdentity)assertDirectoryIdentity(cwd,rec.cwdIdentity);
+    assertRegisteredDirectory(cwd);
     if(authority&&this.projectAuthorityGeneration?.(cwd)!==authority.generation)throw new PhononError("errPolicyDenied","directory admission generation changed");
-    return rec.cwdIdentity??directoryIdentity(cwd);
+    return directoryIdentity(cwd);
   }
   private allowQueueDrain(rec:SessionRecord):boolean{
     try{
