@@ -22,7 +22,7 @@ export class PeerContextBridge {
       };
       void (async () => {
         const actual = Buffer.from(req.headers.authorization ?? ""), expected = Buffer.from("Bearer " + this.token);
-        if (this.closed || req.method !== "POST" || !["/peer-context", "/peer-context/authorize", "/peer-context/observe"].includes(req.url ?? "")) return reply(404, { error: "not_found" });
+        if (this.closed || req.method !== "POST" || !["/peer-context", "/peer-context/authorize", "/peer-context/context-applied", "/peer-context/observe"].includes(req.url ?? "")) return reply(404, { error: "not_found" });
         if (req.headers.origin || req.headers.host !== this.authority || actual.length !== expected.length || !timingSafeEqual(actual, expected)) return reply(403, { error: "forbidden" });
         if (this.pending >= 2 || this.requests >= 512) return reply(429, { error: "checkpoint_limit" });
         this.pending++; this.requests++;
@@ -39,6 +39,10 @@ export class PeerContextBridge {
             const batch = await this.access.prepare(PeerContextBoundary.parse(input), controller.signal);
             if (this.closed || controller.signal.aborted) throw new Error("closed");
             reply(200, batch);
+          } else if (req.url === "/peer-context/context-applied") {
+            if (!this.access.contextApplied) throw new Error("Native context confirmation unavailable");
+            this.access.contextApplied(PeerContextObservation.omit({evidence:true}).parse(input));
+            reply(200,{applied:true});
           } else if (req.url === "/peer-context/authorize") {
             if (!this.access.authorize) throw new Error("Native effect authorization unavailable");
             this.access.authorize(PeerContextObservation.parse(input));

@@ -35,3 +35,23 @@ The reusable inbox and peer controller implement this contract independently
 from any adapter's capability flag. Each harness still needs its own qualified
 native implementation, lifecycle checks and installed current-task acceptance.
 See `MID_TURN_INPUT.md` for the ongoing all-harness integration checkpoint.
+
+## Native Context Binding
+
+An independently qualified adapter may select `receipt: "native_context"` when
+its supported native API applies hook context and exposes the same original
+root's subsequent model continuation. This is an adapter-owned choice, not a
+producer-selected evidence upgrade. Ordinary weak/custom transports retain
+the default provider-payload requirement.
+
+Such a binding still prepares and authorizes the exact bounded input. A hook
+offer, returned value or authorization cannot settle it. Only the separate
+`/peer-context/context-applied` confirmation for the same native root, original
+boundary and message IDs may do so after native continuation is observed.
+The ordinary context-hook observation remains insufficient.
+
+Native context confirmation is neither an invented native user message nor a
+provider-payload/remote-consumption receipt. Independently sourced peer offers
+keep their existing `context_hook` evidence ceiling. A default payload binding
+cannot opt itself into this route, and a context binding cannot claim stronger
+provider evidence. Unconfirmed input still expires with the original turn.

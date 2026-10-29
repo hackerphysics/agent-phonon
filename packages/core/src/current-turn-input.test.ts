@@ -14,13 +14,13 @@ const boundary = (): PeerContextBoundary => ({ boundaryId: randomUUID(), nativeS
   budget: { state: "known", source: "native_estimate", contextWindowTokens: 128000, inputTokens: 1000, outputTokens: 4000, overheadTokens: 1024 } });
 
 async function fixture(work: (state: { input: CurrentTurnInput; access: PeerContextAccess; options: SendOptions;
-  stop: () => void; capability: PeerContextCapability; finish: () => void }) => Promise<void>, parent?: PeerContextAccess) {
+  stop: () => void; capability: PeerContextCapability; finish: () => void }) => Promise<void>, parent?: PeerContextAccess,receipt?:"native_context") {
   const input = new CurrentTurnInput(), started = deferred(), finished = deferred(), abort = new AbortController();
   let captured!: SendOptions;
   const capability: PeerContextCapability = { mode: "context_hook", boundary: "before_model", visibility: "hidden",
     evidence: "provider_payload", nativeSessionId: "native-root" };
   const run = input.run({ turnId: "active", verbosity: "tools", signal: abort.signal, emit: () => {}, ...(parent ? { peerContext: parent } : {}) },
-    { enabled: true, capability: () => capability }, async options => { captured = options; started.resolve(); await finished.promise; });
+    { enabled: true, capability: () => capability,receipt }, async options => { captured = options; started.resolve(); await finished.promise; });
   try {
     await started.promise;
     await work({ input, access: captured.peerContext!, options: captured, stop: () => abort.abort(), capability, finish: finished.resolve });
@@ -50,6 +50,24 @@ test("current-turn input waits for exact native provider payload, not a hook off
   await operation.promise;
   assert.equal(operation.settled(), true);
   assert.equal((await state.access.prepare(boundary())).messages.length, 0);
+}));
+
+test("qualified native context requires a separate application confirmation, not a hook offer",()=>fixture(async state=>{
+  state.capability.evidence="context_hook";
+  const operation=insert(state.input),point={...boundary(),inputEvidence:"context_hook" as const},batch=await state.access.prepare(point);
+  const observation={boundaryId:point.boundaryId,nativeSessionId:point.nativeSessionId,messageIds:batch.messages.map(value=>value.messageId)};
+  state.access.authorize!({...observation,evidence:"context_hook"});
+  state.access.observe({...observation,evidence:"context_hook"});await Promise.resolve();assert.equal(operation.settled(),false);
+  assert.throws(()=>state.access.observe({...observation,evidence:"provider_payload"}),{appCode:"errCapabilityUnsupported"});
+  const url=state.options.environment!.AGENT_PHONON_PEER_CONTEXT_URL!;
+  const response=await fetch(url+"/context-applied",{method:"POST",headers:{Authorization:"Bearer "+state.options.environment!.AGENT_PHONON_PEER_CONTEXT_TOKEN,"Content-Type":"application/json"},body:JSON.stringify(observation)});
+  assert.equal(response.status,200);await operation.promise;
+},undefined,"native_context"));
+
+test("ordinary weak transports cannot opt themselves into native-context application",()=>fixture(async state=>{
+  const operation=insert(state.input),point=boundary(),batch=await state.access.prepare(point);
+  assert.throws(()=>state.access.contextApplied!({boundaryId:point.boundaryId,nativeSessionId:point.nativeSessionId,messageIds:batch.messages.map(value=>value.messageId)}),{appCode:"errCapabilityUnsupported"});
+  assert.equal(operation.settled(),false);operation.controller.abort();await assert.rejects(operation.promise);
 }));
 
 test("current-turn input uses its private local bridge without a coordination callback", () => fixture(async state => {

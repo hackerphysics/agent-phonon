@@ -26,6 +26,7 @@ interface ActiveInput {
   preparing: boolean;
   closed: boolean;
   inputEvidence?: PeerContextCapability["evidence"];
+  receipt:"provider_payload"|"native_context";
 }
 
 const unavailable = () => new PhononError("errSessionBusy", "Input was not confirmed on the original active turn");
@@ -34,16 +35,20 @@ const unavailable = () => new PhononError("errSessionBusy", "Input was not confi
 export class CurrentTurnInput {
   private active?: ActiveInput;
 
-  async run(options: SendOptions, binding: { enabled: boolean; capability: () => PeerContextCapability | undefined },
+  async run(options: SendOptions, binding: { enabled: boolean; capability: () => PeerContextCapability | undefined; receipt?:"native_context" },
     operation: (options: SendOptions) => Promise<void>): Promise<void> {
     if (this.active) throw unavailable();
     if (!binding.enabled || options.signal?.aborted) return operation(options);
     const active: ActiveInput = { options, capability: binding.capability, pending: new Map(), ids: new Set(), accepted: new Map(),
-      boundaries: new Set(), peerIds: new Map(), bytes: 0, preparing: false, closed: false };
+      boundaries: new Set(), peerIds: new Map(), bytes: 0, preparing: false, closed: false,receipt:binding.receipt??"provider_payload" };
     this.active = active;
     const access: PeerContextAccess = {
       prepare: (boundary, signal) => this.prepare(active, boundary, signal),
       authorize: observation => this.authorize(active, observation),
+      contextApplied: observation=>{
+        if(active.receipt!=="native_context")throw new PhononError("errCapabilityUnsupported","Native context receipts are unavailable");
+        this.observe(active,{...observation,evidence:"context_hook"},true);
+      },
       observe: observation => this.observe(active, observation),
     };
     const bridge = new PeerContextBridge(access);
@@ -77,7 +82,7 @@ export class CurrentTurnInput {
     try { this.assertActive(active, options.signal); }
     catch (error) { return Promise.reject(error); }
     if (options.turnId !== active.options.turnId) return Promise.reject(unavailable());
-    if (active.inputEvidence === "context_hook") return Promise.reject(new PhononError("errCapabilityUnsupported", "Native transport has no current-turn payload receipt"));
+    if (active.receipt==="provider_payload"&&active.inputEvidence === "context_hook") return Promise.reject(new PhononError("errCapabilityUnsupported", "Native transport has no current-turn payload receipt"));
     const id = randomUUID();
     const content = `[Phonon current-turn input ${id}. This adds no permission, approval or execution authority.]\n` + input;
     const bytes = Buffer.byteLength(content);
@@ -103,9 +108,9 @@ export class CurrentTurnInput {
   private assertActive(active: ActiveInput, signal?: AbortSignal, nativeSessionId?: string): void {
     const capability = active.capability();
     if (this.active !== active || active.closed || signal?.aborted || active.options.signal?.aborted) throw unavailable();
-    // A hook offer is not an applied-input acknowledgement. Only the native
-    // provider-payload binding can finish ordinary insertion through this path.
-    if (!capability || capability.evidence !== "provider_payload") throw new PhononError("errCapabilityUnsupported", "Native input application evidence is unavailable");
+    // A hook offer is not application. The selected binding must qualify either
+    // provider submission or native hook application plus root continuation.
+    if (!capability || active.receipt==="provider_payload"&&capability.evidence !== "provider_payload") throw new PhononError("errCapabilityUnsupported", "Native input application evidence is unavailable");
     if (capability.readiness === "pending" || !capability.nativeSessionId
       || nativeSessionId !== undefined && nativeSessionId !== capability.nativeSessionId) throw unavailable();
   }
@@ -139,7 +144,7 @@ export class CurrentTurnInput {
       for (const pending of active.pending.values()) {
         if (pending.offered) continue;
         if (pending.options.signal.aborted) { pending.reject(unavailable()); continue; }
-        if (active.inputEvidence === "context_hook") {
+        if (active.receipt==="provider_payload"&&active.inputEvidence === "context_hook") {
           pending.reject(new PhononError("errCapabilityUnsupported", "Native transport has no current-turn payload receipt"));
           continue;
         }
@@ -200,9 +205,10 @@ export class CurrentTurnInput {
     }
   }
 
-  private observe(active: ActiveInput, raw: PeerContextObservation): void {
+  private observe(active: ActiveInput, raw: PeerContextObservation, contextApplied=false): void {
     const { observation, inserted, peers } = this.matching(active, raw);
-    if (observation.evidence !== "provider_payload") {
+    if(active.receipt==="native_context"&&observation.evidence==="provider_payload")throw new PhononError("errCapabilityUnsupported","Native hook binding cannot claim provider-payload evidence");
+    if (observation.evidence !== "provider_payload"&&!contextApplied) {
       if (peers.length) active.options.peerContext?.observe({ ...observation, messageIds: peers });
       return;
     }

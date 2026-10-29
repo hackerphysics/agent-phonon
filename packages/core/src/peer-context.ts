@@ -36,6 +36,8 @@ export interface PeerContextAccess {
   prepare(boundary: PeerContextBoundary, signal?: AbortSignal): Promise<PeerContextBatch>;
   /** Pure pre-effect authorization; never a delivery observation or ACK. */
   authorize?(observation: PeerContextObservation): void;
+  /** Qualified native hook output followed by the same root model continuation. */
+  contextApplied?(observation: Omit<PeerContextObservation,"evidence">): void;
   observe(observation: PeerContextObservation): void;
 }
 export interface PeerContextCapability {

@@ -15,6 +15,8 @@ const codexBin=process.env.PHONON_TEST_CODEX_BIN;
 if(codexBin&&(!isAbsolute(codexBin)||/[\x00-\x1f\x7f]/.test(codexBin)))throw new Error('An explicit absolute native Codex executable is required');
 const hermesBin=process.env.PHONON_TEST_HERMES_BIN;
 if(hermesBin&&(!isAbsolute(hermesBin)||/[\x00-\x1f\x7f]/.test(hermesBin)))throw new Error('An explicit absolute native Hermes executable is required');
+const claudeBin=process.env.PHONON_TEST_CLAUDE_BIN;
+if(claudeBin&&(!isAbsolute(claudeBin)||/[\x00-\x1f\x7f]/.test(claudeBin)))throw new Error('An explicit absolute native Claude executable is required');
 const openCodeBin=process.env.PHONON_TEST_OPENCODE_BIN,openCodeDeps=process.env.PHONON_TEST_OPENCODE_DEPS;
 for(const path of [openCodeBin,openCodeDeps])if(path&&(!isAbsolute(path)||/[\x00-\x1f\x7f]/.test(path)))throw new Error('Explicit absolute native OpenCode and prepared dependency paths are required');
 const openclawSDK=process.env.PHONON_TEST_OPENCLAW_SDK;
@@ -43,6 +45,7 @@ const env = {
   PHONON_TEST_OWNER:process.env.PHONON_TEST_OWNER??'local-'+process.pid,
   ...(codexBin?{PHONON_TEST_CODEX_BIN:codexBin}:{}),
   ...(hermesBin?{PHONON_TEST_HERMES_BIN:hermesBin}:{}),
+  ...(claudeBin?{PHONON_TEST_CLAUDE_BIN:claudeBin}:{}),
   ...(openCodeBin?{PHONON_TEST_OPENCODE_BIN:openCodeBin}:{}),
   ...(openCodeDeps?{PHONON_TEST_OPENCODE_DEPS:openCodeDeps}:{}),
   ...(openclawSDK?{PHONON_TEST_OPENCLAW_SDK:openclawSDK}:{}),
