@@ -126,7 +126,11 @@ export class CurrentTurnInput {
       let available = boundary.budget ? peerContextHeadroom(boundary.budget) : 0;
       let bytes = 0;
       // Preserve source-owned peer offers before using the remaining native budget.
-      const peers = await active.options.peerContext?.prepare(boundary, signal);
+      let peers: PeerContextBatch | undefined;
+      try { peers = await active.options.peerContext?.prepare(boundary, signal); }
+      catch {
+        // Optional peer mail cannot suppress separately authorized ordinary input.
+      }
       this.assertActive(active, signal, boundary.nativeSessionId);
       if (peers && (peers.boundaryId !== boundary.boundaryId || peers.nativeSessionId !== boundary.nativeSessionId)) throw unavailable();
       const peerIds = new Set<string>();

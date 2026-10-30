@@ -60,7 +60,19 @@ approval denial are verified with controlled local provider responses. The
 receiver sees inserted content before its original execution completes, not
 in a replacement task. Test-owned processes, database and fixtures are removed.
 
-That complete real-MCP matrix has not yet been run for the other six harnesses;
+Claude Code now also passes that six-case public/managed MCP matrix with a real
+Codex sender and installed Claude 2.0.1 receiver. Scoped Git tree
+`1fa2f566d40430aeadcd044c355ce5999cb311b1` verifies the original native UUID,
+one native query/result, unchanged Core turn/run, exact retry, late refusal and
+native MCP sender denial. This integration exposed two missing protections:
+optional peer-inbox errors must not suppress independent ordinary input, and
+Claude must recalculate native headroom after asynchronous checkpoints rather
+than reject every newly observed tool record. Rechecking fresh capacity before
+and after authorization retains parallel-tool, generation, window/output and
+source/cancellation fences. See `CLAUDE_CURRENT_TURN_INPUT.md` and the matching
+Phonon Work evidence record for reproduction and later committed-source runs.
+
+That complete real-MCP matrix has not yet been run for the other five harnesses;
 their native adapter/SessionEngine tests are separate evidence, not substitute
 full-chain receipts. All-harness MCP acceptance remains open. Production
 release/activation and broader provider/version/OS acceptance are not claimed.

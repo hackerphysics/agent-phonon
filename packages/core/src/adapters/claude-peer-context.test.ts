@@ -218,6 +218,24 @@ test("Claude parallel root tool outputs share accounting and cannot both claim t
   assert.deepEqual(calls,["/peer-context"],"later tool-result growth suppresses a stale projection without observation");
 }));
 
+for(const phase of ["prepare","authorize"] as const)for(const size of [128,180000])test(`Claude rechecks ${size} bytes of native tool records arriving during ${phase}`,()=>fixture(async f=>{
+  const asset=prepareClaudePeerRunner(f.options,{entry:"/owned/cli.js",sdk:"/owned/sdk.mjs"},{sessionId:f.state.native,prompt:"Original",model:"default",resume:false});f.scope.defer(asset.cleanup);
+  const module=await import(pathToFileURL(asset.args[0]!).href),model="claude-sonnet-4-5-20250929",budget=module.createClaudePeerBudget({sessionId:f.state.native,outputReserve:()=>32000});
+  budget.observe({type:"system",subtype:"init",session_id:f.state.native,model});
+  budget.observe({type:"assistant",session_id:f.state.native,message:{model,usage:{input_tokens:100,output_tokens:20,cache_creation_input_tokens:0,cache_read_input_tokens:0}}});
+  const calls:string[]=[],applications:any[]=[];
+  const hooks=module.createPeerHooks({sessionId:f.state.native,cwd:f.root,rootTools:new Set(["read"]),getBudget:budget.budget,budgetGeneration:budget.generation,
+    offered:(value:any)=>applications.push(value),checkpoint:async(path:string,input:any)=>{
+      calls.push(path);const authorizing=path.endsWith("/authorize");
+      if(authorizing===(phase==="authorize"))budget.observe({type:"user",session_id:f.state.native,message:{content:[{type:"tool_result",tool_use_id:"read",content:"x".repeat(size)}]}});
+      if(authorizing)return{};
+      return {...input,messages:[{messageId:randomUUID(),content:"Current task context"}],deferred:[]};
+    }});
+  const result=await hooks.PostToolUse[0].hooks[0]({session_id:f.state.native,cwd:f.root,transcript_path:join(f.root,f.state.native+".jsonl"),hook_event_name:"PostToolUse",tool_response:{}},"read",{});
+  if(size===128){assert.equal(result.hookSpecificOutput.additionalContext,"Current task context");assert.equal(applications.length,1);assert.deepEqual(calls,["/peer-context","/peer-context/authorize"]);}
+  else{assert.deepEqual(result,{});assert.deepEqual(applications,[]);assert.deepEqual(calls,phase==="authorize"?["/peer-context","/peer-context/authorize"]:["/peer-context"]);}
+}));
+
 for(const mode of["default","plan","missing","duplicate"] as const)test(`Claude startup normalization is root-only and fail-closed for ${mode}`,()=>fixture(async f=>{
   const cli=join(f.root,"startup-cli.mjs"),effect=join(f.root,"startup-effect.json");
   writeFileSync(cli,`import{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(effect)},JSON.stringify({args:process.argv.slice(2),execArgs:process.execArgv}));\n`);

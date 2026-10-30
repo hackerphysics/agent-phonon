@@ -181,17 +181,22 @@ export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBu
       if(!active() || options?.signal?.aborted || generation!==budgetGeneration() || batch.boundaryId!==boundaryId || batch.nativeSessionId!==sessionId || !Array.isArray(batch.messages)
         || batch.messages.length>8 || batch.messages.some(item=>typeof item.messageId!=="string" || typeof item.content!=="string")) return {};
       if(!batch.messages.length) return {};
-      const current=getBudget(input.tool_response);
-      if(budget.state!=="known"||current.state!=="known"||current.contextWindowTokens<budget.contextWindowTokens||current.outputTokens>budget.outputTokens
-        ||current.inputTokens+peerDebit+toolDebit-currentToolBytes>budget.inputTokens)return {};
       const additionalContext=batch.messages.map(item=>item.content).join("\n\n");
       if(Buffer.byteLength(additionalContext)>16000)return {};
-      peerDebit+=Buffer.byteLength(additionalContext)+64*batch.messages.length;
+      const cost=Buffer.byteLength(additionalContext)+64*batch.messages.length;
+      const headroom=()=>{
+        const current=getBudget(input.tool_response);
+        return budget.state==="known"&&current.state==="known"&&current.contextWindowTokens>=budget.contextWindowTokens&&current.outputTokens<=budget.outputTokens
+          &&toolDebit-currentToolBytes<=previousToolDebit
+          &&current.contextWindowTokens-current.inputTokens-current.outputTokens-current.overheadTokens-peerDebit-toolDebit+currentToolBytes>=cost;
+      };
+      if(!headroom())return {};
       const observation={boundaryId,nativeSessionId:sessionId,messageIds:batch.messages.map(item=>item.messageId),evidence:"context_hook"};
       if(offered){await checkpoint("/peer-context/authorize",observation,options?.signal);}
       else try { await checkpoint("/peer-context/observe",observation,options?.signal); }
       catch { /* A returned hook value is not a provider request or a consumption ACK. */ }
-      if(!active() || options?.signal?.aborted || generation!==budgetGeneration()||toolDebit-currentToolBytes>previousToolDebit) return {};
+      if(!active() || options?.signal?.aborted || generation!==budgetGeneration()||!headroom()) return {};
+      peerDebit+=cost;
       offered?.({boundaryId,nativeSessionId:sessionId,messageIds:observation.messageIds},generation);
       return {hookSpecificOutput:{hookEventName:input.hook_event_name,additionalContext}};
     } catch { return {}; }finally{pending=false;}

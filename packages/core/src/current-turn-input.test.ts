@@ -35,6 +35,34 @@ function insert(input: CurrentTurnInput, text = "new information", beforeApply?:
   return { promise, controller, settled: () => settled };
 }
 
+for(const receipt of [undefined,"native_context"] as const)test(`optional peer inbox failure cannot suppress independently authorized ${receipt??"provider_payload"} input`,()=>fixture(async state=>{
+  if(receipt)state.capability.evidence="context_hook";
+  const operation=insert(state.input),point=boundary(),batch=await state.access.prepare(point);
+  assert.equal(batch.messages.length,1);
+  assert.ok(batch.messages[0]!.content.endsWith("new information"));
+  const observation={boundaryId:point.boundaryId,nativeSessionId:point.nativeSessionId,messageIds:batch.messages.map(value=>value.messageId),
+    evidence:receipt?"context_hook" as const:"provider_payload" as const};
+  state.access.authorize!(observation);assert.equal(operation.settled(),false);
+  if(receipt)state.access.contextApplied!(observation);else state.access.observe(observation);
+  await operation.promise;
+},{prepare:async()=>{throw new Error("Optional peer inbox is disabled");},authorize:()=>{throw new Error("No peer authorization was offered");},observe:()=>{throw new Error("No peer application was offered");}},receipt));
+
+test("optional peer failure does not bypass the ordinary input's original source check",()=>fixture(async state=>{
+  const operation=insert(state.input,"source-bound",()=>{throw new Error("Original input source revoked");});
+  assert.equal((await state.access.prepare(boundary())).messages.length,0);
+  await assert.rejects(operation.promise,/Original input source revoked/);
+},{prepare:async()=>{throw new Error("Optional peer inbox is disabled");},observe:()=>{throw new Error("No peer application was offered");}}));
+
+for(const changed of ["cancelled","native-session"] as const)test(`optional peer failure cannot bypass a ${changed} original input window`,async()=>{
+  const gate=deferred();
+  await fixture(async state=>{
+    const operation=insert(state.input),prepared=state.access.prepare(boundary());
+    if(changed==="cancelled")state.stop();else state.capability.nativeSessionId="replacement";
+    gate.resolve();await assert.rejects(prepared,{appCode:"errSessionBusy"});
+    operation.controller.abort();await assert.rejects(operation.promise,{appCode:"errSessionBusy"});
+  },{prepare:async()=>{await gate.promise;throw new Error("Optional peer inbox unavailable");},observe:()=>{throw new Error("No peer application was offered");}});
+});
+
 test("current-turn input waits for exact native provider payload, not a hook offer", () => fixture(async state => {
   const operation = insert(state.input), point = boundary();
   const offered = await state.access.prepare(point);
