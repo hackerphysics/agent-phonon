@@ -86,7 +86,18 @@ Hermes also passes the six-case public/managed MCP matrix with a real Codex
 sender and installed Hermes receiver (Phonon Work `d8f7216`). The receiver sees
 the input in the original native provider continuation before completion.
 
-That complete real-MCP matrix has not yet been run for the other four harnesses;
+OpenCode 1.15.10 also passes the six-case public/managed MCP receiver matrix and
+the 513-case delivery regression lane against scoped native tree
+`9d054b5006922698924747f145e53a12ad8b9a82`. This newer runtime exposed a changed
+empty-stdin prompt representation and dropped final JSON events even without a
+plugin. The adapter now validates the original completed native database leaf
+after a normal exit when output is missing; it never infers success from exit
+zero alone. Native tool permissions retain both Effect and Promise forms with
+one invocation and the original abort signal. Only the default invocation
+plugin entry is exported, preventing native loaders from invoking helper APIs
+as separate plugins.
+
+That complete real-MCP matrix has not yet been run for the other three harnesses;
 their native adapter/SessionEngine tests are separate evidence, not substitute
 full-chain receipts. All-harness MCP acceptance remains open. Production
 release/activation and broader provider/version/OS acceptance are not claimed.

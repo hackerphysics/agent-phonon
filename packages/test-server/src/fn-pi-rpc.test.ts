@@ -243,6 +243,11 @@ test("Pi help alone does not advertise steering for the older unverified RPC lif
   finally { f.close(); }
 });
 
+for(const [version,supported] of [["0.84.2",true],["0.85.0\nNative update notice",true],["\u001b[32mv1.0.0\u001b[0m",true],["0.84.0",false],["0.85.0-preview",false]] as const)
+  test(`Pi minimum version preserves steering eligibility for ${JSON.stringify(version)}`,nativeOptions,()=>{
+    const f=nativeFixture({version});try{assert.equal(f.adapter().capabilities.injectMidTurn,supported);}finally{f.close();}
+  });
+
 test("Pi RPC canonicalizes a configured native-home alias without relaxing its retained file identity", nativeOptions, async () => {
   const f = nativeFixture({auto: true}); let session: AdapterSession | undefined;
   try {

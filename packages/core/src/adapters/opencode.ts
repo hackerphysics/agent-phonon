@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
-import { openCodePure, prepareOpenCodePeerContext } from "./opencode-peer-context.js";
+import { openCodePure, prepareOpenCodePeerContext,formatOpenCodeRunPrompt } from "./opencode-peer-context.js";
+import {readOpenCodeCompletion} from "./opencode-context.js";
 import { CurrentTurnInput } from "../current-turn-input.js";
 import {parseOpenCodeNativeModels} from "./opencode-models.js";
 import type {
@@ -70,9 +71,9 @@ function resolveBin(configured?: string): string {
 }
 
 /** OpenCode 会话库路径(part 表存消息块)。 */
-export function resolveOpenCodeDbPath(): string {
-  const xdg = process.env.XDG_DATA_HOME;
-  const base = xdg ? join(xdg, "opencode") : join(homedir(), ".local", "share", "opencode");
+export function resolveOpenCodeDbPath(environment:NodeJS.ProcessEnv=process.env): string {
+  const xdg = environment.XDG_DATA_HOME;
+  const base = xdg ? join(xdg, "opencode") : join(environment.HOME??homedir(), ".local", "share", "opencode");
   return join(base, "opencode.db");
 }
 
@@ -138,6 +139,7 @@ class OpenCodeSession implements AdapterSession {
   }
 
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
+    const notBefore=Date.now();
     this.peerNativeSession = undefined;
     const peer = this.peerSupported?prepareOpenCodePeerContext(opts, this.ocSessionId,args.at(-1)):undefined;
     let owned:ProcessSupervisor|undefined;
@@ -222,6 +224,11 @@ class OpenCodeSession implements AdapterSession {
       child.on("close", (code) => {
         if (settled) return;
         consume(buf);
+        if(code===0&&!nativeError&&(!sawCompletion||!acc.trim())&&this.ocSessionId&&!opts.signal?.aborted){
+          const completion=readOpenCodeCompletion(resolveOpenCodeDbPath(environment),{sessionId:this.ocSessionId,cwd:this.cwd,model:this.model,
+            prompt:formatOpenCodeRunPrompt(args.at(-1)!),notBefore});
+          if(completion){sawCompletion=true;acc=completion.text;}
+        }
         const failed = code !== 0 || !!nativeError || !sawCompletion || !acc.trim();
         const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [opts.environment?.AGENT_PHONON_PEER_CONTEXT_TOKEN,opts.environment?.AGENT_PHONON_INTERACTION_TOKEN]);
         finish(failed ? "failed" : "completed", acc, failed ? `opencode exited ${code}: ${detail}` : undefined);

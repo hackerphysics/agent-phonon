@@ -774,7 +774,8 @@ export class PiAdapter implements AgentAdapter {
 
   private rpcSupported(): boolean {
     if (this.rpcAvailable === undefined) {
-      const version = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"])?.trim().replace(/^v/, "") : undefined;
+      const output = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"]) : undefined;
+      const version = output ? parsePiVersion(output)?.replace(/^v/, "") : undefined;
       // This is the first verified lifecycle with agent_settled and exact
       // user-message delivery events. Older RPC versions remain JSON-only.
       this.rpcAvailable = nativeVersionAtLeast(version, "0.84.1");

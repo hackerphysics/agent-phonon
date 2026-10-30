@@ -17,6 +17,7 @@ import {AgentInteractionBridge} from "../agent-interaction-bridge.js";
 import {SessionEngine,AdapterRegistry} from "../session-engine.js";
 import {PhononStore} from "../store.js";
 import {CurrentTurnInput} from "../current-turn-input.js";
+import {nativeVersionAtLeast} from "@agent-phonon/protocol";
 
 async function fixture(work: (f: any) => Promise<void>) {
   return withPeerFixture("opencode-peer",async scope=>{
@@ -33,12 +34,13 @@ async function fixture(work: (f: any) => Promise<void>) {
   });
 }
 
-async function activate(f:any,session:Record<string,unknown>={},nativeTransport=false){
-  const asset=prepareOpenCodePeerContext(f.options)!;
+async function activate(f:any,session:Record<string,unknown>={},nativeTransport=false,prompt?:string){
+  const asset=prepareOpenCodePeerContext(f.options,undefined,prompt)!;
   const values={...f.environment,...asset.environment},previous=new Map(Object.keys(values).map(key=>[key,process.env[key]]));
   try{
     Object.assign(process.env,values);
     const module=await import(pathToFileURL(asset.path).href);
+    assert.deepEqual(Object.keys(module),["default"],"native legacy loaders must see exactly one plugin entry");
     assert.equal(process.env.AGENT_PHONON_PEER_CONTEXT_TOKEN,undefined);
     const hooks=await module.default({directory:f.root,client:{session:{get:async({path}:any)=>({data:{id:path.id,directory:f.root,...session}})}}});
     const forwarded:any[]=[];
@@ -88,6 +90,19 @@ test("OpenCode uses an invocation-only Phonon module without copying capabilitie
     assert.equal(source.includes(asset.nonce),false);
   }finally{asset.cleanup();}
   assert.equal(existsSync(asset.path),false);
+}));
+
+for(const variant of ["current","legacy-stdin","wrong","extra-newline"] as const)test(`OpenCode original prompt binding preserves exact native formatting: ${variant}`,()=>fixture(async f=>{
+  const prompt='Original "quoted" task\nwith another line',native=await activate(f,{},false,prompt);
+  try{
+    const encoded='"'+prompt.replace(/"/g,'\\"')+'"';
+    assert.equal(native.asset.environment.AGENT_PHONON_OPENCODE_PROMPT,encoded);
+    const text=variant==="current"?encoded:variant==="legacy-stdin"?encoded+"\n":variant==="wrong"?prompt:encoded+"\n\n";
+    const original=user();original.parts[0]!.text=text;
+    await native.hooks["chat.message"]({sessionID:f.state.native},{message:original.info,parts:original.parts});
+    f.state.pending=true;await native.request();
+    assert.equal(native.forwarded[0].init.body.includes(f.message.text),variant==="current"||variant==="legacy-stdin");
+  }finally{native.asset.cleanup();}
 }));
 
 test("OpenCode native fetch reports actual submitted payload while custom fetch retains its weaker ceiling",()=>fixture(async f=>{
@@ -250,11 +265,13 @@ test("OpenCode cancellation stops the owned process before removing its invocati
   }finally{controller.abort();await session.terminate();await run.catch(()=>{});}
 }));
 
-test("OpenCode outgoing uses exact native message/call identities and preserves permission rejection",{
+for(const permissionStyle of ["effect","promise"] as const)test(`OpenCode outgoing uses exact native message/call identities and preserves ${permissionStyle} permission rejection`,{
   skip:!process.env.PHONON_TEST_OPENCODE_DEPS,
 },()=>fixture(async f=>{
   const config=join(f.root,"config","opencode"),deps=process.env.PHONON_TEST_OPENCODE_DEPS!;
-  f.scope.mountOpenCodeDependencies(deps,"1.14.20",config);
+  const installed=JSON.parse(readFileSync(join(deps,"node_modules/@opencode-ai/plugin/package.json"),"utf8"));
+  assert.equal(nativeVersionAtLeast(installed.version,"1.14.20"),true);
+  f.scope.mountOpenCodeDependencies(deps,installed.version,config);
   let endDuringSend:()=>Promise<void>=async()=>{};
   const sends:any[]=[],bridge=new AgentInteractionBridge(undefined,undefined,undefined,undefined,undefined,undefined,async args=>{sends.push(args);await endDuringSend();return {status:"left",participantId:randomUUID()};});
   f.scope.defer(()=>bridge.close());const channel=await bridge.listen(),options={...f.options,peerContext:undefined,projectCoordination:async()=>({}),environment:{...channel,XDG_CONFIG_HOME:join(f.root,"config")}};
@@ -270,7 +287,7 @@ test("OpenCode outgoing uses exact native message/call identities and preserves 
       message:async()=>({data:{info:{id:mid,sessionID:sid,role:state.role,parentID:"msg_original"},parts:[{type:"tool",tool:"phonon_project_coordination",callID:state.callID,sessionID:sid,messageID:mid,state:{status:state.partStatus,input:state.changed?{operation:"presence"}:args}}]}})}}});
   }finally{for(const[key,value]of previous){if(value===undefined)delete process.env[key];else process.env[key]=value;}}
   const root=user(),context={sessionID:sid,messageID:mid,callID:id,directory:f.root,messages:[root],abort:new AbortController().signal,
-    ask:()=>state.deny?Effect.fail(new Error("native permission denied")):Effect.void};
+    ask:()=>permissionStyle==="promise"?(state.deny?Promise.reject(new Error("native permission denied")):Promise.resolve()):state.deny?Effect.fail(new Error("native permission denied")):Effect.void};
   const run=()=>hooks.tool.phonon_project_coordination.execute(args,context);
   await assert.rejects(run());await hooks["chat.message"]({sessionID:sid},{message:root.info,parts:root.parts});
   await assert.rejects(hooks["tool.execute.before"]({tool:"phonon_project_coordination",sessionID:"ses_child",callID:id},{args}));
@@ -285,7 +302,7 @@ test("OpenCode outgoing uses exact native message/call identities and preserves 
   context.callID=state.callID="call-denied";await hooks["tool.execute.before"]({tool:"phonon_project_coordination",sessionID:sid,callID:context.callID},{args});
   state.deny=true;await assert.rejects(run(),/native permission denied/);state.deny=false;await assert.rejects(run());assert.equal(sends.length,1);
   context.callID=state.callID="call-pending";await hooks["tool.execute.before"]({tool:"phonon_project_coordination",sessionID:sid,callID:context.callID},{args});
-  await assert.rejects(hooks.tool.phonon_project_coordination.execute(args,{...context,abort:AbortSignal.timeout(20),ask:()=>Effect.never}));assert.equal(sends.length,1);
+  await assert.rejects(hooks.tool.phonon_project_coordination.execute(args,{...context,abort:AbortSignal.timeout(20),ask:()=>permissionStyle==="promise"?new Promise(()=>{}):Effect.never}));assert.equal(sends.length,1);
   context.callID=state.callID="call-late";await hooks["tool.execute.before"]({tool:"phonon_project_coordination",sessionID:sid,callID:context.callID},{args});
   endDuringSend=async()=>{state.parentID="ses_changed";};await assert.rejects(run(),/unconfirmed/);assert.equal(sends.length,2);state.parentID=undefined;
   context.callID=state.callID="call-replaced";await hooks["tool.execute.before"]({tool:"phonon_project_coordination",sessionID:sid,callID:context.callID},{args});
@@ -304,7 +321,8 @@ for(const phase of ["baseline","receive","send","denied","unapproved","child","r
   let insertion:Promise<void>|undefined,insertionState:"pending"|"accepted"|"rejected"="pending";
   const dependencies=process.env.PHONON_TEST_OPENCODE_DEPS!,configDirectory=join(f.root,"config","opencode");
   const installed=JSON.parse(readFileSync(join(dependencies,"node_modules","@opencode-ai","plugin","package.json"),"utf8"));
-  assert.equal(installed.version,process.env.PHONON_TEST_OPENCODE_VERSION??"1.14.20","prepare the actual matching native plugin package locally before running acceptance");
+  assert.equal(nativeVersionAtLeast(installed.version,"1.14.20"),true,"prepare a native plugin SDK at or above the minimum locally");
+  if(process.env.PHONON_TEST_OPENCODE_VERSION)assert.equal(installed.version,process.env.PHONON_TEST_OPENCODE_VERSION,"explicit evidence version must match the installed SDK");
   f.scope.mountOpenCodeDependencies(dependencies,installed.version,configDirectory);
   const payloads:any[]=[],errors:unknown[]=[],events:any[]=[];
   const sends:any[]=[],action={operation:"send",requestId:randomUUID(),recipientId:randomUUID(),kind:"notice",text:"PRIVATE_OPENCODE_IMPACT_"+randomUUID()};
@@ -417,11 +435,17 @@ for(const phase of ["baseline","receive","send","denied","unapproved","child","r
     assert.deepEqual(errors,[]);
     const logDirectory=join(f.root,"data","opencode","log");
     const logs=events.at(-1)?.status==="completed"&&(!outgoing||sends.length)?[]:existsSync(logDirectory)?readdirSync(logDirectory).slice(-2).map(name=>readFileSync(join(logDirectory,name),"utf8").slice(-16000).replaceAll(environment.AGENT_PHONON_PEER_CONTEXT_TOKEN!,"[redacted]")):[];
+    let nativeState;
+    if(events.at(-1)?.status!=="completed"){
+      const db=new DatabaseSync(join(f.root,"data/opencode/opencode.db"),{readOnly:true});
+      try{nativeState={messages:db.prepare("SELECT id,data FROM message ORDER BY time_created DESC LIMIT 4").all(),parts:db.prepare("SELECT data FROM part ORDER BY time_created DESC LIMIT 6").all()};}finally{db.close();}
+    }
     if(phase==="unapproved"){
       assert.equal(sends.length,0);assert.equal(events.at(-1)?.status,"failed");assert.equal(payloads.length,1);
-      assert.ok(raw.includes("The user rejected permission"));assert.equal(JSON.stringify(events).includes(action.text),false);return;
+      assert.ok(JSON.stringify({raw,nativeState}).includes("The user rejected permission"),JSON.stringify({events,raw,nativeState}));
+      assert.equal(JSON.stringify(events).includes(action.text),false);return;
     }
-    assert.equal(events.at(-1)?.status,"completed",JSON.stringify({events,requests:payloads.length,receipts:f.journal.records("owner","owned"),raw,logs}));
+    assert.equal(events.at(-1)?.status,"completed",JSON.stringify({nativeState,events,requests:payloads.length,receipts:f.journal.records("owner","owned"),raw,logs}));
     if(outgoing){
       assert.equal(sends.length,["denied","unapproved"].includes(phase)?0:phase==="resume"?2:1,JSON.stringify({events,tools:payloads.map(p=>p.tools.map((t:any)=>t.function?.name)),results:payloads.map(p=>p.messages.filter((m:any)=>m.role==="tool")),sends,raw,logs}));
       assert.equal(payloads.length,phase==="child"?5:phase==="resume"?4:2);

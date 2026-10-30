@@ -13,6 +13,10 @@ export function openCodePure(environment?: Record<string, string>): boolean {
   return !!value && !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
 }
 
+export function formatOpenCodeRunPrompt(prompt:string):string {
+  return prompt.includes(" ")?'"'+prompt.replace(/"/g,'\\"')+'"':prompt;
+}
+
 /** One invocation-scoped Phonon bridge; reuses native dependencies without changing user configuration. */
 export const OPENCODE_RECEIVE_RUNTIME = `const nativeVersionAtLeast = ${nativeVersionAtLeast.toString()};\n` + String.raw`
 import { request } from "node:http";
@@ -23,7 +27,7 @@ import {homedir} from "node:os";
 import {readFileSync,realpathSync} from "node:fs";
 import {pathToFileURL} from "node:url";
 const canonical=value=>JSON.stringify(value&&typeof value==="object"?Array.isArray(value)?value.map(item=>JSON.parse(canonical(item))):Object.fromEntries(Object.keys(value).sort().map(key=>[key,JSON.parse(canonical(value[key]))])):value);
-export async function openCodeCoordinationTool(description,execute){
+async function openCodeCoordinationTool(description,execute){
  const home=process.env.OPENCODE_CONFIG_DIR||join(process.env.XDG_CONFIG_HOME||join(homedir(),".config"),"opencode");
  const require=createRequire(join(home,"package.json")),toolPath=join(home,"node_modules","@opencode-ai","plugin","dist","tool.js");
  if(!nativeVersionAtLeast(JSON.parse(readFileSync(join(toolPath,"..","..","package.json"),"utf8")).version,"1.14.20"))throw new Error("Native plugin dependency requires >=1.14.20");
@@ -34,7 +38,7 @@ export async function openCodeCoordinationTool(description,execute){
   text:z.string().max(4000).optional(),references:z.array(z.string().max(512)).max(8).optional(),inReplyTo:z.string().uuid().optional(),
   after:z.string().optional(),baseRevision:z.number().int().nonnegative().optional(),activity:z.object({summary:z.string().max(500),phase:z.enum(["planning","working","validating","blocked","idle","completed"]),impact:z.array(z.string()).max(16),dependencies:z.string().optional()}).optional(),messageIds:z.array(z.string().uuid()).max(32).optional()},execute});
 }
-export async function installOpenCodePeer(input,capsule,transport) {
+async function installOpenCodePeer(input,capsule,transport) {
   const endpoint = capsule.peer?new URL(capsule.url || ""):undefined;
   const token = capsule.token, nonce = capsule.nonce;
   const expected = capsule.expected || "";
@@ -147,7 +151,15 @@ export async function installOpenCodePeer(input,capsule,transport) {
         };
         if(!call||call.used||call.args!==canonical(args)||!await valid()||call.used||typeof context.ask!=="function")throw new Error("Native coordination source unavailable");
         call.used=true;
-        await Effect.runPromise(context.ask({permission:"phonon_project_coordination",patterns:["*"],always:["*"],metadata:{operation:args.operation}}),{signal:context.abort});
+        const permission=context.ask({permission:"phonon_project_coordination",patterns:["*"],always:["*"],metadata:{operation:args.operation}});
+        if(Effect.isEffect(permission))await Effect.runPromise(permission,{signal:context.abort});
+        else if(permission&&typeof permission.then==="function"){
+          let abort;
+          try{await Promise.race([permission,new Promise((_,reject)=>{
+            abort=()=>reject(new Error("Native permission source ended"));
+            if(context.abort?.aborted)abort();else context.abort?.addEventListener("abort",abort,{once:true});
+          })]);}finally{if(abort)context.abort?.removeEventListener("abort",abort);}
+        }else throw new Error("Native permission API is unavailable");
         if(!await valid())throw new Error("Native coordination source ended");
         let value;
         try{value=transport?.coordinate?await transport.coordinate({nativeAssistantId:context.messageID,toolCallId:context.callID,action:args},context.abort)
@@ -196,7 +208,9 @@ export async function installOpenCodePeer(input,capsule,transport) {
         const value=await input.client.session.get({path:{id:sid}});
         const session=value?.data;
         if(ended || root || !session || session.id!==sid || session.parentID || session.directory!==input.directory) return;
-        if(capsule.prompt&&output.parts?.filter(part=>part.type==="text").map(part=>part.text).join("\n")!==capsule.prompt)return;
+        // Native run versions differ only in whether empty non-TTY stdin adds a newline.
+        const prompt=output.parts?.filter(part=>part.type==="text").map(part=>part.text).join("\n");
+        if(capsule.prompt&&prompt!==capsule.prompt&&prompt!==capsule.prompt+"\n")return;
         root=sid;originalMessage=output.message.id;rootAgent=output.message.agent;
         if(!transport)process.stderr.write("PHONON_OPENCODE_PEER_READY_"+nonce+":"+root+"\n");
       } catch { /* A missing native binding never authorizes a replacement session. */ }
@@ -249,7 +263,7 @@ export function prepareOpenCodePeerContext(options: SendOptions, expectedSession
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...config, plugin: [...config.plugin ?? [], pathToFileURL(path).href] }),
       AGENT_PHONON_OPENCODE_NONCE: nonce, AGENT_PHONON_OPENCODE_SESSION: expectedSession ?? "",
       AGENT_PHONON_OPENCODE_PEER:options.peerContext?"1":"0",AGENT_PHONON_OPENCODE_COORDINATION:options.projectCoordination?"1":"0",
-      AGENT_PHONON_OPENCODE_PROMPT:prompt===undefined?"":(prompt.includes(" ")?'"'+prompt.replace(/"/g,'\\"')+'"':prompt)+"\n",
+      AGENT_PHONON_OPENCODE_PROMPT:prompt===undefined?"":formatOpenCodeRunPrompt(prompt),
       AGENT_PHONON_OPENCODE_OTHER_TOOLS:options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument?"1":"0",
     }, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
   } catch (error) { rmSync(directory, { recursive: true, force: true }); throw error; }
