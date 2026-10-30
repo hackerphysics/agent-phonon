@@ -97,11 +97,31 @@ one invocation and the original abort signal. Only the default invocation
 plugin entry is exported, preventing native loaders from invoking helper APIs
 as separate plugins.
 
-That complete real-MCP matrix has not yet been run for the other three harnesses;
-their native adapter/SessionEngine tests are separate evidence, not substitute
-full-chain receipts. All-harness MCP acceptance remains open. Production
-release/activation and broader provider/version/OS acceptance are not claimed.
-For OpenClaw the qualified path is Gateway, not the unqualified one-shot CLI.
+Pi and Copilot also pass all six public/managed MCP cases with a real Codex
+sender. Pi uses its original native RPC steer and exact user-message consumption;
+Copilot uses its authorized invocation extension and original root continuation.
+The Copilot fixture's separate no-inference permission setup is restricted to an
+owned Git/workspace boundary, never the outer real project or personal profile.
+
+OpenClaw Gateway passes the same six cases using a plugin built only from the
+committed native source. Actual Gateway frames and history retain the original
+native session and run, with exactly one `chat.send` and no `chat.inject`, new
+user input or replacement execution. Its explicit native interaction, peer
+context and hook grants remain enabled only by the synthetic fixture owner.
+
+All seven maintained receivers therefore have full-chain acceptance, not only
+adapter/SessionEngine evidence: 42 real-MCP cases (public/managed success, exact
+retry, closed window and native sender denial), plus 513 delivery regressions.
+The final shared-source sweep uses native `f18cf8c` / tree
+`4a363a9a81b692d211f9be2352e6d69fcdda62c3`; scoped Git-object builds exclude
+unrelated concurrent source changes. The test runner checks owned process exit,
+database deletion and fixture removal. Source integration and local controlled-
+provider acceptance do not claim a production release/activation, physical
+cross-device coverage or every provider/version/OS. For OpenClaw the supported
+path is Gateway, not the unqualified one-shot CLI.
+
+Minimum-version policy is recorded in
+`docs/decisions/2026-10-30-native-harness-minimum-versions.md`.
 
 Mobile waiting batches and FIFO input are separate scheduling requirements.
 This contract does not claim that durable waiting batches, pending-input
