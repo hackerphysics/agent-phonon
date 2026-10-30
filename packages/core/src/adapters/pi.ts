@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
@@ -773,10 +774,10 @@ export class PiAdapter implements AgentAdapter {
 
   private rpcSupported(): boolean {
     if (this.rpcAvailable === undefined) {
-      const version = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"])?.match(/^v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/) : undefined;
+      const version = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"])?.trim().replace(/^v/, "") : undefined;
       // This is the first verified lifecycle with agent_settled and exact
       // user-message delivery events. Older RPC versions remain JSON-only.
-      this.rpcAvailable = !!version && (+version[1]! > 0 || +version[2]! > 84 || +version[2]! === 84 && +version[3]! >= 1);
+      this.rpcAvailable = nativeVersionAtLeast(version, "0.84.1");
     }
     return this.rpcAvailable;
   }

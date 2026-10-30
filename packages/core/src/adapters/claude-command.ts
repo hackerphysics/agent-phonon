@@ -2,6 +2,7 @@ import { basename, dirname, delimiter, isAbsolute, join, resolve } from "node:pa
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { discoveryProbe } from "../discovery-probe.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 
 export interface ClaudeSdkBinding { entry: string; sdk: string; node?: string }
 
@@ -24,7 +25,7 @@ export async function qualifyClaudePeerContext(bin: string): Promise<ClaudeSdkBi
     const {entry,node}=command,sdk = join(dirname(entry), "sdk.mjs");
     if (!statSync(sdk).isFile()) return undefined;
     const version = await discoveryProbe(node, [entry,"--version"]);
-    if (!/^2\.0\.1(?:\s|$)/.test(version?.trim() ?? "")) return undefined;
+    if (!nativeVersionAtLeast(version?.trim().match(/^(\S+)(?: \(Claude Code\))?$/)?.[1], "2.0.1")) return undefined;
     const result = await discoveryProbe(node, ["--input-type=module", "-e",
       "const sdk=await import(process.argv[1]);if(typeof sdk.query==='function'&&typeof sdk.createSdkMcpServer==='function')console.log('phonon_claude_hooks_v1');", pathToFileURL(sdk).href]);
     return result?.trim() === "phonon_claude_hooks_v1" ? {entry,sdk,node} : undefined;

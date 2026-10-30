@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { realpathSync } from "node:fs";
 import { z } from "zod";
 import { loopbackEndpoint, nativeGatewayAuthority, parameterHash, readJson, type GatewayCall } from "./native-interactions.js";
@@ -84,7 +85,7 @@ export class NativePeerContexts {
         const config=z.object({plugins:z.object({enabled:z.boolean().optional(),entries:z.record(z.unknown())}).passthrough()}).parse(raw);
         const entry=z.object({enabled:z.boolean().optional(),config:z.object({peerContext:z.boolean().optional()}).passthrough().optional(),
           hooks:z.object({allowPromptInjection:z.boolean().optional(),allowConversationAccess:z.boolean().optional()}).passthrough().optional()}).parse(config.plugins.entries[api.id??"agent-phonon-hitl"]);
-        return ["2026.9.3","2026.10.7"].includes(api.runtime?.version??"")&&typeof api.registerAgentToolResultMiddleware==="function"&&config.plugins.enabled!==false
+        return nativeVersionAtLeast(api.runtime?.version,"2026.9.3")&&typeof api.registerAgentToolResultMiddleware==="function"&&config.plugins.enabled!==false
           &&entry?.enabled===true&&entry.config?.peerContext===true&&entry.hooks?.allowPromptInjection===true&&entry.hooks.allowConversationAccess===true;
       }catch{return false;}
     };
@@ -95,7 +96,7 @@ export class NativePeerContexts {
           const selectedRuntime="sessionKey" in input?this.selectedRuntime(input.sessionKey,input.model,input.sessionId):null;
           call.respond(true,{version:1,available:this.ready()&&(!("sessionKey"in input)||selectedRuntime==="openclaw"),selectedRuntime:selectedRuntime??null,
             nativeVersion:api.runtime?.version??null,runtimes:["openclaw"],boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",
-            ...(this.ready()&&api.runtime?.version==="2026.10.7"?{currentTurnInput:"native_context_v1"}:{})});};
+            ...(this.ready()&&nativeVersionAtLeast(api.runtime?.version,"2026.10.7")?{currentTurnInput:"native_context_v1"}:{})});};
         if("sessionKey"in input&&this.ready()&&!this.resolveRuntime&&this.options.loadRuntimeResolver){
           this.loading??=this.options.loadRuntimeResolver().then(resolver=>{this.resolveRuntime=resolver;});
           void this.loading.then(reply,()=>this.reject(call));return;
@@ -132,7 +133,7 @@ export class NativePeerContexts {
       const applications=[...binding.applications.values()];binding.applications.clear();
       for(const application of applications)if(application.accepted)await this.confirmContext(binding,application);
     });
-    if(api.runtime?.version==="2026.10.7")api.on("tool_result_persist",(event:any,ctx:NativeContext&{toolCallId?:string})=>{
+    if(nativeVersionAtLeast(api.runtime?.version,"2026.10.7"))api.on("tool_result_persist",(event:any,ctx:NativeContext&{toolCallId?:string})=>{
       const binding=this.get(ctx.sessionKey),message=event.message;
       if(!binding?.nativeInput||ctx.agentId!==binding.sessionKey.split(":")[1]||event.isSynthetic===true||message?.role!=="toolResult"
         ||message.isError===true||!Array.isArray(message.content)||message.content.length>200)return;
@@ -190,7 +191,7 @@ export class NativePeerContexts {
         else call.respond(true,{version:1,released:false});return;}
       if(!this.ready())throw new Error("unsupported peer context");
       const input=bindingInput.parse(call.params);loopbackEndpoint(input.endpoint,"/peer-context");
-      if(input.nativeInput&&this.api?.runtime?.version!=="2026.10.7")throw new Error("unsupported native input lifecycle");
+      if(input.nativeInput&&!nativeVersionAtLeast(this.api?.runtime?.version,"2026.10.7"))throw new Error("unsupported native input lifecycle");
       if(this.selectedRuntime(input.sessionKey,input.model,input.sessionId)!=="openclaw"||realpathSync(input.workspaceDir)!==input.workspaceDir||input.expiresAt<=Date.now()||input.expiresAt>Date.now()+1800000)throw new Error("invalid peer binding");
       for(const key of this.bindings.keys())this.get(key);
       const existing=this.get(input.sessionKey),fingerprint=parameterHash(input);
@@ -205,7 +206,7 @@ export class NativePeerContexts {
   }
   private get(key?:string):Binding|undefined {
     const binding=key?this.bindings.get(key):undefined;
-    if(binding&&(!this.ready()||binding.nativeInput&&this.api?.runtime?.version!=="2026.10.7"||binding.expiresAt<=Date.now()||!binding.current()||this.selectedRuntime(binding.sessionKey,binding.model,binding.sessionId)!=="openclaw")){this.remove(binding);return;}
+    if(binding&&(!this.ready()||binding.nativeInput&&!nativeVersionAtLeast(this.api?.runtime?.version,"2026.10.7")||binding.expiresAt<=Date.now()||!binding.current()||this.selectedRuntime(binding.sessionKey,binding.model,binding.sessionId)!=="openclaw")){this.remove(binding);return;}
     return binding;
   }
   private remove(binding:Binding):void {

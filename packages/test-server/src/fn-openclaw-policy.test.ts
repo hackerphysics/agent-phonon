@@ -27,14 +27,14 @@ test("dynamic catalog policy preserves unrelated tools without plugin groups or 
   ])assert.throws(()=>deriveToolPolicy(bad,"main"));
 });
 
-function fixture(){
+function fixture(version="2026.10.7"){
   const policy=new NativeToolPolicy({resolveRuntime:()=>"openclaw",isMessagingTool:name=>name==="fixture_channel"}),methods=new Map<string,any>(),hooks=new Map<string,any[]>();
   const connection=new AbortController(),resource=new AbortController(),sessionKey="agent:main:phonon-policy-test",sessionId=randomUUID();
   const config:any={plugins:{entries:{"agent-phonon-hitl":{enabled:true,hooks:{allowPromptInjection:true,allowConversationAccess:true}}}},tools:{codeMode:false,toolSearch:false},agents:{entries:{main:{}}}};
   let entry:any={sessionId,modelProvider:"local",model:"m1"};
   const client:any={connId:randomUUID(),connect:{role:"operator",scopes:["operator.admin"]},connectionSignal:connection.signal};
   let evaluator:any,cleanup:any;
-  policy.register({id:"agent-phonon-hitl",runtime:{version:"2026.10.7",config:{current:()=>config},agent:{session:{getSessionEntry:()=>entry}}},
+  policy.register({id:"agent-phonon-hitl",runtime:{version,config:{current:()=>config},agent:{session:{getSessionEntry:()=>entry}}},
     registerGatewayMethod:(name:any,handler:any,options:any)=>{assert.deepEqual(options,{scope:"operator.write",sessionAccess:{mode:"write"}});methods.set(name,handler);},on:(name:any,handler:any)=>hooks.set(name,[...(hooks.get(name)??[]),handler]),
     registerTrustedToolPolicy:(value:any)=>{evaluator=value.evaluate;},lifecycle:{registerRuntimeLifecycle:(value:any)=>{cleanup=value.cleanup;}}});
   const input={version:1,sessionKey,sessionId,runId:randomUUID(),policyId:randomUUID(),agentId:"main",model:"local/m1",expiresAt:Date.now()+60000,catalog:catalog()};
@@ -54,6 +54,14 @@ function fixture(){
   const call=(toolName:string,context:any=ctx,event:any={})=>evaluator({toolName,params:{},runId:context.runId,toolCallId:randomUUID(),...event},context);
   return {policy,input,ctx,client,config,connection,resource,access,retained:()=>retained,hooks,rpc,call,start,controllers,evaluator:()=>evaluator,cleanup:()=>cleanup({}),changeEntry:(value:any)=>{entry=value;}};
 }
+
+for(const version of ["2026.10.8","2026.11.1","2027.1.1"])test(`OpenClaw policy accepts newer native interfaces and reports actual version ${version}`,async()=>{
+  const f=fixture(version);try{
+    const bound=await f.rpc(POLICY_BIND);assert.equal(bound.ok,true);assert.equal(bound.payload.nativeVersion,version);
+    assert.equal((await f.rpc(POLICY_CONFIRM)).ok,true);
+    assert.equal((await f.rpc(POLICY_RELEASE)).ok,true);
+  }finally{f.cleanup();}
+});
 
 test("policy binding requires live admin, exact native identity and safe qualified surface",async()=>{
   const f=fixture();try{
@@ -200,14 +208,14 @@ test("never-dispatched release discards provenance only before any native contro
 
 test("client requires matching policy/catalog proof and the original connection epoch; never reconnects a dispatch",async()=>{
   const client:any=new GatewayClient({baseUrl:"ws://127.0.0.1:1",token:"synthetic-secret"});
-  const calls:any[]=[];let mode="ok",bound:any;
+  const calls:any[]=[];let mode="ok",bound:any,nativeVersion="2026.10.7";
   Object.assign(client,{connected:true,epoch:1});client.connect=async()=>{};
   client.rpc=async(method:string,params:any)=>{
     calls.push({method,params});
     if(method==="tools.catalog")return catalog(params.agentId);
     if(method==="tools.effective")return catalog(params.agentId).effective;
     if(method==="phonon.policy.bind"){
-      bound={version:1,bound:true,policy:"phonon-noninteractive-v1",nativeVersion:"2026.10.7",policyId:params.policyId,
+      bound={version:1,bound:true,policy:"phonon-noninteractive-v1",nativeVersion,policyId:params.policyId,
         sessionKey:params.sessionKey,sessionId:params.sessionId,runId:params.runId,catalogHash:createHash("sha256").update(JSON.stringify(params.catalog)).digest("hex"),executionFence:"native-controller-v1"};
       if(mode==="unsupported")throw new Error("secret must not escape");
       return mode==="stale"?{...bound,runId:randomUUID()}:bound;
@@ -217,6 +225,11 @@ test("client requires matching policy/catalog proof and the original connection 
   };
   const input={sessionKey:"agent:main:phonon-client",sessionId:randomUUID(),runId:randomUUID(),agentId:"main",model:"local/m1"};
   try{
+    for(nativeVersion of ["2026.10.8","2026.11.1","2027.1.1"]){
+      const compatible=await client.bindNoninteractivePolicy(input);await compatible.confirm();await compatible.release();
+    }
+    for(nativeVersion of ["2026.10.6","2026.11.1-preview","unknown"])await assert.rejects(client.bindNoninteractivePolicy(input));
+    nativeVersion="2026.10.7";
     for(mode of ["unsupported","stale"]){await assert.rejects(client.bindNoninteractivePolicy(input),error=>!String(error).includes("secret must not escape"));}
     mode="ok";const policy=await client.bindNoninteractivePolicy(input);await policy.confirm();
     mode="stale-confirm";await assert.rejects(policy.confirm());mode="ok";

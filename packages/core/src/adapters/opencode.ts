@@ -1,4 +1,5 @@
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { PhononError } from "../rpc.js";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
@@ -52,6 +53,8 @@ const CAPABILITIES: AgentCapabilities = {
   limits: { maxConcurrentSessions: 4 },
 };
 
+const MINIMUM_CLI_VERSION="1.14.20";
+
 export interface OpenCodeEnv {
   /** opencode binary 路径（默认探测）。 */
   binPath?: string;
@@ -87,7 +90,7 @@ class OpenCodeSession implements AdapterSession {
   private readonly currentTurnInput = new CurrentTurnInput();
 
   async qualifyPeerContext(): Promise<void> {
-    try { this.peerSupported = (await discoveryProbe(this.bin, ["--version"]))?.trim() === "1.14.20"; }
+    try { this.peerSupported = nativeVersionAtLeast((await discoveryProbe(this.bin, ["--version"]))?.trim(),MINIMUM_CLI_VERSION); }
     catch { this.peerSupported = false; }
   }
   peerContextCapability(environment?: Record<string,string>) {
@@ -324,7 +327,7 @@ export class OpenCodeAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
-    this.capabilities.injectMidTurn = version?.trim() === "1.14.20" && !openCodePure();
+    this.capabilities.injectMidTurn = nativeVersionAtLeast(version?.trim(),MINIMUM_CLI_VERSION) && !openCodePure();
     let models:ModelInfo[]=[];
     this.capabilities.reasoningControl=false;
     if(available)try{

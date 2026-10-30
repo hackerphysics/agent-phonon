@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, realpathSync, writeFileSync, readFileSync, lsta
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { SendOptions } from "../adapter.js";
-import { AgentCoordinationInput } from "@agent-phonon/protocol";
+import { AgentCoordinationInput, nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { verifiedNativeToolChannel } from "../native-tool-channel.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 
 /** Native extension hooks, not messages, permission handlers or a mailbox tool. */
-export const COPILOT_PEER_CONTEXT_SOURCE = String.raw`
+export const COPILOT_PEER_CONTEXT_SOURCE = `export const nativeVersionAtLeast = ${nativeVersionAtLeast.toString()};\n` + String.raw`
 import { request } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -328,14 +328,14 @@ export function prepareCopilotPeerContext(options: SendOptions, input: { session
 import {joinSession} from "@github/copilot-sdk/extension";
 import {readFileSync,lstatSync,unlinkSync,writeFileSync} from "node:fs";
 import {dirname,isAbsolute,join} from "node:path";
-import {installCopilotPeerContext} from "./bridge.mjs";
+import {installCopilotPeerContext,nativeVersionAtLeast} from "./bridge.mjs";
 const path=new URL("./channel.json",import.meta.url),stat=lstatSync(path);
 if(!stat.isFile()||stat.isSymbolicLink()||stat.nlink!==1||stat.size>4096||(stat.mode&0o077)!==0)throw new Error("Unsafe peer capsule");
 const channel=JSON.parse(readFileSync(path,"utf8"));unlinkSync(path);
 const sdk=process.env.COPILOT_SDK_PATH;
 if(typeof sdk!=="string"||!isAbsolute(sdk))throw new Error("Native bundled SDK identity unavailable");
 const host=JSON.parse(readFileSync(join(dirname(sdk),"package.json"),"utf8"));
-if(host.name!=="@github/copilot"||host.version!=="1.0.82")throw new Error("Native peer host version is unqualified");
+if(host.name!=="@github/copilot"||!nativeVersionAtLeast(host.version,"1.0.82"))throw new Error("Native peer host requires Copilot >=1.0.82");
 const ready=new URL("./native-ready.json",import.meta.url);
 await installCopilotPeerContext({joinSession,channel,onReady:value=>writeFileSync(ready,JSON.stringify(value),{mode:0o600,flag:"wx"}),onClosed:()=>{try{unlinkSync(ready);}catch{}}});
 `, { mode: 0o600, flag: "wx" });

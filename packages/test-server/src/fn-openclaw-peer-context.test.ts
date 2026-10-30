@@ -10,7 +10,7 @@ import { OpenClawGatewayAdapter, GatewayClient, spawnSupervisedAgent,SessionEngi
 import { NativePeerContexts, PEER_BIND, PEER_RELEASE, PEER_CAPABILITIES, PEER_BLOCK_TAG,openClawPeerBudgetConfig, type NativePeerApi } from "@agent-phonon/openclaw-plugin/peer-context";
 import { PeerContextJournal, PeerContextReceiver,peerContextHeadroom } from "../../core/dist/peer-context.js";
 import { PeerContextBridge } from "../../core/dist/peer-context-bridge.js";
-import { OpenClawInputCapabilities,projectOpenClawToolResult } from "../../core/dist/adapters/openclaw-peer-context.js";
+import { OpenClawInputCapabilities,OpenClawPeerCapabilities,projectOpenClawToolResult } from "../../core/dist/adapters/openclaw-peer-context.js";
 import { PeerFixture, withPeerFixture, closePeerServer } from "../../core/dist/testing/peer-fixture.js";
 import type { AdapterSession } from "@agent-phonon/core";
 import { CurrentTurnInput } from "../../core/dist/current-turn-input.js";
@@ -61,9 +61,9 @@ class Host {
   close(){this.connection.abort();this.cleanup?.({});}
 }
 
-async function fixture(work:(f:any)=>Promise<void>){return withPeerFixture("openclaw-peer",async scope=>{
+async function fixture(work:(f:any)=>Promise<void>,version="2026.10.7"){return withPeerFixture("openclaw-peer",async scope=>{
   const journal=new PeerContextJournal(join(scope.root,"peer.sqlite"));scope.defer(()=>journal.close());
-  const host=new Host();scope.defer(()=>host.close());
+  const host=new Host(version);scope.defer(()=>host.close());
   const self={id:randomUUID(),position:"1",projectId:randomUUID(),ownerId:"owner",deviceId:randomUUID(),agentId:"openclaw:worker",agentKind:"agent" as const,sourceKind:"native" as const,
     sessionId:"owned",label:"root",activity:{summary:"",phase:"working" as const,impact:[],dependencies:""},activityRevision:0,lastSeenAt:null,presence:"active" as const};
   const message={id:randomUUID(),position:"2",senderId:randomUUID(),recipientId:self.id,kind:"notice" as const,text:"OPENCLAW_PEER_"+randomUUID(),references:[],inReplyTo:null,depth:0,
@@ -130,6 +130,16 @@ test("OpenClaw peer grants are independent of HITL tools, admin-only, source-bou
   assert.equal(f.host.rpc(PEER_RELEASE,{sessionKey:f.input.sessionKey,runId:randomUUID()}).payload.released,false);
   assert.equal(f.host.rpc(PEER_RELEASE,{sessionKey:f.input.sessionKey,runId:f.input.runId}).payload.released,true);
 }));
+
+for(const version of ["2026.10.8","2026.11.1","2027.1.1"])test(`OpenClaw minimum version preserves current input binding after upgrade to ${version}`,()=>fixture(async f=>{
+  const capabilities=f.host.rpc(PEER_CAPABILITIES,{version:1}).payload;
+  assert.equal(capabilities.nativeVersion,version);
+  assert.equal(OpenClawInputCapabilities.safeParse(capabilities).success,true);
+  assert.equal(OpenClawPeerCapabilities.safeParse({...capabilities,selectedRuntime:"openclaw"}).success,true);
+  assert.equal(f.host.rpc(PEER_BIND,{...f.input,nativeInput:true}).ok,true);
+  assert.equal(f.host.hooks.has("tool_result_persist"),true);
+  assert.equal(f.host.rpc(PEER_RELEASE,{sessionKey:f.input.sessionKey,runId:f.input.runId}).payload.released,true);
+},version));
 
 test("OpenClaw ordinary input requires its explicit qualified lifecycle instead of inferring it from older peer support",()=>fixture(async f=>{
   const capabilities=f.host.rpc(PEER_CAPABILITIES,{version:1}).payload;assert.equal(OpenClawInputCapabilities.safeParse(capabilities).success,true);

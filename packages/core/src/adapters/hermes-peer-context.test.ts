@@ -17,7 +17,7 @@ const execFile = promisify(execFileCallback);
 const MOCK_NATIVE = String.raw`
 import types, importlib.metadata
 installed_version = importlib.metadata.version
-importlib.metadata.version = lambda name: "0.21.1" if name == "hermes-agent" else installed_version(name)
+importlib.metadata.version = lambda name: os.environ.get("PEER_TEST_VERSION", "0.21.1") if name == "hermes-agent" else installed_version(name)
 class Handle:
     def __init__(self, items, value): self.items=items; self.value=value; self.active=True
     def dispose(self):
@@ -143,7 +143,7 @@ print(json.dumps({'peerReceive':True,'sameRun':True,'providerCalls':3,'mode':mod
 `;
 }
 
-async function receiverCase(mode: string, installed = false, revoke = false, foreignExecution = false) {
+async function receiverCase(mode: string, installed = false, revoke = false, foreignExecution = false, version="0.21.1") {
   return withPeerFixture("hermes-peer",async scope=>{
   const root = scope.root;
   const journal = new PeerContextJournal(join(root,"peer.sqlite"));
@@ -166,7 +166,7 @@ async function receiverCase(mode: string, installed = false, revoke = false, for
   const capsule = hermesPeerContextEnvironment({environment,peerContext:receiver});
   try {
     const run = execFile(python,["-B","-c",script(!installed)],{cwd:root,timeout:30000,maxBuffer:1024*1024,
-      env:{PATH:process.env.PATH,HOME:root,HERMES_HOME:root,TMPDIR:root,TMP:root,TEMP:root,PYTHONDONTWRITEBYTECODE:"1",LITELLM_LOCAL_MODEL_COST_MAP:"True",...capsule,PEER_TEST_CONTROL:controlUrl,PEER_TEST_MODE:mode,PEER_TEST_REVOKE:revoke?"1":"0",PEER_TEST_FOREIGN_EXECUTION:foreignExecution?"1":"0"}});
+      env:{PATH:process.env.PATH,HOME:root,HERMES_HOME:root,TMPDIR:root,TMP:root,TEMP:root,PYTHONDONTWRITEBYTECODE:"1",LITELLM_LOCAL_MODEL_COST_MAP:"True",...capsule,PEER_TEST_CONTROL:controlUrl,PEER_TEST_MODE:mode,PEER_TEST_REVOKE:revoke?"1":"0",PEER_TEST_FOREIGN_EXECUTION:foreignExecution?"1":"0",PEER_TEST_VERSION:version}});
     scope.watch(run.child);scope.defer(async()=>{if(run.child.exitCode===null&&run.child.signalCode===null)run.child.kill("SIGTERM");await run.catch(()=>{});});
     const result=await run;
     assert.ok(result.stdout.includes('"peerReceive": true'),result.stderr);
@@ -187,6 +187,9 @@ for (const mode of ["chat_completions","anthropic_messages","codex_responses"]) 
   test(`Hermes ${mode} withdraws parent input from a mismatched native execution`,()=>receiverCase(mode,false,false,true));
 }
 test("installed Hermes middleware dispatch accepts the scoped receive bridge without inference",{skip:!process.env.PHONON_TEST_HERMES_BIN,timeout:35000},()=>receiverCase("chat_completions",true));
+
+for(const version of ["0.21.2","0.22.0","1.0.0"])test(`Hermes minimum version preserves middleware delivery after upgrade to ${version}`,
+  ()=>receiverCase("chat_completions",false,false,false,version));
 
 test("Hermes peer capability cannot be enabled by environment alone and refuses foreign endpoint credentials",async()=>{
   const options={environment:{AGENT_PHONON_PEER_CONTEXT_URL:"http://127.0.0.1:4318/peer-context",AGENT_PHONON_PEER_CONTEXT_TOKEN:"x".repeat(43)}};

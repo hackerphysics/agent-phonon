@@ -1,6 +1,7 @@
 import type { SendOptions } from "../adapter.js";
 import { hermesCommand } from "./hermes-command.js";
 import { discoveryProbe } from "../discovery-probe.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 
 /** Read-only qualification; registration itself is checked again in the owned child. */
 export async function hermesPeerContextSupported(bin: string, options?: { cwd?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal }): Promise<boolean> {
@@ -15,7 +16,7 @@ from hermes_cli.middleware import VALID_MIDDLEWARE
 print(json.dumps({"version":version("hermes-agent"),"ready":callable(PluginContext.register_middleware) and callable(get_plugin_manager) and {"llm_request","llm_execution"}.issubset(VALID_MIDDLEWARE)}))
 `, command.entry], options?.signal, options);
     const value = JSON.parse(result ?? "null");
-    return value?.version === "0.21.1" && value.ready === true;
+    return nativeVersionAtLeast(value?.version, "0.21.1") && value.ready === true;
   } catch { return false; }
 }
 
@@ -48,7 +49,8 @@ def _phonon_register_peer_context(agent, capsule, owning_root, announce):
         from importlib.metadata import version
         from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
         from hermes_cli.middleware import VALID_MIDDLEWARE
-        if version("hermes-agent") != "0.21.1" or not {"llm_request", "llm_execution"}.issubset(VALID_MIDDLEWARE):
+        native_version = re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", version("hermes-agent"))
+        if not native_version or tuple(map(int, native_version.groups())) < (0, 21, 1) or not callable(PluginContext.register_middleware) or not callable(get_plugin_manager) or not {"llm_request", "llm_execution"}.issubset(VALID_MIDDLEWARE):
             raise ValueError()
         endpoint = urllib.parse.urlsplit(capsule["url"])
         secret = capsule["token"]

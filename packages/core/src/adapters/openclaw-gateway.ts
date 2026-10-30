@@ -25,6 +25,7 @@ import { OpenClawCheckpoint,OpenClawNativeObservation,observeOpenClawSession,rec
 import { z } from "zod";
 import { OpenClawPeerCapabilities, OpenClawInputCapabilities, projectOpenClawToolResult } from "./openclaw-peer-context.js";
 import { CurrentTurnInput } from "../current-turn-input.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 
 const PHONON_PLUGIN = "agent-phonon-hitl";
 const PHONON_OPTIONAL_TOOLS = ["phonon_request_interaction", "phonon_acknowledge_interaction", "phonon_conversation_board", "phonon_workflow", "phonon_conversation_message", "phonon_publish_document", "phonon_project_coordination"];
@@ -99,7 +100,7 @@ class GatewaySession implements AdapterSession {
       const native=await this.verifyNative(!this.historyStarted);
       const capabilities=OpenClawPeerCapabilities.safeParse(await this.gw.rpc("phonon.peers.capabilities",{version:1,sessionKey:this.sessionKey,sessionId:native.sessionId,model:native.model},5000));
       if(!capabilities.success||signal?.aborted)return;
-      if(!signal?.aborted&&this.gw.isConnected()&&this.gw.connectionEpoch()===epoch)this.peerReady={epoch,native,nativeInput:capabilities.data.nativeVersion==="2026.10.7"&&capabilities.data.currentTurnInput==="native_context_v1"};
+      if(!signal?.aborted&&this.gw.isConnected()&&this.gw.connectionEpoch()===epoch)this.peerReady={epoch,native,nativeInput:nativeVersionAtLeast(capabilities.data.nativeVersion,"2026.10.7")&&capabilities.data.currentTurnInput==="native_context_v1"};
     }catch{this.peerReady=undefined;}
   }
   peerContextCapability(){

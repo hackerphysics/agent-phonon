@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { parse, type ParseError } from "jsonc-parser";
 import type { SendOptions } from "../adapter.js";
 import {verifiedNativeToolChannel} from "../native-tool-channel.js";
+import {nativeVersionAtLeast} from "@agent-phonon/protocol";
 
 export function openCodePure(environment?: Record<string, string>): boolean {
   const value = environment?.OPENCODE_PURE ?? process.env.OPENCODE_PURE;
@@ -13,7 +14,7 @@ export function openCodePure(environment?: Record<string, string>): boolean {
 }
 
 /** One invocation-scoped Phonon bridge; reuses native dependencies without changing user configuration. */
-export const OPENCODE_RECEIVE_RUNTIME = String.raw`
+export const OPENCODE_RECEIVE_RUNTIME = `const nativeVersionAtLeast = ${nativeVersionAtLeast.toString()};\n` + String.raw`
 import { request } from "node:http";
 import { randomUUID } from "node:crypto";
 import {createRequire} from "node:module";
@@ -25,8 +26,9 @@ const canonical=value=>JSON.stringify(value&&typeof value==="object"?Array.isArr
 export async function openCodeCoordinationTool(description,execute){
  const home=process.env.OPENCODE_CONFIG_DIR||join(process.env.XDG_CONFIG_HOME||join(homedir(),".config"),"opencode");
  const require=createRequire(join(home,"package.json")),toolPath=join(home,"node_modules","@opencode-ai","plugin","dist","tool.js");
- if(JSON.parse(readFileSync(join(toolPath,"..","..","package.json"),"utf8")).version!=="1.14.20")throw new Error("Native plugin dependency is unqualified");
- const {tool}=await import(pathToFileURL(toolPath).href),z=tool.schema;
+ if(!nativeVersionAtLeast(JSON.parse(readFileSync(join(toolPath,"..","..","package.json"),"utf8")).version,"1.14.20"))throw new Error("Native plugin dependency requires >=1.14.20");
+ const {tool}=await import(pathToFileURL(toolPath).href),z=tool?.schema;
+ if(typeof tool!=="function"||typeof z?.enum!=="function"||typeof z?.object!=="function")throw new Error("Native plugin tool API is unavailable");
  return tool({description,args:{operation:z.enum(["presence","peers","activity","send","inbox","acknowledge","receipt","leave"]),
   requestId:z.string().uuid().optional(),recipientId:z.string().uuid().optional(),kind:z.enum(["intent","question","notice","request","result"]).optional(),
   text:z.string().max(4000).optional(),references:z.array(z.string().max(512)).max(8).optional(),inReplyTo:z.string().uuid().optional(),

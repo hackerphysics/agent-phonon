@@ -223,13 +223,13 @@ test("OpenCode pure mode, missing controller callbacks and malformed config neve
   assert.throws(()=>prepareOpenCodePeerContext({...f.options,environment:{...f.environment,AGENT_PHONON_PEER_CONTEXT_URL:"https://foreign.invalid/peer-context"}}));
 }));
 
-test("OpenCode unknown/native-failing versions stay polling-only, pure mode stays disabled and recovery never creates a replacement",()=>fixture(async f=>{
-  for(const version of ["1.14.20","1.15.10","0.0.0"]){
+test("OpenCode minimum version admits upgrades, pure mode stays disabled and recovery never creates a replacement",()=>fixture(async f=>{
+  for(const version of ["1.14.20","1.15.10","1.15.11","2.0.0","1.15.10-preview","1.14.19","0.0.0","unknown"]){
     const bin=join(f.root,"probe-"+version+".mjs");
     writeFileSync(bin,`#!${process.execPath}\nif(process.argv.includes('--version'))console.log(${JSON.stringify(version)});else process.exit(17);\n`,{mode:0o700});
     const adapter=new OpenCodeAdapter({env:{binPath:bin}}),params={sessionId:"version-"+version,agentId:"opencode",model:"default",cwd:f.root};
     const session=await adapter.createSession(params);
-    assert.equal(!!session.peerContextCapability?.(),version==="1.14.20");
+    assert.equal(!!session.peerContextCapability?.(),["1.14.20","1.15.10","1.15.11","2.0.0"].includes(version));
     assert.equal(session.peerContextCapability?.({OPENCODE_PURE:"true"}),undefined);
     await assert.rejects(adapter.createSession({...params,reattach:true}),/replacement session/);
     await session.terminate();

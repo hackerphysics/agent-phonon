@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -169,7 +170,7 @@ class CopilotSession implements AdapterSession {
     try {
       const version = await discoveryProbe(this.env.binPath ?? "copilot", ["--no-auto-update", "--version"], signal,
         { cwd: this.cwd, env: buildChildProcessEnvironment(environment) });
-      this.peerQualified = version !== null && parseCopilotVersion(version) === "1.0.82";
+      this.peerQualified = version !== null && nativeVersionAtLeast(parseCopilotVersion(version), "1.0.82");
       if (this.peerQualified) {
         this.nativeSessionId ??= randomUUID();
         if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(this.nativeSessionId)) this.peerQualified = false;
@@ -425,7 +426,7 @@ export class CopilotAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
-    this.capabilities.injectMidTurn=available&&version==="1.0.82"&&this.env.peerContext===true;
+    this.capabilities.injectMidTurn=available&&nativeVersionAtLeast(version,"1.0.82")&&this.env.peerContext===true;
     this.capabilities.reasoningControl=false;
     if(available){
       try{const help=await discoveryProbe(this.env.binPath??"copilot",["--no-auto-update","--help"],signal);this.capabilities.reasoningControl=/--reasoning-effort\s+<level>/.test(help??"");}

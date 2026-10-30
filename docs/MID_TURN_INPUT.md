@@ -33,15 +33,25 @@ Session creation in both SDKs accepts `initialContext`, `agentConfig` and
 
 All seven maintained harness names have a qualified original-turn input path:
 
-| Harness | Qualified Path |
+| Harness | Minimum Version And Path |
 | --- | --- |
-| Pi | Native RPC steering, verified lifecycle from 0.84.1 |
-| Claude Code | 2.0.1 single-input SDK query and native root context continuation |
-| Codex | 0.165.0-alpha.1.2 native app-server steering and exact input completion |
-| Copilot | 1.0.82 owner-authorized invocation plugin and exact root lifecycle |
-| Hermes | 0.21.1 native provider middleware with exact payload observation |
-| OpenCode | 1.14.20 qualified openai-compatible native fetch |
-| OpenClaw | Gateway 2026.10.7 native tool context acceptance and run continuation |
+| Pi | >=0.84.1 native RPC steering and verified lifecycle |
+| Claude Code | >=2.0.1 single-input SDK query and native root context continuation |
+| Codex | >=0.165.0-alpha.1.2 native app-server steering and exact input completion |
+| Copilot | >=1.0.82 owner-authorized invocation plugin and exact root lifecycle |
+| Hermes | >=0.21.1 native provider middleware with exact payload observation |
+| OpenCode | >=1.14.20 openai-compatible native fetch; plugin SDK >=1.14.20 |
+| OpenClaw | Gateway >=2026.10.7 native tool context acceptance and run continuation |
+
+These are minimum supported versions, not an exact-build allowlist. Later
+stable patch, minor and major releases remain eligible without an adapter edit.
+Stable floors exclude preview builds; the Codex prerelease floor admits later
+prereleases using numeric SemVer precedence. Version eligibility never replaces
+required native API checks, active-root/session authority, provider headroom or
+source-confirmed application. A missing/broken native interface fails the
+insertion without silently queuing it or starting a replacement task. Protocol
+and receipt format versions (for example `version: 1`) remain exact contracts;
+they are not native CLI release constraints.
 
 This is not certification of every version, provider or personal configuration.
 Native operator opt-ins and approvals remain mandatory; unsupported paths do
@@ -72,7 +82,11 @@ and after authorization retains parallel-tool, generation, window/output and
 source/cancellation fences. See `CLAUDE_CURRENT_TURN_INPUT.md` and the matching
 Phonon Work evidence record for reproduction and later committed-source runs.
 
-That complete real-MCP matrix has not yet been run for the other five harnesses;
+Hermes also passes the six-case public/managed MCP matrix with a real Codex
+sender and installed Hermes receiver (Phonon Work `d8f7216`). The receiver sees
+the input in the original native provider continuation before completion.
+
+That complete real-MCP matrix has not yet been run for the other four harnesses;
 their native adapter/SessionEngine tests are separate evidence, not substitute
 full-chain receipts. All-harness MCP acceptance remains open. Production
 release/activation and broader provider/version/OS acceptance are not claimed.

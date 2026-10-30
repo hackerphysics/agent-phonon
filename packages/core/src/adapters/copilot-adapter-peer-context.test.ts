@@ -103,6 +103,17 @@ test("Copilot native extension denial preserves the original task without claimi
   assert.equal(f.session.peerContextCapability().nativeSessionId, undefined);
 }, { mode: "denied" }));
 
+for (const version of ["1.0.94","1.1.0","2.0.0"]) {
+  test(`Copilot minimum version preserves native insertion after upgrade to ${version}`, () => fixture(async f => {
+    await f.session.preparePeerContext(f.environment);
+    assert.equal(f.session.peerContextCapability().readiness,"pending");
+    await f.run();
+    assert.equal(f.events.at(-1).status,"completed");
+    assert.equal(f.boundaries.length,1);
+    assert.equal(f.observations[0].evidence,"context_hook");
+  },{version}));
+}
+
 for (const config of [{ enabled: false }, { version: "1.0.81" }]) {
   test(`Copilot unqualified/disabled receive leaves the native invocation untouched: ${JSON.stringify(config)}`, () => fixture(async f => {
     await f.session.preparePeerContext(f.environment); assert.equal(f.session.peerContextCapability(), undefined);

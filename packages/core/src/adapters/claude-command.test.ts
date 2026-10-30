@@ -14,7 +14,16 @@ test("Claude qualification uses the Node and SDK paired with the selected CLI wi
   assert.deepEqual(claudeNodeCommand(cli),{entry,node});
   assert.deepEqual(await qualifyClaudePeerContext(cli),{entry,sdk,node});
   assert.equal(readFileSync(sdk,"utf8"),before);
-  writeFileSync(entry,'console.log("2.0.2 (Claude Code)")\n');assert.equal(await qualifyClaudePeerContext(cli),undefined);
+  for(const version of ["2.0.2","2.1.0","3.0.0"]){
+    writeFileSync(entry,`console.log(${JSON.stringify(version+" (Claude Code)")})\n`);
+    assert.deepEqual(await qualifyClaudePeerContext(cli),{entry,sdk,node});
+  }
+  for(const version of ["2.0.0","2.1.0-preview","unknown"]){
+    writeFileSync(entry,`console.log(${JSON.stringify(version+" (Claude Code)")})\n`);
+    assert.equal(await qualifyClaudePeerContext(cli),undefined);
+  }
+  writeFileSync(entry,'console.log("2.1.0 (Claude Code)")\n');writeFileSync(sdk,'export function query(){}\n');
+  assert.equal(await qualifyClaudePeerContext(cli),undefined,"newer version alone cannot replace a missing SDK API");
 }));
 
 test("Claude native/unknown launchers cannot acquire a fabricated bundled SDK binding",()=>withPeerFixture("claude-command",async scope=>{

@@ -1,4 +1,5 @@
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
@@ -578,7 +579,7 @@ export class CodexAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
-    this.capabilities.injectMidTurn = version?.trim() === "codex-cli 0.165.0-alpha.1.2";
+    this.capabilities.injectMidTurn = nativeVersionAtLeast(version?.trim().match(/^codex-cli (\S+)$/)?.[1], "0.165.0-alpha.1.2");
     const models = await this.discoverModels(signal, available);
     return [{
       agentId: "codex" as AgentDescriptor["agentId"],

@@ -35,3 +35,4 @@ export * from "./schemas/jsonrpc.js";
 export * from "./schemas/methods.js";
 export * from "./schemas/managed-mcp.js";
 export * from "./schemas/project-coordination.js";
+export * from "./native-version.js";
