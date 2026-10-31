@@ -99,7 +99,7 @@ for (const phase of ["retry", "exhausted", "cancel-backoff", "overflow-compactio
           ? "maximum context length exceeded" : "server error: temporarily overloaded", type: "server_error" } }));
         return;
       }
-      if (phase === "exhausted") {
+      if (phase === "exhausted" && !resuming) {
         assert.equal(body.includes(f.message.text), false, "uncertain offered mail is not automatically replayed on a native retry");
         res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "server error: still overloaded" } }));
         return;
@@ -195,10 +195,23 @@ for (const phase of ["retry", "exhausted", "cancel-backoff", "overflow-compactio
       assert.ok(rows.some((row:any)=>row.message?.stopReason==="error"),"native failed-attempt history must stay intact after continuation");
     } else {
       const file=nativeEvents.find(value=>value.type==="response"&&value.command==="get_state")?.data?.sessionFile;
-      assert.ok(file);const nativeBytes=readFileSync(file),beforeRejected=requests.length;
-      assert.equal(session.recoveryCheckpoint(),undefined);
-      await assert.rejects(session.send("Do not silently replace the interrupted native session.",{turnId:"must-not-start",verbosity:"tools",emit:(event:any)=>events.push(event)}));
-      assert.equal(requests.length,beforeRejected);assert.deepEqual(readFileSync(file),nativeBytes);
+      assert.ok(file);const nativeBytes=readFileSync(file),beforeContinuation=requests.length;
+      const saved=session.recoveryCheckpoint();assert.ok(saved);
+      assert.equal(saved.native.path,file);assert.equal(saved.native.sessionId,f.nativeSessionId);
+      assert.equal(saved.native.continuation,true);
+      await session.terminate();
+      session=await adapter.recoverSession({sessionId:f.nativeSessionId,agentId:"pi",model,cwd:f.root},saved);
+      assert.equal(requests.length,beforeContinuation,"observing failed history must not replay the provider");
+      assert.deepEqual(readFileSync(file),nativeBytes,"failed native history must not be repaired or rolled back");
+      clearTimeout(timer);resuming=true;const continued:any[]=[];
+      sending=session.send("Explicitly continue the original native session.",{turnId:"assigned-continuation",verbosity:"tools",signal:AbortSignal.timeout(15000),emit:(event:any)=>continued.push(event)});
+      f.scope.watch(session.current);await sending;
+      assert.equal(continued.at(-1)?.status,"completed");
+      assert.equal(requests.length,beforeContinuation+1);
+      assert.equal(session.recoveryCheckpoint()?.native.sessionId,saved.native.sessionId);
+      assert.equal(session.recoveryCheckpoint()?.native.path,file);
+      assert.deepEqual(readFileSync(file).subarray(0,nativeBytes.length),nativeBytes,"explicit continuation must preserve the complete failed prefix");
+      assert.equal(events.at(-1)?.status,phase==="exhausted"?"failed":"interrupted","later assigned work cannot change the original outcome");
     }
     if (phase === "overflow-compaction") {
       assert.equal(compacted, true); assert.ok(f.state.budgets.some((budget: any) => budget?.state === "unknown"));
