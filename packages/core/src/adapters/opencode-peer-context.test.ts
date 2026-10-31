@@ -372,7 +372,9 @@ for(const phase of ["baseline","receive","send","denied","unapproved","child","r
   const port=(provider.address()as{port:number}).port;
   writeFileSync(join(f.root,"input.txt"),"Only this fixture file\n");
   const config={model:"fixture/m1",small_model:"fixture/m1",share:"disabled",autoupdate:false,snapshot:false,
-    permission:{"*":"deny",read:"allow",...(outgoing?{phonon_project_coordination:phase==="denied"?"deny":phase==="unapproved"?"ask":"allow",...(phase==="child"?{task:"allow"}:{})}:{}),external_directory:{[f.root]:"allow",[f.root+"/*"]:"allow"}},provider:{fixture:{npm:"@ai-sdk/openai-compatible",name:"Local fixture",
+    ...(phase==="child"?{agent:{general:{tools:{read:true,phonon_project_coordination:true,task:false},permission:{"*":"ask",read:"allow",phonon_project_coordination:"allow",task:"deny"}}}}:{}),
+    // Older native Task propagates parent denies without sibling allows; do not make the child tool-less.
+    permission:{"*":phase==="child"?"ask":"deny",read:"allow",...(outgoing?{phonon_project_coordination:phase==="denied"?"deny":phase==="unapproved"?"ask":"allow",...(phase==="child"?{task:"allow"}:{})}:{}),external_directory:{[f.root]:"allow",[f.root+"/*"]:"allow"}},provider:{fixture:{npm:"@ai-sdk/openai-compatible",name:"Local fixture",
       options:{baseURL:`http://127.0.0.1:${port}/v1`,apiKey:"synthetic-local-key"},models:{m1:{name:"m1",limit:{context:headroom?8000:unknown?0:128000,output:2000},cost:{input:0,output:0},toolcall:true}}}}};
   const receiver=new PeerContextReceiver({tenantId:"owner",sessionId:f.self.sessionId,turnId:"turn",runId:randomUUID(),
     nativeSessionId:()=>session?.peerContextCapability?.()?.nativeSessionId,journal:f.journal,active:()=>f.state.active,
@@ -432,7 +434,7 @@ for(const phase of ["baseline","receive","send","denied","unapproved","child","r
       while(!(session as unknown as{current?:unknown}).current&&!events.slice(offset).some(event=>event.final)&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,10));
       f.scope.watch((session as unknown as{current?:{child:ChildProcess}}).current?.child,true);await again;
     }
-    assert.deepEqual(errors,[]);
+    assert.deepEqual(errors,[],JSON.stringify({events,requests:payloads.length,raw:raw.slice(-16000)}));
     const logDirectory=join(f.root,"data","opencode","log");
     const logs=events.at(-1)?.status==="completed"&&(!outgoing||sends.length)?[]:existsSync(logDirectory)?readdirSync(logDirectory).slice(-2).map(name=>readFileSync(join(logDirectory,name),"utf8").slice(-16000).replaceAll(environment.AGENT_PHONON_PEER_CONTEXT_TOKEN!,"[redacted]")):[];
     let nativeState;
