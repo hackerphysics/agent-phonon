@@ -17,6 +17,8 @@ import { CurrentTurnInput } from "../../core/dist/current-turn-input.js";
 
 function deferred(){let resolve!:()=>void;const promise=new Promise<void>(done=>{resolve=done;});return {promise,resolve};}
 const tokens=(value:unknown):value is number=>Number.isSafeInteger(value)&&Number(value)>0;
+const nativeStartupMs=Number(process.env.PHONON_TEST_OPENCLAW_STARTUP_MS??15000);
+assert.ok(Number.isInteger(nativeStartupMs)&&nativeStartupMs>=15000&&nativeStartupMs<=60000,"Native startup budget must be bounded between 15 and 60 seconds");
 let nativeCompileCache:PeerFixture|undefined;
 let nativeCompileDirectory:string|undefined;
 after(async()=>{await nativeCompileCache?.dispose();nativeCompileCache=undefined;nativeCompileDirectory=undefined;});
@@ -303,7 +305,7 @@ test("installed OpenClaw native middleware runner accepts the sourced peer block
 
 for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","resume","engine","engine_send","native_context",
   "insert","insert_revoked","insert_headroom","insert_unknown","insert_closed","insert_stop","insert_engine"] as const)test(`installed OpenClaw Gateway ${phase} keeps collaboration out of human messages and ordinary tool output`,{
-  skip:!process.env.PHONON_TEST_OPENCLAW_SDK,timeout:60000,
+  skip:!process.env.PHONON_TEST_OPENCLAW_SDK,timeout:nativeStartupMs+45000,
 },()=>nativeFixture(async f=>{
   f.state.pending=phase==="initial"||phase==="headroom"||phase==="unknown_budget";
   const ordinary=phase.startsWith("insert"),marker="OPENCLAW_INSERT_"+randomUUID();
@@ -382,7 +384,7 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
   });let logs="";
   native.child.stdout.on("data",chunk=>{logs=(logs+String(chunk)).slice(-18000);});native.child.stderr.on("data",chunk=>{logs=(logs+String(chunk)).slice(-18000);});native.child.stdin.end();
   const gateway={baseUrl:`ws://127.0.0.1:${port}`,token},probe=new GatewayClient(gateway);f.scope.defer(()=>probe.close());
-  let ready=false;const deadline=Date.now()+15000;
+  let ready=false;const deadline=Date.now()+nativeStartupMs;
   while(Date.now()<deadline&&!native.hasStopped()){
     try{const response=await probe.rpc(PEER_CAPABILITIES,{version:1},1000);if(response.available===true){ready=true;break;}}catch{}
     await new Promise(resolve=>setTimeout(resolve,100));
