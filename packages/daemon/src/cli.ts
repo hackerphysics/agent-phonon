@@ -135,7 +135,7 @@ async function main(): Promise<void> {
       process.exit(0);
     case "adapter": {
       const sub = args[0];
-      if (sub === "add") cmdAdapterAdd(args[1] ?? "", { gatewayUrl: opt("gateway-url"), token: opt("token"), defaultAgent: opt("agent"), baseUrl: opt("base-url"), apiKey: opt("api-key"), model: opt("model"), provider: opt("provider"), wireApi: opt("wire-api"), bin: opt("bin") });
+      if (sub === "add") cmdAdapterAdd(args[1] ?? "", { gatewayUrl: opt("gateway-url"), token: opt("token"), defaultAgent: opt("agent"), baseUrl: opt("base-url"), apiKey: opt("api-key"), model: opt("model"), provider: opt("provider"), wireApi: opt("wire-api"), bin: opt("bin"), sdkPath: opt("sdk-path") });
       else if (sub === "list") cmdAdapterList();
       else { console.error("usage: agent-phonon adapter add <type> | list"); process.exit(1); }
       break;

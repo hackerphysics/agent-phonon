@@ -25,6 +25,24 @@ function configuredHermes(f: ReturnType<typeof hermesProfileFixture>, flag?: boo
   return { daemon, adapter };
 }
 
+test("config: only the owner selects Claude Agent SDK paths and both registry constructors retain them", () => withPeerFixture("claude-sdk-config", async scope => {
+  const path = join(scope.root, "config.json"), sdkPath = join(scope.root, "sdk.mjs");
+  const cfg = defaultConfig(); cfg.dbPath = join(scope.root, "state.sqlite"); cfg.workspaceRoot = scope.root; cfg.servers = [];
+  cfg.rescueAgent = { enabled: false }; cfg.obs = { enabled: false };
+  cfg.adapters = [{ type: "claude-code", claudeBinPath: join(scope.root, "not-installed"), claudeSdkPath: sdkPath }];
+  writeConfig(cfg, path); const loaded = loadConfig(path), daemon = new PhononDaemon(loaded);
+  try {
+    for (const registry of [buildRegistry(loaded.adapters, { enabled: false }), (daemon as unknown as { registry: AdapterRegistry }).registry]) {
+      const adapter = registry.resolve("claude-code"); assert.ok(adapter instanceof core.ClaudeCodeAdapter);
+      assert.equal((adapter as unknown as { env: { sdkPath?: string } }).env.sdkPath, sdkPath);
+    }
+  } finally { await daemon.stop(); }
+  for (const value of ["relative-sdk", true, null, "bad\0path", sdkPath + "\n"]) {
+    writeFileSync(path, JSON.stringify({ ...cfg, adapters: [{ ...cfg.adapters[0], claudeSdkPath: value }] }));
+    assert.throws(() => loadConfig(path), /claudeSdkPath must be an absolute local runtime path/);
+  }
+}));
+
 test("config: Copilot peer receive is a strict local default-off option passed unchanged to its adapter", () => withPeerFixture("copilot-peer-config", async scope => {
   const path = join(scope.root, "config.json");
   for (const flag of [undefined, false, true]) {

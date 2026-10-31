@@ -109,7 +109,7 @@ export class PhononDaemon {
         this.gatewayAdapters.push(ad);
         this.registry.register(ad);
       } else if (a.type === "claude-code") {
-        this.registry.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
+        this.registry.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, sdkPath: a.claudeSdkPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
       } else if (a.type === "codex") {
         this.registry.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
       } else if (a.type === "hermes") {

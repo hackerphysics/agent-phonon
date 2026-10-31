@@ -9,6 +9,7 @@ import { PeerContextJournal, PeerContextReceiver } from "../peer-context.js";
 import { PeerContextBridge } from "../peer-context-bridge.js";
 import { prepareClaudePeerRunner } from "./claude-peer-context.js";
 import { spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { ClaudeCodeAdapter } from "./claude-code.js";
 import type { AdapterSession, SendOptions } from "../adapter.js";
 import type { ChildProcess } from "node:child_process";
@@ -177,10 +178,35 @@ test("Claude output reserve includes all possible native settings without changi
   assert.equal(module.claudeOutputReserve({...input,environment:{...input.environment,MAX_THINKING_TOKENS:"180000"}}),180001);
   const standalone=join(f.root,"standalone.json");writeFileSync(standalone,"{}");
   assert.equal(module.claudeOutputReserve({...input,settingsPath:standalone}),32000);
+  assert.equal(module.claudeOutputReserve({...input,settingsPath:standalone,environment:{CLAUDE_CODE_MAX_OUTPUT_TOKENS:"64000"}}),64000);
   writeFileSync(join(config,"settings.json"),"invalid");assert.equal(module.claudeOutputReserve(input),undefined);
   const linked=join(f.root,"linked-settings.json");symlinkSync(standalone,linked);assert.equal(module.claudeOutputReserve({...input,settingsPath:linked}),undefined);
   const large=join(f.root,"large-settings.json");writeFileSync(large," ".repeat(262145));assert.equal(module.claudeOutputReserve({...input,settingsPath:large}),undefined);
   for(const value of ["bad","-1","1.5","1000000000"])assert.equal(module.claudeOutputReserve({...input,settingsPath:standalone,environment:{MAX_THINKING_TOKENS:value}}),undefined);
+}));
+
+for(const cliNode of [undefined,process.execPath])for(const mode of ["inherit","default","equals","plan","duplicate","dangerous","foreign"] as const)
+test(`Claude external SDK startup preserves owner policy for ${cliNode?"JS":"native"} ${mode}`,()=>fixture(async f=>{
+  const entry=join(f.root,"owner-cli.mjs"),asset=prepareClaudePeerRunner(f.options,{entry,sdk:"/owned/sdk.mjs"},{sessionId:f.state.native,prompt:"Original",model:"default",resume:false});f.scope.defer(asset.cleanup);
+  writeFileSync(entry,'#!'+process.execPath+'\nprocess.stdout.write(JSON.stringify({args:process.argv.slice(2),path:process.env.PATH,privatePath:process.env.AGENT_PHONON_CLAUDE_TOOL_PATH}));\n',{mode:0o700});
+  const module=await import(pathToFileURL(asset.args[0]!).href),startup=module.prepareExternalStartup({entry,cwd:f.root,cliNode});
+  const extra=mode==="inherit"?[]:mode==="default"?["--permission-mode","default"]:mode==="equals"?["--permission-mode=default"]:mode==="plan"?["--permission-mode","plan"]:mode==="duplicate"?["--permission-mode","default","--permission-mode","default"]:mode==="dangerous"?["--dangerously-skip-permissions"]:[];
+  const input={command:mode==="foreign"?"foreign-executor":cliNode?"node":entry,args:[...(cliNode?[entry]:[]),...extra,"--model","owned-model"],cwd:f.root,env:{PATH:"temporary-runtime-path",AGENT_PHONON_CLAUDE_TOOL_PATH:"original-tool-path"},signal:new AbortController().signal};
+  if(["plan","duplicate","dangerous","foreign"].includes(mode)){assert.throws(()=>startup.spawnClaudeCodeProcess(input));assert.equal(startup.confirmed(),false);return;}
+  const child=startup.spawnClaudeCodeProcess(input);f.scope.watch(child);let output="";child.stdout.on("data",(value:Buffer)=>output+=value);child.stdin.end();await once(child,"close");
+  assert.equal(child.exitCode,0);assert.equal(startup.confirmed(),true);assert.deepEqual(JSON.parse(output),{args:["--model","owned-model"],path:"original-tool-path"});
+  assert.throws(()=>startup.spawnClaudeCodeProcess(input),/startup owner/);
+}));
+
+test("Claude external SDK budgets require current native context and cannot enlarge the legacy estimate",()=>fixture(async f=>{
+  const asset=prepareClaudePeerRunner(f.options,{entry:"/owned/cli.js",sdk:"/owned/sdk.mjs"},{sessionId:f.state.native,prompt:"Original",model:"default",resume:false});f.scope.defer(asset.cleanup);
+  const module=await import(pathToFileURL(asset.args[0]!).href),model="claude-sonnet-4-5-20250929",base=module.createClaudePeerBudget({sessionId:f.state.native,outputReserve:()=>32000});
+  const observe=()=>{base.observe({type:"system",subtype:"init",session_id:f.state.native,model});base.observe({type:"assistant",session_id:f.state.native,message:{model,usage:{input_tokens:100,output_tokens:20,cache_creation_input_tokens:0,cache_read_input_tokens:0}}});};observe();
+  let value:any={model,totalTokens:100,maxTokens:200000,rawMaxTokens:200000,autoCompactThreshold:167000,isAutoCompactEnabled:true};
+  const native=module.createExternalClaudeBudget({base,model:()=>model,query:()=>({getContextUsage:async()=>value})});
+  assert.equal(native.budget().state,"unknown");await native.refresh();assert.equal(native.budget().outputTokens,33000);assert.equal(native.budget().contextWindowTokens,200000);
+  for(const patch of [{model:"foreign"},{isAutoCompactEnabled:false},{autoCompactThreshold:200000},{totalTokens:-1}]){value={...value,...patch};await native.refresh();assert.equal(native.budget().state,"unknown");value={model,totalTokens:100,maxTokens:200000,rawMaxTokens:200000,autoCompactThreshold:167000,isAutoCompactEnabled:true};}
+  await native.refresh();base.invalidate();assert.equal(native.budget().state,"unknown");
 }));
 
 test("Claude required headroom defers initial/near-full mail and recovers once without synthetic ACK",()=>fixture(async f=>{
@@ -362,8 +388,9 @@ for(const phase of["baseline","midturn","initial","child","denied","plan_cli","p
   const provider=createServer((req,res)=>{
     void(async()=>{
       const path=new URL(req.url??"/","http://local").pathname;
-      if(req.method==="GET"){req.resume();res.writeHead(200,{"Content-Type":"application/json"}).end('{}');return;}
+      if(req.method!=="POST"){req.resume();res.writeHead(200,{"Content-Type":"application/json"}).end('{}');return;}
       let body="";for await(const chunk of req)body+=String(chunk);
+      if(!body){res.writeHead(200,{"Content-Type":"application/json"}).end('{}');return;}
       const payload=JSON.parse(body);requests.push({path,model:payload.model,names:(payload.tools??[]).map((tool:any)=>tool.name)});
       if(path.endsWith("/count_tokens")){res.writeHead(200,{"Content-Type":"application/json"}).end('{"input_tokens":100}');return;}
       const main=(payload.tools??[]).some((tool:any)=>tool.name==="Read");
@@ -375,7 +402,7 @@ for(const phase of["baseline","midturn","initial","child","denied","plan_cli","p
         if(phase==="send_child"&&index===5)assert.equal(sent.length,1,"the original root must retain its own outgoing capability");
         assert.equal(names.some((name:string)=>name.includes("phonon_request_interaction")||name.includes("phonon_conversation_message")),false);
         if(phase!=="send_denied")assert.ok(names.includes(coordinationName));
-        const content=phase==="send_child"&&index===1?[{type:"tool_use",id:"root-delegate",name:"Task",input:{description:"Controlled collaboration child",subagent_type:"general-purpose",prompt:"Complete the assigned isolated check",model:"sonnet"}}]
+        const content=phase==="send_child"&&index===1?[{type:"tool_use",id:"root-delegate",name:names.includes("Agent")?"Agent":"Task",input:{description:"Controlled collaboration child",subagent_type:"general-purpose",prompt:"Complete the assigned isolated check",model:"sonnet"}}]
           :phase==="send_child"&&index===3?[{type:"text",text:"Child fixture check complete"}]
           :(phase==="send_resume"?index%2===0:index===(phase==="send_child"?5:2))?[{type:"text",text:"Original Claude task complete"}]
           :[{type:"tool_use",id:phase==="send_child"&&index===2?"child-send":"root-send-"+index,name:coordinationName,input:action}];
@@ -385,7 +412,7 @@ for(const phase of["baseline","midturn","initial","child","denied","plan_cli","p
         const index=payloads.length;
         assert.equal(body.includes(f.message.text),index===4,"only the original parent continuation can receive peer mail");
         if(index===1)f.state.pending=true;
-        const content=index===1?[{type:"tool_use",id:"root-delegate",name:"Task",input:{description:"Read isolated fixture",subagent_type:"general-purpose",prompt:"Read input.txt exactly once and return a concise summary.",model:"sonnet"}}]
+        const content=index===1?[{type:"tool_use",id:"root-delegate",name:payload.tools.some((tool:any)=>tool.name==="Agent")?"Agent":"Task",input:{description:"Read isolated fixture",subagent_type:"general-purpose",prompt:"Read input.txt exactly once and return a concise summary.",model:"sonnet"}}]
           :index===2?[{type:"tool_use",id:"child-read",name:"Read",input:{file_path:join(f.root,"input.txt")}}]
           :[{type:"text",text:index===3?"Child fixture read complete":"Original Claude task complete"}];
         anthropicResponse(res,payload,content,"child-sequence-"+index);return;
@@ -421,7 +448,7 @@ for(const phase of["baseline","midturn","initial","child","denied","plan_cli","p
   for(const key of keys)delete process.env[key];process.env.HOME=f.root;process.env.USERPROFILE=f.root;process.env.CLAUDE_CONFIG_DIR=join(f.root,"claude");
   let session:AdapterSession|undefined,nativeOut="",nativeErr="";f.scope.defer(()=>session?.terminate());
   try{
-    const adapter=new ClaudeCodeAdapter({env:{binPath:process.env.PHONON_TEST_CLAUDE_BIN!,baseUrl:`http://127.0.0.1:${standalone?1:port}`,authToken:standalone?"stale-key-never-used":"controlled-claude-key",
+    const adapter=new ClaudeCodeAdapter({env:{binPath:process.env.PHONON_TEST_CLAUDE_BIN!,sdkPath:process.env.PHONON_TEST_CLAUDE_SDK,baseUrl:`http://127.0.0.1:${standalone?1:port}`,authToken:standalone?"stale-key-never-used":"controlled-claude-key",
       defaultModel:"claude-sonnet-4-5-20250929",...(standalone?{settingsPath}:{})}});
     if(phase==="send_engine"||phase==="receive_engine"){
       const receiving=phase==="receive_engine";
@@ -491,7 +518,8 @@ for(const phase of["baseline","midturn","initial","child","denied","plan_cli","p
       assert.equal(f.journal.records("owner","owned").length,0);return;
     }
     assert.equal(payloads.length,phase==="child"?4:phase==="unknown_budget"?1:2,diagnostic);assert.equal(events.at(-1).text,"Original Claude task complete");
-    assert.equal(events.filter(event=>event.type==="tool_call"&&event.toolName===(phase==="child"?"Task":"Read")).length,phase==="unknown_budget"?0:1);
+    const rootTool=phase==="child"?(payloads[0].tools.some((tool:any)=>tool.name==="Agent")?"Agent":"Task"):"Read";
+    assert.equal(events.filter(event=>event.type==="tool_call"&&event.toolName===rootTool).length,phase==="unknown_budget"?0:1);
     if(phase==="child")assert.equal(events.some(event=>event.toolCallId==="child-read"),false);
     assert.equal(JSON.stringify(events.filter(event=>event.type==="message"||event.type==="result")).includes(f.message.text),false);
     assert.equal(f.journal.records("owner","owned")[0]?.state,peerEnabled&&phase!=="headroom"&&phase!=="unknown_budget"?"context_hook":undefined);
@@ -500,7 +528,7 @@ for(const phase of["baseline","midturn","initial","child","denied","plan_cli","p
       const used=outcome?.modelUsage?.["claude-sonnet-4-5-20250929"];
       assert.equal(used?.contextWindow,200000,"installed native window must agree with the version-fenced conservative budget");
       assert.ok(payloads.every((payload:any)=>Number.isSafeInteger(payload.max_tokens)&&payload.max_tokens>0&&payload.max_tokens<=(phase==="headroom"?55001:32000)));
-      if(phase==="headroom")assert.equal(payloads[0].max_tokens,55001,"native thinking reserve must reach the actual request without a coordination override");
+      if(phase==="headroom")assert.ok(payloads[0].max_tokens>=32000&&payloads[0].max_tokens<=55001,"native output may clamp the selected thinking budget; coordination must still reserve it conservatively");
     }
     if(phase==="plan_cli"||phase==="plan_sdk"||standalone){
       const init=nativeOut.split("\n").filter(Boolean).map(row=>JSON.parse(row)).find(row=>row.type==="system"&&row.subtype==="init");

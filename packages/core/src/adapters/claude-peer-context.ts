@@ -16,6 +16,7 @@ import { realpathSync, writeFileSync, readFileSync, readSync, statSync, lstatSyn
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { once } from "node:events";
+import { spawn } from "node:child_process";
 
 const coordinationName="mcp__phonon_current_turn__phonon_project_coordination";
 const canonical=value=>JSON.stringify(value&&typeof value==="object"?Array.isArray(value)?value.map(item=>JSON.parse(canonical(item))):Object.fromEntries(Object.keys(value).sort().map(key=>[key,JSON.parse(canonical(value[key]))])):value);
@@ -72,19 +73,53 @@ export function prepareNativeStartup({entry,directory,parentPID=process.pid}) {
   }};
 }
 
+/** Use the SDK's public spawn hook for owner-selected native or modern JS CLIs. */
+export function prepareExternalStartup({entry,cwd,cliNode}) {
+  const expected=realpathSync(entry),workspace=realpathSync(cwd);
+  let invoked=false,started=false,pid;
+  return {confirmed:()=>started&&Number.isInteger(pid)&&pid>0,spawnClaudeCodeProcess(options){
+    if(invoked||options.signal?.aborted||realpathSync(options.cwd??cwd)!==workspace||!Array.isArray(options.args)
+      ||options.args.some(value=>typeof value!=="string"))throw new Error("Unexpected native SDK startup owner");
+    invoked=true;
+    let args=[...options.args];
+    let direct=false;try{direct=isAbsolute(options.command)&&realpathSync(options.command)===expected;}catch{}
+    if(!direct){
+      if(!["node",process.execPath,cliNode].filter(Boolean).includes(options.command)||!args.length||realpathSync(args[0])!==expected)
+        throw new Error("Unexpected native SDK executable");
+      args=args.slice(1);
+    }
+    const modes=args.map((value,index)=>value==="--permission-mode"||value.startsWith("--permission-mode=")?index:-1).filter(index=>index>=0);
+    if(modes.length>1||args.some(value=>value==="--dangerously-skip-permissions"||value==="--allow-dangerously-skip-permissions"))
+      throw new Error("Unexpected SDK permission override");
+    if(modes.length){
+      const index=modes[0],separate=args[index]==="--permission-mode";
+      if((separate?args[index+1]:args[index].slice("--permission-mode=".length))!=="default")throw new Error("Unexpected SDK permission override");
+      args.splice(index,separate?2:1);
+    }
+    const env={...options.env};
+    if(env.AGENT_PHONON_CLAUDE_TOOL_PATH!==undefined)env.PATH=env.AGENT_PHONON_CLAUDE_TOOL_PATH;
+    delete env.AGENT_PHONON_CLAUDE_TOOL_PATH;
+    const child=spawn(cliNode??expected,cliNode?[expected,...args]:args,{cwd:workspace,env,signal:options.signal,stdio:["pipe","pipe","pipe"],windowsHide:true});
+    child.once("spawn",()=>{started=true;pid=child.pid;});
+    child.stderr.on("data",chunk=>process.stderr.write(chunk));
+    return child;
+  }};
+}
+
 const integer=value=>Number.isSafeInteger(value)&&value>=0&&value<=1000000000;
 const unknownBudget=()=>({state:"unknown",source:"native_estimate"});
 // CLI 2.0.1 has a 32K output default/cap but an environment-selected thinking budget.
 export function claudeOutputReserve({cwd,settingsPath,environment=process.env,home=homedir(),platform=process.platform}) {
   let reserve=32000;
-  const charge=value=>{
+  const charge=(value,thinking=true)=>{
     if(value===undefined||value==="")return;
     if(typeof value!=="string"||!/^\d{1,9}$/.test(value))throw new Error("Unknown native thinking budget");
     const tokens=Number(value);if(!integer(tokens)||tokens>=1000000000)throw new Error("Unknown native thinking budget");
-    reserve=Math.max(reserve,tokens+1);
+    reserve=Math.max(reserve,tokens+(thinking?1:0));
   };
   try{
     charge(environment.MAX_THINKING_TOKENS);
+    charge(environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS,false);
     const files=new Set();
     if(settingsPath)files.add(settingsPath);
     else{
@@ -113,9 +148,34 @@ export function claudeOutputReserve({cwd,settingsPath,environment=process.env,ho
       const settings=raw.trim()?JSON.parse(raw):{};
       if(!settings||typeof settings!=="object"||Array.isArray(settings)||settings.env!==undefined&&(!settings.env||typeof settings.env!=="object"||Array.isArray(settings.env)))return;
       charge(settings.env?.MAX_THINKING_TOKENS);
+      charge(settings.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS,false);
     }
     return reserve;
   }catch{return;}
+}
+
+/** Native SDK context metadata can only reduce the already conservative budget. */
+export function createExternalClaudeBudget({base,query,model,active=()=>true}) {
+  let snapshot,snapshotGeneration;
+  return {async refresh(){
+    snapshot=undefined;const generation=base.generation(),current=query();
+    if(!active()||typeof current?.getContextUsage!=="function")return;
+    let timer;
+    try{
+      const value=await Promise.race([current.getContextUsage(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error("Native context metadata timeout")),1500);})]);
+      if(!active()||generation!==base.generation()||value?.model!==model()||value.isAutoCompactEnabled!==true
+        ||![value.totalTokens,value.maxTokens,value.rawMaxTokens,value.autoCompactThreshold].every(integer)
+        ||value.maxTokens===0||value.rawMaxTokens===0||value.autoCompactThreshold===0
+        ||value.autoCompactThreshold>=Math.min(value.maxTokens,value.rawMaxTokens))return;
+      snapshot=value;snapshotGeneration=generation;
+    }catch{/* Missing optional budget evidence leaves the original task unchanged. */}finally{clearTimeout(timer);}
+  },budget(toolResponse){
+    const value=base.budget(toolResponse);
+    if(value.state!=="known"||!snapshot||!active()||snapshotGeneration!==base.generation()||snapshot.model!==model())return unknownBudget();
+    return {...value,contextWindowTokens:Math.min(value.contextWindowTokens,snapshot.maxTokens,snapshot.rawMaxTokens),
+      outputTokens:Math.max(value.outputTokens,snapshot.rawMaxTokens-snapshot.autoCompactThreshold),
+      inputTokens:Math.max(value.inputTokens,snapshot.totalTokens+Buffer.byteLength(JSON.stringify(toolResponse??null)))};
+  }};
 }
 
 // Use the smaller qualified native window even when a 1M variant is selected.
@@ -148,7 +208,7 @@ export function createClaudePeerBudget({sessionId,outputReserve=()=>undefined}) 
   }};
 }
 
-export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBudget=()=>unknownBudget(),invalidateBudget=()=>{},budgetGeneration=()=>0,active=()=>true,offered}) {
+export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBudget=()=>unknownBudget(),refreshBudget,invalidateBudget=()=>{},budgetGeneration=()=>0,active=()=>true,offered}) {
   let firstPrompt=true;
   let peerDebit=0,toolDebit=0,toolGeneration=-1,pending=false;
   const own = input => {
@@ -167,6 +227,8 @@ export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBu
       await new Promise(resolve=>setImmediate(resolve));
       if(!active() || !rootTools.delete(toolUseId)) return {};
     }
+    if(refreshBudget)await refreshBudget();
+    if(!active()||options?.signal?.aborted)return {};
     const observedGeneration=budgetGeneration(),observedBudget=getBudget(input.tool_response);
     if(observedBudget.state==="known"&&toolGeneration!==observedGeneration){toolDebit=0;toolGeneration=observedGeneration;}
     const previousToolDebit=toolDebit,currentToolBytes=initial?0:Buffer.byteLength(JSON.stringify(input.tool_response??null));
@@ -214,6 +276,7 @@ async function main() {
   if(!frame.otherControllerTools)for(const key of ["AGENT_PHONON_MCP_URL","AGENT_PHONON_INTERACTION_TOKEN","AGENT_PHONON_INTERACTION_URL"])delete process.env[key];
   if(typeof frame.prompt!=="string" || typeof frame.model!=="string" || typeof frame.resume!=="boolean"
     || frame.settingsPath!==undefined&&(typeof frame.settingsPath!=="string"||!isAbsolute(frame.settingsPath))
+    || frame.cliNode!==undefined&&(typeof frame.cliNode!=="string"||!isAbsolute(frame.cliNode))
     || !/^[a-f0-9-]{36}$/.test(sessionId||"")) throw new Error("Invalid native invocation");
   const local=(value,path)=>{const url=new URL(value||"");if(url.protocol!=="http:"||url.hostname!=="127.0.0.1"||!url.port||url.pathname!==path||url.username||url.password||url.search||url.hash)throw new Error("Invalid native channel");return url;};
   const endpoint=frame.peerEnabled?local(peerUrl,"/peer-context"):undefined;
@@ -237,11 +300,15 @@ async function main() {
   const contextApplications=new Map();
   let nativeRootModel;
   const peerBudget=createClaudePeerBudget({sessionId,outputReserve:()=>claudeOutputReserve({cwd:process.cwd(),settingsPath:frame.settingsPath})});
+  let nativeQuery;
+  const externalBudget=frame.externalSdk?createExternalClaudeBudget({base:peerBudget,query:()=>nativeQuery,model:()=>nativeRootModel,
+    active:()=>active&&!controller.signal.aborted}):undefined;
   const invalidateBudget=()=>{peerBudget.invalidate();contextApplications.clear();};
-  const startup=prepareNativeStartup({entry,directory:dirname(fileURLToPath(import.meta.url))});
+  const startup=frame.externalSdk?prepareExternalStartup({entry,cwd:process.cwd(),cliNode:frame.cliNode})
+    :prepareNativeStartup({entry,directory:dirname(fileURLToPath(import.meta.url))});
   let startupRejected=false;
   const hooks=frame.peerEnabled?createPeerHooks({sessionId,cwd:process.cwd(),prompt:frame.prompt,checkpoint,rootTools,
-    getBudget:peerBudget.budget,invalidateBudget,budgetGeneration:peerBudget.generation,active:()=>active,
+    getBudget:externalBudget?.budget??peerBudget.budget,...(externalBudget?{refreshBudget:externalBudget.refresh}:{}),invalidateBudget,budgetGeneration:peerBudget.generation,active:()=>active,
     ...(frame.nativeInput?{offered:(observation,generation)=>contextApplications.set(observation.boundaryId,{observation,generation})}:{})}):{};
   let guard,mcpServer,sequence=0;
   if(frame.coordination){
@@ -276,14 +343,15 @@ async function main() {
     return callback(...args);
   });
   const extraArgs={...(!frame.resume?{"session-id":sessionId}:{}),...(frame.settingsPath?{"setting-sources":"",settings:frame.settingsPath}:{})};
-  const options={cwd:process.cwd(),env:{...process.env},executable:"node",pathToClaudeCodeExecutable:entry,
-    executableArgs:startup.executableArgs,extraArgs,abortController:controller,hooks,
+  const options={cwd:process.cwd(),env:{...process.env},pathToClaudeCodeExecutable:entry,
+    ...(frame.externalSdk?{spawnClaudeCodeProcess:startup.spawnClaudeCodeProcess,...(frame.cliNode?{executable:"node"}:{})}
+      :{executable:"node",executableArgs:startup.executableArgs}),extraArgs,abortController:controller,hooks,
     ...(frame.model&&frame.model!=="default"?{model:frame.model}:{}),
     ...(frame.resume?{resume:sessionId}:{}),
     ...(mcpServer?{mcpServers:{phonon_current_turn:mcpServer}}:{}),
     ...(frame.nativeInput?{includePartialMessages:true}:{}),stderr:text=>process.stderr.write(text)};
   let outcome;
-  try { for await(const message of sdk.query({prompt:frame.prompt,options})) {
+  try { nativeQuery=sdk.query({prompt:frame.prompt,options});for await(const message of nativeQuery) {
     if(message.parent_tool_use_id)continue;
     if(message.session_id!==sessionId) throw new Error("Native session changed");
     peerBudget.observe(message);
@@ -330,7 +398,8 @@ export function prepareClaudePeerRunner(options: SendOptions, binding: ClaudeSdk
     writeFileSync(path,CLAUDE_PEER_RUNNER_SOURCE,{mode:0o600,flag:"wx"});
     const types=options.projectCoordination?pathToFileURL(createRequire(import.meta.url).resolve("@modelcontextprotocol/sdk/types.js")).href:"";
     return {args:[path,pathToFileURL(binding.sdk).href,binding.entry,input.sessionId,types],stdin:JSON.stringify({prompt:input.prompt,model:input.model,resume:input.resume,peerEnabled:!!options.peerContext,coordination:!!options.projectCoordination,
-      otherControllerTools:!!(options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument),nativeInput:input.nativeInput===true,...(input.settingsPath?{settingsPath:input.settingsPath}:{})}),
+      otherControllerTools:!!(options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument),nativeInput:input.nativeInput===true,
+      ...(binding.kind==="external"?{externalSdk:true,...(binding.cliNode?{cliNode:binding.cliNode}:{})}:{}),...(input.settingsPath?{settingsPath:input.settingsPath}:{})}),
       cleanup:()=>rmSync(directory,{recursive:true,force:true})};
   } catch(error) {rmSync(directory,{recursive:true,force:true});throw error;}
 }

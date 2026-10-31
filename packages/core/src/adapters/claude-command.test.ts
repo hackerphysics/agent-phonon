@@ -31,3 +31,26 @@ test("Claude native/unknown launchers cannot acquire a fabricated bundled SDK bi
   assert.equal(claudeNodeCommand(bin),undefined);assert.equal(await qualifyClaudePeerContext(bin),undefined);
   assert.equal(await qualifyClaudePeerContext(join(scope.root,"missing")),undefined);
 }));
+
+test("Claude native CLI requires an explicit compatible Agent SDK and admits later releases",{skip:process.platform==="win32"},()=>withPeerFixture("claude-external-sdk",async scope=>{
+  const entry=join(scope.root,"claude-native"),directory=join(scope.root,"owner-sdk"),sdk=join(directory,"sdk.mjs");mkdirSync(directory);
+  writeFileSync(entry,'#!'+process.execPath+'\nconsole.log("2.1.123 (Claude Code)")\n',{mode:0o700});
+  writeFileSync(sdk,'export function query(){};export function createSdkMcpServer(){}\n');
+  assert.equal(await qualifyClaudePeerContext(entry),undefined);
+  for(const version of ["0.2.123","0.2.124","0.3.0","1.0.0"]){
+    writeFileSync(join(directory,"package.json"),JSON.stringify({name:"@anthropic-ai/claude-agent-sdk",version}));
+    assert.deepEqual(await qualifyClaudePeerContext(entry,sdk),{entry,sdk,node:process.execPath,kind:"external"});
+  }
+  writeFileSync(join(directory,"package.json"),JSON.stringify({name:"@anthropic-ai/claude-agent-sdk",version:"0.2.122"}));
+  assert.equal(await qualifyClaudePeerContext(entry,sdk),undefined);
+  writeFileSync(join(directory,"package.json"),JSON.stringify({name:"@anthropic-ai/claude-agent-sdk",version:"0.2.123"}));
+  for(const version of ["2.1.124","2.2.0","3.0.0"]){
+    writeFileSync(entry,'#!'+process.execPath+'\nconsole.log('+JSON.stringify(version+' (Claude Code)')+')\n',{mode:0o700});
+    assert.deepEqual(await qualifyClaudePeerContext(entry,sdk),{entry,sdk,node:process.execPath,kind:"external"});
+  }
+  writeFileSync(entry,'#!'+process.execPath+'\nconsole.log("2.1.122 (Claude Code)")\n',{mode:0o700});
+  assert.equal(await qualifyClaudePeerContext(entry,sdk),undefined);
+  writeFileSync(entry,'#!'+process.execPath+'\nconsole.log("2.1.124 (Claude Code)")\n',{mode:0o700});
+  writeFileSync(sdk,'export function query(){}\n');assert.equal(await qualifyClaudePeerContext(entry,sdk),undefined);
+  assert.equal(await qualifyClaudePeerContext(entry,"sdk.mjs"),undefined);
+}));

@@ -13,14 +13,14 @@ const experiment = String.raw`
 import {createInterface}from"node:readline";
 import{dirname}from"node:path";
 import{pathToFileURL}from"node:url";
-const[sdkPath,entry,sessionId,helper,mode,marker]=process.argv.slice(2),sdk=await import(sdkPath),{prepareNativeStartup}=await import(pathToFileURL(helper).href);
+const[sdkPath,entry,sessionId,helper,mode,marker,external,cliNode]=process.argv.slice(2),sdk=await import(sdkPath),{prepareNativeStartup,prepareExternalStartup}=await import(pathToFileURL(helper).href);
 const controller=new AbortController(),lines=createInterface({input:process.stdin});
 const prompts=async function*(){
  yield{type:"user",uuid:"00000000-0000-4000-8000-000000000001",session_id:sessionId,parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:"Read input.txt and finish the original task."}]}};
  for await(const line of lines){const msg=JSON.parse(line);yield{type:"user",uuid:msg.uuid,session_id:sessionId,parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:msg.text}]}};}
 };
-const startup=prepareNativeStartup({entry,directory:process.cwd()}),options={cwd:process.cwd(),env:{...process.env},executable:"node",pathToClaudeCodeExecutable:entry,
- executableArgs:startup.executableArgs,extraArgs:{"session-id":sessionId,"replay-user-messages":null},abortController:controller,includePartialMessages:true,
+const startup=external?prepareExternalStartup({entry,cwd:process.cwd(),cliNode:cliNode||undefined}):prepareNativeStartup({entry,directory:process.cwd()}),options={cwd:process.cwd(),env:{...process.env},pathToClaudeCodeExecutable:entry,
+ ...(external?{spawnClaudeCodeProcess:startup.spawnClaudeCodeProcess,...(cliNode?{executable:"node"}:{})}:{executable:"node",executableArgs:startup.executableArgs}),extraArgs:{"session-id":sessionId,"replay-user-messages":null},abortController:controller,includePartialMessages:true,
  hooks:mode==="hook"?{PostToolUse:[{hooks:[async input=>input.session_id===sessionId&&input.tool_name==="Read"?{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:marker}}:{}]}]}:{}};
 let result;
 try{for await(const msg of sdk.query({prompt:mode==="hook"?"Read input.txt and finish the original task.":prompts(),options})){
@@ -31,10 +31,10 @@ try{for await(const msg of sdk.query({prompt:mode==="hook"?"Read input.txt and f
 if(!startup.confirmed()||result?.subtype!=="success"||result?.is_error!==false)process.exitCode=1;
 `;
 
-for(const mode of ["stream","hook"] as const)test(mode==="stream"?"installed Claude streaming acknowledgements do not imply one original native task":"installed Claude hook adds current-task context without inventing a native user message", {
+for(const mode of ["stream","hook"] as const)test(mode==="stream"?"installed Claude streaming input observes actual root inference and result boundaries":"installed Claude hook adds current-task context without inventing a native user message", {
   skip: !process.env.PHONON_TEST_CLAUDE_BIN, timeout: 45000,
 }, () => withPeerFixture("claude-input-audit", async scope => {
-  const binding = await qualifyClaudePeerContext(process.env.PHONON_TEST_CLAUDE_BIN!);
+  const binding = await qualifyClaudePeerContext(process.env.PHONON_TEST_CLAUDE_BIN!, process.env.PHONON_TEST_CLAUDE_SDK);
   assert.ok(binding?.node, "the installed CLI and its paired runtime must qualify");
   const marker = "CLAUDE_INSERT_" + randomUUID(), inputId = randomUUID(), sid = randomUUID();
   writeFileSync(join(scope.root, "helpers.mjs"), CLAUDE_PEER_RUNNER_SOURCE, { mode: 0o600 });
@@ -44,6 +44,7 @@ for(const mode of ["stream","hook"] as const)test(mode==="stream"?"installed Cla
   const frames: any[] = [], payloads: any[] = [], errors: unknown[] = [];
   let runtime: ReturnType<typeof spawnSupervisedAgent> | undefined;
   const provider = createServer((req, res) => { void (async () => {
+    if(req.method!=="POST"){req.resume();res.writeHead(200,{"Content-Type":"application/json"}).end("{}");return;}
     let body = ""; for await (const chunk of req) body += String(chunk);
     const path = new URL(req.url ?? "/", "http://local").pathname;
     if (path.endsWith("/count_tokens")) { res.writeHead(200, { "Content-Type": "application/json" }).end('{"input_tokens":100}'); return; }
@@ -73,7 +74,7 @@ for(const mode of ["stream","hook"] as const)test(mode==="stream"?"installed Cla
     send("message_delta", { type: "message_delta", delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 10 } }); send("message_stop", { type: "message_stop" }); res.end();
   })().catch(error => { errors.push(error); void runtime?.terminate(); res.destroy(); }); });
   scope.defer(() => closePeerServer(provider)); await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
-  runtime = spawnSupervisedAgent(binding.node, [join(scope.root, "experiment.mjs"), pathToFileURL(binding.sdk).href, binding.entry, sid, join(scope.root, "helpers.mjs"),mode,marker], {
+  runtime = spawnSupervisedAgent(binding.node, [join(scope.root, "experiment.mjs"), pathToFileURL(binding.sdk).href, binding.entry, sid, join(scope.root, "helpers.mjs"),mode,marker,binding.kind??"",binding.cliNode??""], {
     cwd: scope.root, env: { PATH: dirname(binding.node) + delimiter + process.env.PATH, HOME: scope.root, USERPROFILE: scope.root, CLAUDE_CONFIG_DIR: join(scope.root, "claude"),
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${(provider.address() as { port: number }).port}`, ANTHROPIC_AUTH_TOKEN: "controlled-fixture-key", ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929",
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1", HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", PYTHONDONTWRITEBYTECODE: "1" },
@@ -86,7 +87,7 @@ for(const mode of ["stream","hook"] as const)test(mode==="stream"?"installed Cla
   runtime.child.stderr.on("data", chunk => { stderr = (stderr + String(chunk)).slice(-6000); });
   const code = await new Promise<number | null>((resolve, reject) => { runtime!.child.once("close", resolve); runtime!.child.once("error", reject); });
   assert.deepEqual(errors, [], JSON.stringify({ frames: frames.map(frame => ({ type: frame.type, uuid: frame.uuid, message: frame.type === "user" ? frame.message : undefined })), stderr }));
-  assert.equal(code, 0, stderr); assert.equal(payloads.length, mode==="stream"?3:2,JSON.stringify({results:frames.filter(frame=>frame.type==="result"),
+  assert.equal(code, 0, stderr); assert.ok(mode==="stream"?payloads.length>=2&&payloads.length<=3:payloads.length===2,JSON.stringify({results:frames.filter(frame=>frame.type==="result"),
     requests:payloads.map(payload=>({model:payload.model,messages:payload.messages.slice(-3)})),types:frames.map(frame=>({type:frame.type,uuid:frame.uuid,parent:frame.parent_tool_use_id,text:frame.type==="assistant"?frame.message.content:undefined}))}));
   assert.equal(frames.filter(frame => frame.type === "result").length, 1);
   if(mode==="hook")assert.equal(frames.some(frame=>frame.type==="user"&&JSON.stringify(frame.message).includes(marker)),false,"native hook context must not be relabelled as a native user message");

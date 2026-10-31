@@ -410,6 +410,8 @@ need to force a path/model/provider:
 ```bash
 agent-phonon adapter add codex --bin /path/to/codex --model default
 agent-phonon adapter add claude-code --bin /path/to/claude --model default
+# Native CLI installations additionally select a prepared Agent SDK:
+agent-phonon adapter add claude-code --bin /path/to/claude --sdk-path /path/to/claude-agent-sdk/sdk.mjs --model default
 agent-phonon adapter add copilot --bin /path/to/copilot --model default
 agent-phonon adapter add hermes --bin /path/to/hermes
 agent-phonon adapter add opencode --bin /path/to/opencode

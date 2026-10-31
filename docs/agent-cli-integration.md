@@ -116,6 +116,15 @@ bash scripts/update-plugin.sh /absolute/path/to/prepared-plugin
 
 ## Claude Code adapter
 
+Current-turn input supports the existing Node CLI >=2.0.1 with its bundled SDK.
+For native CLI installations >=2.1.123, configure the owner adapter field
+`claudeSdkPath` (or `adapter add claude-code --sdk-path /absolute/sdk.mjs`) to a
+prepared `@anthropic-ai/claude-agent-sdk` >=0.2.123 module. It is not selected
+from project dependencies or remote session input. Required query/MCP/hook APIs
+and current-query context usage are checked separately from version eligibility.
+The public SDK spawn hook preserves native permissions, settings and identity;
+it never selects bypass permissions or installs an SDK during execution.
+
 Single-agent runtime; `discoverAgents` returns one `claude-code`.
 
 ### Invocation (each part matters)

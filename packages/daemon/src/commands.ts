@@ -209,7 +209,7 @@ export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["
       const token = a.gatewayToken ?? readOpenClawGatewayToken();
       if (token) reg.register(new OpenClawGatewayAdapter({ gateway: { baseUrl: a.gatewayUrl ?? "ws://127.0.0.1:18789", token }, defaultAgent: a.defaultAgent ?? "main" }));
     } else if (a.type === "claude-code") {
-      reg.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
+      reg.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, sdkPath: a.claudeSdkPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
     } else if (a.type === "codex") {
       reg.register(new CodexAdapter({ env: { binPath: a.codexBinPath, baseUrl: a.codexBaseUrl, apiKey: a.codexApiKey, defaultModel: a.codexDefaultModel ?? "default", models: a.codexModels, wireApi: a.codexWireApi ?? "responses" } }));
     } else if (a.type === "hermes") {
@@ -235,7 +235,7 @@ export function cmdAdapterAdd(type: string, opts: Record<string, string | undefi
       a = { type: "openclaw-gateway", gatewayUrl: opts.gatewayUrl ?? "ws://127.0.0.1:18789", gatewayToken: opts.token, defaultAgent: opts.defaultAgent ?? "main" };
       break;
     case "claude-code":
-      a = { type: "claude-code", claudeBinPath: opts.bin, claudeBaseUrl: opts.baseUrl, claudeAuthToken: opts.token, claudeDefaultModel: opts.model ?? "default" };
+      a = { type: "claude-code", claudeBinPath: opts.bin, claudeSdkPath: opts.sdkPath, claudeBaseUrl: opts.baseUrl, claudeAuthToken: opts.token, claudeDefaultModel: opts.model ?? "default" };
       break;
     case "codex":
       a = { type: "codex", codexBinPath: opts.bin, codexBaseUrl: opts.baseUrl, codexApiKey: opts.apiKey, codexDefaultModel: opts.model ?? "default", codexWireApi: (opts.wireApi as "responses" | "chat") ?? "responses" };

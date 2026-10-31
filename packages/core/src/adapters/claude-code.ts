@@ -51,6 +51,8 @@ const CAPABILITIES: AgentCapabilities = {
 export interface ClaudeCodeEnv {
   /** Claude executable path. Prefer an absolute path when running under systemd/launchd. */
   binPath?: string;
+  /** Operator-selected Agent SDK for a native CLI; never selected from a project. */
+  sdkPath?: string;
   /** Owner-selected standalone settings file; replaces legacy endpoint/auth/default-model overrides. */
   settingsPath?: string;
   /** Optional Anthropic-compatible endpoint override. Omit to use the user's native Claude Code login/config. */
@@ -101,7 +103,7 @@ class ClaudeCodeSession implements AdapterSession {
   private readonly command:ReturnType<typeof claudeNodeCommand>;
   private readonly currentTurnInput=new CurrentTurnInput();
   async qualifyPeerContext(): Promise<void> {
-    this.peerBinding=await qualifyClaudePeerContext(this.env.binPath??"claude");
+    this.peerBinding=await qualifyClaudePeerContext(this.env.binPath??"claude",this.env.sdkPath);
   }
   peerContextCapability() {
     return this.peerBinding?{mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.uuid} as const:undefined;
@@ -349,7 +351,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
-    this.capabilities.injectMidTurn=available&&!!await qualifyClaudePeerContext(this.env.binPath??"claude");
+    this.capabilities.injectMidTurn=available&&!!await qualifyClaudePeerContext(this.env.binPath??"claude",this.env.sdkPath);
     return [{
       agentId: "claude-code" as AgentDescriptor["agentId"],
       displayName: "Claude Code",

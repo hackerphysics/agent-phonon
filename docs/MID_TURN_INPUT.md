@@ -36,7 +36,7 @@ All seven maintained harness names have a qualified original-turn input path:
 | Harness | Minimum Version And Path |
 | --- | --- |
 | Pi | >=0.84.1 native RPC steering and verified lifecycle |
-| Claude Code | >=2.0.1 single-input SDK query and native root context continuation |
+| Claude Code | Node CLI >=2.0.1 with bundled SDK, or native CLI >=2.1.123 with owner-selected Agent SDK >=0.2.123; single-input native root continuation |
 | Codex | >=0.165.0-alpha.1.2 native app-server steering and exact input completion |
 | Copilot | >=1.0.82 owner-authorized invocation plugin and exact root lifecycle |
 | Hermes | >=0.21.1 native provider middleware with exact payload observation |

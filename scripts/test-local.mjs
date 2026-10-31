@@ -17,6 +17,8 @@ const hermesBin=process.env.PHONON_TEST_HERMES_BIN;
 if(hermesBin&&(!isAbsolute(hermesBin)||/[\x00-\x1f\x7f]/.test(hermesBin)))throw new Error('An explicit absolute native Hermes executable is required');
 const claudeBin=process.env.PHONON_TEST_CLAUDE_BIN;
 if(claudeBin&&(!isAbsolute(claudeBin)||/[\x00-\x1f\x7f]/.test(claudeBin)))throw new Error('An explicit absolute native Claude executable is required');
+const claudeSdk=process.env.PHONON_TEST_CLAUDE_SDK;
+if(claudeSdk&&(!claudeBin||!isAbsolute(claudeSdk)||/[\x00-\x1f\x7f]/.test(claudeSdk)))throw new Error('An explicit absolute Claude Agent SDK and executable are required');
 const copilotPaths=['PHONON_TEST_COPILOT_BIN','PHONON_TEST_COPILOT_CACHE_HOME','PHONON_TEST_COPILOT_SDK_ROOT'];
 for(const name of copilotPaths){const path=process.env[name];if(path&&(!isAbsolute(path)||/[\x00-\x1f\x7f]/.test(path)))throw new Error('Explicit absolute Copilot runtime paths are required');}
 const openCodeBin=process.env.PHONON_TEST_OPENCODE_BIN,openCodeDeps=process.env.PHONON_TEST_OPENCODE_DEPS;
@@ -48,6 +50,7 @@ const env = {
   ...(codexBin?{PHONON_TEST_CODEX_BIN:codexBin}:{}),
   ...(hermesBin?{PHONON_TEST_HERMES_BIN:hermesBin}:{}),
   ...(claudeBin?{PHONON_TEST_CLAUDE_BIN:claudeBin}:{}),
+  ...(claudeSdk?{PHONON_TEST_CLAUDE_SDK:claudeSdk}:{}),
   ...Object.fromEntries(copilotPaths.filter(name=>process.env[name]).map(name=>[name,process.env[name]])),
   ...(openCodeBin?{PHONON_TEST_OPENCODE_BIN:openCodeBin}:{}),
   ...(openCodeDeps?{PHONON_TEST_OPENCODE_DEPS:openCodeDeps}:{}),

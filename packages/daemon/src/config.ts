@@ -43,6 +43,8 @@ export interface AdapterConfig {
   defaultAgent?: string;
   /** claude-code：网关 baseUrl/token/默认模型。 */
   claudeBinPath?: string;
+  /** Absolute operator-selected Agent SDK module for native Claude CLI integration. */
+  claudeSdkPath?: string;
   /** Local owner-selected standalone settings; takes precedence over legacy endpoint/auth/model overrides. */
   claudeSettingsPath?: string;
   claudeBaseUrl?: string;
@@ -184,6 +186,7 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): DaemonConfig {
   if(raw.employeeProfileFileBrokerRoot!==undefined&&(typeof raw.employeeProfileFileBrokerRoot!=="string"||!isAbsolute(raw.employeeProfileFileBrokerRoot)||raw.employeeProfileFileBrokerRoot.includes("\0")||raw.employeeProfileFileBrokerRoot.length>4096))throw new Error("employeeProfileFileBrokerRoot must be an absolute local runtime path");
   for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.hermesManagedProfileNativeTools!==undefined&&typeof adapter.hermesManagedProfileNativeTools!=="boolean")throw new Error(`adapters[${index}].hermesManagedProfileNativeTools must be a boolean`);
   for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.copilotPeerContext!==undefined&&typeof adapter.copilotPeerContext!=="boolean")throw new Error(`adapters[${index}].copilotPeerContext must be a boolean`);
+  for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.claudeSdkPath!==undefined&&(typeof adapter.claudeSdkPath!=="string"||!isAbsolute(adapter.claudeSdkPath)||/[\x00-\x1f\x7f]/.test(adapter.claudeSdkPath)||adapter.claudeSdkPath.length>4096))throw new Error(`adapters[${index}].claudeSdkPath must be an absolute local runtime path`);
   const d = defaultConfig();
   return {
     deviceId: raw.deviceId ?? d.deviceId,
