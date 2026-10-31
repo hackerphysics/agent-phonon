@@ -39,12 +39,14 @@ test("secure file transfer rejects special files and symlink substitution, prese
     await assert.rejects(tc.call("file.read",{projectId,path:"changing/secret.txt"}));
     await assert.rejects(tc.call("file.write",{projectId,path:"changing/new.txt",data:"outside forbidden"}));
     await unlink(join(project,"changing"));await rename(join(project,"pinned"),join(project,"changing"));
-    let swapping=true;
+    let swapping=true,exposures=0,entered!:()=>void;const exposed=new Promise<void>(resolve=>{entered=resolve;});
     let swapFailure:unknown;
-    const swap=(async()=>{for(let count=0;count<60&&swapping;count++){
+    const swap=(async()=>{try{for(let count=0;count<60&&swapping;count++){
       await rename(join(project,"changing"),join(project,"pinned"));await symlink(outside,join(project,"changing"));
+      exposures++;entered();
       await new Promise(resolve=>setTimeout(resolve,1));await unlink(join(project,"changing"));await rename(join(project,"pinned"),join(project,"changing"));
-    }})().catch(error=>{swapFailure=error;});
+    }}finally{entered();}})().catch(error=>{swapFailure=error;});
+    await exposed;
     try{
       for(let count=0;count<4;count++){
         try{const value=await tc.call("file.read",{projectId,path:"changing/secret.txt"})as any;assert.equal(value.data,"inside file");}catch(error){assert.notEqual((error as Error).name,"AssertionError");}
@@ -53,6 +55,7 @@ test("secure file transfer rejects special files and symlink substitution, prese
       }
     }finally{swapping=false;await swap;}
     assert.ifError(swapFailure);
+    assert.ok(exposures>0,"the adversarial link must actually be installed before broker requests");
     assert.equal(await readFile(join(outside,"secret.txt"),"utf8"),"outside secret");await assert.rejects(readFile(join(outside,"new.txt")));
   }finally{await tc.conn.dispose();store.close();await rm(root,{recursive:true,force:true});await rm(outside,{recursive:true,force:true});}
 });

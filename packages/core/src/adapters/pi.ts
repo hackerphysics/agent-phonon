@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
@@ -11,6 +12,7 @@ import type {
   AdapterSession,
   AdapterHitlContext,
   CreateSessionParams,
+  InsertionOptions,
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
@@ -682,9 +684,10 @@ class PiSession implements AdapterSession {
     return native.supervisor.hasStopped() ? "process_tree_exit" : undefined;
   }
 
-  async insertAtToolGap(input: string, options: {turnId: string; signal: AbortSignal}): Promise<void> {
+  async insertAtToolGap(input: string, options: InsertionOptions): Promise<void> {
     const rpc = this.rpcCurrent;
     if (!rpc || rpc.turnId !== options.turnId || !this.current || options.signal.aborted) throw piRecoveryFailure();
+    options.beforeApply?.();
     await rpc.channel.insert(input, options.signal);
   }
 
@@ -771,10 +774,11 @@ export class PiAdapter implements AgentAdapter {
 
   private rpcSupported(): boolean {
     if (this.rpcAvailable === undefined) {
-      const version = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"])?.match(/^v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/) : undefined;
+      const output = this.flags().rpc ? probePi(this.env.binPath ?? "pi", ["--version"]) : undefined;
+      const version = output ? parsePiVersion(output)?.replace(/^v/, "") : undefined;
       // This is the first verified lifecycle with agent_settled and exact
       // user-message delivery events. Older RPC versions remain JSON-only.
-      this.rpcAvailable = !!version && (+version[1]! > 0 || +version[2]! > 84 || +version[2]! === 84 && +version[3]! >= 1);
+      this.rpcAvailable = nativeVersionAtLeast(version, "0.84.1");
     }
     return this.rpcAvailable;
   }

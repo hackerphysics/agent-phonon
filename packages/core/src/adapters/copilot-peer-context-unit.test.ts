@@ -9,7 +9,7 @@ import { withPeerFixture } from "../testing/peer-fixture.js";
 import {PeerContextJournal,PeerContextReceiver} from "../peer-context.js";
 import type {ProjectCoordinationResult} from "@agent-phonon/protocol";
 
-async function fixture(work: (value: any) => Promise<void>, prime = true) {
+async function fixture(work: (value: any) => Promise<void>, prime = true,nativeInput=false) {
   await withPeerFixture("copilot-peer-unit", async scope => {
     const sessionId = randomUUID(), prompt = "Original assigned task\n";
     const environment = { AGENT_PHONON_PEER_CONTEXT_URL: "http://127.0.0.1:1/peer-context", AGENT_PHONON_PEER_CONTEXT_TOKEN: randomBytes(32).toString("base64url") };
@@ -28,7 +28,7 @@ async function fixture(work: (value: any) => Promise<void>, prime = true) {
     };
     const binding = module.createCopilotPeerHooks({ sessionId, cwd: scope.root, promptHash: createHash("sha256").update(prompt).digest("hex"),
       checkpoint, getNativeTasks: async () => state.tasks,getPendingPermissions:async()=>state.permissions,
-      getNativeBudget:async(...input:any[])=>{state.budgetInputs.push(input);return structuredClone(state.budget);}, active: () => state.active });
+      getNativeBudget:async(...input:any[])=>{state.budgetInputs.push(input);return structuredClone(state.budget);}, active: () => state.active,nativeInput });
     scope.defer(binding.deactivate);
     if (prime) {
       state.mail = false;
@@ -37,11 +37,39 @@ async function fixture(work: (value: any) => Promise<void>, prime = true) {
     }
     const input = { workingDirectory: scope.root, timestamp: new Date(), toolName: "view", toolArgs: { path: join(scope.root, "input.txt") },
       toolResult: { textResultForLlm: "Original file bytes", resultType: "success" } };
-    const start = (id: string, extra: any = {}) => binding.observe({ type: "tool.execution_start", data: { toolCallId: id, toolName: input.toolName, arguments: input.toolArgs }, ...extra });
+    const start = (id: string, extra: any = {}) => binding.observe({ type: "tool.execution_start", data: { toolCallId: id, toolName: input.toolName, arguments: input.toolArgs,turnId:"0",model:"gpt-4.1" }, ...extra });
     await work({ scope, asset, module, binding, state, calls, input, start, invocation: { sessionId }, prompt, message, environment });
     asset.cleanup(); assert.equal(existsSync(asset.path), false);
   });
 }
+
+for(const variant of ["applied","hook-failed","changed-context","child-result","wrong-model","foreign-continuation","child-continuation","same-loop","compaction","permission","authorization-denied"] as const)
+  test(`Copilot native input confirmation requires its complete original-root lifecycle: ${variant}`,()=>fixture(async f=>{
+    const hookId=randomUUID(),interactionId=randomUUID();
+    f.binding.observe({type:"assistant.turn_start",data:{turnId:"0",interactionId}});f.start("owned-read");
+    f.binding.observe({type:"hook.start",data:{hookInvocationId:hookId,hookType:"postToolUse",input:{sessionId:f.invocation.sessionId,cwd:f.scope.root,
+      timestamp:Number(new Date(f.input.timestamp)),toolName:f.input.toolName,toolArgs:f.input.toolArgs,toolResult:f.input.toolResult}}});
+    if(variant==="authorization-denied")f.state.beforeResponse=async(path:string)=>{if(path==="/peer-context/authorize")throw new Error("Source withdrawn");};
+    const output=await f.binding.hooks.onPostToolUse(f.input,f.invocation);
+    assert.deepEqual(f.calls.map((call:any)=>call.path),["/peer-context","/peer-context/authorize"]);
+    if(variant==="authorization-denied"){assert.equal(output,undefined);return;}
+    assert.deepEqual(output,{additionalContext:f.message.content});
+    f.binding.observe({type:"hook.end",data:{hookInvocationId:hookId,hookType:"postToolUse",success:variant!=="hook-failed",
+      output:variant==="changed-context"?{additionalContext:"unrelated"}:output}});
+    assert.equal(f.calls.length,2,"hook acceptance alone cannot settle insertion");
+    f.binding.observe({type:"tool.execution_complete",...(variant==="child-result"?{agentId:"child"}:{}),data:{toolCallId:"owned-read",success:true,
+      turnId:"0",interactionId,model:variant==="wrong-model"?"foreign-model":"gpt-4.1",result:{content:"Original file bytes\n"+output.additionalContext}}});
+    assert.equal(f.calls.length,2,"accepted context alone is not root continuation");
+    if(variant==="compaction")f.binding.observe({type:"session.compaction_start",data:{}});
+    if(variant==="permission")f.binding.observe({type:"permission.requested",data:{}});
+    f.binding.observe({type:"assistant.turn_start",...(variant==="child-continuation"?{agentId:"child"}:{}),data:{
+      turnId:variant==="same-loop"?"0":"1",interactionId:variant==="foreign-continuation"?randomUUID():interactionId}});
+    await Promise.resolve();
+    assert.equal(f.calls.filter((call:any)=>call.path==="/peer-context/context-applied").length,variant==="applied"?1:0);
+    assert.equal(f.calls.some((call:any)=>call.path==="/peer-context/observe"),false,"never fabricate a peer or provider-payload receipt");
+    f.binding.observe({type:"assistant.turn_start",data:{turnId:"2",interactionId}});await Promise.resolve();
+    assert.equal(f.calls.filter((call:any)=>call.path==="/peer-context/context-applied").length,["applied","child-continuation"].includes(variant)?1:0,"only the original root may finish its pending confirmation");
+  },true,true));
 
 test("Copilot peer hooks preserve native data and expose neither permission nor prompt mutation handlers", () => fixture(async f => {
   assert.deepEqual(Object.keys(f.binding.hooks).sort(), ["onPostToolUse", "onUserPromptSubmitted"]);

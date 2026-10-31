@@ -3,7 +3,7 @@ import { discoveryProbe } from "../discovery-probe.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, isAbsolute } from "node:path";
+import { join, isAbsolute, dirname, delimiter } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
 import type {
@@ -13,9 +13,11 @@ import type {
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
-import { qualifyClaudePeerContext, prepareClaudePeerRunner, type ClaudeSdkBinding } from "./claude-peer-context.js";
+import { claudeNodeCommand, qualifyClaudePeerContext, prepareClaudePeerRunner, type ClaudeSdkBinding } from "./claude-peer-context.js";
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
 import { PhononError } from "../rpc.js";
+import { CurrentTurnInput } from "../current-turn-input.js";
+import type { InsertionOptions } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
 
 /**
@@ -96,17 +98,20 @@ class ClaudeCodeSession implements AdapterSession {
   private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   private pendingInject: string[] = [];
   private peerBinding?: ClaudeSdkBinding;
+  private readonly command:ReturnType<typeof claudeNodeCommand>;
+  private readonly currentTurnInput=new CurrentTurnInput();
   async qualifyPeerContext(): Promise<void> {
     this.peerBinding=await qualifyClaudePeerContext(this.env.binPath??"claude");
   }
   peerContextCapability() {
     return this.peerBinding?{mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.uuid} as const:undefined;
   }
-  constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[]) {
+  constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[],private readonly nativeInput=false) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
     this.env = env;
+    this.command=claudeNodeCommand(env.binPath??"claude");
     this.uuid = randomUUID();
     // contextInjection: 把 createSession 的 initialContext（含 workflow systemPrompt/角色定义）
     // 暂存进 pendingInject，首轮 send 拼进 prompt（修：之前 initialContext 被丢弃，
@@ -115,6 +120,13 @@ class ClaudeCodeSession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    return this.currentTurnInput.run(opts,{enabled:this.nativeInput&&!!this.peerBinding,capability:()=>this.peerContextCapability(),receipt:"native_context"},
+      options=>this.sendNative(input,options));
+  }
+
+  insertAtToolGap(input:string,options:InsertionOptions):Promise<void>{return this.currentTurnInput.insert(input,options);}
+
+  private async sendNative(input: string, opts: SendOptions): Promise<void> {
     const { turnId, emit } = opts;
     let prompt = input;
     if (this.pendingInject.length > 0) {
@@ -150,7 +162,7 @@ class ClaudeCodeSession implements AdapterSession {
 
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions, resumed: boolean): Promise<void> {
     const peer=(opts.peerContext||opts.projectCoordination)&&this.peerBinding?prepareClaudePeerRunner(opts,this.peerBinding,{sessionId:this.uuid,
-      prompt:JSON.parse(stdin).message.content[0].text,model:this.model,resume:resumed,settingsPath:this.env.settingsPath}):undefined;
+      prompt:JSON.parse(stdin).message.content[0].text,model:this.model,resume:resumed,settingsPath:this.env.settingsPath,nativeInput:this.nativeInput}):undefined;
     let owned:ProcessSupervisor|undefined;
     return new Promise<void>((resolve) => {
       // 剥离 CLAUDECODE* env（避免外层污染）
@@ -170,7 +182,13 @@ class ClaudeCodeSession implements AdapterSession {
         emit({ type: "error", sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString(), message: "Invalid standalone Claude settings: expected an absolute JSON file with self-contained endpoint authentication", status: "failed", final: true } as StreamEvent);
         resolve(); return;
       }
-      const supervisor = spawnSupervisedAgent(peer?process.execPath:this.env.binPath ?? "claude", peer?peer.args:args, { cwd: this.cwd, env: environment });
+      if(peer&&this.peerBinding?.node){
+        environment.AGENT_PHONON_CLAUDE_TOOL_PATH=environment.PATH??"";
+        environment.PATH=dirname(this.peerBinding.node)+delimiter+(environment.PATH??"");
+      }
+      opts.beforeNativeEffect?.();
+      const supervisor = spawnSupervisedAgent(peer?this.peerBinding?.node??process.execPath:this.command?.node??this.env.binPath ?? "claude",
+        peer?peer.args:this.command?[this.command.entry,...args]:args, { cwd: this.cwd, env: environment });
       owned=supervisor;
       const child = supervisor.child;
       this.current = supervisor;
@@ -321,7 +339,7 @@ class ClaudeCodeSession implements AdapterSession {
 
 export class ClaudeCodeAdapter implements AgentAdapter {
   readonly name = "claude-code";
-  readonly capabilities = CAPABILITIES;
+  readonly capabilities = {...CAPABILITIES};
   private env: ClaudeCodeEnv;
 
   constructor(opts: { env: ClaudeCodeEnv }) {
@@ -331,6 +349,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.injectMidTurn=available&&!!await qualifyClaudePeerContext(this.env.binPath??"claude");
     return [{
       agentId: "claude-code" as AgentDescriptor["agentId"],
       displayName: "Claude Code",
@@ -341,19 +360,20 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       models: this.env.settingsPath ? [{ id: "default", displayName: "Selected standalone Claude settings", available: true }] : this.env.models?.length
         ? this.env.models
         : [{ id: this.env.defaultModel, available: true }],
-      capabilities: CAPABILITIES,
+      capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
   }
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     if(params.reattach)throw new PhononError("errSessionBusy","Claude native recovery is not verified; refusing a replacement session");
-    const session=new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext);
+    const session=new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext,this.capabilities.injectMidTurn);
     await session.qualifyPeerContext();
     return session;
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {
-    return (await discoveryProbe(this.env.binPath ?? "claude", ["--version"], signal));
+    const command=claudeNodeCommand(this.env.binPath??"claude");
+    return command?discoveryProbe(command.node,[command.entry,"--version"],signal):discoveryProbe(this.env.binPath ?? "claude", ["--version"], signal);
   }
 }

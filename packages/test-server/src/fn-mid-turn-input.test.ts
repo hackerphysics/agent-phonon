@@ -9,7 +9,7 @@ function deferred() {
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
 }
-async function setup(options: { capable?: boolean; implemented?: boolean } = {}) {
+async function setup(options: { capable?: boolean; implemented?: boolean; cwd?: string } = {}) {
   const finish = deferred(), gap = deferred(), inserting = deferred();
   const inputs: string[] = [], inserted: string[] = [], turns: string[] = [];
   const adapter: AgentAdapter = {
@@ -20,9 +20,10 @@ async function setup(options: { capable?: boolean; implemented?: boolean } = {})
       return { sessionId: params.sessionId,model: params.model,
         async send(input, context) { inputs.push(input); turns.push(context.turnId); await finish.promise;
           context.emit({ type: "result",sessionId: params.sessionId as never,turnId: context.turnId,origin: "solicited",seq: 0,at: new Date().toISOString(),text: "done",status: "completed",final: true }); },
-        ...(options.implemented ? { async insertAtToolGap(input: string, context: { turnId: string; signal: AbortSignal }) {
+        ...(options.implemented ? { async insertAtToolGap(input: string, context: { turnId: string; signal: AbortSignal; beforeApply?: () => void }) {
           inserting.resolve(); await gap.promise;
           if (context.signal.aborted) throw new Error("tool gap closed");
+          context.beforeApply?.();
           inserted.push(input);
         } } : {}),
         async terminate() {},
@@ -31,7 +32,7 @@ async function setup(options: { capable?: boolean; implemented?: boolean } = {})
   };
   const registry = new AdapterRegistry(); registry.register(adapter);
   const engine = new SessionEngine(registry, () => {});
-  const session = await engine.create({ tenantId: "tenant",project: "project",cwd: "/tmp",agent: "input-test:main",model: "model",verbosity: "tools" });
+  const session = await engine.create({ tenantId: "tenant",project: "project",cwd: options.cwd ?? "/tmp",agent: "input-test:main",model: "model",verbosity: "tools" });
   await engine.send("tenant", session.sessionId, "initial", { turnId: "active" });
   return { engine, session, finish, gap, inserting, inputs, inserted, turns };
 }
@@ -75,6 +76,45 @@ test("a closed turn rejects a pending insertion and never carries it into the ne
     state.gap.resolve(); await new Promise((resolve) => setTimeout(resolve,10));
     assert.deepEqual(state.inputs,["initial"]); assert.deepEqual(state.inserted,[]);
   } finally { state.finish.resolve(); state.gap.resolve(); await state.engine.dispose(); }
+});
+test("an input waiting for its native tool gap revalidates the original source before application", async () => {
+  const state = await setup({ capable: true, implemented: true });
+  let allowed = true, reservations = 0;
+  try {
+    const operation = state.engine.send("tenant", state.session.sessionId, "revoked input", { whenBusy: "inject",
+      beforeInsertion: () => { reservations++; },
+      assertInsertion: () => { if (!allowed) throw new Error("original source revoked"); } });
+    const rejected = assert.rejects(operation, /original source revoked/);
+    await state.inserting.promise;
+    allowed = false;
+    state.gap.resolve();
+    await rejected;
+    assert.deepEqual(state.inputs, ["initial"]);
+    assert.deepEqual(state.inserted, []);
+    assert.equal(reservations, 1, "receipt reservation is separate from repeated source validation");
+  } finally { state.finish.resolve(); state.gap.resolve(); await state.engine.dispose(); }
+});
+for(const field of ["sessionId","tenantId","project","worktreeId","cwd","agent"] as const)test(`a pending native insertion cannot adopt a changed original ${field}`,async()=>{
+  const state=await setup({capable:true,implemented:true}),record=state.engine.assertTenant(state.session.sessionId,"tenant") as unknown as Record<string,unknown>,original=record[field];
+  try{
+    const operation=state.engine.send("tenant",state.session.sessionId,"scope-bound input",{whenBusy:"inject"}),rejected=assert.rejects(operation);
+    await state.inserting.promise;record[field]="foreign-scope";state.gap.resolve();await rejected;
+    assert.deepEqual(state.inputs,["initial"]);assert.deepEqual(state.inserted,[]);assert.deepEqual(state.turns,["active"]);
+  }finally{record[field]=original;state.finish.resolve();state.gap.resolve();await state.engine.dispose();}
+});
+for (const change of ["revoked", "generation"] as const) test(`native insertion rechecks ${change} project authority at the actual tool gap`, async () => {
+  const cwd = process.cwd(), state = await setup({ capable: true, implemented: true, cwd });
+  let allowed = true, generation = "original";
+  state.engine.resolveCwdForReattach = () => { if (!allowed) throw new Error("project authority revoked"); return cwd; };
+  state.engine.projectAuthorityGeneration = () => generation;
+  try {
+    const operation = state.engine.send("tenant", state.session.sessionId, "stale authority", { whenBusy: "inject" });
+    const rejected = assert.rejects(operation, change === "revoked" ? /project authority revoked/ : /directory admission generation changed/);
+    await state.inserting.promise;
+    if (change === "revoked") allowed = false; else generation = "replacement";
+    state.gap.resolve(); await rejected;
+    assert.deepEqual(state.inputs, ["initial"]); assert.deepEqual(state.inserted, []); assert.deepEqual(state.turns, ["active"]);
+  } finally { allowed = true; state.finish.resolve(); state.gap.resolve(); await state.engine.dispose(); }
 });
 test("an insertion arriving after a turn ends cannot start another model invocation",async()=>{
   const state=await setup({capable:true,implemented:true});

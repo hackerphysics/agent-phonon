@@ -13,6 +13,14 @@ const mode = process.argv[2];
 if (!['default', 'e2e', 'python', 'compat','focused'].includes(mode)) throw new Error('expected default, e2e, python, compat or focused');
 const codexBin=process.env.PHONON_TEST_CODEX_BIN;
 if(codexBin&&(!isAbsolute(codexBin)||/[\x00-\x1f\x7f]/.test(codexBin)))throw new Error('An explicit absolute native Codex executable is required');
+const hermesBin=process.env.PHONON_TEST_HERMES_BIN;
+if(hermesBin&&(!isAbsolute(hermesBin)||/[\x00-\x1f\x7f]/.test(hermesBin)))throw new Error('An explicit absolute native Hermes executable is required');
+const claudeBin=process.env.PHONON_TEST_CLAUDE_BIN;
+if(claudeBin&&(!isAbsolute(claudeBin)||/[\x00-\x1f\x7f]/.test(claudeBin)))throw new Error('An explicit absolute native Claude executable is required');
+const copilotPaths=['PHONON_TEST_COPILOT_BIN','PHONON_TEST_COPILOT_CACHE_HOME','PHONON_TEST_COPILOT_SDK_ROOT'];
+for(const name of copilotPaths){const path=process.env[name];if(path&&(!isAbsolute(path)||/[\x00-\x1f\x7f]/.test(path)))throw new Error('Explicit absolute Copilot runtime paths are required');}
+const openCodeBin=process.env.PHONON_TEST_OPENCODE_BIN,openCodeDeps=process.env.PHONON_TEST_OPENCODE_DEPS;
+for(const path of [openCodeBin,openCodeDeps])if(path&&(!isAbsolute(path)||/[\x00-\x1f\x7f]/.test(path)))throw new Error('Explicit absolute native OpenCode and prepared dependency paths are required');
 const openclawSDK=process.env.PHONON_TEST_OPENCLAW_SDK;
 if(openclawSDK&&(!isAbsolute(openclawSDK)||/[\x00-\x1f\x7f]/.test(openclawSDK)))throw new Error('An explicit absolute OpenClaw SDK path is required');
 const sandbox = mkdtempSync(join(tmpdir(), 'phonon-local-tests-'));
@@ -38,6 +46,11 @@ const env = {
   pnpm_config_workspace_concurrency:'1',
   PHONON_TEST_OWNER:process.env.PHONON_TEST_OWNER??'local-'+process.pid,
   ...(codexBin?{PHONON_TEST_CODEX_BIN:codexBin}:{}),
+  ...(hermesBin?{PHONON_TEST_HERMES_BIN:hermesBin}:{}),
+  ...(claudeBin?{PHONON_TEST_CLAUDE_BIN:claudeBin}:{}),
+  ...Object.fromEntries(copilotPaths.filter(name=>process.env[name]).map(name=>[name,process.env[name]])),
+  ...(openCodeBin?{PHONON_TEST_OPENCODE_BIN:openCodeBin}:{}),
+  ...(openCodeDeps?{PHONON_TEST_OPENCODE_DEPS:openCodeDeps}:{}),
   ...(openclawSDK?{PHONON_TEST_OPENCLAW_SDK:openclawSDK}:{}),
 };
 // Required OS process-launch metadata only, not arbitrary inherited provider/proxy env.

@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
 import { randomUUID, createHash } from "node:crypto";
 import { z } from "zod";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 
 /**
  * OpenClaw Gateway WebSocket 客户端（传输层）。
@@ -71,7 +72,7 @@ export class GatewayClient {
       const catalog:Record<string,unknown>={...inventory,effective};
       if(catalog.agentId!==input.agentId||!Array.isArray(catalog.groups)||Buffer.byteLength(JSON.stringify(catalog))>524288)throw new Error("unsupported catalog");
       params={...input,version:1,policyId,expiresAt:Date.now()+1799000,catalog};
-      const receiptSchema=z.object({version:z.literal(1),bound:z.literal(true),policy:z.literal("phonon-noninteractive-v1"),nativeVersion:z.literal("2026.10.7"),
+      const receiptSchema=z.object({version:z.literal(1),bound:z.literal(true),policy:z.literal("phonon-noninteractive-v1"),nativeVersion:z.string().refine(value=>nativeVersionAtLeast(value,"2026.10.7")),
         policyId:z.literal(policyId),sessionKey:z.literal(input.sessionKey),sessionId:z.literal(input.sessionId),runId:z.literal(input.runId),
         catalogHash:z.literal(createHash("sha256").update(JSON.stringify(catalog)).digest("hex")),executionFence:z.literal("native-controller-v1")}).strict();
       receiptSchema.parse(await this.rpcOnConnection(epoch,"phonon.policy.bind",params,5000));
@@ -115,7 +116,7 @@ export class GatewayClient {
     }
   }
 
-  async bindPeerContext(input:{sessionKey:string;sessionId:string;runId:string;workspaceDir:string;model:string;projectionId:string},env:Record<string,string>):Promise<()=>Promise<void>> {
+  async bindPeerContext(input:{sessionKey:string;sessionId:string;runId:string;workspaceDir:string;model:string;projectionId:string;nativeInput?:true},env:Record<string,string>):Promise<()=>Promise<void>> {
     const gateway=new URL(this.config.baseUrl);
     if(!["127.0.0.1","[::1]","localhost"].includes(gateway.hostname)||!["ws:","wss:","http:","https:"].includes(gateway.protocol))throw new Error("Peer checkpoints require a local Gateway");
     await this.connect();

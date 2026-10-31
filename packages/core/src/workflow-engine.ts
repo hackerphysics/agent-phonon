@@ -616,6 +616,11 @@ export class WorkflowEngine {
     const key=JSON.stringify([params.workflowId,params.inputId]);let reserved=false;
     try{
       await this.opts.engine.send(this.opts.tenantId,params.sessionId,params.input,{turnId:params.turnId,whenBusy:'inject',fallback:'inject',expectedActiveTurnId:params.turnId,
+        assertInsertion:()=>{
+          assertActive();
+          const current=this.opts.resolveCwd(session.project,session.worktreeId);
+          if(!session.cwd||fs.realpathSync(current)!==fs.realpathSync(cwd)||fs.realpathSync(current)!==fs.realpathSync(session.cwd))throw new PhononError('errPolicyDenied','workflow insertion workspace changed');
+        },
         beforeInsertion:()=>{
           assertActive();
           reserved=this.opts.store!.workflowInputReserve({tenantId:this.opts.tenantId,workflowId:params.workflowId,inputId:params.inputId,contentHash:hash,nodeId:params.nodeId,sessionId:params.sessionId,turnId:params.turnId,

@@ -1,4 +1,5 @@
 import { adapterDiagnostic } from "../adapter-diagnostic.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { PhononError } from "../rpc.js";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
@@ -8,12 +9,15 @@ import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { dropToolIORowsSqlite } from "../sqlite-compress.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
-import { openCodePure, prepareOpenCodePeerContext } from "./opencode-peer-context.js";
+import { openCodePure, prepareOpenCodePeerContext,formatOpenCodeRunPrompt } from "./opencode-peer-context.js";
+import {readOpenCodeCompletion} from "./opencode-context.js";
+import { CurrentTurnInput } from "../current-turn-input.js";
 import {parseOpenCodeNativeModels} from "./opencode-models.js";
 import type {
   AgentAdapter,
   AdapterSession,
   CreateSessionParams,
+  InsertionOptions,
   SendOptions,
 } from "../adapter.js";
 import { formatInitialContextLines } from "../adapter.js";
@@ -50,6 +54,8 @@ const CAPABILITIES: AgentCapabilities = {
   limits: { maxConcurrentSessions: 4 },
 };
 
+const MINIMUM_CLI_VERSION="1.14.20";
+
 export interface OpenCodeEnv {
   /** opencode binary 路径（默认探测）。 */
   binPath?: string;
@@ -65,9 +71,9 @@ function resolveBin(configured?: string): string {
 }
 
 /** OpenCode 会话库路径(part 表存消息块)。 */
-export function resolveOpenCodeDbPath(): string {
-  const xdg = process.env.XDG_DATA_HOME;
-  const base = xdg ? join(xdg, "opencode") : join(homedir(), ".local", "share", "opencode");
+export function resolveOpenCodeDbPath(environment:NodeJS.ProcessEnv=process.env): string {
+  const xdg = environment.XDG_DATA_HOME;
+  const base = xdg ? join(xdg, "opencode") : join(environment.HOME??homedir(), ".local", "share", "opencode");
   return join(base, "opencode.db");
 }
 
@@ -82,14 +88,15 @@ class OpenCodeSession implements AdapterSession {
   private pendingInject: string[] = [];
   private peerSupported = false;
   private peerNativeSession?: string;
+  private readonly currentTurnInput = new CurrentTurnInput();
 
   async qualifyPeerContext(): Promise<void> {
-    try { this.peerSupported = (await discoveryProbe(this.bin, ["--version"]))?.trim() === "1.14.20"; }
+    try { this.peerSupported = nativeVersionAtLeast((await discoveryProbe(this.bin, ["--version"]))?.trim(),MINIMUM_CLI_VERSION); }
     catch { this.peerSupported = false; }
   }
   peerContextCapability(environment?: Record<string,string>) {
     return this.peerSupported && !openCodePure(environment) ? {mode:"context_hook",boundary:"before_model",visibility:"hidden",
-      evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.peerNativeSession} as const : undefined;
+      evidence:"provider_payload",budget:"native_estimate",nativeSessionId:this.peerNativeSession} as const : undefined;
   }
 
   constructor(sessionId: string, model: string, cwd: string, bin: string, initialContext?: ContextItem[],private readonly variants=new Map<string,Map<ReasoningLevel,string>>(),private readonly defaultVariantModel?:string) {
@@ -102,6 +109,15 @@ class OpenCodeSession implements AdapterSession {
   }
 
   async send(input: string, opts: SendOptions): Promise<void> {
+    return this.currentTurnInput.run(opts, { enabled: this.peerSupported && !openCodePure(opts.environment),
+      capability: () => this.peerContextCapability(opts.environment) }, options => this.sendNative(input, options));
+  }
+
+  insertAtToolGap(input: string, options: InsertionOptions): Promise<void> {
+    return this.currentTurnInput.insert(input, options);
+  }
+
+  private async sendNative(input: string, opts: SendOptions): Promise<void> {
     const { turnId, emit } = opts;
     let message = input;
     if (this.pendingInject.length > 0) {
@@ -123,6 +139,7 @@ class OpenCodeSession implements AdapterSession {
   }
 
   private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
+    const notBefore=Date.now();
     this.peerNativeSession = undefined;
     const peer = this.peerSupported?prepareOpenCodePeerContext(opts, this.ocSessionId,args.at(-1)):undefined;
     let owned:ProcessSupervisor|undefined;
@@ -207,6 +224,11 @@ class OpenCodeSession implements AdapterSession {
       child.on("close", (code) => {
         if (settled) return;
         consume(buf);
+        if(code===0&&!nativeError&&(!sawCompletion||!acc.trim())&&this.ocSessionId&&!opts.signal?.aborted){
+          const completion=readOpenCodeCompletion(resolveOpenCodeDbPath(environment),{sessionId:this.ocSessionId,cwd:this.cwd,model:this.model,
+            prompt:formatOpenCodeRunPrompt(args.at(-1)!),notBefore});
+          if(completion){sawCompletion=true;acc=completion.text;}
+        }
         const failed = code !== 0 || !!nativeError || !sawCompletion || !acc.trim();
         const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [opts.environment?.AGENT_PHONON_PEER_CONTEXT_TOKEN,opts.environment?.AGENT_PHONON_INTERACTION_TOKEN]);
         finish(failed ? "failed" : "completed", acc, failed ? `opencode exited ${code}: ${detail}` : undefined);
@@ -312,6 +334,7 @@ export class OpenCodeAdapter implements AgentAdapter {
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {
     const version = await this.probeVersion(signal);
     const available = version !== null;
+    this.capabilities.injectMidTurn = nativeVersionAtLeast(version?.trim(),MINIMUM_CLI_VERSION) && !openCodePure();
     let models:ModelInfo[]=[];
     this.capabilities.reasoningControl=false;
     if(available)try{
@@ -345,6 +368,7 @@ export class OpenCodeAdapter implements AgentAdapter {
     const variants=this.capabilities.reasoningControl?this.variants:undefined;
     const session = new OpenCodeSession(params.sessionId, model, params.cwd, this.bin, params.initialContext,variants,this.configuredModel);
     await session.qualifyPeerContext();
+    this.capabilities.injectMidTurn = !!session.peerContextCapability();
     return session;
   }
 

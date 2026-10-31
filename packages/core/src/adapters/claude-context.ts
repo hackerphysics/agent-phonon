@@ -1,4 +1,5 @@
 import { open, lstat, realpath } from "node:fs/promises";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { constants } from "node:fs";
 import { basename, dirname, isAbsolute, relative, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -51,7 +52,7 @@ export async function readClaudeContext(file: string, identity: ClaudeContextIde
       const row = JSON.parse(line);
       // Summary indexes do not claim messages; every other record is identity-bearing.
       if (row.type === "summary") continue;
-      if (row.version !== "2.0.1" || row.sessionId !== identity.sessionId || typeof row.isSidechain!=="boolean" || row.userType !== "external"
+      if (!nativeVersionAtLeast(row.version,"2.0.1") || row.sessionId !== identity.sessionId || typeof row.isSidechain!=="boolean" || row.userType !== "external"
         || typeof row.cwd !== "string" || await realpath(row.cwd) !== cwd || !uuid.test(row.uuid ?? "") || seen.has(row.uuid)) return;
       seen.add(row.uuid);
       const timestamp = Date.parse(row.timestamp);

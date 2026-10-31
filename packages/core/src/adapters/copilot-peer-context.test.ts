@@ -41,7 +41,7 @@ await installCopilotPeerContext({channel,joinSession:async config=>{
  config.hooks.onPostToolUse=async(input,invocation)=>{const tasks=await session.rpc.tasks.list();trace({kind:"callback",inputKeys:Object.keys(input),invocationKeys:Object.keys(invocation),timestamp:input.timestamp,toolCallId:input.toolCallId,tool_use_id:input.tool_use_id,agentId:input.agentId,parentToolCallId:input.parentToolCallId,toolName:input.toolName,telemetry:input.toolResult?.toolTelemetry,tasks:tasks.tasks?.map(task=>({type:task.type,id:task.id,toolCallId:task.toolCallId,status:task.status}))});
  const current=await session.rpc.model.getCurrent(),models=await session.rpc.model.list(),context=await session.rpc.metadata.contextInfo({promptTokenLimit:0,outputTokenLimit:0});
  trace({kind:"budget",toolName:input.toolName,current,models:models.list?.map(model=>({id:model.id,limits:model.capabilities?.limits})),context});return original(input,invocation);};
- const session=await joinSession(config);session.on(event=>{if(event.type==="session.usage_info")trace({kind:"usage",agentId:event.agentId,data:event.data});if(event.type==="hook.start"&&event.data?.hookType==="postToolUse")trace({kind:"event",agentId:event.agentId,id:event.id,hookInvocationId:event.data.hookInvocationId,inputKeys:Object.keys(event.data.input??{}),timestamp:event.data.input?.timestamp,toolCallId:event.data.input?.toolCallId,toolName:event.data.input?.toolName});});return session;
+ const session=await joinSession(config);session.on(event=>{if(["hook.start","hook.end","assistant.turn_start","assistant.message_start","tool.execution_start","tool.execution_complete"].includes(event.type))trace({kind:"lifecycle",event});if(event.type==="session.usage_info")trace({kind:"usage",agentId:event.agentId,data:event.data});if(event.type==="hook.start"&&event.data?.hookType==="postToolUse")trace({kind:"event",agentId:event.agentId,id:event.id,hookInvocationId:event.data.hookInvocationId,inputKeys:Object.keys(event.data.input??{}),timestamp:event.data.input?.timestamp,toolCallId:event.data.input?.toolCallId,toolName:event.data.input?.toolName});});return session;
 },onReady:value=>writeFileSync(new URL("./native-ready.json",import.meta.url),JSON.stringify(value),{mode:0o600})});
 `,{mode:0o600});
   const inputPath=join(scope.root,"input.txt"),forbiddenPath=join(scope.root,"forbidden.txt"),fileText="ORIGINAL_NATIVE_FILE_"+randomUUID();writeFileSync(inputPath,fileText);
@@ -112,6 +112,15 @@ finally{binding?.deactivate();await client.stop();}
   const code=await closed;clearTimeout(timer);
   if(variant==="hook-metadata"){
     const records=readFileSync(nativeTrace,"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    const lifecycle=records.filter(record=>record.kind==="lifecycle").map(record=>record.event);
+    const applied=lifecycle.findIndex(event=>event.type==="hook.end"&&event.data?.output?.additionalContext?.includes(marker));
+    assert.ok(applied>=0);
+    assert.equal(lifecycle[applied].agentId,undefined);assert.equal(lifecycle[applied].data.success,true);
+    const accepted=lifecycle.findIndex((event,index)=>index>applied&&event.type==="tool.execution_complete"&&!event.agentId&&event.data?.result?.content?.includes(marker));
+    assert.ok(accepted>applied);
+    const continuation=lifecycle.find((event,index)=>index>accepted&&event.type==="assistant.turn_start"&&!event.agentId);
+    assert.equal(continuation.data.interactionId,lifecycle[accepted].data.interactionId);
+    assert.notEqual(continuation.data.turnId,lifecycle[accepted].data.turnId);
     const callbacks=records.filter(record=>record.kind==="callback");
     assert.equal(callbacks.length,2);
     assert.ok(callbacks.every(record=>!record.inputKeys.includes("toolCallId")&&record.invocationKeys.length===1));

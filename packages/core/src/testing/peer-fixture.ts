@@ -97,10 +97,20 @@ export class PeerFixture {
     this.callbacks.push(callback);
   }
 
-  watch(child: ChildProcess | undefined, group = false): void {
-    if (!child?.pid || !Number.isInteger(child.pid)) return;
-    this.processes.push({ pid: child.pid, group: group && process.platform !== "win32" });
+  watch(child: ChildProcess | undefined, group = false): () => void {
+    if (!child?.pid || !Number.isInteger(child.pid)) return () => {};
+    const reference={ pid: child.pid, group: group && process.platform !== "win32" };
+    this.processes.push(reference);
     this.record();
+    let released=false;
+    return ()=>{
+      if(released)return;
+      this.assertOwned();
+      if(alive(reference))throw new Error("Cannot retire a live native test process");
+      const index=this.processes.indexOf(reference);
+      if(index<0)throw new Error("Native test process ownership changed");
+      this.processes.splice(index,1);this.record();released=true;
+    };
   }
 
   /** Reuse a real, version-matched prepared tree; only its two small manifests are copied. */

@@ -1,6 +1,7 @@
 import type { SendOptions } from "../adapter.js";
 import { hermesCommand } from "./hermes-command.js";
 import { discoveryProbe } from "../discovery-probe.js";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 
 /** Read-only qualification; registration itself is checked again in the owned child. */
 export async function hermesPeerContextSupported(bin: string, options?: { cwd?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal }): Promise<boolean> {
@@ -15,7 +16,7 @@ from hermes_cli.middleware import VALID_MIDDLEWARE
 print(json.dumps({"version":version("hermes-agent"),"ready":callable(PluginContext.register_middleware) and callable(get_plugin_manager) and {"llm_request","llm_execution"}.issubset(VALID_MIDDLEWARE)}))
 `, command.entry], options?.signal, options);
     const value = JSON.parse(result ?? "null");
-    return value?.version === "0.21.1" && value.ready === true;
+    return nativeVersionAtLeast(value?.version, "0.21.1") && value.ready === true;
   } catch { return false; }
 }
 
@@ -48,7 +49,8 @@ def _phonon_register_peer_context(agent, capsule, owning_root, announce):
         from importlib.metadata import version
         from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
         from hermes_cli.middleware import VALID_MIDDLEWARE
-        if version("hermes-agent") != "0.21.1" or not {"llm_request", "llm_execution"}.issubset(VALID_MIDDLEWARE):
+        native_version = re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", version("hermes-agent"))
+        if not native_version or tuple(map(int, native_version.groups())) < (0, 21, 1) or not callable(PluginContext.register_middleware) or not callable(get_plugin_manager) or not {"llm_request", "llm_execution"}.issubset(VALID_MIDDLEWARE):
             raise ValueError()
         endpoint = urllib.parse.urlsplit(capsule["url"])
         secret = capsule["token"]
@@ -132,6 +134,7 @@ def _phonon_register_peer_context(agent, capsule, owning_root, announce):
                         or not isinstance(item.get("content"), str) for item in messages):
                     return None
                 changed = copy.deepcopy(request)
+                rows = []
                 for message in messages:
                     content = message["content"]
                     if native_mode == "codex_responses":
@@ -139,22 +142,43 @@ def _phonon_register_peer_context(agent, capsule, owning_root, announce):
                     else:
                         row = {"role":"user","content":[{"type":"text","text":content}]}
                     changed[field].append(row)
-                pending[request_id] = {**boundary,"messages":messages}
+                    rows.append(row)
+                pending[request_id] = {**boundary,"messages":messages,"rows":rows}
                 return {"request":changed,"source":"phonon-peer-context"}
             except Exception:
                 return None
+        def withdraw(request, current):
+            # Withdraw only our exact rows; retain other native middleware changes.
+            field = "input" if native_mode == "codex_responses" else "messages"
+            if not isinstance(request, dict) or not isinstance(request.get(field), list):
+                raise ValueError("Native input withdrawal could not be confirmed")
+            clean = copy.deepcopy(request)
+            rows = list(current["rows"])
+            retained = []
+            for row in clean[field]:
+                if row in rows:
+                    rows.remove(row)
+                else:
+                    retained.append(row)
+            if rows:
+                raise ValueError("Native input withdrawal could not be confirmed")
+            clean[field] = retained
+            return clean
         def execute(request=None, next_call=None, **context):
             if not callable(next_call):
                 raise ValueError("Native execution callback unavailable")
-            current = pending.pop(context.get("api_request_id"), None) if owning(context) else None
+            current = pending.pop(context.get("api_request_id"), None)
             if current:
-                message_ids = [item["messageId"] for item in current["messages"] if contains(request, item["content"])]
-                if message_ids:
-                    try:
-                        checkpoint("/peer-context/observe", {"boundaryId":current["boundaryId"],"nativeSessionId":sid,
-                            "messageIds":message_ids,"evidence":"provider_payload"})
-                    except Exception:
-                        pass
+                if not owning(context):
+                    request = withdraw(request, current)
+                else:
+                    message_ids = [item["messageId"] for item in current["messages"] if contains(request, item["content"])]
+                    if message_ids:
+                        try:
+                            checkpoint("/peer-context/observe", {"boundaryId":current["boundaryId"],"nativeSessionId":sid,
+                                "messageIds":message_ids,"evidence":"provider_payload"})
+                        except Exception:
+                            request = withdraw(request, current)
             # Never retry the provider callback here or swallow its native exception.
             return next_call(request)
         manager = get_plugin_manager()

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { z } from "zod";
 import { nativeGatewayAuthority, parameterHash, type GatewayCall } from "./native-interactions.js";
 import type { NativePeerApi, NativePeerRuntimeResolver } from "./peer-context.js";
@@ -123,7 +124,7 @@ export class NativeToolPolicy {
   }
   private qualified(input:Input):string{
     const api=this.api,cfg:any=api?.runtime?.config?.current?.()??api?.config,plugin=cfg?.plugins?.entries?.[api?.id??"agent-phonon-hitl"];
-    if(api?.runtime?.version!=="2026.10.7"||!this.isMessagingTool||!api.registerTrustedToolPolicy||!api.lifecycle?.registerRuntimeLifecycle||cfg?.plugins?.enabled===false
+    if(!nativeVersionAtLeast(api?.runtime?.version,"2026.10.7")||!this.isMessagingTool||!api?.registerTrustedToolPolicy||!api.lifecycle?.registerRuntimeLifecycle||cfg?.plugins?.enabled===false
       ||plugin?.enabled!==true||plugin.hooks?.allowPromptInjection!==true||plugin.hooks?.allowConversationAccess!==true)throw new Error("unqualified host");
     const entry=api.runtime?.agent?.session?.getSessionEntry({agentId:input.agentId,sessionKey:input.sessionKey,readConsistency:"latest",hydrateSkillPromptRefs:false});
     const selected=entry?.modelOverride??entry?.model,provider=entry?.providerOverride??entry?.modelProvider;
@@ -204,7 +205,7 @@ export class NativeToolPolicy {
       if(existing){if(configHash!==existing.configHash)throw new Error("policy changed");call.respond(true,existing.receipt);return;}
       this.pruneRetiredRuns();
       if(this.bindings.size>=64||this.knownRuns.size>=256||known)throw new Error("binding limit or retired run");
-      const receipt={version:1,bound:true,policy:POLICY_ID,nativeVersion:"2026.10.7",policyId:input.policyId,sessionKey:input.sessionKey,sessionId:input.sessionId,runId:input.runId,
+      const receipt={version:1,bound:true,policy:POLICY_ID,nativeVersion:this.api?.runtime?.version,policyId:input.policyId,sessionKey:input.sessionKey,sessionId:input.sessionId,runId:input.runId,
         catalogHash:createHash("sha256").update(JSON.stringify(call.params.catalog)).digest("hex"),executionFence:"native-controller-v1"};
       const retained=access.retain();
       const current=()=>{try{retained.assertCurrent();return !retained.signal.aborted&&authority.current();}catch{return false;}};
@@ -218,6 +219,6 @@ export class NativeToolPolicy {
       retained.signal.addEventListener("abort",retire,{once:true});
       if(!current()){this.remove(binding);throw new Error("revoked authority");}
       call.respond(true,receipt);
-    }catch{call.respond(false,undefined,{code:"INVALID_REQUEST",message:"Phonon noninteractive policy unavailable: requires qualified native OpenClaw 2026.10.7, current admin/session authority and unambiguous catalog/effective inventory"});}
+    }catch{call.respond(false,undefined,{code:"INVALID_REQUEST",message:"Phonon noninteractive policy unavailable: requires native OpenClaw >=2026.10.7 with policy APIs, current admin/session authority and unambiguous catalog/effective inventory"});}
   }
 }

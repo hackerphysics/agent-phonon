@@ -34,6 +34,17 @@ test("Claude transcript source binds exact original user UUID, native model/usag
   assert.equal(await readClaudeContext(f.file, { ...f.identity, tool: { name: "Read", input: { file_path: "/fixture" }, phase: "after" } }), undefined);
 }));
 
+test("Claude source validation preserves native context across compatible upgrades", () => fixture(async f => {
+  for(const version of ["2.0.2","2.1.0","3.0.0"]){
+    f.write([f.user,f.assistant,f.result,f.final].map(row=>({...row,version})));
+    assert.equal((await readClaudeContext(f.file,{...f.identity,userMessageId:f.user.uuid}))?.completedText,"Native final");
+  }
+  for(const version of ["2.0.0","2.1.0-preview","unknown"]){
+    f.write([f.user,f.assistant,f.result,f.final].map(row=>({...row,version})));
+    assert.equal(await readClaudeContext(f.file,{...f.identity,userMessageId:f.user.uuid}),undefined);
+  }
+}));
+
 test("Claude transcript completion cannot use stale, foreign, incomplete or error results", () => fixture(async f => {
   for (const patch of [{ sessionId: randomUUID() }, { version: "other" }, { cwd: "/" }, { parentUuid: randomUUID() }, { uuid: f.user.uuid }, { timestamp: "invalid" },
     { message: { ...f.final.message, model: "foreign" } }, { isApiErrorMessage: true }]) {

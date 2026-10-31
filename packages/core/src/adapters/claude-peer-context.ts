@@ -1,28 +1,12 @@
-import { mkdtempSync, realpathSync, writeFileSync, rmSync, statSync, existsSync } from "node:fs";
-import { basename, dirname, delimiter, isAbsolute, join } from "node:path";
+import { mkdtempSync, realpathSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
-import { discoveryProbe } from "../discovery-probe.js";
 import type { SendOptions } from "../adapter.js";
 import {verifiedNativeToolChannel} from "../native-tool-channel.js";
 import {createRequire} from "node:module";
-
-export interface ClaudeSdkBinding { entry: string; sdk: string }
-
-/** Use the SDK shipped with the owner-selected CLI, never one installed from a project. */
-export async function qualifyClaudePeerContext(bin: string): Promise<ClaudeSdkBinding | undefined> {
-  try {
-    const candidate = isAbsolute(bin) ? bin : (process.env.PATH ?? "").split(delimiter).map(path => join(path, bin)).find(path => existsSync(path));
-    if (!candidate) return undefined;
-    const entry = realpathSync(candidate), sdk = join(dirname(entry), "sdk.mjs");
-    if (basename(entry) !== "cli.js" || !statSync(sdk).isFile()) return undefined;
-    const version = await discoveryProbe(bin, ["--version"]);
-    if (!/^2\.0\.1(?:\s|$)/.test(version?.trim() ?? "")) return undefined;
-    const result = await discoveryProbe(process.execPath, ["--input-type=module", "-e",
-      "const sdk=await import(process.argv[1]);if(typeof sdk.query==='function'&&typeof sdk.createSdkMcpServer==='function')console.log('phonon_claude_hooks_v1');", pathToFileURL(sdk).href]);
-    return result?.trim() === "phonon_claude_hooks_v1" ? {entry,sdk} : undefined;
-  } catch { return undefined; }
-}
+import type { ClaudeSdkBinding } from "./claude-command.js";
+export { claudeNodeCommand, qualifyClaudePeerContext, type ClaudeSdkBinding } from "./claude-command.js";
 
 export const CLAUDE_PEER_RUNNER_SOURCE = String.raw`
 import { request } from "node:http";
@@ -77,6 +61,7 @@ export function prepareNativeStartup({entry,directory,parentPID=process.pid}) {
     'const modes=process.argv.map((value,index)=>value==="--permission-mode"||value.startsWith("--permission-mode=")?index:-1).filter(index=>index>=0);',
     'if(modes.length!==1||process.argv[modes[0]]!=="--permission-mode"||process.argv[modes[0]+1]!=="default"||process.argv.includes("--dangerously-skip-permissions"))throw new Error("Unexpected SDK permission override");',
     'process.argv.splice(modes[0],2);',
+    'const originalPath=process.env.AGENT_PHONON_CLAUDE_TOOL_PATH;if(originalPath!==undefined)process.env.PATH=originalPath;delete process.env.AGENT_PHONON_CLAUDE_TOOL_PATH;',
     'const own=fileURLToPath(import.meta.url);for(let i=process.execArgv.length-2;i>=0;i--)if(process.execArgv[i]==="--import"&&(process.execArgv[i+1]===own||process.execArgv[i+1]===import.meta.url))process.execArgv.splice(i,2);',
     'writeFileSync('+JSON.stringify(proof)+',JSON.stringify({nonce:'+JSON.stringify(nonce)+',parentPID:process.ppid,pid:process.pid}),{mode:0o600,flag:"wx"});',
   ].join('\n');
@@ -163,7 +148,7 @@ export function createClaudePeerBudget({sessionId,outputReserve=()=>undefined}) 
   }};
 }
 
-export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBudget=()=>unknownBudget(),invalidateBudget=()=>{},budgetGeneration=()=>0,active=()=>true}) {
+export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBudget=()=>unknownBudget(),invalidateBudget=()=>{},budgetGeneration=()=>0,active=()=>true,offered}) {
   let firstPrompt=true;
   let peerDebit=0,toolDebit=0,toolGeneration=-1,pending=false;
   const own = input => {
@@ -196,19 +181,27 @@ export function createPeerHooks({sessionId,cwd,prompt,checkpoint,rootTools,getBu
       if(!active() || options?.signal?.aborted || generation!==budgetGeneration() || batch.boundaryId!==boundaryId || batch.nativeSessionId!==sessionId || !Array.isArray(batch.messages)
         || batch.messages.length>8 || batch.messages.some(item=>typeof item.messageId!=="string" || typeof item.content!=="string")) return {};
       if(!batch.messages.length) return {};
-      const current=getBudget(input.tool_response);
-      if(budget.state!=="known"||current.state!=="known"||current.contextWindowTokens<budget.contextWindowTokens||current.outputTokens>budget.outputTokens
-        ||current.inputTokens+peerDebit+toolDebit-currentToolBytes>budget.inputTokens)return {};
       const additionalContext=batch.messages.map(item=>item.content).join("\n\n");
       if(Buffer.byteLength(additionalContext)>16000)return {};
-      peerDebit+=Buffer.byteLength(additionalContext)+64*batch.messages.length;
-      try { await checkpoint("/peer-context/observe",{boundaryId,nativeSessionId:sessionId,messageIds:batch.messages.map(item=>item.messageId),evidence:"context_hook"},options?.signal); }
+      const cost=Buffer.byteLength(additionalContext)+64*batch.messages.length;
+      const headroom=()=>{
+        const current=getBudget(input.tool_response);
+        return budget.state==="known"&&current.state==="known"&&current.contextWindowTokens>=budget.contextWindowTokens&&current.outputTokens<=budget.outputTokens
+          &&toolDebit-currentToolBytes<=previousToolDebit
+          &&current.contextWindowTokens-current.inputTokens-current.outputTokens-current.overheadTokens-peerDebit-toolDebit+currentToolBytes>=cost;
+      };
+      if(!headroom())return {};
+      const observation={boundaryId,nativeSessionId:sessionId,messageIds:batch.messages.map(item=>item.messageId),evidence:"context_hook"};
+      if(offered){await checkpoint("/peer-context/authorize",observation,options?.signal);}
+      else try { await checkpoint("/peer-context/observe",observation,options?.signal); }
       catch { /* A returned hook value is not a provider request or a consumption ACK. */ }
-      if(!active() || options?.signal?.aborted || generation!==budgetGeneration()||toolDebit-currentToolBytes>previousToolDebit) return {};
+      if(!active() || options?.signal?.aborted || generation!==budgetGeneration()||!headroom()) return {};
+      peerDebit+=cost;
+      offered?.({boundaryId,nativeSessionId:sessionId,messageIds:observation.messageIds},generation);
       return {hookSpecificOutput:{hookEventName:input.hook_event_name,additionalContext}};
     } catch { return {}; }finally{pending=false;}
   }
-  return {SessionStart:[{hooks:[deliver]}],UserPromptSubmit:[{hooks:[deliver]}],PostToolUse:[{hooks:[deliver]}],PreCompact:[{hooks:[async()=>{invalidateBudget();return {}; }]}]};
+  return {SessionStart:[{hooks:[deliver]}],UserPromptSubmit:[{hooks:[deliver]}],PostToolUse:[{hooks:[deliver]}],PreCompact:[{hooks:[async input=>{if(active()&&own(input))invalidateBudget();return {}; }]}]};
 }
 
 async function main() {
@@ -241,11 +234,15 @@ async function main() {
   });
   const rootTools=new Set(),sdk=await import(sdkPath);
   let active=true;
+  const contextApplications=new Map();
+  let nativeRootModel;
   const peerBudget=createClaudePeerBudget({sessionId,outputReserve:()=>claudeOutputReserve({cwd:process.cwd(),settingsPath:frame.settingsPath})});
+  const invalidateBudget=()=>{peerBudget.invalidate();contextApplications.clear();};
   const startup=prepareNativeStartup({entry,directory:dirname(fileURLToPath(import.meta.url))});
   let startupRejected=false;
   const hooks=frame.peerEnabled?createPeerHooks({sessionId,cwd:process.cwd(),prompt:frame.prompt,checkpoint,rootTools,
-    getBudget:peerBudget.budget,invalidateBudget:peerBudget.invalidate,budgetGeneration:peerBudget.generation,active:()=>active}):{};
+    getBudget:peerBudget.budget,invalidateBudget,budgetGeneration:peerBudget.generation,active:()=>active,
+    ...(frame.nativeInput?{offered:(observation,generation)=>contextApplications.set(observation.boundaryId,{observation,generation})}:{})}):{};
   let guard,mcpServer,sequence=0;
   if(frame.coordination){
     const rpc=(method,params,signal)=>new Promise((resolve,reject)=>{
@@ -284,20 +281,29 @@ async function main() {
     ...(frame.model&&frame.model!=="default"?{model:frame.model}:{}),
     ...(frame.resume?{resume:sessionId}:{}),
     ...(mcpServer?{mcpServers:{phonon_current_turn:mcpServer}}:{}),
-    stderr:text=>process.stderr.write(text)};
+    ...(frame.nativeInput?{includePartialMessages:true}:{}),stderr:text=>process.stderr.write(text)};
   let outcome;
   try { for await(const message of sdk.query({prompt:frame.prompt,options})) {
     if(message.parent_tool_use_id)continue;
     if(message.session_id!==sessionId) throw new Error("Native session changed");
     peerBudget.observe(message);
     guard?.record(message);
+    if(message.type==="system"&&message.subtype==="init")nativeRootModel=message.model;
+    if(message.type==="system"&&message.subtype==="compact_boundary")contextApplications.clear();
+    if(frame.nativeInput&&message.type==="stream_event"&&message.event?.type==="message_start"&&message.event.message?.model===nativeRootModel&&active&&!controller.signal.aborted){
+      for(const[boundaryId,entry]of contextApplications){
+        contextApplications.delete(boundaryId);
+        if(entry.generation!==peerBudget.generation())continue;
+        try{await checkpoint("/peer-context/context-applied",entry.observation);}catch{/* Native context remains unconfirmed; never start another query. */}
+      }
+    }
     if(message.type==="assistant" && !message.parent_tool_use_id) {
       for(const block of message.message?.content??[])if(block.type==="tool_use"&&typeof block.id==="string") {
         rootTools.add(block.id);
         if(rootTools.size>512)rootTools.delete(rootTools.values().next().value);
       }
     }
-    if(message.type==="result"){outcome=message;active=false;}
+    if(message.type==="result"){outcome=message;active=false;contextApplications.clear();}
     if(!process.stdout.write(JSON.stringify(message)+"\n")) await once(process.stdout,"drain");
   }}finally{active=false;guard?.close();await mcpServer?.instance.close();}
   if(startupRejected || !startup.confirmed() || !outcome || outcome.subtype!=="success" || outcome.is_error!==false || typeof outcome.result!=="string" || !outcome.result.trim())process.exitCode=1;
@@ -310,7 +316,7 @@ if(process.argv[1]===fileURLToPath(import.meta.url)) {
 `;
 
 export function prepareClaudePeerRunner(options: SendOptions, binding: ClaudeSdkBinding, input: {
-  sessionId: string; prompt: string; model: string; resume: boolean; settingsPath?: string;
+  sessionId: string; prompt: string; model: string; resume: boolean; settingsPath?: string;nativeInput?:boolean;
 }): { args: string[]; stdin: string; cleanup: () => void } {
   if(options.peerContext){
     const endpoint = new URL(options.environment?.AGENT_PHONON_PEER_CONTEXT_URL ?? "");
@@ -324,7 +330,7 @@ export function prepareClaudePeerRunner(options: SendOptions, binding: ClaudeSdk
     writeFileSync(path,CLAUDE_PEER_RUNNER_SOURCE,{mode:0o600,flag:"wx"});
     const types=options.projectCoordination?pathToFileURL(createRequire(import.meta.url).resolve("@modelcontextprotocol/sdk/types.js")).href:"";
     return {args:[path,pathToFileURL(binding.sdk).href,binding.entry,input.sessionId,types],stdin:JSON.stringify({prompt:input.prompt,model:input.model,resume:input.resume,peerEnabled:!!options.peerContext,coordination:!!options.projectCoordination,
-      otherControllerTools:!!(options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument),...(input.settingsPath?{settingsPath:input.settingsPath}:{})}),
+      otherControllerTools:!!(options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument),nativeInput:input.nativeInput===true,...(input.settingsPath?{settingsPath:input.settingsPath}:{})}),
       cleanup:()=>rmSync(directory,{recursive:true,force:true})};
   } catch(error) {rmSync(directory,{recursive:true,force:true});throw error;}
 }

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { ChildProcess } from "node:child_process";
-import { AdapterRegistry, CopilotAdapter, PhononStore, spawnSupervisedAgent } from "@agent-phonon/core";
+import { AdapterRegistry, CopilotAdapter, PhononStore, SessionEngine, spawnSupervisedAgent, type ProcessSupervisor } from "@agent-phonon/core";
 import type { AdapterSession } from "@agent-phonon/core";
 import { PeerContextBridge } from "../../core/dist/peer-context-bridge.js";
 import { withPeerFixture, closePeerServer, type PeerFixture } from "../../core/dist/testing/peer-fixture.js";
@@ -52,7 +52,10 @@ for (const mode of ["initial", "inflight", "child", "denied", "disabled", "disab
   const create = adapter.createSession.bind(adapter); let session: AdapterSession | undefined;const bindings:unknown[]=[],nativeEvents:string[]=[];
   adapter.createSession = async params => {
     session = await create(params); const send = session.send.bind(session);
-    session.send = async (input, options) => { const pending = send(input, options);scope.watch((session as unknown as { current?: { child: ChildProcess } }).current?.child, true);
+    session.send = async (input, options) => { const pending = send(input, options);
+      let settled=false;void pending.then(()=>{settled=true;},()=>{settled=true;});const deadline=Date.now()+5000;
+      while(!(session as unknown as {current?:ProcessSupervisor}).current&&!settled&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,5));
+      scope.watch((session as unknown as { current?: { child: ChildProcess } }).current?.child, true);
       const asset=(session as unknown as {peer?:{path:string}}).peer;
       if(asset){const capsule=JSON.parse(readFileSync(join(asset.path,"extensions","peer-context","channel.json"),"utf8"));bindings.push({hasCallback:!!options.projectCoordination,hasNativeChannel:!!capsule.coordination,runnerHasTool:readFileSync(join(asset.path,"extensions","peer-context","bridge.mjs"),"utf8").includes("parameters:coordinationSchema")});}
       let buffer="";const child=(session as unknown as {current?:{child:ChildProcess}}).current?.child;
@@ -174,6 +177,118 @@ for (const mode of ["initial", "inflight", "child", "denied", "disabled", "disab
   }
   assert.equal(readFileSync(inputPath, "utf8"), fileText);
 }));
+
+for(const phase of ["insert","engine","revoked","closed","child","resume","denied","headroom","unknown-budget","stop"] as const)
+  test(`installed Copilot current-turn ${phase} preserves the original native task`,{
+    skip:!process.env.PHONON_TEST_COPILOT_BIN||!process.env.PHONON_TEST_COPILOT_SDK_ROOT,timeout:45000,
+  },()=>withPeerFixture("copilot-steering",async scope=>{
+    const cache=process.env.PHONON_TEST_COPILOT_CACHE_HOME;assert.ok(cache&&existsSync(join(cache,"pkg")));
+    const home=join(scope.root,"home"),copilotHome=join(home,".copilot");mkdirSync(copilotHome,{recursive:true});
+    const nativeSettings={model:"gpt-4.1",experimental:true,trustedFolders:[scope.root]};
+    writeFileSync(join(copilotHome,"config.json"),JSON.stringify(nativeSettings));
+    writeFileSync(join(copilotHome,"settings.json"),JSON.stringify(nativeSettings));
+    writeFileSync(join(scope.root,"input.txt"),"Original Copilot native file bytes\n");
+    const marker="CURRENT_COPILOT_"+randomUUID(),payloads:any[]=[],auxiliaries:any[]=[],errors:unknown[]=[],events:any[]=[],abort=new AbortController();
+    let session:AdapterSession|undefined,engine:SessionEngine|undefined,engineId:string|undefined,insertion:Promise<unknown>|undefined,ack:any,accepted=false,authorityChecks=0,raw="";
+    const provider=createServer((req,res)=>{void(async()=>{
+      if(req.method!=="POST"){req.resume();res.writeHead(200,{"Content-Type":"application/json"}).end('{"data":[]}');return;}
+      let body="";for await(const chunk of req)body+=String(chunk);const payload=JSON.parse(body);
+      if(!payload.tools?.some((tool:any)=>tool.function?.name==="view")){
+        auxiliaries.push({model:payload.model,stream:payload.stream});assert.ok(auxiliaries.length<=4,"native auxiliary requests remain bounded");
+        if(!payload.stream){res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({id:"helper",object:"chat.completion",model:payload.model,
+          choices:[{index:0,message:{role:"assistant",content:"Controlled native helper"},finish_reason:"stop"}]}));return;}
+        res.writeHead(200,{"Content-Type":"text/event-stream"});
+        for(const[delta,finish_reason]of [[{role:"assistant",content:"Controlled native helper"},null],[{},"stop"]])res.write("data: "+JSON.stringify({id:"helper",object:"chat.completion.chunk",model:payload.model,choices:[{index:0,delta,finish_reason}]})+"\n\n");
+        res.end("data: [DONE]\n\n");return;
+      }
+      const index=payloads.push(payload);
+      assert.ok(index<=(phase==="child"?4:phase==="resume"?3:2),"insertion must not schedule another native task");
+      const receives=["insert","engine","child","resume"].includes(phase)&&index===(phase==="child"?4:2);
+      assert.equal(body.includes(marker),receives||phase==="resume"&&index===3,"only the original root continuation may receive input");
+      if(index===1){
+        assert.ok(session);
+        insertion=engine?engine.send("owner",engineId!,marker,{turnId:"original",expectedActiveTurnId:"original",whenBusy:"inject"}).then(value=>{ack=value;}):
+          session.insertAtToolGap!(marker,{turnId:"original",signal:AbortSignal.any([abort.signal,AbortSignal.timeout(30000)]),
+            ...(phase==="revoked"?{beforeApply(){if(++authorityChecks>1)throw new Error("Original source withdrawn before native application");}}:{})});
+        void insertion.then(()=>{accepted=true;},()=>{});
+        if(phase==="stop"){void session.interrupt!();return;}
+      }
+      const useTool=phase!=="closed"&&(index===1||phase==="child"&&index===2),tool=phase==="child"&&index===1?"task":"view";
+      const args=tool==="task"?{name:"fixture-reader",agent_type:"general-purpose",model:"gpt-4.1",description:"Read fixture",prompt:"Read input.txt once and finish"}:{path:join(scope.root,"input.txt")};
+      if(useTool)assert.ok(payload.tools.some((item:any)=>item.function?.name===tool));
+      const message=useTool?{role:"assistant",content:null,tool_calls:[{id:"read_"+index,type:"function",function:{name:tool,arguments:JSON.stringify(args)}}]}:
+        {role:"assistant",content:"Original Copilot task complete"};
+      if(!payload.stream){
+        if(receives){await insertion;assert.equal(accepted,true);assert.equal(events.some(event=>event.final),false);}
+        res.writeHead(200,{"Content-Type":"application/json"}).end(JSON.stringify({id:"controlled_"+index,object:"chat.completion",model:payload.model,
+          choices:[{index:0,message,finish_reason:useTool?"tool_calls":"stop"}],usage:{prompt_tokens:100,completion_tokens:10,total_tokens:110}}));return;
+      }
+      res.writeHead(200,{"Content-Type":"text/event-stream"});
+      const send=(delta:any,finish_reason:string|null)=>res.write("data: "+JSON.stringify({id:"controlled_"+index,object:"chat.completion.chunk",model:payload.model,
+        choices:[{index:0,delta,finish_reason}]})+"\n\n");
+      send(useTool?{role:"assistant",tool_calls:[{index:0,...message.tool_calls![0]}]}:message,null);
+      if(receives){await insertion;assert.equal(accepted,true);assert.equal(events.some(event=>event.final),false,"input must be accepted before original execution completes");}
+      send({},useTool?"tool_calls":"stop");res.end("data: [DONE]\n\n");
+    })().catch(error=>{errors.push(error);abort.abort();res.destroy();});});
+    scope.defer(()=>closePeerServer(provider));scope.defer(()=>abort.abort());await new Promise<void>(resolve=>provider.listen(0,"127.0.0.1",resolve));
+    const environment:Record<string,string>={PATH:process.env.PATH!,HOME:home,USERPROFILE:home,COPILOT_HOME:copilotHome,COPILOT_CACHE_HOME:cache,
+      TMPDIR:scope.root,TMP:scope.root,TEMP:scope.root,COPILOT_OFFLINE:"true",COPILOT_PROVIDER_TYPE:"openai",COPILOT_PROVIDER_WIRE_API:"completions",
+      COPILOT_PROVIDER_BASE_URL:`http://127.0.0.1:${(provider.address()as{port:number}).port}/v1`,COPILOT_PROVIDER_API_KEY:"controlled-local-key",COPILOT_MODEL:"gpt-4.1",
+      COPILOT_PROVIDER_MAX_PROMPT_TOKENS:"64000",COPILOT_PROVIDER_MAX_OUTPUT_TOKENS:phase==="unknown-budget"?"":phase==="headroom"?"55000":"4096",
+      HTTP_PROXY:"",HTTPS_PROXY:"",ALL_PROXY:"",http_proxy:"",https_proxy:"",all_proxy:""};
+    const previous=new Map(Object.keys(environment).map(key=>[key,process.env[key]]));
+    scope.defer(()=>{for(const[key,value]of previous){if(value===undefined)delete process.env[key];else process.env[key]=value;}});Object.assign(process.env,environment);
+    if(phase!=="denied")await grantFixtureExtension(scope,scope.root,environment);
+    const adapter=new CopilotAdapter({env:{binPath:process.env.PHONON_TEST_COPILOT_BIN,defaultModel:"gpt-4.1",peerContext:true}});
+    const discovered=await adapter.discoverAgents();assert.equal(discovered[0]!.capabilities.injectMidTurn,true);assert.equal(payloads.length,0,"discovery and fixture consent must not infer");
+    // The native CLI owns its startup settings migration; insertion must preserve the settled settings.
+    const settingsBefore=readFileSync(join(copilotHome,"settings.json"),"utf8");
+    const watch=async()=>{
+      const end=Date.now()+10000,finals=events.filter(event=>event.final).length;let runtime:ProcessSupervisor|undefined;
+      while(!(runtime=(session as unknown as{current?:ProcessSupervisor})?.current)&&events.filter(event=>event.final).length===finals&&Date.now()<end)await new Promise(resolve=>setTimeout(resolve,5));
+      if(!runtime)return;
+      const owned=runtime;scope.watch(owned.child,true);scope.defer(async()=>{
+        await owned.terminate();const deadline=Date.now()+5000;while(!owned.hasStopped()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
+        assert.ok(owned.hasStopped(),"owned Copilot process group must settle before fixture removal");
+      });owned.child.stdout.on("data",chunk=>{raw=(raw+String(chunk)).slice(-128000);});
+    };
+    let run:Promise<unknown>;
+    if(phase==="engine"){
+      const create=adapter.createSession.bind(adapter);adapter.createSession=async params=>session=await create(params);
+      const registry=new AdapterRegistry();registry.register(adapter);let ended!:()=>void;const terminal=new Promise<void>(resolve=>{ended=resolve;});
+      engine=new SessionEngine(registry,event=>{events.push(event);if("final"in event&&event.final)ended();});scope.defer(()=>engine?.dispose());
+      const owned=await engine.create({tenantId:"owner",project:"native-project",agent:"copilot",model:"gpt-4.1",cwd:scope.root,verbosity:"tools"});engineId=owned.sessionId;
+      await assert.rejects(engine.send("foreign",engineId,"unowned",{whenBusy:"inject"}));
+      await engine.send("owner",engineId,"Read input.txt once and finish.",{turnId:"original",environment});
+      run=(async()=>{let timer:ReturnType<typeof setTimeout>|undefined;try{
+        await Promise.race([terminal,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("Original Copilot execution did not settle")),30000);})]);
+        await engine!.settleTurn("owner",engineId!,"original");
+      }finally{clearTimeout(timer);}})();
+    }else{
+      session=await adapter.createSession({sessionId:"owned",agentId:"copilot",model:"gpt-4.1",cwd:scope.root});scope.defer(()=>session?.terminate());
+      await session.preparePeerContext?.(environment);assert.equal(session.peerContextCapability?.()?.readiness,"pending");
+      run=session.send("Read input.txt once and finish.",{turnId:"original",verbosity:"tools",environment,signal:AbortSignal.any([abort.signal,AbortSignal.timeout(30000)]),emit:event=>events.push(event)});
+    }
+    void run.catch(()=>{});await watch();await run;
+    assert.deepEqual(errors,[],JSON.stringify({events:events.slice(-5),requests:payloads.map(payload=>({model:payload.model,stream:payload.stream,hasInput:JSON.stringify(payload).includes(marker)})),auxiliaries}));
+    assert.equal(events.at(-1)?.status,phase==="stop"?"interrupted":"completed",JSON.stringify(events.at(-1)));
+    assert.ok(insertion);
+    if(["revoked","closed","denied","headroom","unknown-budget","stop"].includes(phase))await assert.rejects(insertion);else await insertion;
+    if(phase==="revoked")assert.equal(authorityChecks,2,"source withdrawal must happen at native authorization, not only admission");
+    if(phase==="engine")assert.deepEqual(ack,{turnId:"original",disposition:"injected"});
+    if(phase==="resume"){
+      await session!.preparePeerContext?.(environment);
+      const continued=session!.send("Continue the same native session.",{turnId:"next",verbosity:"tools",environment,signal:AbortSignal.timeout(30000),emit:event=>events.push(event)});
+      await watch();await continued;assert.equal(events.at(-1)?.status,"completed");
+    }
+    const nativeEvents=raw.split("\n").flatMap(line=>{try{return[JSON.parse(line)];}catch{return[];}});
+    const results=nativeEvents.filter(event=>event.type==="result");
+    if(phase==="stop")assert.ok(results.length<=1);else assert.equal(results.length,phase==="resume"?2:1,"one native result per explicit original input");
+    if(phase==="resume")assert.equal(new Set(results.map(event=>event.sessionId)).size,1,"continuation must retain its observed native session");
+    assert.equal(nativeEvents.filter(event=>event.type==="user.message").some(event=>event.data?.content?.includes(marker)),false,"insertion is not an extra user prompt");
+    assert.equal(readFileSync(join(copilotHome,"settings.json"),"utf8"),settingsBefore);
+    assert.equal(readFileSync(join(scope.root,"input.txt"),"utf8"),"Original Copilot native file bytes\n");
+  }));
 
 test("installed Copilot resumes the exact native session with a fresh private receive binding", {
   skip: !process.env.PHONON_TEST_COPILOT_BIN || !process.env.PHONON_TEST_COPILOT_SDK_ROOT, timeout: 30000,

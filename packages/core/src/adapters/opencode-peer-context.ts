@@ -6,14 +6,19 @@ import { pathToFileURL } from "node:url";
 import { parse, type ParseError } from "jsonc-parser";
 import type { SendOptions } from "../adapter.js";
 import {verifiedNativeToolChannel} from "../native-tool-channel.js";
+import {nativeVersionAtLeast} from "@agent-phonon/protocol";
 
 export function openCodePure(environment?: Record<string, string>): boolean {
   const value = environment?.OPENCODE_PURE ?? process.env.OPENCODE_PURE;
   return !!value && !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
 }
 
+export function formatOpenCodeRunPrompt(prompt:string):string {
+  return prompt.includes(" ")?'"'+prompt.replace(/"/g,'\\"')+'"':prompt;
+}
+
 /** One invocation-scoped Phonon bridge; reuses native dependencies without changing user configuration. */
-export const OPENCODE_RECEIVE_RUNTIME = String.raw`
+export const OPENCODE_RECEIVE_RUNTIME = `const nativeVersionAtLeast = ${nativeVersionAtLeast.toString()};\n` + String.raw`
 import { request } from "node:http";
 import { randomUUID } from "node:crypto";
 import {createRequire} from "node:module";
@@ -22,17 +27,18 @@ import {homedir} from "node:os";
 import {readFileSync,realpathSync} from "node:fs";
 import {pathToFileURL} from "node:url";
 const canonical=value=>JSON.stringify(value&&typeof value==="object"?Array.isArray(value)?value.map(item=>JSON.parse(canonical(item))):Object.fromEntries(Object.keys(value).sort().map(key=>[key,JSON.parse(canonical(value[key]))])):value);
-export async function openCodeCoordinationTool(description,execute){
+async function openCodeCoordinationTool(description,execute){
  const home=process.env.OPENCODE_CONFIG_DIR||join(process.env.XDG_CONFIG_HOME||join(homedir(),".config"),"opencode");
  const require=createRequire(join(home,"package.json")),toolPath=join(home,"node_modules","@opencode-ai","plugin","dist","tool.js");
- if(JSON.parse(readFileSync(join(toolPath,"..","..","package.json"),"utf8")).version!=="1.14.20")throw new Error("Native plugin dependency is unqualified");
- const {tool}=await import(pathToFileURL(toolPath).href),z=tool.schema;
+ if(!nativeVersionAtLeast(JSON.parse(readFileSync(join(toolPath,"..","..","package.json"),"utf8")).version,"1.14.20"))throw new Error("Native plugin dependency requires >=1.14.20");
+ const {tool}=await import(pathToFileURL(toolPath).href),z=tool?.schema;
+ if(typeof tool!=="function"||typeof z?.enum!=="function"||typeof z?.object!=="function")throw new Error("Native plugin tool API is unavailable");
  return tool({description,args:{operation:z.enum(["presence","peers","activity","send","inbox","acknowledge","receipt","leave"]),
   requestId:z.string().uuid().optional(),recipientId:z.string().uuid().optional(),kind:z.enum(["intent","question","notice","request","result"]).optional(),
   text:z.string().max(4000).optional(),references:z.array(z.string().max(512)).max(8).optional(),inReplyTo:z.string().uuid().optional(),
   after:z.string().optional(),baseRevision:z.number().int().nonnegative().optional(),activity:z.object({summary:z.string().max(500),phase:z.enum(["planning","working","validating","blocked","idle","completed"]),impact:z.array(z.string()).max(16),dependencies:z.string().optional()}).optional(),messageIds:z.array(z.string().uuid()).max(32).optional()},execute});
 }
-export async function installOpenCodePeer(input,capsule,transport) {
+async function installOpenCodePeer(input,capsule,transport) {
   const endpoint = capsule.peer?new URL(capsule.url || ""):undefined;
   const token = capsule.token, nonce = capsule.nonce;
   const expected = capsule.expected || "";
@@ -40,7 +46,7 @@ export async function installOpenCodePeer(input,capsule,transport) {
     || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || !/^[A-Za-z0-9_-]{43}$/.test(token||""))
     || !/^[a-f0-9]{32}$/.test(nonce||"")) throw new Error("Phonon native peer checkpoint unavailable");
   let root,originalMessage,rootAgent,ended = false;
-  const calls=new Map(),nativeRequests=new Map(),wrappedProviders=new Map();
+  const calls=new Map(),nativeRequests=new Map(),wrappedProviders=new Map(),providerEvidence=new Map();
   const markerHeader="x-phonon-native-boundary";
   const own=async(sid,signal)=>{const session=(await input.client.session.get({path:{id:sid},...(signal?{signal}:{})}))?.data;
     return !ended&&(!transport||transport.active())&&sid===root&&session?.id===root&&!session.parentID&&realpathSync(session.directory)===realpathSync(input.directory)
@@ -80,19 +86,33 @@ export async function installOpenCodePeer(input,capsule,transport) {
         // At most 16KB of peer text can double in JSON escaping; reserve that expansion too.
         inputTokens:Buffer.byteLength(init.body),outputTokens:Math.max(...caps),overheadTokens:17024}:{state:"unknown",source:"native_estimate"};
       if(!valid())throw new Error("Native source ended");
-      const boundaryId=randomUUID(),batch=await checkpoint("/peer-context",{boundaryId,nativeSessionId:root,budget});
+      const boundaryId=randomUUID(),batch=await checkpoint("/peer-context",{boundaryId,nativeSessionId:root,budget,inputEvidence:binding.inputEvidence});
       if(!valid()||!await own(root,init.signal)||batch.boundaryId!==boundaryId||batch.nativeSessionId!==root||!Array.isArray(batch.messages)
         ||batch.messages.length>8||batch.messages.some(item=>typeof item.messageId!=="string"||typeof item.content!=="string"))throw new Error("Native context unconfirmed");
       if(batch.messages.length){
         // Final request copy only: native messages and authenticated transport stay owned by OpenCode.
         request.messages.push(...batch.messages.map(item=>({role:"user",content:item.content})));
-        changed=JSON.stringify(request);observation={boundaryId,nativeSessionId:root,messageIds:batch.messages.map(item=>item.messageId),evidence:"context_hook"};
+        changed=JSON.stringify(request);observation={boundaryId,nativeSessionId:root,messageIds:batch.messages.map(item=>item.messageId),evidence:binding.inputEvidence};
       }
     }catch{/* Optional receive never retries or replaces the original provider operation. */}
     if(changed&&!ended&&!init?.signal?.aborted){
-      try{await checkpoint("/peer-context/observe",observation);}catch{}
-      let current=false;try{current=valid()&&await own(root,init.signal);}catch{}
-      if(current)return next(target,{...clean,body:changed});
+      let authorized=false;
+      try{
+        // A custom fetch may rewrite the body; it retains only the original hook ceiling.
+        if(observation.evidence==="context_hook")await checkpoint("/peer-context/observe",observation);
+        if(valid()&&await own(root,init.signal)){
+          await checkpoint("/peer-context/authorize",observation);
+          authorized=valid();
+        }
+      }catch{/* A denied batch must not enter the provider request. */}
+      if(!authorized)return next(target,clean);
+      // Invoke the selected transport exactly once before claiming native submission.
+      const response=Promise.resolve(next(target,{...clean,body:changed}));
+      void response.catch(()=>{});
+      if(observation.evidence==="provider_payload"){
+        try{await checkpoint("/peer-context/observe",observation);}catch{/* Submitted input stays unconfirmed; never retry the provider. */}
+      }
+      return response;
     }
     return next(target,clean);
   }
@@ -131,7 +151,15 @@ export async function installOpenCodePeer(input,capsule,transport) {
         };
         if(!call||call.used||call.args!==canonical(args)||!await valid()||call.used||typeof context.ask!=="function")throw new Error("Native coordination source unavailable");
         call.used=true;
-        await Effect.runPromise(context.ask({permission:"phonon_project_coordination",patterns:["*"],always:["*"],metadata:{operation:args.operation}}),{signal:context.abort});
+        const permission=context.ask({permission:"phonon_project_coordination",patterns:["*"],always:["*"],metadata:{operation:args.operation}});
+        if(Effect.isEffect(permission))await Effect.runPromise(permission,{signal:context.abort});
+        else if(permission&&typeof permission.then==="function"){
+          let abort;
+          try{await Promise.race([permission,new Promise((_,reject)=>{
+            abort=()=>reject(new Error("Native permission source ended"));
+            if(context.abort?.aborted)abort();else context.abort?.addEventListener("abort",abort,{once:true});
+          })]);}finally{if(abort)context.abort?.removeEventListener("abort",abort);}
+        }else throw new Error("Native permission API is unavailable");
         if(!await valid())throw new Error("Native coordination source ended");
         let value;
         try{value=transport?.coordinate?await transport.coordinate({nativeAssistantId:context.messageID,toolCallId:context.callID,action:args},context.abort)
@@ -154,6 +182,7 @@ export async function installOpenCodePeer(input,capsule,transport) {
           const exposed=transport?.bindProvider?transport.bindProvider(providerID,wrapper):wrapper;
           provider.options={...provider.options,fetch:exposed};
           wrappedProviders.set(providerID,exposed);
+          providerEvidence.set(providerID,prior===undefined?"provider_payload":"context_hook");
         }
       },
       async "chat.headers"(event,output){
@@ -161,7 +190,7 @@ export async function installOpenCodePeer(input,capsule,transport) {
         const model=event.model;
         if(model?.api?.npm!=="@ai-sdk/openai-compatible"||!wrappedProviders.has(model.providerID)||typeof model.api.id!=="string"
           ||event.provider?.options?.fetch!==wrappedProviders.get(model.providerID))return;
-        const key=randomUUID();nativeRequests.set(key,{providerID:model.providerID,model,modelKey:modelKey(model),messageID:originalMessage});
+        const key=randomUUID();nativeRequests.set(key,{providerID:model.providerID,model,modelKey:modelKey(model),messageID:originalMessage,inputEvidence:providerEvidence.get(model.providerID)});
         output.headers[markerHeader]=key;
       },
     }:{}),
@@ -179,7 +208,9 @@ export async function installOpenCodePeer(input,capsule,transport) {
         const value=await input.client.session.get({path:{id:sid}});
         const session=value?.data;
         if(ended || root || !session || session.id!==sid || session.parentID || session.directory!==input.directory) return;
-        if(capsule.prompt&&output.parts?.filter(part=>part.type==="text").map(part=>part.text).join("\n")!==capsule.prompt)return;
+        // Native run versions differ only in whether empty non-TTY stdin adds a newline.
+        const prompt=output.parts?.filter(part=>part.type==="text").map(part=>part.text).join("\n");
+        if(capsule.prompt&&prompt!==capsule.prompt&&prompt!==capsule.prompt+"\n")return;
         root=sid;originalMessage=output.message.id;rootAgent=output.message.agent;
         if(!transport)process.stderr.write("PHONON_OPENCODE_PEER_READY_"+nonce+":"+root+"\n");
       } catch { /* A missing native binding never authorizes a replacement session. */ }
@@ -232,7 +263,7 @@ export function prepareOpenCodePeerContext(options: SendOptions, expectedSession
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ ...config, plugin: [...config.plugin ?? [], pathToFileURL(path).href] }),
       AGENT_PHONON_OPENCODE_NONCE: nonce, AGENT_PHONON_OPENCODE_SESSION: expectedSession ?? "",
       AGENT_PHONON_OPENCODE_PEER:options.peerContext?"1":"0",AGENT_PHONON_OPENCODE_COORDINATION:options.projectCoordination?"1":"0",
-      AGENT_PHONON_OPENCODE_PROMPT:prompt===undefined?"":(prompt.includes(" ")?'"'+prompt.replace(/"/g,'\\"')+'"':prompt)+"\n",
+      AGENT_PHONON_OPENCODE_PROMPT:prompt===undefined?"":formatOpenCodeRunPrompt(prompt),
       AGENT_PHONON_OPENCODE_OTHER_TOOLS:options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument?"1":"0",
     }, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
   } catch (error) { rmSync(directory, { recursive: true, force: true }); throw error; }
