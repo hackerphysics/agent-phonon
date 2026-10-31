@@ -36,6 +36,12 @@ input merely because the release string differs from a tested build.
 This does not make the unsupported OpenClaw one-shot CLI an input-capable
 runtime and does not restore any retired integration.
 
+The optional older Codex context-hook interface has its own floor,
+`0.163.0-alpha.10.2`, plus mandatory scoped `hooks/list` evidence. It has no
+exact release allowlist and a version-only probe cannot qualify it. Its
+installed tests require `PHONON_TEST_CODEX_HOOKS_BIN`; the maintained current-turn
+app-server lane uses `PHONON_TEST_CODEX_BIN` and does not depend on hook support.
+
 The external Claude SDK floor is separate from the legacy bundled interface:
 native binary installations have no sibling `sdk.mjs`. The selected public SDK
 must expose query/MCP APIs; its original query provides context usage through

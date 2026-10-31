@@ -8,12 +8,13 @@ import { discoveryProbe } from "../discovery-probe.js";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import type { PeerContextAccess } from "../peer-context.js";
 import {readCodexContext} from "./codex-context.js";
+import {nativeVersionAtLeast} from "@agent-phonon/protocol";
 
 export async function qualifyCodexPeerContext(bin: string, scope?: {cwd:string;env:NodeJS.ProcessEnv;signal?:AbortSignal;onRuntime?:(runtime:ProcessSupervisor)=>void}): Promise<boolean> {
-  if (process.platform === "win32") return false;
+  if (process.platform === "win32" || !scope) return false;
   try {
-    if (!["codex-cli 0.163.0-alpha.10.2","codex-cli 0.163.0-alpha.11.2"].includes((await discoveryProbe(bin,["--version"],scope?.signal))?.trim()??"")) return false;
-    if (!scope) return true;
+    const version=(await discoveryProbe(bin,["--version"],scope.signal))?.trim().match(/^codex-cli (\S+)$/)?.[1];
+    if (!nativeVersionAtLeast(version,"0.163.0-alpha.10.2")) return false;
     const command = quote(process.execPath)+" -e "+quote("process.stdout.write('{}')")+" phonon-peer-capability";
     const hooks = await listCodexHooks({bin,args:codexPeerDefinitions(command),...scope});
     return events.every(event => hooks.some(hook => hook.command===command && hook.eventName===event.wire && hook.source==="sessionFlags" && hook.enabled));

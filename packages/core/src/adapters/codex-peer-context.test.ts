@@ -12,6 +12,29 @@ import { CodexAdapter } from "./codex.js";
 import type { AdapterSession } from "../adapter.js";
 import type { ChildProcess } from "node:child_process";
 import {resolveCodexContextFile} from "./codex-context.js";
+import {createRequire} from "node:module";
+
+test("Codex optional hook qualification uses a minimum and mandatory native API evidence",{skip:process.platform==="win32"},()=>withPeerFixture("codex-hook-minimum",async scope=>{
+  const bin=join(scope.root,"codex.cjs"),state=join(scope.root,"state.json"),parser=createRequire(import.meta.url).resolve("smol-toml");
+  writeFileSync(bin,'#!'+process.execPath+'\n'+String.raw`
+const fs=require('node:fs'),{createInterface}=require('node:readline'),{parse}=require(PARSER),state=JSON.parse(fs.readFileSync(STATE));
+if(process.argv.includes('--version')){console.log('codex-cli '+state.version);process.exit(0);}
+const definitions={};for(let i=2;i<process.argv.length;i++)if(process.argv[i]==='-c')Object.assign(definitions,parse(process.argv[++i]).hooks);
+const hooks=Object.entries(definitions).map(([event,rows])=>({key:event,currentHash:'native-current-hash',eventName:event[0].toLowerCase()+event.slice(1),source:state.mode==='foreign'?'userConfig':'sessionFlags',enabled:state.mode!=='disabled',isManaged:false,trustStatus:'trusted',handlerType:'command',command:rows[0].hooks[0].command,timeoutSec:3,additionalContextLimit:0}));
+createInterface({input:process.stdin}).on('line',line=>{const frame=JSON.parse(line);if(!frame.id)return;const result=frame.id===1?{}:{data:[{cwd:process.cwd(),hooks:state.mode==='missing'?hooks.slice(1):hooks,errors:[]}]};console.log(JSON.stringify({id:frame.id,...(frame.id===2&&state.mode==='unavailable'?{error:{code:-32601,message:'Native API unavailable'}}:{result})}));});
+`.replace('PARSER',JSON.stringify(parser)).replace('STATE',JSON.stringify(state)),{mode:0o700});
+  const context={cwd:scope.root,env:{...process.env},onRuntime:(runtime:ReturnType<typeof spawnSupervisedAgent>)=>scope.watch(runtime.child,true)};
+  for(const version of ["0.163.0-alpha.10.2","0.163.0-alpha.11.2","0.165.0-alpha.1.2","0.200.0","1.0.0"]){
+    writeFileSync(state,JSON.stringify({version,mode:"valid"}));assert.equal(await qualifyCodexPeerContext(bin,context),true,version);
+  }
+  for(const version of ["0.162.0","0.163.0-alpha.10.1","unknown"]){
+    writeFileSync(state,JSON.stringify({version,mode:"valid"}));assert.equal(await qualifyCodexPeerContext(bin,context),false,version);
+  }
+  for(const mode of ["missing","disabled","foreign","unavailable"]){
+    writeFileSync(state,JSON.stringify({version:"1.0.0",mode}));assert.equal(await qualifyCodexPeerContext(bin,context),false,mode);
+  }
+  assert.equal(await qualifyCodexPeerContext(bin),false,"a version alone is not native API evidence");
+}));
 
 function response(res:ServerResponse,item:any,id:string,inputTokens=10) {
   res.writeHead(200,{"Content-Type":"text/event-stream"});
@@ -96,7 +119,7 @@ test("Codex budgeted hook ingress defers missing usage and includes the current 
 }));
 
 for(const phase of ["baseline","midturn","initial","denied","resume","headroom","unknown_budget"] as const)test(`installed Codex ${phase} completes its original task with native peer-context semantics`,{
-  skip:!process.env.PHONON_TEST_CODEX_BIN,timeout:45000,
+  skip:!process.env.PHONON_TEST_CODEX_HOOKS_BIN,timeout:45000,
 },()=>fixture(async f=>{
   const home=join(f.root,"native-home");mkdirSync(home);
   writeFileSync(join(home,"config.toml"),(phase==="unknown_budget"?"":"model_context_window = 128000\n")+"[features]\nplugins = false\n");
@@ -108,7 +131,7 @@ for(const phase of ["baseline","midturn","initial","denied","resume","headroom",
     writeFileSync(hook,'process.stdin.resume();process.stdin.on("end",()=>process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:"Fixture native denial"}})));\n');
     const base=readFileSync(join(home,"config.toml"),"utf8")+'\n[[hooks.PreToolUse]]\nmatcher = "Bash"\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = '+JSON.stringify(command)+'\ntimeout = 3\n';
     writeFileSync(join(home,"config.toml"),base);
-    const hooks=await listCodexHooks({bin:process.env.PHONON_TEST_CODEX_BIN!,args:[],cwd:f.root,env:{...process.env,CODEX_HOME:home},onRuntime:runtime=>f.scope.watch(runtime.child,true)});
+    const hooks=await listCodexHooks({bin:process.env.PHONON_TEST_CODEX_HOOKS_BIN!,args:[],cwd:f.root,env:{...process.env,CODEX_HOME:home},onRuntime:runtime=>f.scope.watch(runtime.child,true)});
     const own=hooks.filter(row=>row.command===command);assert.equal(own.length,1);
     writeFileSync(join(home,"config.toml"),base+'\n[hooks.state.'+JSON.stringify(own[0]!.key)+']\ntrusted_hash = '+JSON.stringify(own[0]!.currentHash)+'\n');
   }
@@ -144,7 +167,7 @@ for(const phase of ["baseline","midturn","initial","denied","resume","headroom",
     })().catch(error=>{errors.push(error);abort.abort();res.destroy();});
   });
   f.scope.defer(()=>closePeerServer(provider));await new Promise<void>(resolve=>provider.listen(0,"127.0.0.1",resolve));
-  const adapter=new CodexAdapter({env:{binPath:process.env.PHONON_TEST_CODEX_BIN!,codexHome:home,baseUrl:`http://127.0.0.1:${(provider.address()as{port:number}).port}/v1`,apiKey:"controlled-codex-key",defaultModel:"gpt-5.4"}});
+  const adapter=new CodexAdapter({env:{binPath:process.env.PHONON_TEST_CODEX_HOOKS_BIN!,codexHome:home,baseUrl:`http://127.0.0.1:${(provider.address()as{port:number}).port}/v1`,apiKey:"controlled-codex-key",defaultModel:"gpt-5.4"}});
   const session=await adapter.createSession({sessionId:f.self.sessionId,agentId:"codex",model:"gpt-5.4",cwd:f.root});
   f.state.session=session;f.scope.defer(()=>session.terminate());
   let stdout="",stderr="";const watched=new Set<ChildProcess>();
@@ -194,7 +217,7 @@ for(const phase of ["baseline","midturn","initial","denied","resume","headroom",
 }));
 
 test("installed Codex keeps newly pending parent mail out of actual native child requests",{
-  skip:!process.env.PHONON_TEST_CODEX_BIN,timeout:45000,
+  skip:!process.env.PHONON_TEST_CODEX_HOOKS_BIN,timeout:45000,
 },()=>fixture(async f=>{
   const home=join(f.root,"child-home");mkdirSync(home);writeFileSync(join(home,"config.toml"),"model_context_window = 128000\n[features]\nplugins = false\nmulti_agent = true\n");
   const previous=new Map(["HOME","USERPROFILE"].map(key=>[key,process.env[key]]));process.env.HOME=f.root;process.env.USERPROFILE=f.root;
@@ -234,7 +257,7 @@ test("installed Codex keeps newly pending parent mail out of actual native child
     })().catch(error=>{errors.push(error);abort.abort();res.destroy();});
   });
   f.scope.defer(()=>closePeerServer(provider));await new Promise<void>(resolve=>provider.listen(0,"127.0.0.1",resolve));
-  const adapter=new CodexAdapter({env:{binPath:process.env.PHONON_TEST_CODEX_BIN!,codexHome:home,baseUrl:`http://127.0.0.1:${(provider.address()as{port:number}).port}/v1`,apiKey:"controlled-codex-key",defaultModel:"gpt-5.4"}});
+  const adapter=new CodexAdapter({env:{binPath:process.env.PHONON_TEST_CODEX_HOOKS_BIN!,codexHome:home,baseUrl:`http://127.0.0.1:${(provider.address()as{port:number}).port}/v1`,apiKey:"controlled-codex-key",defaultModel:"gpt-5.4"}});
   const session=await adapter.createSession({sessionId:f.self.sessionId,agentId:"codex",model:"gpt-5.4",cwd:f.root});f.state.session=session;f.scope.defer(()=>session.terminate());
   const watched=new Set<ChildProcess>();let stderr="";
   const monitor=setInterval(()=>{const native=(session as unknown as{current?:{child:ChildProcess}}).current?.child;
@@ -273,21 +296,21 @@ test("Codex pending human decisions and closed current-turn authority cannot dra
 }));
 
 for(const disabled of [false,true])test(`installed Codex native hook discovery ${disabled?"honors disabled hooks":"trusts only the invocation's own exact hook hashes"}`,{
-  skip:!process.env.PHONON_TEST_CODEX_BIN,timeout:30000,
+  skip:!process.env.PHONON_TEST_CODEX_HOOKS_BIN,timeout:30000,
 },()=>fixture(async f=>{
   const home=join(f.root,"home"),codexHome=join(home,".codex");mkdirSync(codexHome,{recursive:true});
   const config="[features]\nplugins = false\n"+(disabled?"hooks = false\n":'[[hooks.PostToolUse]]\n[[hooks.PostToolUse.hooks]]\ntype = "command"\ncommand = "printf existing-hook-not-auto-trusted"\n');
   writeFileSync(join(codexHome,"config.toml"),config);
   const env={...process.env,HOME:home,USERPROFILE:home,CODEX_HOME:codexHome,HTTP_PROXY:"",HTTPS_PROXY:"",ALL_PROXY:""};
-  assert.equal(await qualifyCodexPeerContext(process.env.PHONON_TEST_CODEX_BIN!),true);
-  assert.equal(await qualifyCodexPeerContext(process.env.PHONON_TEST_CODEX_BIN!,{cwd:f.root,env,onRuntime:runtime=>f.scope.watch(runtime.child,true)}),!disabled);
-  if(disabled){await assert.rejects(f.asset.nativeArguments(process.env.PHONON_TEST_CODEX_BIN!,env),/could not be qualified/);}
+  assert.equal(await qualifyCodexPeerContext(process.env.PHONON_TEST_CODEX_HOOKS_BIN!),false,"hook availability requires scoped API evidence");
+  assert.equal(await qualifyCodexPeerContext(process.env.PHONON_TEST_CODEX_HOOKS_BIN!,{cwd:f.root,env,onRuntime:runtime=>f.scope.watch(runtime.child,true)}),!disabled);
+  if(disabled){await assert.rejects(f.asset.nativeArguments(process.env.PHONON_TEST_CODEX_HOOKS_BIN!,env),/could not be qualified/);}
   else{
-    const before=await listCodexHooks({bin:process.env.PHONON_TEST_CODEX_BIN!,args:f.asset.definitionArguments(),cwd:f.root,env,onRuntime:runtime=>f.scope.watch(runtime.child,true)});
+    const before=await listCodexHooks({bin:process.env.PHONON_TEST_CODEX_HOOKS_BIN!,args:f.asset.definitionArguments(),cwd:f.root,env,onRuntime:runtime=>f.scope.watch(runtime.child,true)});
     let args:string[];
-    try{args=await f.asset.nativeArguments(process.env.PHONON_TEST_CODEX_BIN!,env);}catch(error){assert.fail(String(error)+"\n"+JSON.stringify(before));}
+    try{args=await f.asset.nativeArguments(process.env.PHONON_TEST_CODEX_HOOKS_BIN!,env);}catch(error){assert.fail(String(error)+"\n"+JSON.stringify(before));}
     assert.equal(args.some((value:string)=>/bypass|features\.hooks|approval_policy|sandbox_mode/.test(value)),false);
-    const hooks=await listCodexHooks({bin:process.env.PHONON_TEST_CODEX_BIN!,args,cwd:f.root,env,onRuntime:runtime=>f.scope.watch(runtime.child,true)});
+    const hooks=await listCodexHooks({bin:process.env.PHONON_TEST_CODEX_HOOKS_BIN!,args,cwd:f.root,env,onRuntime:runtime=>f.scope.watch(runtime.child,true)});
     const existing=hooks.filter(row=>row.command?.includes("existing-hook-not-auto-trusted"));
     assert.equal(existing.length,1);assert.equal(existing[0]!.trustStatus,"untrusted");
     const own=hooks.filter(row=>row.command===f.asset.command);assert.equal(own.length,2);assert.ok(own.every(row=>row.trustStatus==="trusted"));

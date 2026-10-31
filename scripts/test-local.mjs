@@ -13,6 +13,8 @@ const mode = process.argv[2];
 if (!['default', 'e2e', 'python', 'compat','focused'].includes(mode)) throw new Error('expected default, e2e, python, compat or focused');
 const codexBin=process.env.PHONON_TEST_CODEX_BIN;
 if(codexBin&&(!isAbsolute(codexBin)||/[\x00-\x1f\x7f]/.test(codexBin)))throw new Error('An explicit absolute native Codex executable is required');
+const codexHooksBin=process.env.PHONON_TEST_CODEX_HOOKS_BIN;
+if(codexHooksBin&&(!isAbsolute(codexHooksBin)||/[\x00-\x1f\x7f]/.test(codexHooksBin)))throw new Error('An explicit absolute native Codex hooks executable is required');
 const hermesBin=process.env.PHONON_TEST_HERMES_BIN;
 if(hermesBin&&(!isAbsolute(hermesBin)||/[\x00-\x1f\x7f]/.test(hermesBin)))throw new Error('An explicit absolute native Hermes executable is required');
 const claudeBin=process.env.PHONON_TEST_CLAUDE_BIN;
@@ -48,6 +50,7 @@ const env = {
   pnpm_config_workspace_concurrency:'1',
   PHONON_TEST_OWNER:process.env.PHONON_TEST_OWNER??'local-'+process.pid,
   ...(codexBin?{PHONON_TEST_CODEX_BIN:codexBin}:{}),
+  ...(codexHooksBin?{PHONON_TEST_CODEX_HOOKS_BIN:codexHooksBin}:{}),
   ...(hermesBin?{PHONON_TEST_HERMES_BIN:hermesBin}:{}),
   ...(claudeBin?{PHONON_TEST_CLAUDE_BIN:claudeBin}:{}),
   ...(claudeSdk?{PHONON_TEST_CLAUDE_SDK:claudeSdk}:{}),
