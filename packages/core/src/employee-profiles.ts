@@ -30,26 +30,54 @@ export class EmployeeProfiles {
     let state=shared.get(store);if(!state){state={uses:new Map(),writes:new Map()};shared.set(store,state);}this.shared=state;
   }
   private key(id:string){return this.tenant+"\0"+id;}
+  private profileKey(input:EmployeeProfileApplyParams){
+    const binding=input.profileBinding;
+    return this.key(binding?.kind==="employee"?binding.employeeId:binding?.kind==="harness"?"harness:"+input.agent:input.employeeId);
+  }
   use(id:string):()=>void{
-    const key=this.key(id);if(this.shared.writes.has(key))throw new PhononError("errSessionBusy","employee profile is being applied");
-    this.shared.uses.set(key,(this.shared.uses.get(key)??0)+1);let released=false;
-    return ()=>{if(released)return;released=true;const count=(this.shared.uses.get(key)??1)-1;if(count)this.shared.uses.set(key,count);else this.shared.uses.delete(key);};
+    const record=this.store.employeeProfile(this.tenant,id);
+    if(!record)throw new PhononError("errInvalidParams","employee profile not found");
+    const keys=[...new Set([this.key(id),this.profileKey(record.input)])];
+    if(keys.some(key=>this.shared.writes.has(key)))throw new PhononError("errSessionBusy","employee profile is being applied");
+    for(const key of keys)this.shared.uses.set(key,(this.shared.uses.get(key)??0)+1);let released=false;
+    return ()=>{if(released)return;released=true;for(const key of keys){const count=(this.shared.uses.get(key)??1)-1;if(count)this.shared.uses.set(key,count);else this.shared.uses.delete(key);}};
   }
   async apply(raw:unknown):Promise<EmployeeProfileStatusResult>{
     this.policy.assertEmployeeProfiles();const input=EmployeeProfileApplyParams.parse(raw);
+    if(input.profileBinding&&(input.documents.agents||input.documents.user||input.documents.tools))throw new PhononError("errInvalidParams","shared profile configuration is read-only");
     if(Buffer.byteLength(JSON.stringify(input))>512*1024)throw new PhononError("errInvalidParams","employee profile is too large");
     this.policy.assertAgentAllowed(input.agent);
     const available=(await this.registry.inventory.list()).some(item=>item.agentId===input.agent&&item.available&&item.models.some(model=>model.id===input.model&&model.available!==false));
     if(this.closed)throw new PhononError("errSessionBusy","employee runtime is closing");
     if(!available)throw new PhononError("errAgentUnavailable","employee base harness/model is unavailable");
     const key=this.key(input.employeeId),hash=employeeHash(input),previous=this.store.employeeProfile(this.tenant,input.employeeId);
-    if(previous&&(previous.input.agent!==input.agent||previous.input.profileId!==input.profileId))throw new PhononError("errInvalidParams","employee runtime binding is immutable");
+    if(previous&&(previous.input.agent!==input.agent||previous.input.profileId!==input.profileId||employeeHash(previous.input.profileBinding??null)!==employeeHash(input.profileBinding??null)))throw new PhononError("errInvalidParams","employee runtime binding is immutable");
     if(previous&&(input.revision<previous.input.revision||input.revision===previous.input.revision&&hash!==previous.requestHash))throw new PhononError("errInvalidParams","employee profile revision conflict");
     const inFlight=this.shared.writes.get(key);if(inFlight){if(previous?.requestHash!==hash)throw new PhononError("errSessionBusy","another employee revision is being applied");return inFlight;}
     if(previous?.state==="ready"&&previous.requestHash===hash)return this.status(input.employeeId);
     if(this.shared.uses.has(key)||this.store.employeeBusy(this.tenant,input.employeeId))throw new PhononError("errSessionBusy","employee has an active or unrecovered Session");
     const adapter=this.registry.resolve(input.agent);if(!adapter?.provisionEmployee||!adapter.inspectEmployee)throw new PhononError("errCapabilityUnsupported","selected harness cannot provision employee profiles");
-    const work=this.applyProfile(input,hash,previous).finally(()=>this.shared.writes.delete(key));this.shared.writes.set(key,work);return work;
+    const profileKey=this.profileKey(input);
+    if(profileKey!==key&&this.shared.writes.has(profileKey))throw new PhononError("errSessionBusy","shared employee profile is being applied");
+    if(input.profileBinding?.kind==="employee")this.profileSource(input);
+    if(input.profileBinding?.kind==="harness"&&(!adapter.inspectHarnessProfile||input.agent.split(":")[1]?.startsWith("phn-")))throw new PhononError("errCapabilityUnsupported","managed profiles require an owned employee reference");
+    // Reserve the shared profile during binding, so a concurrent owner update cannot race readback.
+    const work=this.applyProfile(input,hash,previous).finally(()=>{this.shared.writes.delete(key);if(profileKey!==key)this.shared.writes.delete(profileKey);});
+    this.shared.writes.set(key,work);if(profileKey!==key)this.shared.writes.set(profileKey,work);return work;
+  }
+  private profileSource(input:EmployeeProfileApplyParams){
+    const binding=input.profileBinding;
+    const source=binding?.kind==="employee"?this.store.employeeProfile(this.tenant,binding.employeeId):undefined;
+    if(!source||binding?.kind!=="employee"||binding.employeeId===input.employeeId||source.input.profileBinding||source.input.agent!==input.agent||source.input.profileId!==input.profileId||source.state!=="ready")throw new PhononError("employee_profile_source_unavailable","shared profile must be an owned, ready profile on the same harness");
+    return source;
+  }
+  private async inspectShared(input:EmployeeProfileApplyParams){
+    if(input.profileBinding?.kind==="employee"){
+      const source=this.profileSource(input),status=await this.status(source.input.employeeId);
+      if(status.state!=="ready")throw new PhononError("employee_profile_source_unavailable");
+      return {...await this.registry.resolve(input.agent)!.inspectEmployee!(this.target(source)),runtimeProfile:source.runtimeProfile};
+    }
+    return this.registry.resolve(input.agent)!.inspectHarnessProfile!(input.agent);
   }
   private async applyProfile(input:EmployeeProfileApplyParams,hash:string,previous?:Record<string,any>):Promise<EmployeeProfileStatusResult>{
     const adapter=this.registry.resolve(input.agent)!;
@@ -77,8 +105,10 @@ export class EmployeeProfiles {
         record.workspace.projectId=project.projectId;this.store.saveEmployeeProfile(this.tenant,input.employeeId,record);
       }
       await this.checkWorkspace(record);
-      const observed=await adapter.provisionEmployee!(this.target(record));
-      for(const[file,content]of Object.entries(employeeDocuments(input)))if(observed.documentHashes[file]!==createHash("sha256").update(content).digest("hex"))throw new PhononError("employee_profile_verification_failed","native profile readback differs from the requested documents");
+      const sharedObservation=input.profileBinding?await this.inspectShared(input):undefined;
+      const observed=sharedObservation??await adapter.provisionEmployee!(this.target(record));
+      if(sharedObservation)record.runtimeProfile=sharedObservation.runtimeProfile;
+      else for(const[file,content]of Object.entries(employeeDocuments(input)))if(observed.documentHashes[file]!==createHash("sha256").update(content).digest("hex"))throw new PhononError("employee_profile_verification_failed","native profile readback differs from the requested documents");
       record={...record,state:"ready",observation:observed};this.store.saveEmployeeProfile(this.tenant,input.employeeId,record);
       return await this.status(input.employeeId);
     }catch(error){
@@ -135,8 +165,9 @@ export class EmployeeProfiles {
     try{
       await this.checkWorkspace(record);const adapter=this.registry.resolve(record.input.agent);
       if(!adapter?.inspectEmployee)throw new Error("unsupported");
-      const observed=await adapter.inspectEmployee(this.target(record));
-      if(observed.home!==record.observation.home||JSON.stringify(observed.documentHashes)!==JSON.stringify(record.observation.documentHashes))throw new PhononError("employee_profile_local_changes","employee profile files changed outside the editor");
+      const sharedObservation=record.input.profileBinding?await this.inspectShared(record.input):undefined;
+      const observed=sharedObservation??await adapter.inspectEmployee(this.target(record));
+      if(observed.home!==record.observation.home||sharedObservation&&sharedObservation.runtimeProfile!==record.runtimeProfile||!record.input.profileBinding&&JSON.stringify(observed.documentHashes)!==JSON.stringify(record.observation.documentHashes))throw new PhononError("employee_profile_local_changes","employee profile files changed outside the editor");
       if(record.observation.nativeIdentity&&observed.nativeIdentity!==record.observation.nativeIdentity)throw new PhononError("employee_profile_identity_changed","native employee profile directory changed");
       if(!record.observation.nativeIdentity&&observed.nativeIdentity)this.store.saveEmployeeProfile(this.tenant,id,{...record,observation:observed});
       return this.view({...record,observation:observed});
@@ -151,9 +182,9 @@ export class EmployeeProfiles {
     const status=await this.status(id),record=this.store.employeeProfile(this.tenant,id)!;
     if(status.state!=="ready"||revision!==undefined&&status.revision!==revision||status.agent!==agent)throw new PhononError("errInvalidParams","employee profile is not ready at the selected revision");
     revision=status.revision;
-    const documents=employeeDocuments(record.input);
+    const documents=record.input.profileBinding?{"SOUL.md":employeeDocuments(record.input)["SOUL.md"]}:employeeDocuments(record.input);
     return {employeeId:id,revision,runtimeProfile:status.runtimeProfile,provider:status.provider,home:record.observation.home,
-      context:[{role:"system",content:`Current employee profile revision ${revision}. This supersedes earlier identity configuration. Native long-term memory remains in ${record.observation.home}.\n\n`+Object.entries(documents).map(([file,body])=>`[${file}]\n${body}`).join("\n\n")} ]};
+      context:[{role:"system",content:`Current employee identity revision ${revision}. This supersedes earlier identity configuration for this employee only. ${record.input.profileBinding?"Native profile settings and long-term memory are shared; do not overwrite them with this per-employee identity. ":""}Native long-term memory remains in ${record.observation.home}.\n\n`+Object.entries(documents).map(([file,body])=>`[${file}]\n${body}`).join("\n\n")} ]};
   }
   async dispose(){this.closed=true;await Promise.allSettled([...this.shared.writes].filter(([key])=>key.startsWith(this.tenant+"\0")).map(([,promise])=>promise));}
 }

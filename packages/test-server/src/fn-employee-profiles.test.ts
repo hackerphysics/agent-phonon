@@ -185,3 +185,90 @@ test("a successful adapter call without matching document readback never becomes
   try{const status=await tc.call("employee.profile.apply",spec()) as any;assert.equal(status.state,"failed");assert.equal(status.errorCode,"employee_profile_verification_failed");}
   finally{await tc.conn.dispose();store.close();rmSync(root,{recursive:true,force:true});}
 });
+
+test("DEs share one owned native profile without sharing Sessions, workspaces or document writes",async()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"phonon-shared-profile-"))),store=new PhononStore(join(root,"state.db")),registry=new AdapterRegistry(),adapter=new EmployeeAdapter();registry.register(adapter);
+  const tc=new TestConn({store,registry,workspaceRoot:root,tenantId:"owner",policy:{allowEmployeeProfiles:true}});
+  try{
+    const source=spec(),first=await tc.call("employee.profile.apply",source) as any;
+    const alias={...source,employeeId:randomUUID(),name:"Reviewer",profileBinding:{kind:"employee",employeeId:source.employeeId},documents:{soul:"Review independently",agents:"",user:"",tools:""}};
+    const second=await tc.call("employee.profile.apply",alias) as any;
+    assert.equal(second.state,"ready");assert.equal(second.runtimeProfile,first.runtimeProfile);
+    assert.notEqual(second.privateWorkspace.path,first.privateWorkspace.path);
+    assert.notEqual(second.privateWorkspace.projectId,first.privateWorkspace.projectId);
+    assert.equal(second.privateWorkspace.employeeId,alias.employeeId);assert.equal(adapter.targets.size,1);
+    assert.equal(readFileSync(join(first.privateWorkspace.path,"SOUL.md"),"utf8"),docs({input:source} as EmployeeProfileTarget)["SOUL.md"]);
+    const session=await tc.call("session.create",{project:second.privateWorkspace.projectId,agent:source.agent,model:source.model,agentConfig:{employee:{id:alias.employeeId,revision:1}}}) as any;
+    assert.equal(adapter.created.at(-1)?.employee?.employeeId,alias.employeeId);
+    assert.equal(adapter.created.at(-1)?.employee?.home,first.privateWorkspace.path);
+    assert.ok(adapter.created.at(-1)?.initialContext?.some(item=>item.content.includes("Reviewer")));
+    const sent=await tc.call("session.send",{sessionId:session.sessionId,input:"Review"}) as any;
+    assert.equal(store.employeeBusy("owner",source.employeeId),true);
+    await assert.rejects(tc.call("employee.profile.apply",{...source,revision:2}));
+    await tc.waitTurnEnd(sent.turnId);await new Promise(resolve=>setTimeout(resolve,10));
+    const updated=await tc.call("employee.profile.apply",{...source,revision:2,documents:{...source.documents,agents:"Shared instruction update"}}) as any;
+    assert.equal(updated.state,"ready");assert.equal((await tc.call("employee.profile.status",{employeeId:alias.employeeId}) as any).state,"ready");
+    await tc.call("employee.profile.apply",{...alias,revision:2,documents:{...alias.documents,soul:"Updated per-DE identity"}});
+    assert.equal(readFileSync(join(first.privateWorkspace.path,"AGENTS.md"),"utf8"),"Shared instruction update");
+    assert.equal(adapter.targets.get(first.runtimeProfile)?.input.employeeId,source.employeeId);
+    await assert.rejects(tc.call("employee.profile.apply",{...alias,employeeId:randomUUID(),profileBinding:{kind:"employee",employeeId:alias.employeeId}}));
+    const foreign=new TestConn({store,registry,workspaceRoot:root,tenantId:"other",policy:{allowEmployeeProfiles:true}});
+    try{await assert.rejects(foreign.call("employee.profile.apply",{...alias,employeeId:randomUUID()}));}finally{await foreign.conn.dispose();}
+  }finally{await tc.conn.dispose();store.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("binding a discovered native profile is read-only, repeatable and retains each DE's private workspace",async()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"phonon-native-profile-binding-"))),store=new PhononStore(join(root,"state.db")),registry=new AdapterRegistry();
+  const nativeHome=join(root,"native");mkdirSync(nativeHome);writeFileSync(join(nativeHome,"SOUL.md"),"Existing native identity");
+  class ExistingAdapter extends EmployeeAdapter {
+    home=nativeHome;
+    async inspectHarnessProfile(){return {home:this.home,nativeIdentity:this.home,documentHashes:{"SOUL.md":hash(readFileSync(join(nativeHome,"SOUL.md"),"utf8"))},memoryBytes:0,runtimeProfile:"base"};}
+  }
+  const adapter=new ExistingAdapter();registry.register(adapter);
+  const tc=new TestConn({store,registry,workspaceRoot:root,tenantId:"owner",policy:{allowEmployeeProfiles:true}});
+  try{
+    const input={...spec(),profileBinding:{kind:"harness"},documents:{soul:"Per-DE identity",agents:"",user:"",tools:""}};
+    await assert.rejects(tc.call("employee.profile.apply",{...input,documents:{...input.documents,agents:"Must not be silently ignored"}}));
+    const first=await tc.call("employee.profile.apply",input) as any,second=await tc.call("employee.profile.apply",{...input,employeeId:randomUUID(),name:"Second"}) as any;
+    assert.equal(first.state,"ready");assert.equal(second.state,"ready");assert.equal(first.runtimeProfile,"base");
+    assert.notEqual(first.privateWorkspace.path,second.privateWorkspace.path);assert.equal(adapter.targets.size,0);
+    assert.equal(readFileSync(join(nativeHome,"SOUL.md"),"utf8"),"Existing native identity");
+    writeFileSync(join(nativeHome,"SOUL.md"),"Native operator update");
+    assert.equal((await tc.call("employee.profile.status",{employeeId:input.employeeId}) as any).state,"ready");
+    adapter.home=join(root,"replacement");
+    assert.equal((await tc.call("employee.profile.status",{employeeId:input.employeeId}) as any).state,"failed");
+    await assert.rejects(tc.call("employee.profile.apply",{...input,revision:2,profileBinding:undefined}));
+  }finally{await tc.conn.dispose();store.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("existing OpenClaw binding only reads the selected native agent and preserves its documents",async()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"phonon-openclaw-bind-"))),calls:string[]=[];
+  const adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:"ws://127.0.0.1:1",token:"test"}});
+  (adapter as any).gw={connect:async()=>{},rpc:async(method:string,params:any)=>{
+    calls.push(method);
+    if(method==="agents.list")return {agents:[{id:"existing",workspace:root}]};
+    if(method==="agents.files.get"){assert.equal(params.agentId,"existing");return {workspace:root,file:{content:params.name==="MEMORY.md"?"Shared native memory":"Native document"}};}
+    throw new Error("must not mutate existing native profile");
+  }};
+  try{
+    const result=await adapter.inspectHarnessProfile("openclaw:existing");
+    assert.equal(result.home,root);assert.equal(result.runtimeProfile,"existing");assert.equal(result.memoryBytes,Buffer.byteLength("Shared native memory"));
+    assert.ok(calls.every(method=>["agents.list","agents.files.get"].includes(method)));
+    await assert.rejects(adapter.inspectHarnessProfile("openclaw:missing"));
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test("installed Hermes existing-profile inspection does not create profiles or rewrite native identity",async t=>{
+  const bin=process.env.PHONON_TEST_HERMES_BIN;
+  if(!bin||process.platform==="win32"){t.skip("Explicit installed POSIX Hermes runtime required");return;}
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"phonon-hermes-existing-"))),old=process.env.HERMES_HOME;process.env.HERMES_HOME=root;
+  try{
+    writeFileSync(join(root,"config.yaml"),"model:\n  default: m1\n");writeFileSync(join(root,"SOUL.md"),"Native identity, not DE identity");
+    mkdirSync(join(root,"memories"));writeFileSync(join(root,"memories","MEMORY.md"),"Shared native memory");
+    const adapter=new HermesAdapter({env:{binPath:bin}}),result=await adapter.inspectHarnessProfile("hermes:default");
+    assert.equal(result.home,root);assert.equal(result.runtimeProfile,"default");assert.equal(result.memoryBytes,Buffer.byteLength("Shared native memory"));
+    assert.equal(result.documentHashes["SOUL.md"],hash("Native identity, not DE identity"));assert.equal(existsSync(join(root,"profiles")),false);
+    rmSync(join(root,"SOUL.md"));symlinkSync(join(root,"config.yaml"),join(root,"SOUL.md"));
+    await assert.rejects(adapter.inspectHarnessProfile("hermes:default"));
+  }finally{if(old===undefined)delete process.env.HERMES_HOME;else process.env.HERMES_HOME=old;rmSync(root,{recursive:true,force:true});}
+});

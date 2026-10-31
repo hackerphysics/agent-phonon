@@ -1,6 +1,7 @@
 import { parse as parseYaml } from "yaml";
 import { HERMES_BRIDGE } from "./hermes-bridge.js";
 import { HERMES_PROFILE_BRIDGE } from "./hermes-profile-bridge.js";
+import { inspectExistingHermesProfile } from "./hermes-existing-profile.js";
 import { hermesNativeToolEnvironment } from "./hermes-native-tools.js";
 import { hermesPeerContextEnvironment, hermesPeerContextSupported } from "./hermes-peer-context.js";
 import { CurrentTurnInput } from "../current-turn-input.js";
@@ -72,6 +73,7 @@ const HERMES_PROVIDER_FALLBACK_MODELS: Record<string, string[]> = {
 const CAPABILITIES: AgentCapabilities = {
   reasoningControl:true,
   employeeProfiles:true,
+  employeeProfileBindings:process.platform!=="win32",
   nativeSession: true, // --resume / --pass-session-id
   nativeCompression: false,
   customCompression: true,
@@ -557,6 +559,11 @@ export class HermesAdapter implements AgentAdapter {
   }
   provisionEmployee(target:EmployeeProfileTarget){return this.employeeOperation("apply",target);}
   inspectEmployee(target:EmployeeProfileTarget){return this.employeeOperation("inspect",target);}
+  async inspectHarnessProfile(agent:string){
+    if(!agent.startsWith("hermes:"))throw new PhononError("employee_profile_source_unavailable");
+    const runtimeProfile=agent.slice("hermes:".length);
+    return {...await inspectExistingHermesProfile(this.env.binPath??"hermes",runtimeProfile),runtimeProfile};
+  }
   private async windowsProfileRuntime():Promise<string>{
     this.capabilities.employeeProfiles=false;
     if(!this.env.profileFileBrokerRoot)throw new PhononError("employee_profile_platform_unsupported","Windows profiles require prepared native file runtime assets");

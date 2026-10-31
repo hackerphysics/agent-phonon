@@ -990,8 +990,9 @@ export class PhononStore {
     this.db.prepare("INSERT INTO employee_profiles(tenant_id,employee_id,document) VALUES(?,?,?) ON CONFLICT(tenant_id,employee_id) DO UPDATE SET document=excluded.document").run(tenant,id,JSON.stringify(document));
   }
   employeeBusy(tenant:string,id:string):boolean{
-    return !!this.db.prepare(`SELECT 1 FROM sessions s WHERE s.tenant_id=? AND s.employee_id=? AND
-      (s.status IN ('running','paused') OR EXISTS(SELECT 1 FROM compression_receipts c WHERE c.tenant_id=s.tenant_id AND c.session_id=s.session_id AND c.state IN ('running','unknown'))) LIMIT 1`).get(tenant,id);
+    return !!this.db.prepare(`SELECT 1 FROM sessions s LEFT JOIN employee_profiles p ON p.tenant_id=s.tenant_id AND p.employee_id=s.employee_id
+      WHERE s.tenant_id=? AND (s.employee_id=? OR json_extract(p.document,'$.input.profileBinding.employeeId')=?) AND
+      (s.status IN ('running','paused') OR EXISTS(SELECT 1 FROM compression_receipts c WHERE c.tenant_id=s.tenant_id AND c.session_id=s.session_id AND c.state IN ('running','unknown'))) LIMIT 1`).get(tenant,id,id);
   }
   beginInteraction(tenant: string, request: string, hash: string, payload: string): void {
     this.db.prepare(`INSERT INTO interaction_receipts(tenant_id,request_id,request_hash,request_json,state,updated_at)

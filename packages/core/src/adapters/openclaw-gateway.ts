@@ -12,7 +12,7 @@ import { GatewayClient, type GatewayConfig } from "../gateway-client.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, basename, matchesGlob } from "node:path";
+import { join, basename, matchesGlob, isAbsolute } from "node:path";
 import { dropToolIOFromJsonlFiles } from "../custom-compress.js";
 import { PhononError } from "../rpc.js";
 import { createHash } from "node:crypto";
@@ -55,6 +55,7 @@ const coversNativeTool=(patterns:string[]|undefined,name:string)=>patterns?.some
 const CAPABILITIES: AgentCapabilities = {
   reasoningControl:true,
   employeeProfiles:true,
+  employeeProfileBindings:true,
   nativeSession: true,
   nativeCompression: true, // sessions.compact
   contextInjection: true, // chat.inject
@@ -541,6 +542,20 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     }
   }
 
+  async inspectHarnessProfile(agent:string){
+    if(!agent.startsWith("openclaw:"))throw new PhononError("employee_profile_source_unavailable");
+    await this.gw.connect();
+    const runtimeProfile=agent.slice("openclaw:".length);
+    const listing=await this.gw.rpc("agents.list",{},15000) as {agents:Array<{id:string;workspace?:string}>};
+    const entry=listing.agents.find(item=>item.id===runtimeProfile);
+    if(!entry?.workspace||!isAbsolute(entry.workspace))throw new PhononError("employee_profile_source_unavailable");
+    const info=await lstat(entry.workspace);
+    if(!info.isDirectory()||info.isSymbolicLink()||await realpath(entry.workspace)!==entry.workspace)throw new PhononError("employee_profile_identity_changed");
+    const target={runtimeProfile,workspace:entry.workspace},documentHashes:Record<string,string>={};
+    for(const name of ["SOUL.md","AGENTS.md","USER.md","TOOLS.md"])documentHashes[name]=this.fileHash(await this.employeeFile(target,name)??"");
+    const memory=await this.employeeFile(target,"MEMORY.md");
+    return {runtimeProfile,home:entry.workspace,nativeIdentity:`${info.dev}:${info.ino}`,documentHashes,memoryBytes:Buffer.byteLength(memory??"")};
+  }
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     if(params.reattach)throw new PhononError("errSessionBusy","OpenClaw recovery requires a verified native checkpoint");
     await this.gw.connect();
@@ -721,11 +736,11 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
   }
   private fileHash(content:string){return createHash("sha256").update(content).digest("hex");}
   private employeeMarker(target:EmployeeProfileTarget){return `<!-- phonon-employee:${target.input.employeeId}:${target.nonce} -->`;}
-  private async employeeFile(target:EmployeeProfileTarget,name:string):Promise<string|undefined>{
+  private async employeeFile(target:Pick<EmployeeProfileTarget,"runtimeProfile"|"workspace"> & Partial<Pick<EmployeeProfileTarget,"input">>,name:string):Promise<string|undefined>{
     let result:{workspace?:string;file?:{missing?:boolean;content?:string}};
     try{result=await this.gw.rpc("agents.files.get",{agentId:target.runtimeProfile,name},15000) as typeof result;}
     catch(error){
-      if(name==="TOOLS.md"&&target.input.documents.tools===""&&this.unsupportedEmployeeFile(error,name))return undefined;
+      if(name==="TOOLS.md"&&!(target.input?.documents.tools)&&this.unsupportedEmployeeFile(error,name))return undefined;
       throw error;
     }
     if(result.workspace!==target.workspace)throw new PhononError("employee_profile_identity_changed");
