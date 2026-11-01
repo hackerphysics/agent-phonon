@@ -74,7 +74,11 @@ for (const phase of ["baseline", "insert", "resume", "engine", "approval-allow",
     await assert.rejects(engine.send("foreign",owned.sessionId,"borrowed input",{turnId:"original-turn",whenBusy:"inject"}));
     await engine.send("owner",owned.sessionId,"Read the native tool boundary and finish.",{turnId:"original-turn"});
     const deadline=Date.now()+5000;while(!(session as any)?.current&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,10));
-    scope.watch((session as any).current?.child,true);await engine.settleTurn("owner",owned.sessionId,"original-turn");
+    scope.watch((session as any).current?.child,true);
+    const terminalDeadline=Date.now()+30000;
+    while(!events.some(event=>event.final)&&Date.now()<terminalDeadline)await new Promise(resolve=>setTimeout(resolve,20));
+    assert.ok(events.some(event=>event.final),"Original native execution must reach its terminal before finalization");
+    await engine.settleTurn("owner",owned.sessionId,"original-turn");
   }else{
     session = await adapter.createSession({ sessionId: "owned", agentId: "codex", model: "gpt-5.4", cwd: root }); scope.defer(() => session?.terminate());
     const run = session.send("Read the native tool boundary and finish.", { turnId: "original-turn", verbosity: "tools", signal: AbortSignal.any([abort.signal,AbortSignal.timeout(30000)]), emit: event => events.push(event),environment:bridgeEnvironment,
