@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import { PhononError } from "../rpc.js";
+import {inspectWindowsNativeSecurity, WINDOWS_NATIVE_SECURITY_SCRIPT} from "../windows-native-file-security.js";
 
 const MAX_BYTES = 32 * 1024 * 1024;
 const text = z.string().min(1).max(4096);
@@ -15,6 +16,7 @@ export const PiNativeObservation = z.object({
   bytes: z.number().int().positive().max(MAX_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/),
   entries: z.number().int().positive(), snapshotHash: z.string().regex(/^[a-f0-9]{64}$/),
   continuation: z.literal(true).optional(),
+  windowsOwner: z.string().regex(/^S-1-\d+(?:-\d+)+$/).optional(),
 }).strict();
 export type PiNativeObservation = z.infer<typeof PiNativeObservation>;
 export const PiCheckpoint = z.object({
@@ -32,7 +34,12 @@ function expandPath(value: string): string {
 
 function directory(path: string): string {
   const stat = lstatSync(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0 || typeof process.getuid !== "function" || stat.uid !== process.getuid()) throw piRecoveryFailure();
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw piRecoveryFailure();
+  if (process.platform === "win32") {
+    inspectWindowsNativeSecurity(path, true);
+    const after = lstatSync(path);
+    if (stat.dev !== after.dev || stat.ino !== after.ino) throw piRecoveryFailure();
+  } else if ((stat.mode & 0o022) !== 0 || typeof process.getuid !== "function" || stat.uid !== process.getuid()) throw piRecoveryFailure();
   return `${stat.dev}:${stat.ino}`;
 }
 
@@ -174,8 +181,9 @@ export function observePiSession(cwd: string, sessionId: string, timestamp: stri
     if (realpathSync(location.sessionDir) !== location.sessionDir || realpathSync(expected) !== expected) throw piRecoveryFailure();
     fd = openSync(expected, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const before = fstatSync(fd);
-    if (!before.isFile() || before.nlink !== 1 || before.uid !== process.getuid!() || (before.mode & 0o022) !== 0 || before.size <= 0 || before.size > MAX_BYTES) throw piRecoveryFailure();
+    if (!before.isFile() || before.nlink !== 1 || process.platform !== "win32" && (before.uid !== process.getuid!() || (before.mode & 0o022) !== 0) || before.size <= 0 || before.size > MAX_BYTES) throw piRecoveryFailure();
     const bytes = readFileSync(fd);
+    const windowsOwner = process.platform === "win32" ? inspectWindowsNativeSecurity(expected, false, digest(bytes)) : undefined;
     const after = fstatSync(fd), current = lstatSync(expected);
     if (before.dev !== current.dev || before.ino !== current.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || bytes.length !== before.size) throw piRecoveryFailure();
     const content = bytes.toString("utf8");
@@ -187,6 +195,7 @@ export function observePiSession(cwd: string, sessionId: string, timestamp: stri
       device: String(before.dev), inode: String(before.ino), owner: before.uid, homeInode, directoryInode,
       bytes: bytes.length, sha256: digest(bytes), entries: rows.length, snapshotHash: digest(JSON.stringify(rows)),
       ...(continuation ? { continuation: true } : {}),
+      ...(windowsOwner ? {windowsOwner} : {}),
     });
   } catch { throw piRecoveryFailure(); }
   finally { if (fd !== undefined) closeSync(fd); }
@@ -288,9 +297,16 @@ export function materializePiRecoveryGuard(saved: PiNativeObservation, model: st
   const path = join(root, "guard.mjs"), acknowledgement = `phonon-pi-guard:${randomUUID()}`;
   const source = `import {createHash} from "node:crypto";
 import {lstatSync,readFileSync,realpathSync} from "node:fs";
+import {spawnSync} from "node:child_process";
+import {join} from "node:path";
 const saved=${JSON.stringify(saved)}, requested=${JSON.stringify(model)};
 const hash=value=>createHash("sha256").update(value).digest("hex");
 const fail=()=>{process.stderr.write("Pi native recovery guard rejected continuation\\n");process.exit(78);};
+const windowsSecurity=${JSON.stringify(WINDOWS_NATIVE_SECURITY_SCRIPT)};
+const security=(path,directory,sha256)=>{
+  const r=spawnSync(join(process.env.SystemRoot??'C:\\\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path,directory,sha256}),encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
+  if(r.error||r.status!==0)fail();const v=JSON.parse(r.stdout);if(v.ok!==true||v.owner!==saved.windowsOwner)fail();
+};
 export default function activate(pi){
   const identity=ctx=>{
     const sm=ctx.sessionManager,h=sm.getHeader(),m=ctx.model;
@@ -301,10 +317,12 @@ export default function activate(pi){
   pi.on("session_start",(_event,ctx)=>{try{
     identity(ctx);
     for(const [path,inode] of [[saved.home,saved.homeInode],[saved.sessionDir,saved.directoryInode]]){
-      const s=lstatSync(path);if(!s.isDirectory()||s.uid!==saved.owner||(s.mode&0o022)!==0||s.dev+":"+s.ino!==inode||realpathSync(path)!==path)fail();
+      const s=lstatSync(path);if(!s.isDirectory()||s.isSymbolicLink()||process.platform!=='win32'&&(s.uid!==saved.owner||(s.mode&0o022)!==0)||s.dev+":"+s.ino!==inode||realpathSync(path)!==path)fail();
+      if(process.platform==='win32'){security(path,true);const after=lstatSync(path);if(s.dev!==after.dev||s.ino!==after.ino)fail();}
     }
     const s=lstatSync(saved.path),bytes=readFileSync(saved.path);
-    if(!s.isFile()||s.nlink!==1||s.uid!==saved.owner||(s.mode&0o022)!==0||String(s.dev)!==saved.device||String(s.ino)!==saved.inode||realpathSync(saved.path)!==saved.path||hash(bytes.subarray(0,saved.bytes))!==saved.sha256)fail();
+    if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1||process.platform!=='win32'&&(s.uid!==saved.owner||(s.mode&0o022)!==0)||String(s.dev)!==saved.device||String(s.ino)!==saved.inode||realpathSync(saved.path)!==saved.path||hash(bytes.subarray(0,saved.bytes))!==saved.sha256)fail();
+    if(process.platform==='win32'){security(saved.path,false,hash(bytes));const after=lstatSync(saved.path);if(s.dev!==after.dev||s.ino!==after.ino||s.size!==after.size||s.mtimeMs!==after.mtimeMs||s.ctimeMs!==after.ctimeMs)fail();}
     const rows=[ctx.sessionManager.getHeader(),...ctx.sessionManager.getEntries()];
     if(hash(JSON.stringify(rows.slice(0,saved.entries)))!==saved.snapshotHash)fail();
     const extra=bytes.subarray(saved.bytes).toString("utf8");

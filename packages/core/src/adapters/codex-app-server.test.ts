@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { CodexAppServer } from "./codex-app-server.js";
@@ -35,6 +35,7 @@ for await(const line of createInterface({input:process.stdin})){
   send({id:f.id,method:"native/foreign",params:{threadId:"foreign",turnId:"native-turn"}});reply({actual:true});
  }else if(f.method==="test/malformed")process.stdout.write("not JSON\n");
 }
+if(process.env.FAKE_CLOSED_FILE){const{writeFileSync}=await import('node:fs');writeFileSync(process.env.FAKE_CLOSED_FILE,'native EOF history flushed');}
 `;
 
 async function fixture(mode: string, work: (f: { channel: CodexAppServer; events: any[]; failures: Error[]; requests: any[] }) => Promise<void>) {
@@ -53,6 +54,22 @@ async function fixture(mode: string, work: (f: { channel: CodexAppServer; events
     await work({ channel, events, failures, requests });
   });
 }
+
+test("Codex completed native turns flush history through EOF before forced tree cleanup", () => withPeerFixture("codex-native-eof", async scope => {
+  const bin = join(scope.root, "native.mjs"), flushed = join(scope.root, "flushed.txt");
+  writeFileSync(bin, "#!" + process.execPath + "\n" + fakeSource, {mode: 0o700});
+  const channel = new CodexAppServer({bin, args: [], cwd: scope.root, env: {PATH: process.env.PATH, FAKE_CLOSED_FILE: flushed},
+    onRuntime: runtime => scope.watch(runtime.child, true), notify: () => {}, request: async () => ({}), failed: () => {}});
+  scope.defer(() => channel.close());
+  await channel.initialize();
+  channel.bindThread((await channel.rpc("thread/start", {})).thread);
+  const clientUserMessageId = channel.arm("owned", "original");
+  channel.acceptStart(await channel.rpc("turn/start", {clientUserMessageId, input: [{type: "text", text: "original"}]}));
+  await channel.rpc("test/push", {frames: [{method: "turn/completed", params: {threadId: "native-thread", turn: {id: "native-turn", status: "completed"}}}]});
+  await channel.close();
+  assert.equal(readFileSync(flushed, "utf8"), "native EOF history flushed");
+  assert.equal(channel.runtime.hasStopped(), true);
+}));
 
 for (const mode of ["normal", "event-first"]) test(`Codex native steering correlates exact current-turn input (${mode})`, () => fixture(mode, async f => {
   await Promise.all([f.channel.insert("same input", { turnId: "phonon-turn", signal: new AbortController().signal }),

@@ -92,7 +92,7 @@ jobs:
             claude {
               & npm install --prefix $root --no-fund --no-audit '@anthropic-ai/claude-code@2.1.143' '@anthropic-ai/claude-agent-sdk@0.2.123'
               if ($LASTEXITCODE -ne 0) { throw 'Claude preparation failed' }
-              Set-NativeEnv PHONON_TEST_CLAUDE_BIN "$root/node_modules/@anthropic-ai/claude-code/cli.js"
+              Set-NativeEnv PHONON_TEST_CLAUDE_BIN "$root/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
               Set-NativeEnv PHONON_TEST_CLAUDE_SDK "$root/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs"
             }
             copilot {
@@ -120,6 +120,10 @@ jobs:
               $source = Join-Path $root 'hermes-agent-9e0dc4319ae2d59c60f5226b5c0af58d17755bfa'
               & uv sync --project $source --frozen --no-dev --extra edge-tts --extra anthropic --python "$env:pythonLocation/python.exe"
               if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows Hermes preparation failed' }
+              & "$source/.venv/Scripts/python.exe" -m ensurepip --default-pip
+              if ($LASTEXITCODE -ne 0) { throw 'CI-only console launcher preparation failed' }
+              & "$source/.venv/Scripts/python.exe" -m pip install --no-deps --no-compile --force-reinstall $source
+              if ($LASTEXITCODE -ne 0) { throw 'Standard native Hermes console launcher preparation failed' }
               Set-NativeEnv PHONON_TEST_HERMES_BIN "$source/.venv/Scripts/hermes.exe"
             }
             opencode {
@@ -132,11 +136,15 @@ jobs:
               & npm install --prefix $root --no-fund --no-audit 'openclaw@2026.10.7'
               if ($LASTEXITCODE -ne 0) { throw 'OpenClaw preparation failed' }
               Set-NativeEnv PHONON_TEST_OPENCLAW_SDK "$root/node_modules/openclaw/dist/plugin-sdk"
+              Set-NativeEnv PHONON_TEST_OPENCLAW_STARTUP_MS '45000'
             }
             default { throw 'Unknown native harness' }
           }
       - name: Verify actual original-turn input and write a source-bound receipt
         run: node scripts/windows-native-qualification.mjs
+      - name: Verify Windows native history and capsule ACL boundaries
+        if: matrix.harness == 'pi'
+        run: node scripts/test-local.mjs focused --test-reporter=tap packages/core/dist/windows-native-file-security.test.js
       - name: Retain concise qualification evidence
         if: always()
         uses: actions/upload-artifact@v4

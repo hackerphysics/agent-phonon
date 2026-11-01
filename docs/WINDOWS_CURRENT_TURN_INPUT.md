@@ -30,6 +30,13 @@ proof that the original native execution has stopped. The CI-built helper is
 not itself a production deployment artifact or a replacement for the release
 toolchain/provenance checks.
 
+The Windows lane budgets 45 seconds for Gateway startup, separately from
+original-turn execution and input receipt deadlines. Its native lifecycle/lock
+startup includes Windows process-identity queries and exceeded the original
+15-second POSIX fixture allowance before listening. The first run remains a
+failed qualification, not a successful receipt. No permissions or native
+application/stop evidence requirements are relaxed.
+
 ## Activation Boundary
 
 CI qualification alone does not enable a user's Windows device. Prepare one

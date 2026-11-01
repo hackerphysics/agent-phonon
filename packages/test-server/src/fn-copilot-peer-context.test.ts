@@ -19,13 +19,14 @@ async function grantFixtureExtension(scope: PeerFixture, cwd: string, environmen
   // Synthetic fixture consent only. Production never calls this grant API.
   writeFileSync(runner, `
 import{CopilotClient,RuntimeConnection}from${JSON.stringify(pathToFileURL(join(sdk, "index.js")).href)};
+import{realpathSync}from"node:fs";
 const client=new CopilotClient({connection:RuntimeConnection.forStdio({path:${JSON.stringify(process.env.PHONON_TEST_COPILOT_BIN)},args:["--no-auto-update","--no-remote","--no-remote-export","--disable-builtin-mcps"]}),workingDirectory:process.cwd(),env:{...process.env},useLoggedInUser:false});
 let session;
 try{
  session=await client.createSession({sessionId:${JSON.stringify(sessionId)},workingDirectory:process.cwd(),enableConfigDiscovery:true,onPermissionRequest:()=>({kind:"reject"})});
  if((await client.getStatus()).version!=="1.0.82")throw new Error("Unqualified native fixture version");
  const location=await session.rpc.permissions.locations.resolve({workingDirectory:process.cwd()});
- if(location.locationKey!==process.cwd())throw new Error("Fixture consent escaped its directory");
+ if(typeof location.locationKey!=="string"||realpathSync(location.locationKey)!==realpathSync(process.cwd()))throw new Error("Fixture consent escaped its directory");
  const result=await session.rpc.permissions.locations.addToolApproval({locationKey:location.locationKey,approval:{kind:"extension-permission-access",extensionName:"plugin:agent-phonon:peer-context"}});
  if(result.success!==true)throw new Error("Native fixture consent was not persisted");
  ${approveCoordination?'if((await session.rpc.permissions.locations.addToolApproval({locationKey:location.locationKey,approval:{kind:"custom-tool",toolName:"phonon_project_coordination"}})).success!==true)throw new Error("Native fixture tool consent unavailable");':''}

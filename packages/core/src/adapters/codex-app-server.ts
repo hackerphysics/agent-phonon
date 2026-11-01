@@ -214,7 +214,7 @@ export class CodexAppServer {
     this.runtime.child.stdin.write(JSON.stringify(frame) + "\n");
   }
 
-  private fail(error: Error, report = true): void {
+  private fail(error: Error, report = true, terminate = true): void {
     if (this.failure || this.closing) return;
     this.failure = error;
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
@@ -223,14 +223,21 @@ export class CodexAppServer {
     for (const controller of this.serverRequests.values()) controller.abort();
     this.serverRequests.clear();
     if (report) this.options.failed(error);
-    void this.runtime.terminate();
+    if (terminate) void this.runtime.terminate();
   }
 
   close(): Promise<void> {
     if (this.closing) return this.closing;
-    this.fail(unavailable(), false);
+    const graceful = this.ended && !this.failure;
+    this.fail(unavailable(), false, !graceful);
     this.options.signal?.removeEventListener("abort", this.abort);
     this.closing = (async () => {
+      if (graceful) {
+        // EOF lets the native server flush its original history before exit.
+        this.runtime.child.stdin.end();
+        const deadline = Date.now() + 1000;
+        while (!this.runtime.hasStopped() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+      }
       await this.runtime.terminate();
       const deadline = Date.now() + 1000;
       while (!this.runtime.hasStopped() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));

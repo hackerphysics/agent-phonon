@@ -1,6 +1,7 @@
 import {lstatSync,realpathSync} from "node:fs";
 import {basename,dirname,join} from "node:path";
 import {DatabaseSync} from "node:sqlite";
+import {inspectWindowsNativeSecurity} from "../windows-native-file-security.js";
 
 type Identity={sessionId:string;cwd:string;model:string;prompt:string;notBefore:number};
 const id=(value:unknown,prefix:string)=>typeof value==="string"&&value.length<=512&&new RegExp("^"+prefix+"_[A-Za-z0-9]+$").test(value);
@@ -10,11 +11,17 @@ const timestamp=(value:unknown):value is number=>typeof value==="number"&&Number
 export function readOpenCodeCompletion(file:string,identity:Identity):{messageId:string;text:string}|undefined {
   let db:DatabaseSync|undefined;
   try{
-    if(process.platform==="win32"||!id(identity.sessionId,"ses")||!timestamp(identity.notBefore)||identity.model&&!identity.model.includes("/"))return;
+    if(!id(identity.sessionId,"ses")||!timestamp(identity.notBefore)||identity.model&&!identity.model.includes("/"))return;
     const directory=realpathSync(dirname(file)),cwd=realpathSync(identity.cwd),info=lstatSync(file),parent=lstatSync(directory);
-    const owned=(stat:typeof info)=>stat.uid===process.getuid?.()&&(stat.mode&0o022)===0;
+    const owned=(stat:typeof info)=>process.platform==="win32"||stat.uid===process.getuid?.()&&(stat.mode&0o022)===0;
     if(!owned(info)||!owned(parent)||!parent.isDirectory()||!info.isFile()||info.isSymbolicLink()||info.nlink!==1
       ||realpathSync(file)!==join(directory,basename(file)))return;
+    if(process.platform==="win32"){
+      inspectWindowsNativeSecurity(directory,true);
+      inspectWindowsNativeSecurity(file,false);
+      const after=lstatSync(file),parentAfter=lstatSync(directory);
+      if(after.dev!==info.dev||after.ino!==info.ino||parentAfter.dev!==parent.dev||parentAfter.ino!==parent.ino)return;
+    }
     db=new DatabaseSync(file,{readOnly:true});db.exec("BEGIN");
     const session=db.prepare("SELECT directory,parent_id FROM session WHERE id=?").get(identity.sessionId);
     if(!session||session.parent_id!==null||typeof session.directory!=="string"||realpathSync(session.directory)!==cwd)return;
@@ -57,6 +64,7 @@ export function readOpenCodeCompletion(file:string,identity:Identity):{messageId
     const result=text.join("\n"),current=lstatSync(file);
     if(stops!==1||!result.trim()||Buffer.byteLength(result)>128000||current.ino!==info.ino||current.dev!==info.dev
       ||!current.isFile()||current.isSymbolicLink()||current.nlink!==1||!owned(current))return;
+    if(process.platform==="win32")inspectWindowsNativeSecurity(file,false);
     return {messageId:lastId!,text:result};
   }catch{return;}
   finally{try{db?.close();}catch{/* Optional source proof never replaces the native exit. */}}

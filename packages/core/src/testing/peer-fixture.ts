@@ -28,7 +28,7 @@ function privateDirectory(path: string): string {
   if (!stat.isDirectory() || stat.isSymbolicLink() || process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)) {
     throw new Error("Peer fixture directory is not privately owned");
   }
-  return realpathSync(path);
+  return process.platform === "win32" ? realpathSync.native(path) : realpathSync(path);
 }
 
 async function signalCleanup(signal: NodeJS.Signals) {
@@ -68,7 +68,8 @@ export class PeerFixture {
     this.base = privateDirectory(base);
     const disk = statfsSync(this.base);
     if (disk.bavail * disk.bsize < 128 * 1024 * 1024) throw new Error("Insufficient disk space for bounded peer fixtures");
-    this.root = realpathSync(mkdtempSync(join(this.base, workflow + "-")));
+    const root = mkdtempSync(join(this.base, workflow + "-"));
+    this.root = process.platform === "win32" ? realpathSync.native(root) : realpathSync(root);
     const identity = lstatSync(this.root); this.identity = { dev: identity.dev, ino: identity.ino };
     try { this.record(true); }
     catch (error) { rmSync(this.root, { recursive: true, force: true }); throw error; }

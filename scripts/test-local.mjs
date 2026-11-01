@@ -62,6 +62,7 @@ const env = {
   ...(openCodeBin?{PHONON_TEST_OPENCODE_BIN:openCodeBin}:{}),
   ...(openCodeDeps?{PHONON_TEST_OPENCODE_DEPS:openCodeDeps}:{}),
   ...(openclawSDK?{PHONON_TEST_OPENCLAW_SDK:openclawSDK}:{}),
+  ...(openclawSDK&&process.env.PHONON_TEST_OPENCLAW_STARTUP_MS?{PHONON_TEST_OPENCLAW_STARTUP_MS:process.env.PHONON_TEST_OPENCLAW_STARTUP_MS}:{}),
 };
 // Required OS process-launch metadata only, not arbitrary inherited provider/proxy env.
 for (const name of ['SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT']) if (process.env[name]) env[name] = process.env[name];

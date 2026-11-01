@@ -7,6 +7,7 @@ import { AgentCoordinationInput, nativeVersionAtLeast } from "@agent-phonon/prot
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { verifiedNativeToolChannel } from "../native-tool-channel.js";
 import { buildChildProcessEnvironment } from "../child-env.js";
+import {inspectWindowsNativeSecurity, WINDOWS_NATIVE_SECURITY_SCRIPT} from "../windows-native-file-security.js";
 
 /** Native extension hooks, not messages, permission handlers or a mailbox tool. */
 export const COPILOT_PEER_CONTEXT_SOURCE = `export const nativeVersionAtLeast = ${nativeVersionAtLeast.toString()};\n` + String.raw`
@@ -317,6 +318,7 @@ export function prepareCopilotPeerContext(options: SendOptions, input: { session
   }
   let closed = false;
   try {
+    if(process.platform === "win32")inspectWindowsNativeSecurity(directory,true,undefined,true,true);
     // Keep credentials out of argv and native shell/MCP environments. The extension consumes this once.
     writeFileSync(join(directory, ".phonon-peer-owner.json"), JSON.stringify({ version: 1, pid: process.pid, workflow: "copilot-peer-context" }), { mode: 0o600, flag: "wx" });
     mkdirSync(extension, { recursive: true, mode: 0o700 });
@@ -324,13 +326,20 @@ export function prepareCopilotPeerContext(options: SendOptions, input: { session
     writeFileSync(modulePath, COPILOT_PEER_CONTEXT_SOURCE, { mode: 0o600, flag: "wx" });
     writeFileSync(join(extension, "channel.json"), JSON.stringify({ url: endpoint.href, token, sessionId: input.sessionId, cwd: realpathSync(input.cwd),
       promptHash: createHash("sha256").update(input.prompt).digest("hex"), nonce,budgetEnvironment,nativeInput:input.nativeInput===true,...(coordination?{coordination}:{}) }), { mode: 0o600, flag: "wx" });
-    writeFileSync(join(extension, "extension.mjs"), String.raw`
+    writeFileSync(join(extension, "extension.mjs"), `const windowsSecurity=${JSON.stringify(WINDOWS_NATIVE_SECURITY_SCRIPT)};\n` + String.raw`
 import {joinSession} from "@github/copilot-sdk/extension";
 import {readFileSync,lstatSync,unlinkSync,writeFileSync} from "node:fs";
 import {dirname,isAbsolute,join} from "node:path";
+import {fileURLToPath} from "node:url";
+import {spawnSync} from "node:child_process";
 import {installCopilotPeerContext,nativeVersionAtLeast} from "./bridge.mjs";
 const path=new URL("./channel.json",import.meta.url),stat=lstatSync(path);
-if(!stat.isFile()||stat.isSymbolicLink()||stat.nlink!==1||stat.size>4096||(stat.mode&0o077)!==0)throw new Error("Unsafe peer capsule");
+if(!stat.isFile()||stat.isSymbolicLink()||stat.nlink!==1||stat.size>4096||process.platform!=="win32"&&(stat.mode&0o077)!==0)throw new Error("Unsafe peer capsule");
+if(process.platform==="win32"){
+ const r=spawnSync(join(process.env.SystemRoot??'C:\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path:fileURLToPath(path),directory:false,private:true}),encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
+ if(r.error||r.status!==0||JSON.parse(r.stdout).ok!==true)throw new Error("Unsafe peer capsule ACL");
+ const after=lstatSync(path);if(after.dev!==stat.dev||after.ino!==stat.ino)throw new Error("Changed peer capsule");
+}
 const channel=JSON.parse(readFileSync(path,"utf8"));unlinkSync(path);
 const sdk=process.env.COPILOT_SDK_PATH;
 if(typeof sdk!=="string"||!isAbsolute(sdk))throw new Error("Native bundled SDK identity unavailable");
@@ -343,7 +352,11 @@ await installCopilotPeerContext({joinSession,channel,onReady:value=>writeFileSyn
       if (closed) return false;
       try {
         const path = join(extension, "native-ready.json"), stat = lstatSync(path);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 || (stat.mode & 0o077) !== 0) return false;
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 || process.platform !== "win32" && (stat.mode & 0o077) !== 0) return false;
+        if(process.platform === "win32"){
+          inspectWindowsNativeSecurity(path,false,undefined,true);
+          const after=lstatSync(path);if(after.dev!==stat.dev||after.ino!==stat.ino)return false;
+        }
         const value = JSON.parse(readFileSync(path, "utf8"));
         if (value.version !== 1 || value.nativeSessionId !== input.sessionId || value.nonce !== nonce || !Number.isSafeInteger(value.nativeProcessId) || value.nativeProcessId <= 0) return false;
         process.kill(value.nativeProcessId, 0);
