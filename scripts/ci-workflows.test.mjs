@@ -45,3 +45,21 @@ test('Windows native input qualification is main-only, serialized and requires a
   assert(runner.includes('counts.pass >= minimumPasses'));
   assert(runner.includes('productionActivated: false'));
 });
+
+test('Windows native runtime preparation is CI-only, source-bound and retains no personal state', () => {
+  const prepared=parse(readFileSync(new URL('../.github/workflows/windows-native-runtime.yml',import.meta.url),'utf8'));
+  const job=prepared.jobs.prepare;
+  assert.equal(job.if,"github.ref == 'refs/heads/main'");
+  assert.equal(job['runs-on'],'windows-2025');
+  assert.equal(prepared.concurrency['cancel-in-progress'],false);
+  assert.equal(job.steps.at(-1).if,'always()');
+  const upload=job.steps.find(step=>step.uses==='actions/upload-artifact@v4');
+  assert.equal(upload.with['retention-days'],3);
+  assert.equal(upload.with['if-no-files-found'],'error');
+  const builder=readFileSync(new URL('./prepare-windows-native-artifact.mjs',import.meta.url),'utf8');
+  assert(builder.includes("process.env.GITHUB_ACTIONS, 'true'"));
+  assert(builder.includes("process.env.GITHUB_REF, 'refs/heads/main'"));
+  assert(builder.includes("assert.equal(commit, process.env.GITHUB_SHA)"));
+  assert(builder.includes('productionActivated:false'));
+  assert(!builder.includes('process.env.HOME'));
+});

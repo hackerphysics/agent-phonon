@@ -1,0 +1,62 @@
+name: Prepare Windows native runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-runtime
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - name: Prepare ready-to-run native packages in CI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA -or (git status --porcelain)) { throw 'Only clean main source may prepare runtime artifacts' }
+          if ((Get-PSDrive C).Free -lt 8GB) { throw 'Insufficient artifact preparation headroom' }
+          $root = Join-Path $env:RUNNER_TEMP 'phonon-windows-runtime'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          & npm install --prefix $root --omit=dev --no-fund --no-audit 'openclaw@2026.10.9' '@earendil-works/pi-coding-agent@0.84.1' 'opencode-ai@1.15.10' '@opencode-ai/plugin@1.15.10' '@anthropic-ai/claude-agent-sdk@0.2.123'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows package preparation failed' }
+          $helperRoot = Join-Path $env:GITHUB_WORKSPACE 'packages/core/dist/native-process'
+          New-Item -ItemType Directory -Path $helperRoot -ErrorAction Stop | Out-Null
+          $binary = Join-Path $helperRoot 'phonon-process-job.exe'
+          & cl.exe /nologo /std:c11 /O2 /D_CRT_SECURE_NO_WARNINGS "/Fe:$binary" "/Fo:$env:RUNNER_TEMP/phonon-process-job.obj" packages/core/native/process-job.c
+          if ($LASTEXITCODE -ne 0) { throw 'Qualification Job helper compilation failed' }
+          @{version=1; platform='win32'; arch='x64'; file='phonon-process-job.exe'; sha256=(Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()} |
+            ConvertTo-Json -Compress | Set-Content -Encoding utf8NoBOM (Join-Path $helperRoot 'manifest.json')
+          & node scripts/prepare-windows-native-artifact.mjs $root
+          if ($LASTEXITCODE -ne 0) { throw 'Windows runtime integrity qualification failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-runtime
+          path: |
+            windows-native-runtime.tar.gz
+            windows-native-runtime.json
+            windows-native-evidence.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Remove this job's disposable runtime tree
+        if: always()
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'phonon-windows-runtime'
+          if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+
