@@ -98,7 +98,7 @@ const qualificationEnv={...nativeEnv,PHONON_TEST_CODEX_BIN:codex[0],PHONON_TEST_
 const acceptance=[];
 for(const harness of ['codex','copilot','pi','opencode','openclaw']){
   execFileSync(process.execPath,['scripts/windows-native-qualification.mjs'],{env:{...qualificationEnv,PHONON_WINDOWS_HARNESS:harness},
-    timeout:25*60*1000,stdio:'inherit'});
+    timeout:40*60*1000,stdio:'inherit'});
   const receipt=JSON.parse(await fs.readFile('windows-native-evidence.json'));assert.equal(receipt.success,true);acceptance.push(receipt);
 }
 await fs.rm(path.join(root,'package-lock.json'));

@@ -23,13 +23,22 @@ assert(process.env[required] && existsSync(process.env[required]), 'Prepared nat
 const receipt = {sourceCommit: process.env.GITHUB_SHA, harness, platform: process.platform, arch: process.arch,
   node: process.version, runId: process.env.GITHUB_RUN_ID, success: false, productionActivated: false};
 try {
-  const result = spawnSync(process.execPath, ['scripts/test-local.mjs', 'focused', '--test-reporter=tap', '--test-name-pattern=' + pattern, file],
+  const patterns=harness==='openclaw'?[
+    '^installed OpenClaw Gateway (baseline|midturn|initial|headroom|unknown_budget|resume|engine|engine_send) ',
+    '^installed OpenClaw Gateway (native_context|insert|insert_revoked|insert_headroom|insert_unknown|insert_closed|insert_stop|insert_engine) ',
+  ]:[pattern];
+  const counts={pass:0,fail:0,cancelled:0,skipped:0};
+  // Each Windows Gateway has a cold startup; keep each unchanged 15-minute runner bounded.
+  for(const selected of patterns){
+  const result = spawnSync(process.execPath, ['scripts/test-local.mjs', 'focused', '--test-reporter=tap', '--test-name-pattern=' + selected, file],
     {encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 20 * 60 * 1000});
   process.stdout.write(result.stdout ?? '');
   process.stderr.write(result.stderr ?? '');
   assert.ifError(result.error);
   assert.equal(result.status, 0, 'Actual native Windows acceptance failed');
-  const counts = Object.fromEntries([...result.stdout.matchAll(/^# (pass|fail|cancelled|skipped) (\d+)\r?$/gm)].map(value => [value[1], Number(value[2])]));
+  const batch=Object.fromEntries([...result.stdout.matchAll(/^# (pass|fail|cancelled|skipped) (\d+)\r?$/gm)].map(value => [value[1], Number(value[2])]));
+  for(const name of Object.keys(counts)){assert(Number.isSafeInteger(batch[name]),'Missing native test counts');counts[name]+=batch[name];}
+  }
   assert(counts.pass >= minimumPasses, 'Missing or skipped installed-native cases are not acceptance');
   assert.equal(counts.fail, 0);
   assert.equal(counts.cancelled, 0);

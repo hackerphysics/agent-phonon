@@ -222,7 +222,8 @@ export async function installCopilotPeerContext({joinSession,channel,onReady=()=
     ||!/^[a-f0-9]{64}$/.test(channel.promptHash||"")||typeof channel.cwd!=="string")throw new Error("Invalid owned native peer binding");
   let joined=false;
   const checkpoint=(path,input)=>new Promise((resolve,reject)=>{
-    const req=request(new URL(path,endpoint),{method:"POST",agent:false,signal:AbortSignal.timeout(1500),
+    // Native authorization rechecks Windows ACLs before applying any offered input.
+    const req=request(new URL(path,endpoint),{method:"POST",agent:false,signal:AbortSignal.timeout(process.platform==="win32"?10000:1500),
       headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"}},res=>{
       const chunks=[];let size=0;
       res.on("data",chunk=>{size+=chunk.length;if(size>65536){res.destroy();reject(new Error("Checkpoint exceeds limit"));}else chunks.push(chunk);});
