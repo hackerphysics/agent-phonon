@@ -7,6 +7,7 @@ import test from "node:test";
 import {PiAdapter} from "@agent-phonon/core";
 import type {AdapterSession} from "@agent-phonon/core";
 import {withPeerFixture, closePeerServer} from "../../core/dist/testing/peer-fixture.js";
+import {inspectWindowsNativeSecurity} from "../../core/dist/windows-native-file-security.js";
 
 for (const phase of ["insert", "revoked", "closed", "resume"] as const) test(`installed Pi current-turn ${phase} retains its original native RPC execution`, {
   skip: !process.env.PHONON_TEST_PI_BIN, timeout: 45000,
@@ -81,7 +82,14 @@ for (const phase of ["insert", "revoked", "closed", "resume"] as const) test(`in
   else if (phase === "revoked") {await assert.rejects(insertion!); assert.equal(accepted, false);}
   else {await insertion; assert.equal(accepted, true);}
   const checkpoint = session.recoveryCheckpoint?.();
-  assert(checkpoint, "The original native history must remain recoverable");
+  const diagnostics: Record<string, unknown> = {};
+  if (!checkpoint && process.platform === "win32") {
+    for (const [label, target] of [["home", home], ["sessions", join(home, "sessions")]] as const) {
+      try {diagnostics[label] = inspectWindowsNativeSecurity(target, true);} catch (error) {diagnostics[label] = String(error);}
+    }
+    diagnostics.nativeStop = await session.observeNativeStop?.("original");
+  }
+  assert(checkpoint, "The original native history must remain recoverable: " + JSON.stringify(diagnostics));
   if (phase === "resume") {
     const next = session.send("Continue the same native session.", {turnId: "next", verbosity: "tools", signal: AbortSignal.timeout(30000), emit: event => events.push(event)});
     pending.push(next); watchNative(); await next;

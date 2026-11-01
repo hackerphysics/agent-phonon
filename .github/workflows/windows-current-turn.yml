@@ -122,7 +122,7 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows Hermes preparation failed' }
               & "$source/.venv/Scripts/python.exe" -m ensurepip --default-pip
               if ($LASTEXITCODE -ne 0) { throw 'CI-only console launcher preparation failed' }
-              & "$source/.venv/Scripts/python.exe" -m pip install --no-deps --no-compile --force-reinstall $source
+              & "$source/.venv/Scripts/python.exe" -c "import sys; from pip._vendor.distlib.scripts import ScriptMaker; maker=ScriptMaker(None, sys.argv[1]); maker.executable=sys.executable; maker.clobber=True; maker.variants={''}; maker.make('hermes = hermes_cli.main:main')" "$source/.venv/Scripts"
               if ($LASTEXITCODE -ne 0) { throw 'Standard native Hermes console launcher preparation failed' }
               Set-NativeEnv PHONON_TEST_HERMES_BIN "$source/.venv/Scripts/hermes.exe"
             }

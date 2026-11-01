@@ -68,7 +68,11 @@ try {
     }finally{$stream.Dispose()}
   }
   @{ok=$true;owner=$owner}|ConvertTo-Json -Compress
-}catch{@{ok=$false}|ConvertTo-Json -Compress;exit 1}
+}catch{
+  $code=[string]$_.Exception.Message
+  if($code -notin @('invalid path','untrusted owner','null ACL','unsupported ACE','foreign access ACL','linked ancestor','linked target','wrong target type','not an empty owned directory','untrusted directory owner','invalid expected file','changed file bytes')){$code='native security query unavailable'}
+  @{ok=$false;code=$code}|ConvertTo-Json -Compress;exit 1
+}
 `;
 
 export function inspectWindowsNativeSecurity(path: string, directory: boolean, sha256?: string, privateFile = false, initializePrivateDirectory = false): string {
@@ -77,8 +81,9 @@ export function inspectWindowsNativeSecurity(path: string, directory: boolean, s
   const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(WINDOWS_NATIVE_SECURITY_SCRIPT, "utf16le").toString("base64")], {
     input: JSON.stringify({path, directory, sha256, private: privateFile, ...(initializePrivateDirectory ? {operation: "private-directory"} : {})}), encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 4096,
   });
-  if (result.error || result.status !== 0) throw new Error("Windows ownership or ACL could not be verified");
+  if (result.error) throw new Error("Windows ownership or ACL could not be verified");
   const value = JSON.parse(result.stdout);
+  if (result.status !== 0) throw new Error("Windows ownership or ACL could not be verified: " + value.code);
   if (value?.ok !== true || typeof value.owner !== "string" || !/^S-1-\d+(?:-\d+)+$/.test(value.owner)) throw new Error("Windows ownership is unconfirmed");
   return value.owner;
 }

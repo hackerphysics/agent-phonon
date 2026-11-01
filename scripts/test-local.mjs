@@ -2,7 +2,7 @@
 // Thin entrypoint using existing pnpm, node:test and unittest runners; no test framework.
 // Environment isolation follows acceptance/takeover-20260914-tests/run.py.
 import { mkdtempSync, mkdirSync, rmSync,writeFileSync,readFileSync,readdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join,isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn,execFile } from 'node:child_process';
@@ -29,7 +29,8 @@ const openCodeBin=process.env.PHONON_TEST_OPENCODE_BIN,openCodeDeps=process.env.
 for(const path of [openCodeBin,openCodeDeps])if(path&&(!isAbsolute(path)||/[\x00-\x1f\x7f]/.test(path)))throw new Error('Explicit absolute native OpenCode and prepared dependency paths are required');
 const openclawSDK=process.env.PHONON_TEST_OPENCLAW_SDK;
 if(openclawSDK&&(!isAbsolute(openclawSDK)||/[\x00-\x1f\x7f]/.test(openclawSDK)))throw new Error('An explicit absolute OpenClaw SDK path is required');
-const sandbox = mkdtempSync(join(tmpdir(), 'phonon-local-tests-'));
+// Windows TEMP may grant foreign replacement rights. Use an owned profile child.
+const sandbox = mkdtempSync(join(process.platform === 'win32' ? homedir() : tmpdir(), 'phonon-local-tests-'));
 const marker=join(sandbox,'resources.json'),nonce=randomUUID();
 let child,interrupted=false,settled=true;
 const record=()=>writeFileSync(marker,JSON.stringify({root,pid:process.pid,nonce,mode,childPID:child?.pid??null}),{mode:0o600});

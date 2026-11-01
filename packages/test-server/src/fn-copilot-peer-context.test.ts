@@ -189,7 +189,7 @@ for(const phase of ["insert","engine","revoked","closed","child","resume","denie
     writeFileSync(join(copilotHome,"config.json"),JSON.stringify(nativeSettings));
     writeFileSync(join(copilotHome,"settings.json"),JSON.stringify(nativeSettings));
     writeFileSync(join(scope.root,"input.txt"),"Original Copilot native file bytes\n");
-    const marker="CURRENT_COPILOT_"+randomUUID(),payloads:any[]=[],auxiliaries:any[]=[],errors:unknown[]=[],events:any[]=[],abort=new AbortController();
+    const marker="CURRENT_COPILOT_"+randomUUID(),payloads:any[]=[],auxiliaries:any[]=[],errors:unknown[]=[],events:any[]=[],budgets:any[]=[],abort=new AbortController();
     let session:AdapterSession|undefined,engine:SessionEngine|undefined,engineId:string|undefined,insertion:Promise<unknown>|undefined,ack:any,accepted=false,authorityChecks=0,raw="";
     const provider=createServer((req,res)=>{void(async()=>{
       if(req.method!=="POST"){req.resume();res.writeHead(200,{"Content-Type":"application/json"}).end('{"data":[]}');return;}
@@ -268,10 +268,12 @@ for(const phase of ["insert","engine","revoked","closed","child","resume","denie
     }else{
       session=await adapter.createSession({sessionId:"owned",agentId:"copilot",model:"gpt-4.1",cwd:scope.root});scope.defer(()=>session?.terminate());
       await session.preparePeerContext?.(environment);assert.equal(session.peerContextCapability?.()?.readiness,"pending");
-      run=session.send("Read input.txt once and finish.",{turnId:"original",verbosity:"tools",environment,signal:AbortSignal.any([abort.signal,AbortSignal.timeout(30000)]),emit:event=>events.push(event)});
+      run=session.send("Read input.txt once and finish.",{turnId:"original",verbosity:"tools",environment,signal:AbortSignal.any([abort.signal,AbortSignal.timeout(30000)]),emit:event=>events.push(event),
+        peerContext:{prepare:async boundary=>{budgets.push(boundary.budget);return {...boundary,messages:[],deferred:[]};},authorize:()=>{},observe:()=>{}}});
     }
     void run.catch(()=>{});await watch();await run;
-    assert.deepEqual(errors,[],JSON.stringify({events:events.slice(-5),requests:payloads.map(payload=>({model:payload.model,stream:payload.stream,hasInput:JSON.stringify(payload).includes(marker)})),auxiliaries}));
+    assert.deepEqual(errors,[],JSON.stringify({budgets,events:events.slice(-5),requests:payloads.map(payload=>({model:payload.model,stream:payload.stream,hasInput:JSON.stringify(payload).includes(marker)})),auxiliaries,
+      native:raw.split("\n").flatMap(line=>{try{const event=JSON.parse(line);return [{type:event.type,agentId:event.agentId,hookType:event.data?.hookType,success:event.data?.success,toolCallId:event.data?.toolCallId,turnId:event.data?.turnId,interactionId:event.data?.interactionId}];}catch{return [];}})}));
     assert.equal(events.at(-1)?.status,phase==="stop"?"interrupted":"completed",JSON.stringify(events.at(-1)));
     assert.ok(insertion);
     if(["revoked","closed","denied","headroom","unknown-budget","stop"].includes(phase))await assert.rejects(insertion);else await insertion;

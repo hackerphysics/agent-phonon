@@ -51,7 +51,7 @@ for (const phase of ["insert", "engine", "revoked", "headroom", "closed", "child
   const previous = new Map(["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CLAUDECODE"].map(key => [key, process.env[key]]));
   process.env.HOME = root; process.env.USERPROFILE = root; process.env.CLAUDE_CONFIG_DIR = join(root, "claude"); delete process.env.CLAUDECODE;
   scope.defer(() => { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
-  const payloads: any[] = [], events: any[] = [], errors: unknown[] = [], sent: any[] = [], abort = new AbortController();
+  const payloads: any[] = [], events: any[] = [], errors: unknown[] = [], sent: any[] = [], budgets: any[] = [], abort = new AbortController();
   let session: AdapterSession | undefined, insertion: Promise<void> | undefined, insertionState = "pending", raw = "";
   let engine:SessionEngine|undefined,engineSessionId:string|undefined,insertAck:any;
   const action = { operation: "send", requestId: randomUUID(), recipientId: randomUUID(), kind: "notice", text: "Native Claude MCP result" };
@@ -90,6 +90,7 @@ for (const phase of ["insert", "engine", "revoked", "headroom", "closed", "child
   const adapter = new ClaudeCodeAdapter({ env: { binPath: process.env.PHONON_TEST_CLAUDE_BIN, sdkPath:process.env.PHONON_TEST_CLAUDE_SDK, defaultModel: "claude-sonnet-4-5-20250929", baseUrl: `http://127.0.0.1:${(provider.address() as { port: number }).port}`, authToken: "controlled-claude-key" } });
   const discovered = await adapter.discoverAgents(); assert.equal(discovered[0]!.capabilities.injectMidTurn, true);
   const options: SendOptions = { turnId: "original-turn", verbosity: "tools", signal: AbortSignal.any([abort.signal, AbortSignal.timeout(30000)]), emit: event => events.push(event),
+    peerContext: {prepare: async boundary => {budgets.push(boundary.budget); return {...boundary, messages: [], deferred: []};}, authorize: () => {}, observe: () => {}},
     ...(phase === "mcp" ? { projectCoordination: async () => ({}) } : {}), environment: { ...controllerEnvironment, CLAUDE_CONFIG_DIR: join(root, "claude"),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1", HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "",
       ...(phase === "headroom" ? { MAX_THINKING_TOKENS: "55000" } : {}) } };
@@ -117,7 +118,7 @@ for (const phase of ["insert", "engine", "revoked", "headroom", "closed", "child
   const deadline = Date.now() + 5000; while (!(session as any).current && !events.some(event => event.final) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   const native = watchNative(scope,session);native?.stdout?.on("data", (chunk: any) => { raw = (raw + String(chunk)).slice(-128000); });
   await run;
-  assert.deepEqual(errors, []); assert.equal(events.at(-1)?.status, "completed", JSON.stringify(events));
+  assert.deepEqual(errors, [], JSON.stringify({budgets, events: events.slice(-8), native: raw.split("\n").flatMap(line => {try{const v=JSON.parse(line);return [{type:v.type,subtype:v.subtype,parent:v.parent_tool_use_id}];}catch{return [];}})})); assert.equal(events.at(-1)?.status, "completed", JSON.stringify(events));
   if (phase !== "mcp") { assert.ok(insertion); if (["revoked","headroom","closed"].includes(phase)) await assert.rejects(insertion); else await insertion; }
   if(phase==="engine")assert.deepEqual(insertAck,{turnId:"original-turn",disposition:"injected"});
   if (phase === "resume") {
