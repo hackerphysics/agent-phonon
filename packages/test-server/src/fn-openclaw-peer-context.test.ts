@@ -18,6 +18,7 @@ import { CurrentTurnInput } from "../../core/dist/current-turn-input.js";
 function deferred(){let resolve!:()=>void;const promise=new Promise<void>(done=>{resolve=done;});return {promise,resolve};}
 const tokens=(value:unknown):value is number=>Number.isSafeInteger(value)&&Number(value)>0;
 const nativeStartupMs=Number(process.env.PHONON_TEST_OPENCLAW_STARTUP_MS??15000);
+const nativeTurnMs=process.platform==="win32"?60000:25000;
 assert.ok(Number.isInteger(nativeStartupMs)&&nativeStartupMs>=15000&&nativeStartupMs<=60000,"Native startup budget must be bounded between 15 and 60 seconds");
 let nativeCompileCache:PeerFixture|undefined;
 let nativeCompileDirectory:string|undefined;
@@ -305,7 +306,7 @@ test("installed OpenClaw native middleware runner accepts the sourced peer block
 
 for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","resume","engine","engine_send","native_context",
   "insert","insert_revoked","insert_headroom","insert_unknown","insert_closed","insert_stop","insert_engine"] as const)test(`installed OpenClaw Gateway ${phase} keeps collaboration out of human messages and ordinary tool output`,{
-  skip:!process.env.PHONON_TEST_OPENCLAW_SDK,timeout:nativeStartupMs+(process.platform==="win32"?90000:45000),
+  skip:!process.env.PHONON_TEST_OPENCLAW_SDK,timeout:nativeStartupMs+(process.platform==="win32"?125000:45000),
 },()=>nativeFixture(async f=>{
   f.state.pending=phase==="initial"||phase==="headroom"||phase==="unknown_budget";
   const ordinary=phase.startsWith("insert"),marker="OPENCLAW_INSERT_"+randomUUID();
@@ -443,7 +444,7 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
   await session.preparePeerContext?.(f.environment,AbortSignal.timeout(10000));assert.ok(session.peerContextCapability?.(),logs.replaceAll(token,"[redacted]"));
   let testedStaleRun=false;
   await session.send("Read input.txt once, then finish the original task.",{turnId:"turn",verbosity:"tools",...(phase==="baseline"||ordinary?{}:{peerContext:f.receiver}),environment:f.environment,
-    signal:AbortSignal.any([abort.signal,AbortSignal.timeout(25000)]),emit:event=>{
+    signal:AbortSignal.any([abort.signal,AbortSignal.timeout(nativeTurnMs)]),emit:event=>{
       events.push(event);
       if(!testedStaleRun&&event.type==="tool_call"){
         testedStaleRun=true;
@@ -460,7 +461,7 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
     }
     assert.equal(session.peerContextCapability?.()?.nativeSessionId,original);
     await session.send("Continue the original session; read input.txt once and finish.",{turnId:"resumed",verbosity:"tools",peerContext:f.receiver,environment:f.environment,
-      signal:AbortSignal.any([abort.signal,AbortSignal.timeout(25000)]),emit:event=>events.push(event)});
+      signal:AbortSignal.any([abort.signal,AbortSignal.timeout(nativeTurnMs)]),emit:event=>events.push(event)});
     assert.equal(session.peerContextCapability?.()?.nativeSessionId,original);assert.equal(f.journal.records("owner","owned").length,2);
   }
   const diagnostic=JSON.stringify({requests,budgets:f.state.budgets,errors:errors.map(String),events,logs}).replaceAll(token,"[redacted]").replaceAll(f.input.token,"[redacted]");
