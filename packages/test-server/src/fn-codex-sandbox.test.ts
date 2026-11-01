@@ -36,10 +36,11 @@ for (const event of [{type: 'thread.started', thread_id: id}, {type: 'item.compl
 
 function assertSandbox(args: string[]) {
   const overrides = args.flatMap((arg, index) => arg === "-c" ? [args[index + 1]!] : []);
-  assert.deepEqual(overrides.filter(value => value.startsWith("sandbox_mode=")), ['sandbox_mode="workspace-write"']);
+  assert.deepEqual(overrides.filter(value => value.startsWith("sandbox_mode=")), ['sandbox_mode="danger-full-access"']);
+  assert.deepEqual(overrides.filter(value => value.startsWith("approval_policy=")), ['approval_policy="never"']);
   assert.ok(!args.some(arg => /dangerously|--full-auto|--approve-for-me/.test(arg)));
-  assert.ok(!overrides.some(value => /^(approval_policy|approvals_reviewer|sandbox_workspace_write\.|permissions\.)/.test(value)),
-    "working-directory writes must not override native approvals, networking or additional writable roots");
+  assert.ok(!overrides.some(value => /^(approvals_reviewer|sandbox_workspace_write\.|permissions\.)/.test(value)),
+    "authority overrides must not rewrite approvals_reviewer or additional writable-root tables");
   assert.ok(args.includes("--skip-git-repo-check"));
 }
 
@@ -52,7 +53,7 @@ async function send(session: Awaited<ReturnType<CodexAdapter["createSession"]>>,
 }
 
 for (const providerOverride of [false, true]) {
-  test(`Codex new and resumed turns explicitly allow workspace writes (provider override: ${providerOverride})`, fixtureOptions, async () => {
+  test(`Codex new and resumed turns use Desktop-equivalent full authority (provider override: ${providerOverride})`, fixtureOptions, async () => {
     const f = fixture(providerOverride);
     const session = await f.adapter.createSession({sessionId: "sandbox", agentId: "codex", model: "fixture", cwd: f.cwd});
     try {
@@ -142,7 +143,8 @@ test("installed Codex writes inside its workspace on new and resumed turns while
   await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
   const port = (provider.address() as {port: number}).port;
   const adapter = new CodexAdapter({env: {binPath: process.env.PHONON_TEST_CODEX_BIN!, codexHome: home,
-    baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "isolated-fixture-not-a-real-key", defaultModel: "gpt-5.4"}});
+    baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: "isolated-fixture-not-a-real-key", defaultModel: "gpt-5.4",
+    sandboxMode: "workspace-write", approvalPolicy: "never"}});
   const session = await adapter.createSession({sessionId: "native-sandbox", agentId: "codex", model: "gpt-5.4", cwd});
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45000);
   try {

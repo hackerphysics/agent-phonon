@@ -172,6 +172,18 @@ export interface CodexEnv {
   providerId?: string;
   /** provider 显示名（默认 phonon-gateway）。 */
   providerName?: string;
+  /**
+   * Headless Phonon command sandbox. Defaults to danger-full-access so native DE
+   * sessions match Codex Desktop (git write + network). Confined coding profiles
+   * and sandbox-escape tests should pass workspace-write explicitly.
+   */
+  sandboxMode?: "danger-full-access" | "workspace-write";
+  /**
+   * Headless approval policy. Defaults to never so escalations do not depend on
+   * Codex Desktop approvals_reviewer=user, which fails as "approval request failed"
+   * under agent_phonon_native.
+   */
+  approvalPolicy?: "never" | "on-request" | "untrusted";
 }
 
 function codexProviderArgs(env: CodexEnv): string[] {
@@ -180,6 +192,13 @@ function codexProviderArgs(env: CodexEnv): string[] {
   return ["-c", `model_provider=${id}`, "-c", `model_providers.${id}.name=${name}`,
     "-c", `model_providers.${id}.base_url=${env.baseUrl}`, "-c", `model_providers.${id}.wire_api=${env.wireApi ?? "responses"}`,
     "-c", `model_providers.${id}.env_key=OPENAI_API_KEY`];
+}
+
+/** Explicit -c overrides so headless Phonon matches Desktop DE authority. */
+export function codexAuthorityArgs(env: Pick<CodexEnv, "sandboxMode" | "approvalPolicy"> = {}): string[] {
+  const sandbox = env.sandboxMode ?? "danger-full-access";
+  const approval = env.approvalPolicy ?? "never";
+  return ["-c", `sandbox_mode="${sandbox}"`, "-c", `approval_policy="${approval}"`];
 }
 
 function codexNativeEnvironment(env: CodexEnv, overlay?: Record<string, string>): NodeJS.ProcessEnv {
@@ -249,7 +268,8 @@ class CodexSession implements AdapterSession {
       ? ["exec", "resume", this.threadId, "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : [])]
       : ["exec", "-", "--json", ...this.providerArgs(), ...(this.model !== "default" ? ["--model", this.model] : [])];
     // exec defaults to read-only; -c also works for resume, which has no --sandbox option.
-    args.push("-c", 'sandbox_mode="workspace-write"');
+    // Default authority matches Codex Desktop: danger-full-access + approval never.
+    args.push(...codexAuthorityArgs(this.env));
     // Phonon authorizes the working directory; ordinary chats need no Git repo.
     args.push("--skip-git-repo-check");
     if(opts.reasoning?.level)args.push("-c",`model_reasoning_effort=${nativeReasoning(opts.reasoning.level)}`);
@@ -298,7 +318,7 @@ class CodexSession implements AdapterSession {
   private async runAppServer(prompt: string, opts: SendOptions): Promise<void> {
     const tools = new CodexNativeRequests(opts);
     opts.beforeNativeEffect?.();
-    const args = [...this.providerArgs(), "-c", 'sandbox_mode="workspace-write"', ...codexNativeToolArgs(opts)];
+    const args = [...this.providerArgs(), ...codexAuthorityArgs(this.env), ...codexNativeToolArgs(opts)];
     if (opts.reasoning?.level) args.push("-c", `model_reasoning_effort=${nativeReasoning(opts.reasoning.level)}`);
     const environment = this.nativeEnvironment(opts.environment);
     let resolve!: (value: { status: "completed" | "failed" | "interrupted" | "timeout"; message?: string }) => void;
