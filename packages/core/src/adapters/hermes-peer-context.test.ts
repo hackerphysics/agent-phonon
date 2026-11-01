@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { PeerContextJournal, PeerContextReceiver } from "../peer-context.js";
 import { PeerContextBridge } from "../peer-context-bridge.js";
 import { HERMES_PEER_CONTEXT_BRIDGE, hermesPeerContextEnvironment, hermesPeerContextSupported } from "./hermes-peer-context.js";
-import { hermesCommand } from "./hermes-command.js";
+import { hermesCommand, hermesBridgeInvocation } from "./hermes-command.js";
 import { HermesAdapter } from "./hermes.js";
 import { withPeerFixture, closePeerServer } from "../testing/peer-fixture.js";
 
@@ -165,8 +165,10 @@ async function receiverCase(mode: string, installed = false, revoke = false, for
     : process.env.PHONON_TEST_PYTHON ?? (process.platform === "win32" ? "python" : "python3");
   const capsule = hermesPeerContextEnvironment({environment,peerContext:receiver});
   try {
-    const run = execFile(python,["-B","-c",script(!installed)],{cwd:root,timeout:30000,maxBuffer:1024*1024,
-      env:{PATH:process.env.PATH,HOME:root,HERMES_HOME:root,TMPDIR:root,TMP:root,TEMP:root,PYTHONDONTWRITEBYTECODE:"1",LITELLM_LOCAL_MODEL_COST_MAP:"True",...capsule,PEER_TEST_CONTROL:controlUrl,PEER_TEST_MODE:mode,PEER_TEST_REVOKE:revoke?"1":"0",PEER_TEST_FOREIGN_EXECUTION:foreignExecution?"1":"0",PEER_TEST_VERSION:version}});
+    const invocation = hermesBridgeInvocation(script(!installed), []);
+    const run = execFile(python,invocation.args,{cwd:root,timeout:30000,maxBuffer:1024*1024,
+      env:{PATH:process.env.PATH,HOME:root,HERMES_HOME:root,TMPDIR:root,TMP:root,TEMP:root,PYTHONDONTWRITEBYTECODE:"1",HERMES_DISABLE_LAZY_INSTALLS:"1",LITELLM_LOCAL_MODEL_COST_MAP:"True",...capsule,PEER_TEST_CONTROL:controlUrl,PEER_TEST_MODE:mode,PEER_TEST_REVOKE:revoke?"1":"0",PEER_TEST_FOREIGN_EXECUTION:foreignExecution?"1":"0",PEER_TEST_VERSION:version}});
+    run.child.stdin?.end(invocation.stdin);
     scope.watch(run.child);scope.defer(async()=>{if(run.child.exitCode===null&&run.child.signalCode===null)run.child.kill("SIGTERM");await run.catch(()=>{});});
     const result=await run;
     assert.ok(result.stdout.includes('"peerReceive": true'),result.stderr);

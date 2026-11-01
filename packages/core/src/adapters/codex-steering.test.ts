@@ -51,7 +51,7 @@ for (const phase of ["baseline", "insert", "resume", "engine", "approval-allow",
       const name = mcp?namespace?.tools?.find((tool:any)=>tool.name==="phonon_project_coordination")?.name:names.includes("exec_command") ? "exec_command" : "shell_command";
       assert.ok(name&&(namespace||names.includes(name)),"actual native tool catalog: "+JSON.stringify(names));
       nativeResponse(res, { type: "function_call", id: "fc_original", call_id: "call_original", name,...(namespace?{namespace:namespace.name}:{}),
-        arguments: JSON.stringify(mcp?action:name === "exec_command" ? { cmd: "printf original-native-boundary",...(approval?{sandbox_permissions:"require_escalated",justification:"Controlled native approval check"}:{}) } : { command: "printf original-native-boundary" }) }, "response_"+payloads.length);
+        arguments: JSON.stringify(mcp?action:name === "exec_command" ? { cmd: "echo original-native-boundary",...(approval?{sandbox_permissions:"require_escalated",justification:"Controlled native approval check"}:{}) } : { command: "echo original-native-boundary" }) }, "response_"+payloads.length);
     } else {
       assert.equal(text.includes(marker), insert, "input must enter the actual original native context");
       if (insert) await insertion;

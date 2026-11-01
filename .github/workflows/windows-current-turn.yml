@@ -1,0 +1,153 @@
+name: Windows current-turn input
+
+on:
+  workflow_dispatch:
+    inputs:
+      harness:
+        description: Native harness to qualify
+        type: choice
+        default: all
+        options: [all, codex, claude, copilot, pi, hermes, opencode, openclaw]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-current-turn
+  cancel-in-progress: false
+
+jobs:
+  native-input:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        harness: ${{ fromJSON(inputs.harness == 'all' && '["codex","claude","copilot","pi","hermes","opencode","openclaw"]' || format('["{0}"]', inputs.harness)) }}
+    env:
+      PHONON_WINDOWS_HARNESS: ${{ matrix.harness }}
+      HERMES_DISABLE_LAZY_INSTALLS: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        if: matrix.harness == 'hermes'
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+        if: matrix.harness == 'hermes'
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Check committed main and disk headroom
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA) { throw 'Source commit changed' }
+          if (git status --porcelain) { throw 'Uncommitted source' }
+          if ((Get-PSDrive C).Free -lt 8GB) { throw 'Insufficient build disk headroom' }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      - name: Prepare the native Job Object helper in CI
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'packages/core/dist/native-process'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $binary = Join-Path $root 'phonon-process-job.exe'
+          & cl.exe /nologo /std:c11 /O2 /D_CRT_SECURE_NO_WARNINGS "/Fe:$binary" "/Fo:$env:RUNNER_TEMP/phonon-process-job.obj" packages/core/native/process-job.c
+          if ($LASTEXITCODE -ne 0) { throw 'Native Job helper compilation failed' }
+          @{version=1; platform='win32'; arch='x64'; file='phonon-process-job.exe'; sha256=(Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()} |
+            ConvertTo-Json -Compress | Set-Content -Encoding utf8NoBOM (Join-Path $root 'manifest.json')
+      - name: Prepare the selected native runtime without personal credentials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'phonon-windows-native'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          function Set-NativeEnv($Name, $Value) {
+            [Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
+            "$Name=$Value" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+          function Get-VerifiedRelease($Repo, $Tag, $Asset, $Sha) {
+            $archive = Join-Path $root $Asset
+            Invoke-WebRequest "https://github.com/$Repo/releases/download/$Tag/$Asset" -OutFile $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Sha) { throw 'Native release checksum mismatch' }
+            $members = @(& tar -tf $archive)
+            if ($LASTEXITCODE -ne 0 -or !$members.Count -or @($members | Where-Object { $_ -match '(^[\\/]|^[A-Za-z]:|(^|[\\/])\.\.([\\/]|$))' }).Count) { throw 'Invalid native archive members' }
+            & tar -xf $archive -C $root
+            if ($LASTEXITCODE -ne 0) { throw 'Native release extraction failed' }
+            Remove-Item -LiteralPath $archive
+          }
+          switch ($env:PHONON_WINDOWS_HARNESS) {
+            codex {
+              Get-VerifiedRelease 'openai/codex' 'rust-v0.165.0-alpha.1.2' 'codex-package-x86_64-pc-windows-msvc.tar.gz' '2c94827210d7d100633db08361dd9d8cdcc9c3ed6ee3cd062e21d7ad5206106d'
+              $files = @(Get-ChildItem $root -Recurse -File -Filter codex.exe)
+              if ($files.Count -ne 1) { throw 'Expected one native Codex package entry' }
+              Set-NativeEnv PHONON_TEST_CODEX_BIN $files[0].FullName
+            }
+            claude {
+              & npm install --prefix $root --no-fund --no-audit '@anthropic-ai/claude-code@2.1.143' '@anthropic-ai/claude-agent-sdk@0.2.123'
+              if ($LASTEXITCODE -ne 0) { throw 'Claude preparation failed' }
+              Set-NativeEnv PHONON_TEST_CLAUDE_BIN "$root/node_modules/@anthropic-ai/claude-code/cli.js"
+              Set-NativeEnv PHONON_TEST_CLAUDE_SDK "$root/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs"
+            }
+            copilot {
+              Get-VerifiedRelease 'github/copilot-cli' 'v1.0.82' 'copilot-win32-x64.zip' 'dec18634ab7cc62a8c6829b1a25e6dd84a22e941a9b9f75ef88e3ec2a718b78f'
+              $files = @(Get-ChildItem $root -Recurse -File -Filter copilot.exe)
+              if ($files.Count -ne 1) { throw 'Expected one native Copilot entry' }
+              Set-NativeEnv COPILOT_HOME "$root/home"
+              Set-NativeEnv COPILOT_CACHE_HOME "$root/cache"
+              & $files[0].FullName --version
+              if ($LASTEXITCODE -ne 0) { throw 'Copilot metadata preparation failed' }
+              Set-NativeEnv PHONON_TEST_COPILOT_BIN $files[0].FullName
+              Set-NativeEnv PHONON_TEST_COPILOT_CACHE_HOME "$root/cache"
+              Set-NativeEnv PHONON_TEST_COPILOT_SDK_ROOT "$root/cache/pkg/win32-x64/1.0.82/copilot-sdk"
+            }
+            pi {
+              & npm install --prefix $root --no-fund --no-audit '@earendil-works/pi-coding-agent@0.84.1'
+              if ($LASTEXITCODE -ne 0) { throw 'Pi preparation failed' }
+              Set-NativeEnv PHONON_TEST_PI_BIN "$root/node_modules/.bin/pi.cmd"
+            }
+            hermes {
+              $archive = Join-Path $root 'hermes.zip'
+              Invoke-WebRequest 'https://github.com/NousResearch/hermes-agent/archive/9e0dc4319ae2d59c60f5226b5c0af58d17755bfa.zip' -OutFile $archive
+              Expand-Archive $archive -DestinationPath $root
+              Remove-Item -LiteralPath $archive
+              $source = Join-Path $root 'hermes-agent-9e0dc4319ae2d59c60f5226b5c0af58d17755bfa'
+              & uv sync --project $source --frozen --no-dev --extra edge-tts --extra anthropic --python "$env:pythonLocation/python.exe"
+              if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows Hermes preparation failed' }
+              Set-NativeEnv PHONON_TEST_HERMES_BIN "$source/.venv/Scripts/hermes.exe"
+            }
+            opencode {
+              & npm install --prefix $root --no-fund --no-audit 'opencode-ai@1.15.3' '@opencode-ai/plugin@1.15.3'
+              if ($LASTEXITCODE -ne 0) { throw 'OpenCode preparation failed' }
+              Set-NativeEnv PHONON_TEST_OPENCODE_BIN "$root/node_modules/opencode-windows-x64/bin/opencode.exe"
+              Set-NativeEnv PHONON_TEST_OPENCODE_DEPS $root
+            }
+            openclaw {
+              & npm install --prefix $root --no-fund --no-audit 'openclaw@2026.10.7'
+              if ($LASTEXITCODE -ne 0) { throw 'OpenClaw preparation failed' }
+              Set-NativeEnv PHONON_TEST_OPENCLAW_SDK "$root/node_modules/openclaw/dist/plugin-sdk"
+            }
+            default { throw 'Unknown native harness' }
+          }
+      - name: Verify actual original-turn input and write a source-bound receipt
+        run: node scripts/windows-native-qualification.mjs
+      - name: Retain concise qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-current-turn-${{ matrix.harness }}
+          path: windows-native-evidence.json
+          if-no-files-found: ignore
+          retention-days: 3
+      - name: Remove this job's disposable native tree
+        if: always()
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'phonon-windows-native'
+          if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
