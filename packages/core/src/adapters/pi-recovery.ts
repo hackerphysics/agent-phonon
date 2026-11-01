@@ -305,7 +305,7 @@ const fail=()=>{process.stderr.write("Pi native recovery guard rejected continua
 const windowsSecurity=${JSON.stringify(WINDOWS_NATIVE_SECURITY_SCRIPT)};
 const security=(path,directory,sha256)=>{
   const r=spawnSync(join(process.env.SystemRoot??'C:\\\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path,directory,sha256})+'\\n',env:{SystemRoot:process.env.SystemRoot??'C:\\\\Windows'},encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
-  if(r.error||r.status!==0)fail();const v=JSON.parse(r.stdout);if(v.ok!==true||v.owner!==saved.windowsOwner)fail();
+  if(r.error||r.status!==0)fail();const v=JSON.parse(r.stdout);if(v.ok!==true||!directory&&v.owner!==saved.windowsOwner)fail();
 };
 export default function activate(pi){
   const identity=ctx=>{
