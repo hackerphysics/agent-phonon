@@ -204,7 +204,7 @@ def run():
                 profile_publish(profiles,stage,name,stage_fd)
             finally: profile_close(stage_fd)
             profile=directory(profiles,name)
-        if data.get('previousIdentity') and profile_identity(profile)!=data['previousIdentity']: fail('employee_profile_identity_changed')
+        if data.get('previousIdentity') and not profile_identity_equivalent(data['previousIdentity'], profile_identity(profile)): fail('employee_profile_identity_changed')
         if read(profile,'.phonon-employee.json')!=marker: fail('employee_profile_owner_conflict')
         assert_live()
         # A retry may find an already-published directory. Verify it instead of

@@ -25,6 +25,15 @@ def profile_identity(fd):
     value=os.fstat(fd)
     return 'p:'+format(value.st_dev,'x')+':'+format(value.st_ino,'x')
 
+def profile_identity_equivalent(expected, actual):
+    # APFS remounts can change st_dev while keeping the same directory inode.
+    if expected == actual: return True
+    if not isinstance(expected, str) or not isinstance(actual, str): return False
+    if not expected.startswith('p:') or not actual.startswith('p:'): return False
+    left=expected.split(':'); right=actual.split(':')
+    hexdigits=set('0123456789abcdef')
+    return len(left)==3 and len(right)==3 and left[2]==right[2] and all(part and set(part)<=hexdigits for part in left[1:]+right[1:])
+
 def profile_entries(fd):
     if os.name != 'nt': return os.listdir(fd)
     profile_root(fd.path,fd.identity)
