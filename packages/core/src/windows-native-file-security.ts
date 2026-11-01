@@ -5,12 +5,15 @@ import {isAbsolute, join} from "node:path";
 export const WINDOWS_NATIVE_SECURITY_SCRIPT = String.raw`
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-[Console]::InputEncoding=New-Object Text.UTF8Encoding($false)
-[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
+[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+[void][Reflection.Assembly]::Load('System.Web.Extensions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35')
+$json=[Web.Script.Serialization.JavaScriptSerializer]::new()
+$json.MaxJsonLength=16384
 try {
   $line=[Console]::In.ReadLine()
   if($null -eq $line -or $line.Length -gt 16384){throw 'invalid path'}
-  $request=$line|ConvertFrom-Json
+  $request=$json.DeserializeObject($line)
   $path=[IO.Path]::GetFullPath([string]$request.path)
   if($path -notmatch '^[A-Za-z]:\\' -or $path.Substring(2).Contains(':')){throw 'invalid path'}
   $user=[Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,7 +38,7 @@ try {
   $parent=[IO.Directory]::GetParent($path)
   while($null -ne $parent){
     if(([IO.File]::GetAttributes($parent.FullName) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'linked ancestor'}
-    [void](Check-Acl (Get-Acl -LiteralPath $parent.FullName) $true)
+    [void](Check-Acl ([IO.Directory]::GetAccessControl($parent.FullName)) $true)
     $parent=$parent.Parent
   }
   $attributes=[IO.File]::GetAttributes($path)
@@ -44,18 +47,18 @@ try {
   if($directory -ne [bool]$request.directory){throw 'wrong target type'}
   if([string]$request.operation -eq 'private-directory'){
     if(!$directory -or [IO.Directory]::GetFileSystemEntries($path).Length -ne 0){throw 'not an empty owned directory'}
-    $current=Get-Acl -LiteralPath $path
+    $current=[IO.Directory]::GetAccessControl($path)
     if($trusted -notcontains $current.GetOwner([Security.Principal.SecurityIdentifier]).Value){throw 'untrusted directory owner'}
-    $acl=New-Object Security.AccessControl.DirectorySecurity
+    $acl=[Security.AccessControl.DirectorySecurity]::new()
     $acl.SetOwner($user.User);$acl.SetAccessRuleProtection($true,$false)
     foreach($sid in $trusted){
-      $principal=New-Object Security.Principal.SecurityIdentifier($sid)
-      $rule=New-Object Security.AccessControl.FileSystemAccessRule($principal,[Security.AccessControl.FileSystemRights]::FullControl,([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
+      $principal=[Security.Principal.SecurityIdentifier]::new($sid)
+      $rule=[Security.AccessControl.FileSystemAccessRule]::new($principal,[Security.AccessControl.FileSystemRights]::FullControl,([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit),[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow)
       [void]$acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $path -AclObject $acl
+    [IO.Directory]::SetAccessControl($path,$acl)
   }
-  if($directory){$owner=Check-Acl (Get-Acl -LiteralPath $path) $false}
+  if($directory){$owner=Check-Acl ([IO.Directory]::GetAccessControl($path)) $false}
   else {
     $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try {
@@ -69,11 +72,11 @@ try {
       }
     }finally{$stream.Dispose()}
   }
-  @{ok=$true;owner=$owner}|ConvertTo-Json -Compress
+  [Console]::Out.WriteLine($json.Serialize(@{ok=$true;owner=$owner}))
 }catch{
   $code=[string]$_.Exception.Message
   if($code -notin @('invalid path','untrusted owner','null ACL','unsupported ACE','foreign access ACL','linked ancestor','linked target','wrong target type','not an empty owned directory','untrusted directory owner','invalid expected file','changed file bytes')){$code='native security query unavailable'}
-  @{ok=$false;code=$code}|ConvertTo-Json -Compress;exit 1
+  [Console]::Out.WriteLine($json.Serialize(@{ok=$false;code=$code}));exit 1
 }
 `;
 
