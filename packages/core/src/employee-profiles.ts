@@ -13,6 +13,20 @@ import { NativeFileBroker,NativeFileBrokerError,type NativeFileRequest } from ".
 import { workspacePathKey } from "./workspace-paths.js";
 
 const shared=new WeakMap<PhononStore,{uses:Map<string,number>;writes:Map<string,Promise<EmployeeProfileStatusResult>>}>();
+export const employeeIdentityEquivalent=(previous?:string,next?:string)=>{
+  if(!previous||!next)return previous===next;
+  if(previous===next)return true;
+  const parse=(value:string)=>{
+    if(value.startsWith("p:")){
+      const parts=value.split(":");
+      return parts.length===3&&/^[a-f0-9]+$/.test(parts[1]!)&&/^[a-f0-9]+$/.test(parts[2]!)?{kind:"hermes" as const,inode:parts[2]!}:undefined;
+    }
+    const parts=value.split(":");
+    return parts.length===2&&/^\d+$/.test(parts[0]!)&&/^\d+$/.test(parts[1]!)?{kind:"posix" as const,inode:parts[1]!}:undefined;
+  };
+  const left=parse(previous),right=parse(next);
+  return !!left&&!!right&&left.kind===right.kind&&left.inode===right.inode;
+};
 export const employeeHash=(value:unknown)=>{
   const normalize=(item:unknown):unknown=>Array.isArray(item)?item.map(normalize):item&&typeof item==="object"?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a<b?-1:a>b?1:0).map(([key,value])=>[key,normalize(value)])):item;
   return createHash("sha256").update(JSON.stringify(normalize(value))).digest("hex");
@@ -130,15 +144,17 @@ export class EmployeeProfiles {
     if(project.employeeId!==record.input.employeeId||project.path!==record.workspace.path)throw new PhononError("errPolicyDenied","employee project identity changed");
   }
   async status(id:string):Promise<EmployeeProfileStatusResult>{
-    const record=this.store.employeeProfile(this.tenant,id);if(!record)throw new PhononError("errInvalidParams","employee profile not found");
+    let record=this.store.employeeProfile(this.tenant,id);if(!record)throw new PhononError("errInvalidParams","employee profile not found");
     if(record.state!=="ready")return this.view(record);
     try{
       await this.checkWorkspace(record);const adapter=this.registry.resolve(record.input.agent);
       if(!adapter?.inspectEmployee)throw new Error("unsupported");
       const observed=await adapter.inspectEmployee(this.target(record));
       if(observed.home!==record.observation.home||JSON.stringify(observed.documentHashes)!==JSON.stringify(record.observation.documentHashes))throw new PhononError("employee_profile_local_changes","employee profile files changed outside the editor");
-      if(record.observation.nativeIdentity&&observed.nativeIdentity!==record.observation.nativeIdentity)throw new PhononError("employee_profile_identity_changed","native employee profile directory changed");
-      if(!record.observation.nativeIdentity&&observed.nativeIdentity)this.store.saveEmployeeProfile(this.tenant,id,{...record,observation:observed});
+      if(record.observation.nativeIdentity&&observed.nativeIdentity!==record.observation.nativeIdentity){
+        if(!employeeIdentityEquivalent(record.observation.nativeIdentity,observed.nativeIdentity))throw new PhononError("employee_profile_identity_changed","native employee profile directory changed");
+        record={...record,observation:observed};this.store.saveEmployeeProfile(this.tenant,id,record);
+      }else if(!record.observation.nativeIdentity&&observed.nativeIdentity)this.store.saveEmployeeProfile(this.tenant,id,{...record,observation:observed});
       return this.view({...record,observation:observed});
     }catch(error){return this.view({...record,state:"failed",errorCode:(error as {appCode?:string}).appCode??"employee_profile_unavailable"});}
   }
