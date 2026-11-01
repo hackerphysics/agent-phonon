@@ -21,6 +21,7 @@ import { PiCheckpoint, materializePiRecoveryGuard, observePiRpcSession, piRecove
 import { preparePiNativeTools } from "./pi-native-tools.js";
 import { PiRpcChannel } from "./pi-rpc.js";
 import { discoverPiNativeModels } from "./pi-models.js";
+import { nativeReasoning as nativeReasoningValue } from "../reasoning.js";
 import type {
   AgentCapabilities,
   AgentDescriptor,
@@ -363,8 +364,7 @@ class PiSession implements AdapterSession {
       else if (this.sessionFlags.session && this.sessionFlags.sessionId) args.push("--session-id", this.piSessionId);
       else if (this.sessionFlags.session && this.sessionFlags.name) args.push("--name", this.piSessionId);
       const reasoningLevel = opts.reasoning?.level;
-      const nativeReasoning = reasoningLevel
-        ? ({ low: "low", standard: "medium", high: "high", xhigh: "xhigh", max: "max" } as const)[reasoningLevel] : undefined;
+      const nativeReasoning = reasoningLevel ? nativeReasoningValue(reasoningLevel) : undefined;
       if (launchModel && launchModel !== "default") args.push("--model", launchModel);
       if (nativeReasoning) args.push("--thinking", nativeReasoning);
       if (this.env.appendSystemPrompt) args.push("--append-system-prompt", this.env.appendSystemPrompt);

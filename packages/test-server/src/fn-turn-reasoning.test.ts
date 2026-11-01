@@ -10,9 +10,9 @@ import { MockAdapter,TestConn } from "./harness.js";
 import {PeerFixture} from "../../core/dist/testing/peer-fixture.js";
 import {qualifyOpenClawTestGateway} from "./openclaw-policy-fixture.js";
 
-async function setup(send?: (input:string,opts:SendOptions)=>Promise<void>,reasoningControl=true){
+async function setup(send?: (input:string,opts:SendOptions)=>Promise<void>,reasoningControl=true,levels=["low","standard","high"]){
   const scope=new PeerFixture("turn-reasoning"),root=scope.root,store=new PhononStore(join(root,"state.db")),registry=new AdapterRegistry();
-  const adapter=new MockAdapter({caps:{reasoningControl},reasoningLevels:["low","standard","high"],sendDelayMs:30});
+  const adapter=new MockAdapter({caps:{reasoningControl},reasoningLevels:levels,sendDelayMs:30});
   if(send){const create=adapter.createSession.bind(adapter);adapter.createSession=async params=>{const session=await create(params);session.send=send;return session;};}
   registry.register(adapter);const tc=new TestConn({registry,store,workspaceRoot:root,tenantId:"owner"});
   const project=(await tc.call("project.create",{name:"reasoning",git:false}) as any).project.projectId;
@@ -136,6 +136,25 @@ test("TypeScript SDK forwards native reasoning and explicit default without agen
   assert.deepEqual(calls.map(call=>call.params),[{sessionId:"session",input:"task",reasoning:{level:"high"}},{sessionId:"session",input:"reset",reasoning:{level:null}},{sessionId:"session",input:"maximum",reasoning:{level:"max"}}]);
 });
 
+test("all native efforts survive SDK admission, queued turns and exact controller confirmation",async()=>{
+  const levels=["off","none","minimal","low","standard","high","xhigh","max","ultra","auto","adaptive","native-next"];
+  const state=await setup(undefined,true,levels);
+  try{
+    for(const level of levels)await state.tc.call("session.send",{sessionId:state.session,input:"original "+level,turnId:level,verbosity:"final",reasoning:{level}});
+    await state.tc.waitTurnEnd(levels.at(-1)!);
+    const proof=state.tc.streamEvents.filter(event=>event.type==="runtime_settings");
+    assert.deepEqual(proof.map(event=>(event.reasoning as any).requestedLevel),levels);
+    assert.deepEqual(proof.map(event=>(event.reasoning as any).nativeValue),levels.map(level=>level==="standard"?"medium":level));
+    assert.deepEqual(proof.map(event=>(event.reasoning as any).effectiveLevel),levels);
+    const reset=await state.tc.call("session.send",{sessionId:state.session,input:"default",reasoning:{level:null}}) as any;
+    await state.tc.waitTurnEnd(reset.turnId);
+    assert.equal((state.tc.streamEvents.filter(event=>event.type==="runtime_settings").at(-1)?.reasoning as any).nativeValue,null);
+    const calls:any[]=[],session=new PhononSession({call:async(method:string,params:unknown)=>{calls.push({method,params});return {};}} as never,"session");
+    for(const level of levels)await session.send("original "+level,{reasoning:{level}});
+    assert.deepEqual(calls.map(call=>call.params.reasoning.level),levels);
+  }finally{await state.close();}
+});
+
 test("Codex keeps actual completion when fresh setting evidence is absent or mismatched",async()=>{
   const scope=new PeerFixture("codex-effort-turns"),root=scope.root,home=process.env.HOME;
   process.env.HOME=root;
@@ -161,7 +180,7 @@ test("Hermes attempts native work even when its optional effort is clamped",asyn
     writeFileSync(join(root,"hermes_cli","main.py"),"def main():\n import sys\n from run_agent import AIAgent\n a=AIAgent()\n a.reasoning_config={'effort':sys.argv[sys.argv.index('--reasoning')+1] if '--reasoning' in sys.argv else 'low'}\n if 'mismatch' in sys.argv: a.reasoning_config={'effort':'low'}\n a.run_conversation()\n");
     writeFileSync(join(root,"run_agent.py"),"class AIAgent:\n def run_conversation(self,*a,**kw): return {'completed':True,'final_response':'native ran','messages':[]}\n");
     const session=await new HermesAdapter({env:{binPath:join(root,"hermes")}}).createSession({sessionId:"test",agentId:"hermes:base",model:"model",cwd:root});
-    for(const [input,level,expected] of [["override","standard","medium"],["default",null,"low"],["mismatch","high","low"]] as const){
+    for(const [input,level,expected] of [["override","standard","medium"],["default",null,"low"],["mismatch","high","low"],...["off","none","minimal","ultra","auto","adaptive","native-next"].map(level=>[level,level,level])] as const){
       const values:any[]=[],events:any[]=[];
       await session.send(input,{turnId:input,verbosity:"final",reasoning:{level},acknowledgeReasoning:value=>values.push(value),emit:event=>events.push(event)});
       assert.deepEqual(values,[expected]);assert.equal(events.at(-1).status,"completed");

@@ -105,7 +105,7 @@ const finish=(text,steering)=>{
  emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:text}});emit({type:'message_end',message});emit({type:'agent_settled',aborted:false});
 };
 let buffer='';for await(const bytes of process.stdin){buffer+=bytes;let end;while((end=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,end);buffer=buffer.slice(end+1);if(!line)continue;const command=JSON.parse(line);log(command);
- if(command.type==='get_state'&&!control.holdState)response(command,{sessionId:control.identity==='wrong'?'wrong':rows[0].id,sessionFile:file,model:{provider,id:control.model==='wrong'?'wrong':modelId},isStreaming:false,isCompacting:false,pendingMessageCount:control.pending?1:0});
+ if(command.type==='get_state'&&!control.holdState)response(command,{sessionId:control.identity==='wrong'?'wrong':rows[0].id,sessionFile:file,model:{provider,id:control.model==='wrong'?'wrong':modelId},thinkingLevel:control.thinkingLevel??(args.includes('--thinking')?args[args.indexOf('--thinking')+1]:'off'),isStreaming:false,isCompacting:false,pendingMessageCount:control.pending?1:0});
  else if(command.type==='prompt'){
   initial=command.message;response(command);emit({type:'agent_start'});
   if(!resumed)append('model_change',{provider,modelId});
@@ -147,6 +147,19 @@ async function until(check: () => boolean, ms = 5000) {
   while (!check()) { assert.ok(Date.now() < deadline, "native fixture observation deadline"); await new Promise(resolve => setTimeout(resolve, 10)); }
 }
 const nativeOptions = {skip: process.platform === "win32", timeout: 15000};
+
+test("Pi passes off and minimal through the native CLI and confirms only exact RPC state",nativeOptions,async()=>{
+  const f=nativeFixture({auto:true});let session:AdapterSession|undefined;
+  try{
+    session=await f.adapter().createSession(f.params);
+    for(const level of ["off","minimal","standard","xhigh","max"]){
+      const events:any[]=[],proof:unknown[]=[];
+      await session.send("original "+level,{turnId:level,verbosity:"final",reasoning:{level},acknowledgeReasoning:value=>proof.push(value),emit:event=>events.push(event)});
+      assert.deepEqual(proof,[level==="standard"?"medium":level]);assert.equal(events.at(-1)?.status,"completed");
+    }
+    assert.equal(f.calls().filter(command=>command.type==="prompt").length,5);
+  }finally{await session?.terminate();f.close();}
+});
 
 test("Pi adapter delivers steering through original RPC process/turn and retains complete native history", nativeOptions, async () => {
   const f = nativeFixture(), events: any[] = [], adapter = f.adapter(), session = await adapter.createSession(f.params);

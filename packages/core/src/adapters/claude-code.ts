@@ -19,6 +19,7 @@ import { PhononError } from "../rpc.js";
 import { CurrentTurnInput } from "../current-turn-input.js";
 import type { InsertionOptions } from "../adapter.js";
 import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, ModelInfo } from "@agent-phonon/protocol";
+import { nativeReasoning, reportedReasoningLevels } from "../reasoning.js";
 
 /**
  * Claude Code adapter（design D10，单 agent runtime）。
@@ -31,6 +32,12 @@ import type { AgentCapabilities, AgentDescriptor, StreamEvent, ContextItem, Mode
  *
  * 单 agent runtime：discoverAgents 只返回一个 claude-code。
  */
+
+export function parseClaudeReasoningLevels(help: string): string[] | undefined {
+  const block = help.match(/^[ \t]*--effort\b[^\r\n]*(?:\r?\n(?![ \t]*-)[ \t]{6,}[^\r\n]*)*/m)?.[0];
+  const list = block?.match(/\((?:choices?:\s*)?([a-z][a-z0-9_-]*(?:(?:\s*,\s*(?:or\s+)?|\s*\|\s*|\s+or\s+)[a-z][a-z0-9_-]*)+)\)/i)?.[1];
+  return list ? reportedReasoningLevels(list.split(/\s*,\s*(?:or\s+)?|\s*\|\s*|\s+or\s+/)) : undefined;
+}
 
 const CAPABILITIES: AgentCapabilities = {
   nativeSession: true, // --session-id / --resume
@@ -106,7 +113,7 @@ class ClaudeCodeSession implements AdapterSession {
   peerContextCapability() {
     return this.peerBinding?{mode:"context_hook",boundary:"after_tools",visibility:"collapsed",evidence:"context_hook",budget:"native_estimate",nativeSessionId:this.uuid} as const:undefined;
   }
-  constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[],private readonly nativeInput=false) {
+  constructor(sessionId: string, model: string, cwd: string, env: ClaudeCodeEnv, initialContext?: ContextItem[],private readonly nativeInput=false,private readonly reasoningControl=false) {
     this.sessionId = sessionId;
     this.model = model;
     this.cwd = cwd;
@@ -146,6 +153,7 @@ class ClaudeCodeSession implements AdapterSession {
     ];
     if (this.env.settingsPath) args.push("--setting-sources", "", "--settings", this.env.settingsPath);
     if (this.model !== "default") args.push("--model", this.model);
+    if (this.reasoningControl && opts.reasoning?.level) args.push("--effort", nativeReasoning(opts.reasoning.level)!);
     // 首轮 --session-id，后续 --resume（持续会话）
     const resumed=this.started;
     if (this.started) args.push("--resume", this.uuid);
@@ -162,7 +170,8 @@ class ClaudeCodeSession implements AdapterSession {
 
   private run(args: string[], stdin: string, turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions, resumed: boolean): Promise<void> {
     const peer=(opts.peerContext||opts.projectCoordination)&&this.peerBinding?prepareClaudePeerRunner(opts,this.peerBinding,{sessionId:this.uuid,
-      prompt:JSON.parse(stdin).message.content[0].text,model:this.model,resume:resumed,settingsPath:this.env.settingsPath,nativeInput:this.nativeInput}):undefined;
+      prompt:JSON.parse(stdin).message.content[0].text,model:this.model,resume:resumed,settingsPath:this.env.settingsPath,nativeInput:this.nativeInput,
+      ...(this.reasoningControl&&opts.reasoning?.level?{effort:nativeReasoning(opts.reasoning.level)!}:{})}):undefined;
     let owned:ProcessSupervisor|undefined;
     return new Promise<void>((resolve) => {
       // 剥离 CLAUDECODE* env（避免外层污染）
@@ -350,6 +359,12 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     const version = await this.probeVersion(signal);
     const available = version !== null;
     this.capabilities.injectMidTurn=available&&!!await qualifyClaudePeerContext(this.env.binPath??"claude");
+    const command=claudeNodeCommand(this.env.binPath??"claude");
+    const help=available?await discoveryProbe(command?.node??this.env.binPath??"claude",command?[command.entry,"--help"]:["--help"],signal):null;
+    const levels=help?parseClaudeReasoningLevels(help):undefined;
+    this.capabilities.reasoningControl=/^[ \t]*--effort\b/m.test(help??"");
+    const models=this.env.settingsPath ? [{ id: "default", displayName: "Selected standalone Claude settings", available: true }] : this.env.models?.length
+      ? this.env.models : [{ id: this.env.defaultModel, available: true }];
     return [{
       agentId: "claude-code" as AgentDescriptor["agentId"],
       displayName: "Claude Code",
@@ -357,9 +372,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       available,
       ...(available ? {} : { unavailableReason: "claude CLI not found" }),
       ...(version ? { version } : {}),
-      models: this.env.settingsPath ? [{ id: "default", displayName: "Selected standalone Claude settings", available: true }] : this.env.models?.length
-        ? this.env.models
-        : [{ id: this.env.defaultModel, available: true }],
+      models: models.map(model=>({...model,...(model.reasoningLevels===undefined&&levels?{reasoningLevels:levels}:{})})),
       capabilities: this.capabilities,
       scannedAt: new Date().toISOString(),
     }];
@@ -367,7 +380,7 @@ export class ClaudeCodeAdapter implements AgentAdapter {
 
   async createSession(params: CreateSessionParams): Promise<AdapterSession> {
     if(params.reattach)throw new PhononError("errSessionBusy","Claude native recovery is not verified; refusing a replacement session");
-    const session=new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext,this.capabilities.injectMidTurn);
+    const session=new ClaudeCodeSession(params.sessionId, params.model, params.cwd, this.env, params.initialContext,this.capabilities.injectMidTurn,this.capabilities.reasoningControl);
     await session.qualifyPeerContext();
     return session;
   }

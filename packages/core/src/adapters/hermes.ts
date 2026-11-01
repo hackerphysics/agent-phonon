@@ -103,7 +103,8 @@ export function parseHermesConfig(configPath = join(process.env.HERMES_HOME || j
 
 export function parseHermesReasoningLevels(help: string): ModelInfo["reasoningLevels"] {
   const block = help.match(/^[ \t]*--reasoning[^\r\n]*(?:\r?\n(?![ \t]*-)[ \t]{6,}[^\r\n]*)*/m)?.[0];
-  const values = block?.match(/\b(?:low|medium|high|xhigh|max)\b/g);
+  const list = block?.match(/(?:effort[^:]*:|choose)\s+([a-z][a-z0-9_-]*(?:(?:\s*,\s*(?:or\s+)?|\s+or\s+)[a-z][a-z0-9_-]*)*)/i)?.[1];
+  const values = list?.split(/\s*,\s*(?:or\s+)?|\s+or\s+/);
   return values?.length ? reportedReasoningLevels(values) : undefined;
 }
 

@@ -196,6 +196,14 @@ class SessionOptions(unittest.IsolatedAsyncioTestCase):
             ("session.send", {"sessionId": "session", "input": "maximum", "reasoning": {"level": "max"}}),
         ])
 
+        levels = ["off", "none", "minimal", "ultra", "auto", "adaptive", "native-next"]
+        for level in levels:
+            await session.send(level, reasoning={"level": level})
+        self.assertEqual(device.calls[3:], [
+            ("session.send", {"sessionId": "session", "input": level, "reasoning": {"level": level}})
+            for level in levels
+        ])
+
     async def test_compression_request_identity_and_status_are_forwarded(self):
         class Device:
             def __init__(self):
