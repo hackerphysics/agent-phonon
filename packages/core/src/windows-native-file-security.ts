@@ -21,12 +21,12 @@ try {
     $raw=[Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(),0)
     if($null -eq $raw.DiscretionaryAcl){throw 'null ACL'}
     foreach($ace in $raw.DiscretionaryAcl){
-      if(($ace.AceFlags -band [Security.AccessControl.AceFlags]::InheritOnly) -ne 0){continue}
+      if(([int]$ace.AceFlags -band [int][Security.AccessControl.AceFlags]::InheritOnly) -ne 0){continue}
       if($ace.AceType -eq [Security.AccessControl.AceType]::AccessDenied){continue}
       if($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed){throw 'unsupported ACE'}
       $mask=[long]0x500d0156;if($ancestor){$mask=[long]0x100d0040}
       $foreign=$owners -notcontains $ace.SecurityIdentifier.Value
-      if($foreign -and (($ace.AccessMask -band $mask) -ne 0 -or ([bool]$request.private -and !$ancestor -and ($ace.AccessMask -band [long]0x90000001) -ne 0))){throw 'foreign access ACL'}
+      if($foreign -and (([long]$ace.AccessMask -band $mask) -ne 0 -or ([bool]$request.private -and !$ancestor -and ([long]$ace.AccessMask -band [long]0x90000001) -ne 0))){throw 'foreign access ACL'}
     }
     return $owner
   }
