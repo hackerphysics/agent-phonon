@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
@@ -126,12 +126,12 @@ test("session stream sequence continues after all prior events are ACKed and the
 });
 
 test("connect.hello advertises local resumeFrom and welcome ACK is persisted before replay", async () => {
-  const wss = new WebSocketServer({ port: 0 });
+  const wss = new WebSocketServer({ host:"127.0.0.1",port: 0 });
   await new Promise<void>((resolve) => wss.once("listening", resolve));
   const address = wss.address();
   if (!address || typeof address === "string") throw new Error("missing websocket port");
   const serverUrl = `ws://127.0.0.1:${address.port}`;
-  const dbPath = join(mkdtempSync(join(tmpdir(), "phonon-welcome-ack-")), "state.sqlite");
+  const root=mkdtempSync(join(tmpdir(), "phonon-welcome-ack-")),dbPath=join(root,"state.sqlite");
   const store = new PhononStore(dbPath);
   const seed = new Outbox({ store, tenantId: "tenant-welcome" });
   seed.enqueue(event("s-resume", 0));
@@ -159,15 +159,18 @@ test("connect.hello advertises local resumeFrom and welcome ACK is persisted bef
   const client = new PhononClient({
     serverUrl, deviceId: "dev-resume", registry, store, expectedTenantId: "tenant-welcome",
   });
-  await client.connect();
-  await waitFor(() => replayed.length === 1);
-  assert.deepEqual(hello?.resumeFrom, [{ sessionId: "s-resume", fromSeq: 0 }]);
-  assert.deepEqual(replayed, [1], "server-ACKed seq 0 must be removed before replay");
-  assert.deepEqual(store.outboxLoad("tenant-welcome").map((r) => r.seq), [1], "welcome ACK must be durable");
-
-  await client.close();
-  store.close();
-  await new Promise<void>((resolve) => wss.close(() => resolve()));
+  try{
+    await client.connect();
+    await waitFor(() => replayed.length === 1);
+    assert.deepEqual(hello?.resumeFrom, [{ sessionId: "s-resume", fromSeq: 0 }]);
+    assert.deepEqual(replayed, [1], "server-ACKed seq 0 must be removed before replay");
+    assert.deepEqual(store.outboxLoad("tenant-welcome").map((r) => r.seq), [1], "welcome ACK must be durable");
+  }finally{
+    try{await client.close();}finally{
+      store.close();for(const socket of wss.clients)socket.terminate();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));rmSync(root,{recursive:true});
+    }
+  }
 });
 
 test("stream transport send failure leaves events in outbox for a later replay", async () => {
