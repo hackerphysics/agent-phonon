@@ -134,6 +134,7 @@ export function claudeOutputReserve({cwd,settingsPath,environment=process.env,ho
     }
     if(platform==="darwin")files.add("/Library/Application Support/ClaudeCode/managed-settings.json");
     else if(platform==="linux")files.add("/etc/claude-code/managed-settings.json");
+    else if(platform==="win32")files.add("C:\\Program Files\\ClaudeCode\\managed-settings.json");
     else return;
     for(const path of files){
       let stat;try{stat=lstatSync(path);}catch(error){if(error?.code==="ENOENT")continue;throw error;}

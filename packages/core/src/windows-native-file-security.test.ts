@@ -9,7 +9,8 @@ import {inspectWindowsNativeSecurity, WINDOWS_NATIVE_SECURITY_SCRIPT} from "./wi
 
 test("Windows native file security never executes on a foreign platform", {skip: process.platform === "win32"}, () => {
   assert.throws(() => inspectWindowsNativeSecurity("/must-not-read", false), /Windows identity/);
-  assert(WINDOWS_NATIVE_SECURITY_SCRIPT.includes("[Console]::In.ReadToEnd()"));
+  assert(WINDOWS_NATIVE_SECURITY_SCRIPT.includes("[Console]::In.ReadLine()"));
+  assert(!WINDOWS_NATIVE_SECURITY_SCRIPT.includes("[Console]::In.ReadToEnd()"));
   assert(WINDOWS_NATIVE_SECURITY_SCRIPT.includes("ReparsePoint"));
   assert(WINDOWS_NATIVE_SECURITY_SCRIPT.includes("DiscretionaryAcl"));
 });

@@ -172,9 +172,11 @@ test("Claude output reserve includes all possible native settings without changi
   const module=await import(pathToFileURL(asset.args[0]!).href),config=join(f.root,"config"),cwd=join(f.root,"workspace");mkdirSync(config);mkdirSync(cwd);mkdirSync(join(cwd,".claude"));
   const input={cwd,home:f.root,platform:"darwin",environment:{CLAUDE_CONFIG_DIR:config}};
   assert.equal(module.claudeOutputReserve(input),32000);
+  assert.equal(module.claudeOutputReserve({...input,platform:"win32"}),32000);
   writeFileSync(join(config,"settings.json"),JSON.stringify({env:{MAX_THINKING_TOKENS:"100000"}}));
   writeFileSync(join(cwd,".claude","settings.json"),JSON.stringify({env:{MAX_THINKING_TOKENS:"50000"}}));
   assert.equal(module.claudeOutputReserve(input),100001);
+  assert.equal(module.claudeOutputReserve({...input,platform:"win32"}),100001);
   assert.equal(module.claudeOutputReserve({...input,environment:{...input.environment,MAX_THINKING_TOKENS:"180000"}}),180001);
   const standalone=join(f.root,"standalone.json");writeFileSync(standalone,"{}");
   assert.equal(module.claudeOutputReserve({...input,settingsPath:standalone}),32000);

@@ -8,7 +8,9 @@ $ProgressPreference='SilentlyContinue'
 [Console]::InputEncoding=New-Object Text.UTF8Encoding($false)
 [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
 try {
-  $request=[Console]::In.ReadToEnd()|ConvertFrom-Json
+  $line=[Console]::In.ReadLine()
+  if($null -eq $line -or $line.Length -gt 16384){throw 'invalid path'}
+  $request=$line|ConvertFrom-Json
   $path=[IO.Path]::GetFullPath([string]$request.path)
   if($path -notmatch '^[A-Za-z]:\\' -or $path.Substring(2).Contains(':')){throw 'invalid path'}
   $user=[Security.Principal.WindowsIdentity]::GetCurrent()
@@ -79,7 +81,7 @@ export function inspectWindowsNativeSecurity(path: string, directory: boolean, s
   if (process.platform !== "win32" || !isAbsolute(path)) throw new Error("Windows identity requires an absolute native path");
   const executable = join(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe");
   const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(WINDOWS_NATIVE_SECURITY_SCRIPT, "utf16le").toString("base64")], {
-    input: JSON.stringify({path, directory, sha256, private: privateFile, ...(initializePrivateDirectory ? {operation: "private-directory"} : {})}), encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 4096,
+    input: JSON.stringify({path, directory, sha256, private: privateFile, ...(initializePrivateDirectory ? {operation: "private-directory"} : {})}) + "\n", encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 4096,
     env: {SystemRoot: process.env.SystemRoot ?? "C:\\Windows"},
   });
   if (result.error) throw new Error("Windows ownership or ACL could not be verified: " + (result.error as NodeJS.ErrnoException).code);
