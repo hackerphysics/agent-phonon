@@ -133,7 +133,7 @@ jobs:
               Set-NativeEnv PHONON_TEST_HERMES_BIN "$source/.venv/Scripts/hermes.exe"
             }
             opencode {
-              & npm install --prefix $root --no-fund --no-audit 'opencode-ai@1.15.3' '@opencode-ai/plugin@1.15.3'
+              & npm install --prefix $root --no-fund --no-audit 'opencode-ai@1.15.10' '@opencode-ai/plugin@1.15.10'
               if ($LASTEXITCODE -ne 0) { throw 'OpenCode preparation failed' }
               Set-NativeEnv PHONON_TEST_OPENCODE_BIN "$root/node_modules/opencode-windows-x64/bin/opencode.exe"
               Set-NativeEnv PHONON_TEST_OPENCODE_DEPS $root
@@ -142,7 +142,7 @@ jobs:
               & npm install --prefix $root --no-fund --no-audit 'openclaw@2026.10.7'
               if ($LASTEXITCODE -ne 0) { throw 'OpenClaw preparation failed' }
               Set-NativeEnv PHONON_TEST_OPENCLAW_SDK "$root/node_modules/openclaw/dist/plugin-sdk"
-              Set-NativeEnv PHONON_TEST_OPENCLAW_STARTUP_MS '45000'
+              Set-NativeEnv PHONON_TEST_OPENCLAW_STARTUP_MS '60000'
             }
             default { throw 'Unknown native harness' }
           }
