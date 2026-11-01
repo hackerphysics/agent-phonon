@@ -62,6 +62,7 @@ for (const phase of ["baseline", "insert", "resume", "engine", "approval-allow",
   })().catch(error => { errors.push(error); abort.abort();if(engine&&engineSessionId)void engine.interrupt("owner",engineSessionId).catch(()=>{});res.destroy(); }); });
   scope.defer(() => closePeerServer(provider)); await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
   const adapter = new CodexAdapter({ env: { binPath: process.env.PHONON_TEST_CODEX_BIN, codexHome: home, defaultModel: "gpt-5.4",
+    ...(approval?{sandboxMode:"workspace-write",approvalPolicy:"on-request"}:{}),
     models: [{ id: "gpt-5.4", available: true, reasoningLevels: ["low", "standard"] }],
     baseUrl: `http://127.0.0.1:${(provider.address() as { port: number }).port}/v1`, apiKey: "controlled-native-key" } });
   const inventory = await adapter.discoverAgents(); assert.equal(inventory[0]!.capabilities.injectMidTurn, true);

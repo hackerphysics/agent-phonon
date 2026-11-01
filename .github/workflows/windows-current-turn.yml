@@ -150,6 +150,13 @@ jobs:
         if: matrix.harness == 'claude'
         run: node scripts/test-local.mjs focused --test-reporter=tap --test-name-pattern="installed Claude hook adds" packages/core/dist/adapters/claude-input-lifecycle.test.js
       - name: Verify actual original-turn input and write a source-bound receipt
+        if: matrix.harness != 'openclaw'
+        run: node scripts/windows-native-qualification.mjs
+      - name: Verify isolated Windows Gateway startup before the full native suite
+        if: matrix.harness == 'openclaw'
+        run: node scripts/test-local.mjs focused --test-reporter=tap --test-name-pattern="^installed OpenClaw Gateway baseline " packages/test-server/dist/fn-openclaw-peer-context.test.js
+      - name: Verify actual Gateway original-turn input and write a source-bound receipt
+        if: matrix.harness == 'openclaw'
         run: node scripts/windows-native-qualification.mjs
       - name: Verify Windows native history and capsule ACL boundaries
         if: matrix.harness == 'pi'

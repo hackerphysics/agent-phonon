@@ -373,7 +373,9 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
       config:{peerContext:true,nativeInteractions:false,interceptTools:["fixture-no-legacy-hook"]}}}}};
   const originalConfig=JSON.stringify(config);writeFileSync(configPath,originalConfig,{mode:0o600});
   const entry=join(process.env.PHONON_TEST_OPENCLAW_SDK!,"../../openclaw.mjs");
+  const systemEnvironment=Object.fromEntries(["SystemRoot","SYSTEMROOT","COMSPEC","PATHEXT"].filter(name=>process.env[name]).map(name=>[name,process.env[name]!]));
   const native=spawnSupervisedAgent(process.execPath,[entry,"gateway","run","--port",String(port),"--bind","loopback"],{cwd:workspace,env:{PATH:process.env.PATH,HOME:f.scope.root,USERPROFILE:f.scope.root,
+    ...systemEnvironment,APPDATA:join(f.scope.root,"config"),LOCALAPPDATA:join(f.scope.root,"data"),
     TMPDIR:f.scope.root,TMP:f.scope.root,TEMP:f.scope.root,NODE_COMPILE_CACHE:f.compileDirectory,OPENCLAW_STATE_DIR:stateDir,OPENCLAW_CONFIG_PATH:configPath,OPENCLAW_GATEWAY_TOKEN:token,
     HTTP_PROXY:"",HTTPS_PROXY:"",ALL_PROXY:"",http_proxy:"",https_proxy:"",all_proxy:""}});
   const retireCache=f.compileCache.watch(native.child,true);f.scope.defer(retireCache);
