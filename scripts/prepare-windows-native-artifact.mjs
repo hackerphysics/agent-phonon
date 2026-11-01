@@ -4,6 +4,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
+import {pruneWindowsRuntime} from './windows-runtime-pruning.mjs';
 
 assert.equal(process.platform, 'win32');
 assert.equal(process.arch, 'x64');
@@ -60,27 +61,7 @@ execFileSync(copilot[0],['--version'],{env:nativeEnv,timeout:30000,stdio:'pipe'}
 await fs.rm(path.join(root,'synthetic-home'),{recursive:true,force:true});
 
 // Keep required package manifests/notices and native payloads, never tests or build tooling.
-const removed=[];
-async function prune(folder){
-  for(const item of await fs.readdir(folder,{withFileTypes:true})){
-    const file=path.join(folder,item.name),relative=path.relative(root,file);
-    if(/licen[sc]e|copying|copyright|notice/i.test(item.name))continue;
-    if(item.isSymbolicLink()){
-      const resolved=await fs.realpath(file);assert(resolved.startsWith(root+path.sep),'Escaping runtime link');continue;
-    }
-    if(item.isDirectory()){
-      if(/^(?:tests?|__tests__|fixtures?|__fixtures__|__mocks__|examples?|benchmarks?|coverage|\.cache|\.github|\.git|\.vscode)$/.test(item.name)){
-        await fs.rm(file,{recursive:true});removed.push(relative);
-      }else await prune(file);
-    }else if(/\.(?:map|tsbuildinfo)$|\.d\.[cm]?ts$|(?:^|\.)(?:test|spec)\.[cm]?[jt]s$/.test(item.name)){
-      await fs.rm(file);removed.push(relative);
-    }else if(item.name==='package.json'){
-      const pkg=JSON.parse(await fs.readFile(file));delete pkg.scripts;delete pkg.devDependencies;
-      await fs.writeFile(file,JSON.stringify(pkg)+'\n');
-    }
-  }
-}
-await prune(root);
+const removed=await pruneWindowsRuntime(root);
 const openclaw=path.join(root,'node_modules/openclaw/openclaw.mjs'),pi=path.join(root,'node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
   opencode=path.join(root,'node_modules/opencode-windows-x64/bin/opencode.exe');
 for(const [executable,args] of [[codex[0],['--version']],[copilot[0],['--version']],[opencode,['--version']],

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import './windows-runtime-pruning.test.mjs';
 
 // Reuse the daemon's declared YAML dependency rather than adding another copy.
 const require = createRequire(new URL('../packages/daemon/package.json', import.meta.url));
