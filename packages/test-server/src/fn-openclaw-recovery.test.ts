@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { WebSocketServer,type WebSocket } from "ws";
-import { AdapterRegistry,OpenClawGatewayAdapter,PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry,OpenClawGatewayAdapter,PhononStore,GatewayClient } from "@agent-phonon/core";
 import { TestConn } from "./harness.js";
 
 const model="local/m1";
@@ -91,6 +91,18 @@ async function fixture(){
     async close(){releaseHistory?.();await conn.conn.dispose();adapter.close();for(const socket of server.clients)socket.terminate();await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();rmSync(root,{recursive:true,force:true});},
   };
 }
+
+test("OpenClaw native creation has one bounded platform startup budget and never dispatches a turn",async()=>{
+  const f=await fixture();
+  try{
+    const gateway=(f.adapter as unknown as {gw:GatewayClient}).gw,rpc=gateway.rpc.bind(gateway),budgets:number[]=[];
+    gateway.rpc=(method,params,timeout)=>{if(method==="sessions.create")budgets.push(timeout!);return rpc(method,params,timeout);};
+    await f.create();
+    assert.deepEqual(budgets,[process.platform==="win32"?60000:15000]);
+    assert.equal(f.calls.filter(call=>call.method==="sessions.create").length,1);
+    assert.equal(f.inferences.length,0);
+  }finally{await f.close();}
+});
 
 test("OpenClaw Gateway DE recovery retains private/group native histories, memory, pending context and updated identity without work",async()=>{
   const f=await fixture();

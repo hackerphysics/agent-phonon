@@ -139,7 +139,7 @@ jobs:
               Set-NativeEnv PHONON_TEST_OPENCODE_DEPS $root
             }
             openclaw {
-              & npm install --prefix $root --no-fund --no-audit 'openclaw@2026.10.7'
+              & npm install --prefix $root --no-fund --no-audit 'openclaw@2026.10.9'
               if ($LASTEXITCODE -ne 0) { throw 'OpenClaw preparation failed' }
               Set-NativeEnv PHONON_TEST_OPENCLAW_SDK "$root/node_modules/openclaw/dist/plugin-sdk"
               Set-NativeEnv PHONON_TEST_OPENCLAW_STARTUP_MS '60000'

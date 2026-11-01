@@ -305,7 +305,7 @@ test("installed OpenClaw native middleware runner accepts the sourced peer block
 
 for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","resume","engine","engine_send","native_context",
   "insert","insert_revoked","insert_headroom","insert_unknown","insert_closed","insert_stop","insert_engine"] as const)test(`installed OpenClaw Gateway ${phase} keeps collaboration out of human messages and ordinary tool output`,{
-  skip:!process.env.PHONON_TEST_OPENCLAW_SDK,timeout:nativeStartupMs+45000,
+  skip:!process.env.PHONON_TEST_OPENCLAW_SDK,timeout:nativeStartupMs+(process.platform==="win32"?90000:45000),
 },()=>nativeFixture(async f=>{
   f.state.pending=phase==="initial"||phase==="headroom"||phase==="unknown_budget";
   const ordinary=phase.startsWith("insert"),marker="OPENCLAW_INSERT_"+randomUUID();
@@ -437,7 +437,9 @@ for(const phase of ["baseline","midturn","initial","headroom","unknown_budget","
     assert.ok(calls.every(call=>call.sessionId===owned.sessionId&&call.runId===runId));
     assert.equal(JSON.stringify(events).includes(f.message.text),false);assert.equal(readFileSync(configPath,"utf8"),settledConfig);return;
   }
-  const session=await adapter.createSession({sessionId:f.self.sessionId,agentId:"openclaw:worker",model:"phonon-fixture/m1",cwd:workspace});f.state.session=session;f.scope.defer(()=>session.terminate());
+  const session=await adapter.createSession({sessionId:f.self.sessionId,agentId:"openclaw:worker",model:"phonon-fixture/m1",cwd:workspace}).catch(error=>{
+    assert.fail(JSON.stringify({error:String(error),logs}).replaceAll(token,"[redacted]").replaceAll(f.input.token,"[redacted]"));
+  });f.state.session=session;f.scope.defer(()=>session.terminate());
   await session.preparePeerContext?.(f.environment,AbortSignal.timeout(10000));assert.ok(session.peerContextCapability?.(),logs.replaceAll(token,"[redacted]"));
   let testedStaleRun=false;
   await session.send("Read input.txt once, then finish the original task.",{turnId:"turn",verbosity:"tools",...(phase==="baseline"||ordinary?{}:{peerContext:f.receiver}),environment:f.environment,

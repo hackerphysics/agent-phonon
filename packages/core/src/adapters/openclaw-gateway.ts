@@ -551,7 +551,8 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     const session = new GatewaySession(this.gw, params.sessionId, params.model, subAgent, params.initialContext,params.upstreamRuns,params,this.gatewayIdentity,undefined,()=>{if(this.sessions.get(session.key)===session)this.sessions.delete(session.key);},this.capabilities.injectMidTurn);
     // sessions.create 失败要外显（修 P0#6），不能静默吞
     try {
-      session.bindCreatedIdentity(await this.gw.rpc("sessions.create", { key: session.key, model: params.model,cwd:params.cwd,worktree:false }, 15000));
+      // Windows native ownership checks may pay cold PowerShell module startup.
+      session.bindCreatedIdentity(await this.gw.rpc("sessions.create", { key: session.key, model: params.model,cwd:params.cwd,worktree:false }, process.platform==="win32"?60000:15000));
     } catch (err) {
       throw new Error(`OpenClaw sessions.create failed: ${(err as Error)?.message ?? "?"}`);
     }
