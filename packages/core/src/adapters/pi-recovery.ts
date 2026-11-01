@@ -304,7 +304,7 @@ const hash=value=>createHash("sha256").update(value).digest("hex");
 const fail=()=>{process.stderr.write("Pi native recovery guard rejected continuation\\n");process.exit(78);};
 const windowsSecurity=${JSON.stringify(WINDOWS_NATIVE_SECURITY_SCRIPT)};
 const security=(path,directory,sha256)=>{
-  const r=spawnSync(join(process.env.SystemRoot??'C:\\\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path,directory,sha256}),encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
+  const r=spawnSync(join(process.env.SystemRoot??'C:\\\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path,directory,sha256}),env:{SystemRoot:process.env.SystemRoot??'C:\\\\Windows'},encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
   if(r.error||r.status!==0)fail();const v=JSON.parse(r.stdout);if(v.ok!==true||v.owner!==saved.windowsOwner)fail();
 };
 export default function activate(pi){

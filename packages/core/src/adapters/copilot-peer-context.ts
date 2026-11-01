@@ -336,7 +336,7 @@ import {installCopilotPeerContext,nativeVersionAtLeast} from "./bridge.mjs";
 const path=new URL("./channel.json",import.meta.url),stat=lstatSync(path);
 if(!stat.isFile()||stat.isSymbolicLink()||stat.nlink!==1||stat.size>4096||process.platform!=="win32"&&(stat.mode&0o077)!==0)throw new Error("Unsafe peer capsule");
 if(process.platform==="win32"){
- const r=spawnSync(join(process.env.SystemRoot??'C:\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path:fileURLToPath(path),directory:false,private:true}),encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
+ const r=spawnSync(join(process.env.SystemRoot??'C:\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe'),['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(windowsSecurity,'utf16le').toString('base64')],{input:JSON.stringify({path:fileURLToPath(path),directory:false,private:true}),env:{SystemRoot:process.env.SystemRoot??'C:\\Windows'},encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:4096});
  if(r.error||r.status!==0||JSON.parse(r.stdout).ok!==true)throw new Error("Unsafe peer capsule ACL");
  const after=lstatSync(path);if(after.dev!==stat.dev||after.ino!==stat.ino)throw new Error("Changed peer capsule");
 }

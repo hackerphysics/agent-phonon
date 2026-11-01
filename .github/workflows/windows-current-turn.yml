@@ -140,6 +140,9 @@ jobs:
             }
             default { throw 'Unknown native harness' }
           }
+      - name: Observe the original Claude native context API without guessing its capacity
+        if: matrix.harness == 'claude'
+        run: node scripts/test-local.mjs focused --test-reporter=tap --test-name-pattern="installed Claude hook adds" packages/core/dist/adapters/claude-input-lifecycle.test.js
       - name: Verify actual original-turn input and write a source-bound receipt
         run: node scripts/windows-native-qualification.mjs
       - name: Verify Windows native history and capsule ACL boundaries

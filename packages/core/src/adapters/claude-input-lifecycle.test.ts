@@ -19,11 +19,22 @@ const prompts=async function*(){
  yield{type:"user",uuid:"00000000-0000-4000-8000-000000000001",session_id:sessionId,parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:"Read input.txt and finish the original task."}]}};
  for await(const line of lines){const msg=JSON.parse(line);yield{type:"user",uuid:msg.uuid,session_id:sessionId,parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:msg.text}]}};}
 };
+let query;
 const startup=external?prepareExternalStartup({entry,cwd:process.cwd(),cliNode:cliNode||undefined}):prepareNativeStartup({entry,directory:process.cwd()}),options={cwd:process.cwd(),env:{...process.env},pathToClaudeCodeExecutable:entry,
  ...(external?{spawnClaudeCodeProcess:startup.spawnClaudeCodeProcess,...(cliNode?{executable:"node"}:{})}:{executable:"node",executableArgs:startup.executableArgs}),extraArgs:{"session-id":sessionId,"replay-user-messages":null},abortController:controller,includePartialMessages:true,
- hooks:mode==="hook"?{PostToolUse:[{hooks:[async input=>input.session_id===sessionId&&input.tool_name==="Read"?{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:marker}}:{}]}]}:{}};
+ hooks:mode==="hook"?{PostToolUse:[{hooks:[async input=>{
+  if(input.session_id!==sessionId||input.tool_name!=="Read")return {};
+  if(external){
+    let timer;try{
+      const value=await Promise.race([query.getContextUsage(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('native budget timeout')),1500);})]);
+      console.log(JSON.stringify({type:'phonon.native.budget',model:value?.model,totalTokens:value?.totalTokens,maxTokens:value?.maxTokens,rawMaxTokens:value?.rawMaxTokens,autoCompactThreshold:value?.autoCompactThreshold,isAutoCompactEnabled:value?.isAutoCompactEnabled}));
+    }catch{console.log(JSON.stringify({type:'phonon.native.budget',available:false}));}finally{clearTimeout(timer);}
+  }
+  return {hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:marker}};
+ }]}]}:{}};
 let result;
-try{for await(const msg of sdk.query({prompt:mode==="hook"?"Read input.txt and finish the original task.":prompts(),options})){
+try{query=sdk.query({prompt:mode==="hook"?"Read input.txt and finish the original task.":prompts(),options});for await(const msg of query){
+ if(msg.type==='system'&&msg.subtype==='init')console.log(JSON.stringify({type:'phonon.native.model',model:msg.model}));
  if(!msg.parent_tool_use_id&&msg.session_id!==sessionId)throw new Error("Native root changed");
  process.stdout.write(JSON.stringify(msg)+"\n");
  if(msg.type==="result"&&!msg.parent_tool_use_id){result=msg;lines.close();controller.abort();break;}
@@ -90,5 +101,6 @@ for(const mode of ["stream","hook"] as const)test(mode==="stream"?"installed Cla
   assert.equal(code, 0, stderr); assert.ok(mode==="stream"?payloads.length>=2&&payloads.length<=3:payloads.length===2,JSON.stringify({results:frames.filter(frame=>frame.type==="result"),
     requests:payloads.map(payload=>({model:payload.model,messages:payload.messages.slice(-3)})),types:frames.map(frame=>({type:frame.type,uuid:frame.uuid,parent:frame.parent_tool_use_id,text:frame.type==="assistant"?frame.message.content:undefined}))}));
   assert.equal(frames.filter(frame => frame.type === "result").length, 1);
+  if(binding.kind==="external")console.log(JSON.stringify({nativeBudget:frames.filter(frame=>frame.type?.startsWith("phonon.native."))}));
   if(mode==="hook")assert.equal(frames.some(frame=>frame.type==="user"&&JSON.stringify(frame.message).includes(marker)),false,"native hook context must not be relabelled as a native user message");
 }));
