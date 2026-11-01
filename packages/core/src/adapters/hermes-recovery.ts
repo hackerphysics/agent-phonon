@@ -143,7 +143,17 @@ export async function observeHermesSession(bin:string,profile:string,sessionId:s
   });
 }
 
+/** APFS remounts can change st_dev while keeping the same state.db inode. */
+export function hermesDatabaseIdentityEquivalent(savedDevice:string,savedInode:string,currentDevice:string,currentInode:string):boolean{
+  if(savedInode!==currentInode||!/^\d+$/.test(savedInode)||!/^\d+$/.test(currentInode))return false;
+  if(savedDevice===currentDevice)return true;
+  return /^\d+$/.test(savedDevice)&&/^\d+$/.test(currentDevice);
+}
+
 export function sameHermesSession(saved:HermesNativeObservation,current:HermesNativeObservation):boolean{
-  const {messageCount:before,...identity}=saved,{messageCount:after,...observed}=current;
-  return after>=before&&Object.entries(identity).every(([key,value])=>observed[key as keyof typeof observed]===value);
+  const {messageCount:before,databaseDevice:savedDevice,databaseInode:savedInode,...identity}=saved;
+  const {messageCount:after,databaseDevice:currentDevice,databaseInode:currentInode,...observed}=current;
+  return after>=before
+    &&hermesDatabaseIdentityEquivalent(savedDevice,savedInode,currentDevice,currentInode)
+    &&Object.entries(identity).every(([key,value])=>observed[key as keyof typeof observed]===value);
 }
