@@ -1,5 +1,6 @@
 import {HERMES_NATIVE_TOOLS_BRIDGE} from "./hermes-native-tools.js";
 import {HERMES_PEER_CONTEXT_BRIDGE} from "./hermes-peer-context.js";
+import {HERMES_COMMAND_APPROVAL_BRIDGE} from "./hermes-command-approval.js";
 
 /**
  * Narrow instrumentation of the installed Hermes CLI, not an inference client.
@@ -26,12 +27,16 @@ def emit(value):
     peer_capability = globals().get("_phonon_peer_secret")
     if isinstance(peer_capability, str) and peer_capability:
         payload = payload.replace(peer_capability, "[REDACTED]")
+    approval_capability = globals().get("_phonon_approval_secret")
+    if isinstance(approval_capability, str) and approval_capability:
+        payload = payload.replace(approval_capability, "[REDACTED]")
     with wire_lock:
         wire.write(payload + "\n")
         wire.flush()
 
 # PHONON_NATIVE_TOOLS
 # PHONON_PEER_CONTEXT
+# PHONON_COMMAND_APPROVAL
 
 # Import main FIRST: it applies --profile and native dotenv precedence before
 # modules cache HERMES_HOME. Do not read or copy any native authentication cache.
@@ -176,9 +181,11 @@ def observe(self, *args, **kwargs):
     else:
         kwargs = dict(kwargs)
         kwargs["stream_callback"] = chained
+    close_command_approval = _phonon_install_command_approval()
     try:
         result = native_run(self, *args, **kwargs)
     finally:
+        close_command_approval()
         close_peer_context()
         _phonon_native_turn_finished(self)
         with wire_lock:
@@ -270,4 +277,4 @@ except Exception as exc:
     sys.exit(1)
 else:
     finalize_legacy_quiet_session()
-`.replace("# PHONON_NATIVE_TOOLS", HERMES_NATIVE_TOOLS_BRIDGE).replace("# PHONON_PEER_CONTEXT", HERMES_PEER_CONTEXT_BRIDGE);
+`.replace("# PHONON_NATIVE_TOOLS", HERMES_NATIVE_TOOLS_BRIDGE).replace("# PHONON_PEER_CONTEXT", HERMES_PEER_CONTEXT_BRIDGE).replace("# PHONON_COMMAND_APPROVAL", HERMES_COMMAND_APPROVAL_BRIDGE);
