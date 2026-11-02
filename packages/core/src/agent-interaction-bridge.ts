@@ -17,10 +17,10 @@ const receiptInput=z.object({requestId:z.string().min(1).max(512),decisionHash:z
 class InteractionLimitError extends Error {}
 class InteractionProofError extends Error {}
 
-/** A current-turn-only loopback capability, with no caller-controlled routing. */
+/** Session-stable loopback transport with an explicitly bound current execution. */
 export class AgentInteractionBridge {
   private server?:Server;
-  private token=randomBytes(32).toString("base64url");
+  private token="";
   private delivered=new Map<string,string>();
   private pending=0;
   private requests=0;
@@ -28,6 +28,23 @@ export class AgentInteractionBridge {
   private closing?:Promise<void>;
   private mcp?:NativeMcpEndpoint;
   private authority="";
+  private environment?:Record<string,string>;
+  private binding?:AgentInteractionBridge;
+  private suspended=false;
+  private generation=0;
+  private capabilities():boolean[]{return [this.request,this.applied,this.board,this.workflow,this.message,this.document,this.coordination].map(Boolean);}
+  rebind(...handlers:ConstructorParameters<typeof AgentInteractionBridge>):void{
+    if(this.closed||!this.suspended)throw new Error("bridge is not idle");
+    const next=new AgentInteractionBridge(...handlers);
+    if(JSON.stringify(next.capabilities())!==JSON.stringify(this.capabilities()))throw new Error("session tool capabilities changed");
+    this.binding=next;this.suspended=false;this.mcp?.resetRequestBudget();
+  }
+  suspend():void{
+    this.generation++;
+    this.suspended=true;
+    if(this.binding)void this.binding.close();
+    this.delivered.clear();
+  }
   constructor(private request:((input:AgentInteractionInput)=>Promise<InteractionRequestResult>)|undefined,private applied:((id:string,hash:string)=>void)|undefined,
     private board?:(input:AgentBoardInput)=>Promise<ConversationBoardResult>,private workflow?:(input:AgentWorkflowInput)=>Promise<ConversationWorkflowResult>,
     private message?: (input: AgentMessageInput) => Promise<ConversationMessageResult>,private document?:(input:NativeDocumentInput)=>Promise<DocumentSendResult>,
@@ -36,6 +53,9 @@ export class AgentInteractionBridge {
   }
 
   async listen():Promise<Record<string,string>>{
+    if(this.closed)throw new Error("bridge closed");
+    if(this.environment)return {...this.environment};
+    this.token=randomBytes(32).toString("base64url");
     this.server=createServer((req,res)=>{void this.handle(req,res);});
     await new Promise<void>((resolve,reject)=>{this.server!.once("error",reject);this.server!.listen(0,"127.0.0.1",()=>resolve());});
     const address=this.server.address();if(!address||typeof address==="string")throw new Error("interaction bridge unavailable");
@@ -52,7 +72,7 @@ export class AgentInteractionBridge {
     ];
     this.authority=`127.0.0.1:${address.port}`;
     this.mcp=new NativeMcpEndpoint(this.authority,tools,(route,input)=>this.invoke(route,input));
-    return {AGENT_PHONON_INTERACTION_URL:`http://127.0.0.1:${address.port}/interaction`,
+    this.environment={AGENT_PHONON_INTERACTION_URL:`http://127.0.0.1:${address.port}/interaction`,
       AGENT_PHONON_MCP_URL:`http://127.0.0.1:${address.port}/mcp`,
       ...(this.request?{AGENT_PHONON_INTERACTION_RECEIPT_URL:`http://127.0.0.1:${address.port}/applied`}:{}),AGENT_PHONON_INTERACTION_TOKEN:this.token,
       ...(this.board?{AGENT_PHONON_BOARD_URL:`http://127.0.0.1:${address.port}/board`}:{}),
@@ -60,15 +80,26 @@ export class AgentInteractionBridge {
       ...(this.message ? { AGENT_PHONON_MESSAGE_URL: `http://127.0.0.1:${address.port}/message` } : {}),
       ...(this.document?{AGENT_PHONON_DOCUMENT_URL:`http://127.0.0.1:${address.port}/document`}:{}),
       ...(this.coordination?{AGENT_PHONON_COORDINATION_URL:`http://127.0.0.1:${address.port}/coordination`}:{})};
+    return {...this.environment};
   }
   close():Promise<void>{
     if(this.closing)return this.closing;
     this.closed=true;const server=this.server;this.server=undefined;
+    this.suspend();this.environment=undefined;
     this.delivered.clear();this.token="";
     this.closing=(async()=>{await this.mcp?.close();if(server){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}})();
     return this.closing;
   }
   private async handle(req:IncomingMessage,res:ServerResponse){
+    // Capture before reading the body; delayed calls cannot migrate to a new turn.
+    const target=this.binding??this,admitted=!this.suspended;
+    const current=()=>admitted&&!this.closed&&!this.suspended&&(this.binding??this)===target;
+    const invoke=async(route:string,input:unknown)=>{
+      if(!current())throw new Error("execution ended");
+      const result=await target.invoke(route,input);
+      if(!current())throw new Error("execution ended");
+      return result;
+    };
     const send=(status:number,body:unknown)=>{if(!res.destroyed)res.writeHead(status,{"Content-Type":"application/json","Cache-Control":"no-store"}).end(JSON.stringify(body));};
     const auth=Buffer.from(req.headers.authorization??""),expected=Buffer.from("Bearer "+this.token);
     if(this.closed||req.method!=="POST"||!['/mcp',...(this.request?['/interaction','/applied']:[]),...(this.board?['/board']:[]),...(this.workflow?['/workflow']:[]),...(this.message?['/message']:[]),...(this.document?['/document']:[]),...(this.coordination?['/coordination']:[])].includes(req.url??"")){send(404,{error:"not_found"});return;}
@@ -77,12 +108,13 @@ export class AgentInteractionBridge {
       const chunks:Buffer[]=[];let size=0;
       for await(const raw of req){const chunk=Buffer.from(raw);size+=chunk.length;if(size>65536){send(413,{error:"request_too_large"});return;}chunks.push(chunk);}
       const input=JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      if(req.url==="/mcp"){await this.mcp!.handle(req,res,input);return;}
-      send(200,await this.invoke(req.url!,input));
+      if(req.url==="/mcp"){await this.mcp!.handle(req,res,input,invoke);return;}
+      send(200,await invoke(req.url!,input));
     }catch(error){send(error instanceof InteractionLimitError?429:409,{error:error instanceof InteractionLimitError?"interaction_limit":error instanceof InteractionProofError?"application_proof_mismatch":"interaction_unavailable"});}
   }
   private async invoke(route:string,input:unknown):Promise<unknown>{
-    if(this.closed)throw new Error("native turn ended");
+    const generation=this.generation;
+    if(this.closed||this.suspended)throw new Error("native turn ended");
     if(route==="/applied"&&this.applied){
       const proof=receiptInput.parse(input);
       if(this.delivered.get(proof.requestId)!==proof.decisionHash)throw new InteractionProofError();
@@ -100,11 +132,11 @@ export class AgentInteractionBridge {
       else if(route==="/interaction"&&this.request){
         const parsed=AgentInteractionInput.parse(input),requestId=parsed.requestId??randomUUID();
         const reply=InteractionRequestResult.parse(await this.request({...parsed,requestId}));
-        if(this.closed||reply.requestId!==requestId)throw new Error("interaction result identity mismatch");
+        if(this.closed||this.suspended||generation!==this.generation||reply.requestId!==requestId)throw new Error("interaction result identity mismatch");
         const hash=interactionHash(reply);if(reply.action==="submit")this.delivered.set(reply.requestId,hash);
         result={...reply,decisionHash:hash};
       }else throw new Error("native tool unavailable");
-      if(this.closed)throw new Error("native turn ended");
+      if(this.closed||this.suspended||generation!==this.generation)throw new Error("native turn ended");
       return result;
     }finally{this.pending--;}
   }

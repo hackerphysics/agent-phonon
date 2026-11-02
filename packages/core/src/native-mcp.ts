@@ -82,7 +82,8 @@ export class NativeMcpEndpoint {
     this.catalog = tools.map(tool => ({name: tool.name, description: tool.description,
       inputSchema: nativeMcpInputSchema(tool.schema)}));
   }
-  async handle(req: IncomingMessage, res: ServerResponse, input: unknown) {
+  resetRequestBudget() { this.requests = 0; }
+  async handle(req: IncomingMessage, res: ServerResponse, input: unknown, invoke = this.invoke) {
     if (this.closed || this.active.size >= 32 || this.requests++ >= 256) {
       res.writeHead(this.closed ? 410 : 429, {"Content-Type": "application/json"}).end(JSON.stringify({error: "native_mcp_unavailable"})); return;
     }
@@ -98,7 +99,7 @@ export class NativeMcpEndpoint {
       try {
         const tool = this.tools.find(tool => tool.name === request.params.name);
         if (this.closed || !tool) throw new Error("native tool unavailable");
-        const result = await this.invoke(tool.route, request.params.arguments ?? {});
+        const result = await invoke(tool.route, request.params.arguments ?? {});
         if (this.closed) throw new Error("native turn ended");
         const text = JSON.stringify(result);
         if (Buffer.byteLength(text) > 65536) throw new Error("native result too large");
