@@ -65,7 +65,16 @@ test("SessionEngine exposes the actual coordination-only MCP catalog without ins
   assert.ok(calls.every(call => call.workflowId === "owned-workflow" && call.sessionId === session.sessionId));
   assert.equal(calls[0].workspaceVersion,1);assert.equal(calls[1].workspaceVersion,undefined);
   assert.ok(calls.slice(2).every(call => !call.receive&&!call.workspaceVersion));
-  await engine.dispose(); await assert.rejects(fetch(endpoint, { method: "POST", headers: { authorization: "Bearer " + token }, body: "{}" }));
+  const firstEndpoint=endpoint,firstToken=token;
+  for(let n=0;n<100&&(await engine.status("owner",session.sessionId)).status!=="idle";n++)await new Promise(resolve=>setTimeout(resolve,10));
+  const before=events.filter(event=>event.final).length;
+  await engine.send("owner",session.sessionId,"Follow-up in the same session",{});
+  for(let n=0;n<100&&events.filter(event=>event.final).length===before;n++)await new Promise(resolve=>setTimeout(resolve,10));
+  assert.equal(events.at(-1)?.status,"completed");
+  assert.equal(endpoint,firstEndpoint);assert.equal(token,firstToken);
+  await engine.terminate("owner",session.sessionId);
+  await assert.rejects(fetch(endpoint, { method: "POST", headers: { authorization: "Bearer " + token }, body: "{}" }));
+  await engine.dispose();
 }));
 
 for(const legacy of [false,true])test(`SessionEngine preserves receive negotiation and original work with workspace legacy=${legacy}`,()=>withPeerFixture("workspace-context",async scope=>{

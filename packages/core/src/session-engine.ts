@@ -85,6 +85,7 @@ export class AdapterRegistry {
 
 /** 引擎内 session 记录。 */
 interface SessionRecord {
+  interactionBridge?:AgentInteractionBridge;
   nativeStop?:NativeStopTarget;
   nativeStopOperation?:Promise<void>;
   nativeStopSettled?:boolean;
@@ -899,10 +900,17 @@ export class SessionEngine {
       } : undefined;
       const projectCoordination=requestCoordination ? (raw:AgentCoordinationInput)=>requestCoordination(raw,false) : undefined;
       if(requestInteraction||conversationBoard||conversationWorkflow||conversationMessage||publishDocument||projectCoordination){
-        interactionBridge=new AgentInteractionBridge(requestInteraction,requestInteraction?acknowledgeInteraction:undefined,conversationBoard,conversationWorkflow,conversationMessage,publishDocument,projectCoordination);
+        const handlers:ConstructorParameters<typeof AgentInteractionBridge>=[requestInteraction,requestInteraction?acknowledgeInteraction:undefined,conversationBoard,conversationWorkflow,conversationMessage,publishDocument,projectCoordination];
+        if(rec.interactionBridge){
+          rec.interactionBridge.rebind(...handlers);
+          interactionBridge=rec.interactionBridge;
+        }else{
+          interactionBridge=new AgentInteractionBridge(...handlers);
+          rec.interactionBridge=interactionBridge;
+        }
         runtimeEnvironment={...environment,...await interactionBridge.listen()};
-        if(abort.signal.aborted)void interactionBridge.close();
-        else abort.signal.addEventListener("abort",()=>{void interactionBridge?.close();},{once:true});
+        if(abort.signal.aborted)interactionBridge.suspend();
+        else abort.signal.addEventListener("abort",()=>{interactionBridge?.suspend();},{once:true});
       }
       if (projectCoordination) {
         if(abort.signal.aborted||rec.currentTurnId!==turnId||rec.terminalTurns.has(turnId))return;
@@ -1016,7 +1024,7 @@ export class SessionEngine {
       if(coordinationHeartbeat)clearInterval(coordinationHeartbeat);
       await peerBridge?.close();
       if(interactionBridge)abort.abort();
-      await interactionBridge?.close();
+      interactionBridge?.suspend();
       releaseEmployee?.();
       insertion.abort();
       if (rec.insertionWindow?.controller === insertion) rec.insertionWindow = undefined;
@@ -1310,6 +1318,7 @@ export class SessionEngine {
     rec.queue.length = 0;
     rec.status = "terminated";
     rec.currentTurnId = undefined;
+    await rec.interactionBridge?.close();rec.interactionBridge=undefined;
     this.persist(rec);
     if (!rec.detached && rec.adapterSession?.terminate) {
       await settleWithin([Promise.resolve().then(() => rec.adapterSession.terminate()).catch(() => {})]);
@@ -1358,6 +1367,7 @@ export class SessionEngine {
       rec.queue.length = 0;
       rec.abort?.abort();
       rec.abort = undefined;
+      if(rec.interactionBridge){closing.push(rec.interactionBridge.close());rec.interactionBridge=undefined;}
       if (!rec.detached && rec.adapterSession) {
         rec.adapterSession.setUnsolicitedSink?.(() => {});
         const wasRunning = rec.status === "running";

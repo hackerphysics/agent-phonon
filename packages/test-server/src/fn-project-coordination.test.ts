@@ -71,7 +71,7 @@ for(const sourceKind of ["native","dev"] as const)test(`${sourceKind} coordinati
     }
     assert.ok(calls.slice(probes).every(call=>call.receive===undefined&&call.workspaceVersion===undefined),"legacy server did not negotiate receive/workspace reporting");
     await assert.rejects(retained({operation:"inbox"}));
-    await assert.rejects(fetch(channel,{method:"POST",headers,body:'{"operation":"inbox"}'}));
+    assert.equal((await fetch(channel,{method:"POST",headers,body:'{"operation":"inbox"}'})).status,409);
     assert.equal(calls.length,expectedCalls);
     assert.ok(tc.streamEvents.filter(event=>event.type==="message"||event.type==="result").every(event=>!JSON.stringify(event).includes("coordination")));
   }finally{await tc.conn.dispose();}

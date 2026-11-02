@@ -88,7 +88,7 @@ test("a turn interruption cancels an unanswered form instead of approving it",as
     await sending;
     const receipt=await state.tc.call("interaction.status",{requestId:"waiting"}) as any;
     assert.equal(receipt.state,"cancelled");
-    await assert.rejects(state.post("AGENT_PHONON_INTERACTION_URL",{form}));
+    assert.equal((await state.post("AGENT_PHONON_INTERACTION_URL",{form})).status,409);
     await assert.rejects(state.tc.call("interaction.status",{requestId:"missing"}));
   }finally{await state.close();}
 });

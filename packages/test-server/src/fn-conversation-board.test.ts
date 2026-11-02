@@ -56,7 +56,7 @@ test("current-turn loopback and embedded board calls stamp lineage and reject ex
     assert.equal((await post({ operation: "write", requestId: randomUUID(), baseRevision: 0, goal: "", items: [] })).status, 200);
     malformed = true; assert.equal((await post({ operation: "read" })).status, 409);
     await tc.call("session.interrupt", { sessionId: seen[0].sessionId });
-    await assert.rejects(post({ operation: "read" }));
+    assert.equal((await post({ operation: "read" })).status,409);
     await assert.rejects(options.conversationBoard!({ operation: "read" }), /ended/);
   } finally { ended.resolve(); await tc.conn.dispose(); store.close(); rmSync(root, { recursive: true, force: true }); }
 });
