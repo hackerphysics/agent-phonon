@@ -2,7 +2,7 @@ import { adapterDiagnostic } from "../adapter-diagnostic.js";
 import { nativeVersionAtLeast } from "@agent-phonon/protocol";
 import { PhononError } from "../rpc.js";
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
-import { discoveryProbe } from "../discovery-probe.js";
+import { OpenCodeRuntimeDirectory, openCodeDiscoveryProbe } from "./opencode-runtime.js";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -91,7 +91,7 @@ class OpenCodeSession implements AdapterSession {
   private readonly currentTurnInput = new CurrentTurnInput();
 
   async qualifyPeerContext(): Promise<void> {
-    try { this.peerSupported = nativeVersionAtLeast((await discoveryProbe(this.bin, ["--version"]))?.trim(),MINIMUM_CLI_VERSION); }
+    try { this.peerSupported = nativeVersionAtLeast((await openCodeDiscoveryProbe(this.bin, ["--version"]))?.trim(),MINIMUM_CLI_VERSION); }
     catch { this.peerSupported = false; }
   }
   peerContextCapability(environment?: Record<string,string>) {
@@ -138,21 +138,25 @@ class OpenCodeSession implements AdapterSession {
     await this.run(args, turnId, emit, opts);
   }
 
-  private run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
+  private async run(args: string[], turnId: string, emit: (e: StreamEvent) => void, opts: SendOptions): Promise<void> {
     const notBefore=Date.now();
     this.peerNativeSession = undefined;
-    const peer = this.peerSupported?prepareOpenCodePeerContext(opts, this.ocSessionId,args.at(-1)):undefined;
+    const temporary = new OpenCodeRuntimeDirectory();
+    let peer: ReturnType<typeof prepareOpenCodePeerContext>;
     let owned:ProcessSupervisor|undefined;
-    return new Promise<void>((resolve) => {
+    try {
+    peer = this.peerSupported?prepareOpenCodePeerContext(opts, this.ocSessionId,args.at(-1)):undefined;
+    await new Promise<void>((resolve) => {
       // 关键：stdin 设 ignore(=DEVNULL)，否则 OpenCode 检测到 stdin pipe 会等交互输入卡死
       // shell:win32 — bin 回退为 PATH 上的 `opencode`（.cmd shim），Node 22 不带 shell spawn .cmd 会抛 EINVAL（与其它 adapter 一致）。
-      const environment = buildChildProcessEnvironment(opts.environment);
+      const environment = temporary.environment(buildChildProcessEnvironment(opts.environment));
       // OpenCode also consults PWD; it must not retain the daemon's project directory.
       environment.PWD = this.cwd;
       if (peer) Object.assign(environment, peer.environment);
       else { environment.AGENT_PHONON_PEER_CONTEXT_URL="";environment.AGENT_PHONON_PEER_CONTEXT_TOKEN=""; }
       const supervisor = spawnSupervisedAgent(this.bin, args, { cwd: this.cwd, stdio: ["ignore", "pipe", "pipe"], env: environment });
       owned=supervisor;
+      temporary.watch(supervisor);
       const child = supervisor.child;
       this.current = supervisor;
       this.lastNative={turnId,supervisor};
@@ -233,9 +237,13 @@ class OpenCodeSession implements AdapterSession {
         const detail = adapterDiagnostic(nativeError || stderr || "native CLI returned no completion or output", [opts.environment?.AGENT_PHONON_PEER_CONTEXT_TOKEN,opts.environment?.AGENT_PHONON_INTERACTION_TOKEN]);
         finish(failed ? "failed" : "completed", acc, failed ? `opencode exited ${code}: ${detail}` : undefined);
       });
-    }).finally(async()=>{if(owned&&!owned.hasStopped())await owned.terminate();const deadline=Date.now()+1000;
+    });
+    } finally {
+      if(owned&&!owned.hasStopped())await owned.terminate();const deadline=Date.now()+1000;
       while(owned&&!owned.hasStopped()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20));
-      if(owned&&!owned.hasStopped())throw new PhononError("errSessionBusy","OpenCode native process termination is unconfirmed; invocation assets retained");peer?.cleanup();});
+      if(owned&&!owned.hasStopped())throw new PhononError("errSessionBusy","OpenCode native process termination is unconfirmed; invocation assets retained");
+      try { peer?.cleanup(); } finally { temporary.cleanup(); }
+    }
   }
 
   /** 解析 OpenCode JSON 事件 → phonon StreamEvent。 */
@@ -338,11 +346,11 @@ export class OpenCodeAdapter implements AgentAdapter {
     let models:ModelInfo[]=[];
     this.capabilities.reasoningControl=false;
     if(available)try{
-      const help=await discoveryProbe(this.bin,["run","--help"],signal);
+      const help=await openCodeDiscoveryProbe(this.bin,["run","--help"],signal);
       this.capabilities.reasoningControl=/--variant\b/.test(help??"");
-      const output=await discoveryProbe(this.bin,["models","--pure","--verbose"],signal);
+      const output=await openCodeDiscoveryProbe(this.bin,["models","--pure","--verbose"],signal);
       if(output){const catalog=parseOpenCodeNativeModels(output);models=catalog.models;this.variants=catalog.variants;}
-      const config=await discoveryProbe(this.bin,["debug","config","--pure"],signal);
+      const config=await openCodeDiscoveryProbe(this.bin,["debug","config","--pure"],signal);
       const configured=config?JSON.parse(config).model:undefined;
       this.configuredModel=typeof configured==="string"&&models.some(model=>model.id===configured)?configured:undefined;
     }catch{/* Optional inventory never blocks the existing execution path. */}
@@ -373,6 +381,6 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   private async probeVersion(signal?: AbortSignal): Promise<string | null> {
-    return (await discoveryProbe(this.bin, ["--version"], signal));
+    return (await openCodeDiscoveryProbe(this.bin, ["--version"], signal));
   }
 }

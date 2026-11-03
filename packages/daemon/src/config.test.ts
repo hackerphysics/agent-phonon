@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync,rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ADAPTER_TYPES, writeConfig, redactConfig, defaultConfig, configureRescueAgent, loadConfig, type AdapterConfig } from "./config.js";
@@ -75,6 +75,20 @@ test("config: removed and unknown adapters are rejected without migration or con
     assert.throws(() => buildRegistry(adapters, { enabled: false }), /unsupported adapter type/);
     assert.equal(readFileSync(path, "utf8"), source);
   }
+}));
+
+test("startup auto-detection registers OpenCode without executing an unsupervised native probe", { skip: process.platform === "win32" }, () => withPeerFixture("opencode-startup", async scope => {
+  const previous = process.env.HOME, marker = join(scope.root, "invoked");
+  const directory = join(scope.root, ".opencode", "bin"), bin = join(directory, "opencode");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(bin, `#!${process.execPath}\nimport{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(marker)},'unowned native probe');process.exit(1);\n`, { mode: 0o700 });
+  try {
+    process.env.HOME = scope.root;
+    const adapters = ADAPTER_TYPES.filter(type => type !== "opencode").map(type => ({ type }));
+    const detected = autoDetectAdapters(adapters).filter(adapter => adapter.type === "opencode");
+    assert.deepEqual(detected, [{ type: "opencode", opencodeBinPath: bin }]);
+    assert.equal(existsSync(marker), false);
+  } finally { if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous; }
 }));
 
 test("runtime scope: only maintained native adapters are exported and implemented", () => {

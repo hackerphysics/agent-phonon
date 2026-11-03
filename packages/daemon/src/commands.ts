@@ -110,7 +110,8 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
   }
 
   const ocBin = openCodeBin();
-  if (!has("opencode") && probe(ocBin).ok) out.push({ type: "opencode", opencodeBinPath: ocBin === "opencode" ? undefined : ocBin });
+  // Availability belongs to supervised discovery, not an unowned startup probe.
+  if (!has("opencode") && ocBin !== "opencode") out.push({ type: "opencode", opencodeBinPath: ocBin });
 
   if (!has("copilot")) {
     const copilotPath = commandPath("copilot");
@@ -162,8 +163,8 @@ export async function cmdDoctor(): Promise<void> {
   }
   // OpenCode (often not in PATH)
   const ocBin = openCodeBin();
-  const oc = probe(ocBin);
-  console.log(`  OpenCode (${ocBin}): ${oc.ok ? "✓ " + oc.out : "✗ not found"}`);
+  const oc = await new OpenCodeAdapter({ env: { binPath: ocBin } }).discoverAgents().then(rows => rows[0], () => undefined);
+  console.log(`  OpenCode (${ocBin}): ${oc?.available ? "✓ " + (oc.version ?? "") : "✗ not found"}`);
   // config
   console.log("");
   try {
