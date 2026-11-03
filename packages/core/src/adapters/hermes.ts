@@ -2,6 +2,7 @@ import { parse as parseYaml } from "yaml";
 import { HERMES_BRIDGE } from "./hermes-bridge.js";
 import { HERMES_PROFILE_BRIDGE } from "./hermes-profile-bridge.js";
 import { hermesNativeToolEnvironment } from "./hermes-native-tools.js";
+import { hermesCommandApprovalEnvironment } from "./hermes-command-approval.js";
 import { hermesPeerContextEnvironment, hermesPeerContextSupported } from "./hermes-peer-context.js";
 import { CurrentTurnInput } from "../current-turn-input.js";
 import type { InsertionOptions } from "../adapter.js";
@@ -255,7 +256,7 @@ class HermesSession implements AdapterSession {
       const invocation=hermesBridgeInvocation(HERMES_BRIDGE,[command.entry,...args]);
       const supervisor = spawnSupervisedAgent(command.python, invocation.args, {
         cwd: this.cwd,
-        env: {...buildChildProcessEnvironment(opts.environment),...hermesNativeToolEnvironment(opts),...hermesPeerContextEnvironment(opts),PHONON_REASONING_REQUEST:opts.reasoning?JSON.stringify({level:nativeReasoning(opts.reasoning.level)}):"",
+        env: {...buildChildProcessEnvironment(opts.environment),...hermesNativeToolEnvironment(opts),...hermesCommandApprovalEnvironment(opts),...hermesPeerContextEnvironment(opts),PHONON_REASONING_REQUEST:opts.reasoning?JSON.stringify({level:nativeReasoning(opts.reasoning.level)}):"",
           PHONON_HERMES_EXPECTED_PROFILE_HOME:this.expectedProfileHome??"",
           PHONON_HERMES_EXPECTED_SESSION:this.hermesSessionId?JSON.stringify({sessionId:this.hermesSessionId,home:this.profileHome,cwd:this.cwd}):""},
       });

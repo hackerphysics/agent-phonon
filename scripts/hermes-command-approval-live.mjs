@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict';
+import {mkdtemp,writeFile,readFile} from 'node:fs/promises';
+import {join,resolve} from 'node:path';
+import {spawn} from 'node:child_process';
+import {HERMES_COMMAND_APPROVAL_BRIDGE,hermesCommandApprovalEnvironment} from '../packages/core/dist/adapters/hermes-command-approval.js';
+const expected=process.argv[2];
+assert(['allow','deny','check'].includes(expected),'Use check, deny or allow');
+const names=['AGENT_PHONON_MCP_URL','AGENT_PHONON_INTERACTION_URL','AGENT_PHONON_INTERACTION_RECEIPT_URL','AGENT_PHONON_INTERACTION_TOKEN'];
+const present=Object.fromEntries(names.map(name=>[name,Boolean(process.env[name])]));
+if(expected==='check'){console.log(JSON.stringify({channelEnvironmentPresent:present}));process.exit(0);}
+assert(Object.values(present).every(Boolean),'Current-turn human channel environment is absent; do not substitute another turn or owner');
+const environment=hermesCommandApprovalEnvironment({turnId:'native-live-probe',verbosity:'final',emit(){},requestInteraction:async()=>{throw Error('HTTP transport only');},acknowledgeInteraction(){},environment:process.env});
+const root=await mkdtemp(resolve('../approval-live-'));
+const file=join(root,'probe.py');
+const source=process.env.PHONON_HERMES_TEST_SOURCE,python=process.env.PHONON_HERMES_TEST_PYTHON;
+assert(source&&python,'Pass the installed Hermes source/interpreter explicitly');
+await writeFile(file,`import os,sys,json,threading,shlex\nsys.path.insert(0,os.environ['NATIVE_SOURCE'])\n${HERMES_COMMAND_APPROVAL_BRIDGE}\nfrom pathlib import Path\nfrom tools.terminal_tool import terminal_tool\nfrom tools.approval import check_all_command_guards\nroot=Path(os.environ['PROBE_ROOT'])\nvictim=root/('APPROVAL_TEST_'+os.environ['PROBE_EXPECTED'].upper())\nvictim.mkdir()\n(victim/'marker.txt').write_text('Disposable approval verification fixture; no user data.')\ncommand='rm -r '+shlex.quote(str(victim))\nassert check_all_command_guards(command,'local')['approved'] is False\nclose=_phonon_install_command_approval()\ntry:\n    result=json.loads(terminal_tool(command,workdir=str(root),timeout=10))\nfinally: close()\nactual='deny' if victim.exists() else 'allow'\nreceipt={'expected':os.environ['PROBE_EXPECTED'],'actual':actual,'fixture':str(victim),'fixtureExists':victim.exists(),'nativeResult':result}\n(root/'verification.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2))\nprint(json.dumps(receipt,ensure_ascii=False),flush=True)\nassert actual==os.environ['PROBE_EXPECTED'], 'Human decision did not match test instruction; do not claim success'\n`);
+console.log(JSON.stringify({test:expected,root,notice:'Waiting for the real Phonon human decision; this is not a mocked approval.'}));
+const child=spawn(python,[file],{stdio:'inherit',env:{...process.env,...environment,NATIVE_SOURCE:source,PROBE_ROOT:root,PROBE_EXPECTED:expected,HERMES_SINGLE_QUERY_SESSION:'1',HERMES_INTERACTIVE:'1'}});
+const code=await new Promise(resolve=>child.once('exit',resolve));
+process.exitCode=code??1;
