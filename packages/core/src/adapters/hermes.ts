@@ -181,6 +181,8 @@ class HermesSession implements AdapterSession {
   private lastNative?:{turnId:string;supervisor:ProcessSupervisor};
   private pendingInject: string[] = [];
   private nativeObservation?:HermesNativeObservation;
+  private stopCheckpointObservation?:Promise<void>;
+  private observationGeneration=0;
   private employeeId?:string;
   private peerSupported = false;
   private peerNativeSession?: string;
@@ -219,6 +221,7 @@ class HermesSession implements AdapterSession {
   }
 
   private async sendNative(input: string, opts: SendOptions): Promise<void> {
+    this.observationGeneration++;
     const { turnId, emit } = opts;
     if(this.hermesSessionId){
       const current=await observeHermesSession(this.env.binPath??"hermes",this.profile,this.hermesSessionId,this.cwd,this.env.profileFileBrokerRoot);
@@ -376,9 +379,13 @@ class HermesSession implements AdapterSession {
     if(native?.turnId!==turnId||!native.supervisor.hasStopped())return;
     // Interruption clears the old checkpoint. Re-read the same native history
     // after real tree exit instead of leaving recovery permanently unavailable.
-    if(!this.nativeObservation&&this.hermesSessionId&&this.profileHome){
-      const observed=await observeHermesSession(this.env.binPath??"hermes",this.profile,this.hermesSessionId,this.cwd,this.env.profileFileBrokerRoot).catch(()=>undefined);
-      if(this.lastNative===native&&observed?.nativeHome===this.profileHome)this.nativeObservation=observed;
+    if(!this.nativeObservation&&this.hermesSessionId&&this.profileHome&&!this.stopCheckpointObservation){
+      const generation=this.observationGeneration,sessionId=this.hermesSessionId,home=this.profileHome;
+      const pending=observeHermesSession(this.env.binPath??"hermes",this.profile,sessionId,this.cwd,this.env.profileFileBrokerRoot).then(observed=>{
+        if(this.lastNative===native&&this.observationGeneration===generation&&this.hermesSessionId===sessionId
+          &&this.profileHome===home&&observed.nativeHome===home)this.nativeObservation=observed;
+      }).catch(()=>{}).finally(()=>{if(this.stopCheckpointObservation===pending)this.stopCheckpointObservation=undefined;});
+      this.stopCheckpointObservation=pending;
     }
     return "process_tree_exit" as const;
   }
