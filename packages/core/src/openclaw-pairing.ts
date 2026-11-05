@@ -28,26 +28,44 @@ const pendingSchema = z.object({ requestId: z.string(), deviceId: z.string(), pu
 
 /** No CLI fallback: it could target another profile or approve with broader owner authority. */
 export async function approveLocalGatewayPairing(input: {
-  baseUrl: string; token: string; requestId: string; deviceId: string; publicKey: string; scopes: string[]; assertCurrent: () => void;
+  baseUrl: string; token: string; requestId: string; deviceId: string; publicKey: string; scopes: string[]; assertCurrent: () => void; signal?: AbortSignal;
 }): Promise<void> {
   if (!isLoopbackGateway(input.baseUrl)) throw new GatewayConnectionError("Remote blind approval refused; run openclaw devices list / approve on the Gateway host", "REMOTE_APPROVAL_REFUSED", input.requestId);
   if (!input.token || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.requestId)) throw new Error("Local pairing requires a shared bootstrap credential and an exact requestId");
-  input.assertCurrent();
+  const assertCurrent = () => {
+    input.assertCurrent();
+    if (input.signal?.aborted) throw new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED");
+  };
+  assertCurrent();
   const ws = new WebSocket(input.baseUrl.replace(/^http/, "ws"));
   try {
     await new Promise<void>((resolve, reject) => {
       let step: "connect" | "list" | "approve" = "connect";
       let challenged = false;
+      let settled = false;
       const timer = setTimeout(() => finish(new Error("Local pairing approval timed out")), 10000);
-      const finish = (error?: Error) => { clearTimeout(timer); ws.removeAllListeners("message"); error ? reject(error) : resolve(); };
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        input.signal?.removeEventListener("abort", onAbort);
+        ws.removeAllListeners("message");
+        error ? reject(error) : resolve();
+      };
+      const onAbort = () => finish(new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED"));
       const send = (method: string, params: unknown) => {
-        input.assertCurrent();
+        assertCurrent();
         ws.send(JSON.stringify({ type: "req", id: step, method, params }));
       };
-      ws.on("error", () => finish(new Error("Local pairing helper could not reach the Gateway")));
-      ws.on("close", () => finish(new Error("Local pairing helper closed; approve the exact request on the Gateway host")));
+      const onError = () => finish(new Error("Local pairing helper could not reach the Gateway"));
+      const onClose = () => {
+        finish(new Error("Local pairing helper closed; approve the exact request on the Gateway host"));
+        ws.removeListener("error", onError); ws.removeListener("close", onClose);
+      };
+      ws.on("error", onError);
+      ws.on("close", onClose);
       ws.on("message", raw => {
         try {
+          assertCurrent();
           const frame = JSON.parse(raw.toString());
           if (step === "connect" && frame.type === "event" && frame.event === "connect.challenge" && !challenged) {
             challenged = true;
@@ -72,8 +90,11 @@ export async function approveLocalGatewayPairing(input: {
               finish();
             }
           }
-        } catch { finish(new Error("Local pairing could not verify the exact new device request; inspect and approve it on the Gateway host")); }
+        } catch (error) { finish(error instanceof GatewayConnectionError && error.code === "CONNECTION_CANCELLED" ? error
+          : new Error("Local pairing could not verify the exact new device request; inspect and approve it on the Gateway host")); }
       });
+      input.signal?.addEventListener("abort", onAbort, { once: true });
+      if (input.signal?.aborted) onAbort();
     });
-  } finally { ws.close(); }
+  } finally { ws.terminate(); }
 }

@@ -51,6 +51,7 @@ export class GatewayClient {
   private pending = new Map<string, Pending>();
   private eventHandlers = new Set<GatewayEventHandler>();
   private connectPromise: Promise<void> | null = null;
+  private connectController: AbortController | null = null;
   private connectGeneration = 0;
 
   constructor(config: GatewayConfig) {
@@ -140,30 +141,52 @@ export class GatewayClient {
     }catch{await release();throw new Error("OpenClaw current-run peer binding is unavailable");}
   }
 
-  connect(): Promise<void> {
+  /** Any caller may cancel the shared pending attempt, but never a settled transport. */
+  connect(signal?: AbortSignal): Promise<void> {
+    if (this.connectPromise) return this.attachConnectSignal(signal, this.connectController!, this.connectPromise);
+    if (signal?.aborted) return Promise.reject(new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED"));
     if (this.connected) return Promise.resolve();
-    if (this.connectPromise) return this.connectPromise;
-    const connecting = this.connectWithPairing(++this.connectGeneration).catch(error => {
+    const controller = new AbortController();
+    this.connectController = controller;
+    const connecting = this.connectWithPairing(++this.connectGeneration, controller.signal).finally(() => {
+      if (controller.signal.aborted && this.connectController === controller) {
+        this.ws?.terminate();
+        this.close();
+      }
+      if (this.connectController === controller) this.connectController = null;
       if (this.connectPromise === connecting) this.connectPromise = null;
-      throw error;
+      if (controller.signal.aborted) throw new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED");
     });
     this.connectPromise = connecting;
-    return connecting;
+    return this.attachConnectSignal(signal, controller, connecting);
+  }
+
+  private attachConnectSignal(signal: AbortSignal | undefined, controller: AbortController, attempt: Promise<void>): Promise<void> {
+    if (!signal) return attempt;
+    const onAbort = () => {
+      if (this.connectController === controller && this.connectPromise === attempt) controller.abort();
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void attempt.then(cleanup, cleanup);
+    if (signal.aborted) onAbort();
+    return attempt;
   }
 
   private emit(event: string, payload: Record<string, unknown>): void {
     for (const handler of this.eventHandlers) { try { handler(event, payload); } catch { /* observer only */ } }
   }
 
-  private async connectWithPairing(generation: number): Promise<void> {
+  private async connectWithPairing(generation: number, signal?: AbortSignal): Promise<void> {
     const assertCurrent = () => {
-      if (generation !== this.connectGeneration) throw new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED");
+      if (generation !== this.connectGeneration || signal?.aborted) throw new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED");
     };
+    assertCurrent();
     let store: OpenClawDeviceStore;
     let identity: ReturnType<OpenClawDeviceStore["identity"]>;
     try { store = new OpenClawDeviceStore(this.config.baseUrl, this.config.deviceStateDir); identity = store.identity(); store.token(identity.deviceId); }
     catch { throw new GatewayConnectionError("OpenClaw device identity unavailable; check the Phonon-owned state directory (0700), files (0600) and key integrity; do not reset keys to bypass pairing", "DEVICE_AUTH_LOCAL_IDENTITY"); }
-    try { await this.doConnect(store, identity, assertCurrent); }
+    try { await this.doConnect(store, identity, assertCurrent, signal); assertCurrent(); }
     catch (error) {
       assertCurrent();
       if (!(error instanceof GatewayConnectionError) || error.code !== "PAIRING_REQUIRED") throw error;
@@ -180,15 +203,17 @@ export class GatewayClient {
       assertCurrent(); record("requested");
       try {
         await approveLocalGatewayPairing({ baseUrl: this.config.baseUrl, token: this.config.token, requestId: error.requestId,
-          deviceId: identity.deviceId, publicKey: identity.publicKey, scopes: this.scopes(), assertCurrent });
-      } catch {
-        record("failed");
+          deviceId: identity.deviceId, publicKey: identity.publicKey, scopes: this.scopes(), assertCurrent, signal });
+      } catch (approvalError) {
         assertCurrent();
+        if (approvalError instanceof GatewayConnectionError && approvalError.code === "CONNECTION_CANCELLED") throw approvalError;
+        record("failed");
         throw new GatewayConnectionError(`OpenClaw local approval failed for ${error.requestId}; no scopes were widened. On the Gateway host run openclaw devices list, then openclaw devices approve ${error.requestId}`, "PAIRING_APPROVAL_FAILED", error.requestId, error.recommendedNextStep);
       }
-      record("approved"); assertCurrent();
+      assertCurrent(); record("approved"); assertCurrent();
       // One retry only. Never replay a chat/RPC, or retry a stale/superseded approval.
-      await this.doConnect(store, identity, assertCurrent);
+      await this.doConnect(store, identity, assertCurrent, signal);
+      assertCurrent();
     }
   }
 
@@ -197,7 +222,7 @@ export class GatewayClient {
     return this.config.scopes ?? (approved ? approved.filter(scope => defaults.includes(scope)) : defaults);
   }
 
-  private doConnect(store: OpenClawDeviceStore, identity: ReturnType<OpenClawDeviceStore["identity"]>, assertCurrent: () => void): Promise<void> {
+  private doConnect(store: OpenClawDeviceStore, identity: ReturnType<OpenClawDeviceStore["identity"]>, assertCurrent: () => void, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
       assertCurrent();
       if (this.config.authMode === "none" && !isLoopbackGateway(this.config.baseUrl)) throw new GatewayConnectionError("OpenClaw auth mode none is supported only for a local loopback Gateway", "AUTH_CONFIGURATION_INVALID");
@@ -207,6 +232,7 @@ export class GatewayClient {
         reject(new GatewayConnectionError("OpenClaw shared Gateway token missing; run openclaw configure --section gateway", "AUTH_TOKEN_MISSING")); return;
       }
       const wsUrl = this.config.baseUrl.replace(/^http/, "ws");
+      assertCurrent();
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
       let handshakeDone = false;
@@ -215,9 +241,12 @@ export class GatewayClient {
       const fail = (error: Error) => {
         if (failed || handshakeDone) return;
         failed = true; clearTimeout(handshakeTimer);
+        signal?.removeEventListener("abort", onAbort);
+        ws.removeAllListeners("message");
         if (this.ws === ws) this.ws = null;
         ws.terminate(); reject(error);
       };
+      const onAbort = () => fail(new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED"));
       const handshakeTimer=setTimeout(()=>fail(new GatewayConnectionError("OpenClaw Gateway handshake timed out; check openclaw gateway status and the configured local port", "GATEWAY_TIMEOUT")),10000);
       handshakeTimer.unref();
 
@@ -238,7 +267,9 @@ export class GatewayClient {
             try {
               assertCurrent();
               device = signOpenClawDevice(identity, frame.payload, scopes, cached?.token ?? this.config.token);
-            } catch { fail(new GatewayConnectionError("OpenClaw DEVICE_AUTH_CHALLENGE_INVALID: require a fresh nonce and non-negative integer challenge ts; check Gateway version/clock", "DEVICE_AUTH_CHALLENGE_INVALID")); return; }
+              assertCurrent();
+            } catch (error) { fail(error instanceof GatewayConnectionError && error.code === "CONNECTION_CANCELLED" ? error
+              : new GatewayConnectionError("OpenClaw DEVICE_AUTH_CHALLENGE_INVALID: require a fresh nonce and non-negative integer challenge ts; check Gateway version/clock", "DEVICE_AUTH_CHALLENGE_INVALID")); return; }
             challenged = true;
             ws.send(
               JSON.stringify({
@@ -264,9 +295,12 @@ export class GatewayClient {
               assertCurrent();
               const auth = (frame.payload as { auth?: { deviceToken?: unknown } }).auth;
               if (auth?.deviceToken !== undefined) store.saveToken(identity, auth);
-            } catch { fail(new GatewayConnectionError("OpenClaw device token could not be persisted; check private state permissions and the hello-ok auth receipt", "DEVICE_AUTH_PERSIST_FAILED")); return; }
+              assertCurrent();
+            } catch (error) { fail(error instanceof GatewayConnectionError && error.code === "CONNECTION_CANCELLED" ? error
+              : new GatewayConnectionError("OpenClaw device token could not be persisted; check private state permissions and the hello-ok auth receipt", "DEVICE_AUTH_PERSIST_FAILED")); return; }
             handshakeDone = true;
             clearTimeout(handshakeTimer);
+            signal?.removeEventListener("abort", onAbort);
             this.connected = true;
             const advertised=(frame.payload as {features?:{capabilities?:unknown}}).features?.capabilities;
             this.capabilities=new Set(Array.isArray(advertised)?advertised.filter((value):value is string=>typeof value==="string"):[]);
@@ -302,11 +336,15 @@ export class GatewayClient {
         }
       });
 
-      ws.on("error", (err) => {
+      const onError = (err: Error) => {
         if (!handshakeDone) fail(new GatewayConnectionError(`OpenClaw Gateway not reachable (${(err as NodeJS.ErrnoException).code ?? "transport error"}); check openclaw gateway status, gateway.port and loopback listener`, "GATEWAY_UNREACHABLE"));
-      });
-      ws.on("close", () => {
+      };
+      const onClose = () => {
         clearTimeout(handshakeTimer);
+        signal?.removeEventListener("abort", onAbort);
+        ws.removeAllListeners("message");
+        ws.removeListener("error", onError);
+        ws.removeListener("close", onClose);
         if(!handshakeDone) fail(new GatewayConnectionError("OpenClaw Gateway closed before authentication; check credentials and pairing on the Gateway host", "GATEWAY_CLOSED"));
         if(this.ws!==ws)return;
         this.connected = false;
@@ -317,7 +355,11 @@ export class GatewayClient {
           p.reject(new Error("gateway connection closed"));
         }
         this.pending.clear();
-      });
+      };
+      ws.on("error", onError);
+      ws.on("close", onClose);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     });
   }
 
@@ -344,6 +386,8 @@ export class GatewayClient {
 
   close(): void {
     this.connectGeneration++;
+    this.connectController?.abort();
+    this.connectController = null;
     const socket=this.ws;
     this.ws = null;
     this.connected = false;

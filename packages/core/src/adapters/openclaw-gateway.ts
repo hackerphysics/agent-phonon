@@ -472,7 +472,7 @@ export class OpenClawGatewayAdapter implements AgentAdapter {
     this.capabilities.injectMidTurn=false;
     let connected = false;
     try {
-      await this.gw.connect();
+      await this.gw.connect(signal);
       connected = this.gw.isConnected();
     } catch {
       connected = false;

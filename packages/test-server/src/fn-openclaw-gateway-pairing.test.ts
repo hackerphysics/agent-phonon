@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { WebSocketServer } from "ws";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { discoverOpenClawGateway, GatewayClient, GatewayConnectionError, isLoopbackGateway } from "@agent-phonon/core";
+import { getEventListeners } from "node:events";
+import { discoverOpenClawGateway, GatewayClient, GatewayConnectionError, isLoopbackGateway, OpenClawGatewayAdapter } from "@agent-phonon/core";
 import { approveLocalGatewayPairing } from "../../core/dist/openclaw-pairing.js";
 
 const scopes = ["operator.read", "operator.write", "operator.admin"];
@@ -18,9 +19,23 @@ function temp(t: TestContext) {
   return root;
 }
 
-async function fixture(t: TestContext, options: { remote?: boolean; mutatePending?: (row: any) => void; approveFail?: boolean; error?: string; challenge?: unknown; reason?: string; receiptScopes?: string[]; onList?: () => void } = {}) {
+async function within<T>(operation: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([operation, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Gateway cancellation did not settle promptly")), 1000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+async function fixture(t: TestContext, options: { remote?: boolean; mutatePending?: (row: any) => void; approveFail?: boolean; error?: string; challenge?: unknown; reason?: string; receiptScopes?: string[];
+  onList?: () => void; stallList?: boolean; onConnect?: () => void; stallConnect?: boolean; onConnection?: () => void; stallChallenge?: boolean;
+  onHelperConnect?: () => void; stallHelperConnect?: boolean; onApprove?: () => void } = {}) {
   const root = temp(t), requestId = randomUUID(), frames: any[] = [], deviceIds: string[] = [], errors: unknown[] = [];
   let paired = false, pending: any, connectCount = 0;
+  let onHelperClosed!: () => void, onSocketClosed!: () => void;
+  const helperClosed = new Promise<void>(resolve => { onHelperClosed = resolve; });
+  const socketClosed = new Promise<void>(resolve => { onSocketClosed = resolve; });
   const host = options.remote ? "127.0.0.2" : "127.0.0.1";
   const server = new WebSocketServer({ host, port: 0 });
   await new Promise<void>((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
@@ -36,7 +51,9 @@ async function fixture(t: TestContext, options: { remote?: boolean; mutatePendin
   server.on("connection", socket => {
     const challenge = options.challenge ?? { nonce: randomUUID(), ts: Date.now() - 2500 };
     let helper = false;
-    socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: challenge }));
+    socket.once("close", () => { onSocketClosed(); if (helper) onHelperClosed(); });
+    options.onConnection?.();
+    if (!options.stallChallenge) socket.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: challenge }));
     socket.on("message", raw => {
       try {
         const frame = JSON.parse(raw.toString()), p = frame.params;
@@ -50,6 +67,8 @@ async function fixture(t: TestContext, options: { remote?: boolean; mutatePendin
           assert.equal(p.client.mode, p.device ? "cli" : "backend");
           if (!p.device) {
             helper = true; assert.equal(p.auth.token, shared); assert.deepEqual(p.scopes, scopes);
+            options.onHelperConnect?.();
+            if (options.stallHelperConnect) return;
             respond({ type: "hello-ok" }); return;
           }
           const d = p.device, c = challenge as { nonce: string; ts: number };
@@ -58,6 +77,8 @@ async function fixture(t: TestContext, options: { remote?: boolean; mutatePendin
           const payload = ["v3", d.id, "gateway-client", "cli", "operator", p.scopes.join(","), String(c.ts), p.auth.token ?? p.auth.deviceToken, c.nonce, p.client.platform, ""].join("|");
           assert.ok(verify(null, Buffer.from(payload), createPublicKey({ format: "jwk", key: { kty: "OKP", crv: "Ed25519", x: d.publicKey } }), Buffer.from(d.signature, "base64url")));
           deviceIds.push(d.id);
+          options.onConnect?.();
+          if (options.stallConnect) return;
           if (options.error) { fail("INVALID_REQUEST", { code: options.error }); return; }
           if (!paired) {
             assert.deepEqual(p.auth, { token: shared });
@@ -70,12 +91,14 @@ async function fixture(t: TestContext, options: { remote?: boolean; mutatePendin
           respond({ type: "hello-ok", auth: { deviceToken, role: "operator", scopes: options.receiptScopes ?? p.scopes }, features: { capabilities: ["fixture"] } }); return;
         }
         if (frame.method === "device.pair.list") {
-          assert.ok(helper); options.onList?.(); respond({ pending: [pending], paired: [] }); return;
+          assert.ok(helper); options.onList?.();
+          if (!options.stallList) respond({ pending: [pending], paired: [] });
+          return;
         }
         if (frame.method === "device.pair.approve") {
           assert.ok(helper); assert.deepEqual(p, { requestId });
           if (options.approveFail) { fail("INVALID_REQUEST"); return; }
-          paired = true; respond({ requestId, device: { deviceId: pending.deviceId } }); return;
+          paired = true; options.onApprove?.(); respond({ requestId, device: { deviceId: pending.deviceId } }); return;
         }
         if (frame.method === "chat.send") { assert.ok(paired); respond({ runId: "fixture-chat", status: "started" }); return; }
         if (frame.method === "sessions.patch") { assert.deepEqual(p, { key: "session", model: "local/model" }); respond({ key: p.key }); return; }
@@ -83,7 +106,7 @@ async function fixture(t: TestContext, options: { remote?: boolean; mutatePendin
       } catch (error) { errors.push(error); socket.terminate(); }
     });
   });
-  return { root, config, frames, deviceIds, requestId, get connectCount() { return connectCount; },
+  return { root, config, frames, deviceIds, requestId, helperClosed, socketClosed, get paired() { return paired; }, get connectCount() { return connectCount; },
     client(extra: Partial<ConstructorParameters<typeof GatewayClient>[0]> = {}) { const client = new GatewayClient({ ...config, ...extra }); clients.push(client); return client; } };
 }
 
@@ -164,6 +187,181 @@ test("Gateway pairing: cancellation during optional request lookup prevents appr
   const f = await fixture(t, { onList: () => client.close() }); client = f.client();
   await assert.rejects(client.connect(), { code: "CONNECTION_CANCELLED" });
   assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0); assert.equal(f.connectCount, 2);
+});
+
+test("Gateway pairing: AbortSignal during optional request lookup prevents approval/reconnect", async t => {
+  const abort = new AbortController(), f = await fixture(t, { onList: () => abort.abort() }), client = f.client(), decisions: unknown[] = [];
+  client.onEvent((event, payload) => { if (event === "phonon.pairing.audit") decisions.push(payload.decision); });
+  await assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" });
+  await within(f.helperClosed);
+  assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+  assert.equal(f.paired, false); assert.equal(f.connectCount, 2); assert.equal(client.isConnected(), false);
+  assert.equal(client.connectionEpoch(), 0); assert.ok(!decisions.includes("approved"));
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+});
+
+test("Gateway pairing: abort promptly terminates a helper with a stalled list response", async t => {
+  const abort = new AbortController(), f = await fixture(t, { onList: () => abort.abort(), stallList: true }), client = f.client();
+  await assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" });
+  await within(f.helperClosed);
+  assert.equal(f.paired, false); assert.equal(f.connectCount, 2); assert.equal(client.isConnected(), false);
+  assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+});
+
+test("Gateway pairing: close promptly terminates a helper with a stalled list response", async t => {
+  let client: GatewayClient;
+  const f = await fixture(t, { onList: () => client.close(), stallList: true }); client = f.client();
+  await assert.rejects(within(client.connect()), { code: "CONNECTION_CANCELLED" });
+  await within(f.helperClosed);
+  assert.equal(f.paired, false); assert.equal(f.connectCount, 2);
+  assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+});
+
+test("Gateway pairing: abort promptly cancels a stalled helper handshake before list/approve", async t => {
+  const abort = new AbortController(), f = await fixture(t, { onHelperConnect: () => abort.abort(), stallHelperConnect: true }), client = f.client();
+  await assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" });
+  await within(f.helperClosed);
+  assert.equal(f.paired, false); assert.equal(f.connectCount, 2);
+  assert.equal(f.frames.filter(row => row.method.startsWith("device.pair.")).length, 0);
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+});
+
+test("Gateway pairing: cancellation before an approval receipt never audits success or reconnects", async t => {
+  const abort = new AbortController(), f = await fixture(t, { onApprove: () => abort.abort() }), client = f.client(), decisions: unknown[] = [];
+  client.onEvent((event, payload) => { if (event === "phonon.pairing.audit") decisions.push(payload.decision); });
+  await assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" });
+  await within(f.helperClosed);
+  assert.equal(f.paired, true, "approval already dispatched before cancellation cannot be undone");
+  assert.equal(f.connectCount, 2); assert.equal(client.isConnected(), false); assert.deepEqual(decisions, ["requested"]);
+});
+
+test("Gateway pairing helper: generation cancellation remains typed instead of becoming a verification failure", async t => {
+  let cancelled = false;
+  const f = await fixture(t, { onList: () => { cancelled = true; } });
+  await assert.rejects(f.client({ autoPair: false }).connect(), { code: "PAIRING_REQUIRED" });
+  const device = f.frames[0].params.device;
+  await assert.rejects(within(approveLocalGatewayPairing({ ...f.config, requestId: f.requestId, deviceId: device.id, publicKey: device.publicKey, scopes,
+    assertCurrent() { if (cancelled) throw new GatewayConnectionError("Fixture cancelled", "CONNECTION_CANCELLED"); } })), { code: "CONNECTION_CANCELLED" });
+  await within(f.helperClosed);
+  assert.equal(f.paired, false); assert.equal(f.connectCount, 2);
+  assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+});
+
+test("OpenClaw Gateway discovery: abort mid-pairing prevents approval/reconnect even if lookup stalls", async t => {
+  for (const stallList of [false, true]) {
+    const abort = new AbortController(), f = await fixture(t, { onList: () => abort.abort(), stallList });
+    const adapter = new OpenClawGatewayAdapter({ gateway: f.config }); t.after(() => adapter.close());
+    await assert.rejects(within(adapter.discoverAgents(abort.signal)), { name: "AbortError" });
+    await within(f.helperClosed);
+    assert.equal(f.paired, false); assert.equal(f.connectCount, 2);
+    assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+  }
+});
+
+test("OpenClaw Gateway discovery: joining an unsignalled connection lets abort cancel pairing for all waiters", async t => {
+  for (const stallList of [false, true]) {
+    const abort = new AbortController(), f = await fixture(t, { onList: () => abort.abort(), stallList });
+    const adapter = new OpenClawGatewayAdapter({ gateway: f.config }); t.after(() => adapter.close());
+    const gateway = (adapter as unknown as { gw: GatewayClient }).gw, decisions: unknown[] = [];
+    gateway.onEvent((event, payload) => { if (event === "phonon.pairing.audit") decisions.push(payload.decision); });
+    const connecting = gateway.connect();
+    assert.equal(gateway.connect(), connecting, "signal-less callers share the pending attempt");
+    await Promise.all([assert.rejects(within(connecting), { code: "CONNECTION_CANCELLED" }),
+      assert.rejects(within(adapter.discoverAgents(abort.signal)), { name: "AbortError" })]);
+    await within(f.helperClosed);
+    assert.equal(f.paired, false); assert.equal(f.connectCount, 2); assert.equal(gateway.isConnected(), false);
+    assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+    assert.ok(!decisions.includes("approved")); assert.equal(gateway.connectionEpoch(), 0);
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+  }
+});
+
+test("Gateway device auth: abort promptly cancels stalled challenge and handshake responses", async t => {
+  for (const stallChallenge of [true, false]) {
+    const abort = new AbortController(), f = await fixture(t, { stallChallenge, stallConnect: true,
+      ...(stallChallenge ? { onConnection: () => abort.abort() } : { onConnect: () => abort.abort() }) }), client = f.client();
+    await assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" });
+    await within(f.socketClosed);
+    assert.equal(f.connectCount, stallChallenge ? 0 : 1); assert.equal(f.paired, false); assert.equal(client.isConnected(), false);
+    assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+  }
+});
+
+test("Gateway connection: pre-aborted signals never start a connection", async t => {
+  const f = await fixture(t), client = f.client(), abort = new AbortController(); abort.abort();
+  await assert.rejects(client.connect(abort.signal), { code: "CONNECTION_CANCELLED" });
+  assert.equal(f.connectCount, 0); assert.equal(f.frames.length, 0); assert.equal(client.isConnected(), false);
+});
+
+test("Gateway connection: a joining caller aborts the shared pending attempt and all waiters", async t => {
+  for (const stallList of [false, true]) {
+    const owner = new AbortController(), joiner = new AbortController(), observer = new AbortController();
+    const f = await fixture(t, { onList: () => joiner.abort(), stallList }), client = f.client();
+    const attempts = [client.connect(owner.signal), client.connect(), client.connect(joiner.signal), client.connect(observer.signal)];
+    await Promise.all(attempts.map(attempt => assert.rejects(within(attempt), { code: "CONNECTION_CANCELLED" })));
+    await within(f.helperClosed);
+    assert.equal(client.isConnected(), false); assert.equal(f.connectCount, 2); assert.equal(f.paired, false);
+    assert.equal(f.frames.filter(row => row.method === "device.pair.approve").length, 0);
+    for (const controller of [owner, joiner, observer]) assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  }
+});
+
+test("Gateway connection: a pre-aborted joining signal cancels the shared pending attempt", async t => {
+  const f = await fixture(t), client = f.client(), abort = new AbortController();
+  const connecting = client.connect(); abort.abort();
+  await Promise.all([assert.rejects(within(connecting), { code: "CONNECTION_CANCELLED" }),
+    assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" })]);
+  assert.equal(f.connectCount, 0); assert.equal(f.paired, false); assert.equal(client.isConnected(), false);
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+});
+
+test("Gateway connection: owner abort cancels all shared waiters without approval/reconnect", async t => {
+  const abort = new AbortController(), f = await fixture(t, { onList: () => abort.abort() }), client = f.client();
+  const connecting = client.connect(abort.signal);
+  await Promise.all([assert.rejects(within(connecting), { code: "CONNECTION_CANCELLED" }),
+    assert.rejects(within(client.connect()), { code: "CONNECTION_CANCELLED" })]);
+  assert.equal(f.paired, false); assert.equal(f.connectCount, 2); assert.equal(client.isConnected(), false);
+});
+
+test("Gateway connection: abort before shared success settles rejects all waiters and closes the transport", async t => {
+  const abort = new AbortController(), f = await fixture(t), client = f.client();
+  const internals = client as unknown as { connectWithPairing(generation: number, signal?: AbortSignal): Promise<void> };
+  const connectWithPairing = internals.connectWithPairing.bind(client);
+  t.mock.method(internals, "connectWithPairing", async (generation: number, signal?: AbortSignal) => {
+    await connectWithPairing(generation, signal);
+    queueMicrotask(() => abort.abort());
+  });
+  const connecting = client.connect();
+  await Promise.all([assert.rejects(within(connecting), { code: "CONNECTION_CANCELLED" }),
+    assert.rejects(within(client.connect(abort.signal)), { code: "CONNECTION_CANCELLED" })]);
+  assert.equal(client.isConnected(), false); assert.equal(f.connectCount, 3);
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+});
+
+test("Gateway connection: abort after success does not disconnect or poison later connections", async t => {
+  const abort = new AbortController(), joiner = new AbortController(), f = await fixture(t), client = f.client();
+  await Promise.all([client.connect(abort.signal), client.connect(joiner.signal)]);
+  assert.equal(getEventListeners(abort.signal, "abort").length, 0);
+  assert.equal(getEventListeners(joiner.signal, "abort").length, 0);
+  abort.abort(); joiner.abort(); assert.equal(client.isConnected(), true);
+  await client.connect(); assert.equal(f.connectCount, 3);
+  assert.equal((await client.rpc("chat.send", { message: "still connected" })).status, "started");
+  client.close(); await client.connect(); assert.equal(f.connectCount, 4);
+});
+
+test("Gateway connection: signals from a cancelled attempt cannot abort a later pending attempt", async t => {
+  const owner = new AbortController(), joiner = new AbortController();
+  let retry = false;
+  const f = await fixture(t, { onList: () => { if (retry) owner.abort(); else joiner.abort(); } }), client = f.client();
+  await Promise.all([assert.rejects(within(client.connect(owner.signal)), { code: "CONNECTION_CANCELLED" }),
+    assert.rejects(within(client.connect(joiner.signal)), { code: "CONNECTION_CANCELLED" })]);
+  assert.equal(getEventListeners(owner.signal, "abort").length, 0); assert.equal(getEventListeners(joiner.signal, "abort").length, 0);
+  assert.equal(f.connectCount, 2); assert.equal(f.paired, false);
+  retry = true;
+  await client.connect();
+  assert.equal(owner.signal.aborted, true); assert.equal(client.isConnected(), true); assert.equal(f.connectCount, 5);
 });
 
 test("Gateway device auth: invalid challenges are rejected without sending connect", async t => {
