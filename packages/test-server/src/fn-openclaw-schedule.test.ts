@@ -540,6 +540,19 @@ const credentialCases = [
       ];
     }));
   }),
+  ...["token", "api_key", "secret", "password", "api-key"].flatMap(key => ['"', "'"].flatMap(quote => {
+    const opposite = quote === '"' ? "'" : '"';
+    return [
+      ...["prefix", "X"].flatMap(prefix => ["", "PRIVATE_SUFFIX", quote, `${quote}PRIVATE_SUFFIX`].map(suffix => ({
+        label: `HOLD22 top-level quoted ${key} crossing ${quote} with ${prefix} and suffix ${JSON.stringify(suffix)}`,
+        input: `${key}=${quote}${prefix} password=${opposite}HIDE ${quote} LEAK_ME${opposite}${suffix}`,
+        expected: `${key}=${quote}[redacted]${quote}`, secrets: /LEAK_ME|PRIVATE_SUFFIX|HIDE|prefix|X/,
+      }))),
+      { label: `HOLD22 glued top-level quoted ${key} crossing ${quote} control`,
+        input: `${key}=${quote}prefix password=${opposite}HIDE ${quote}LEAK_ME${opposite}${quote}`,
+        expected: `${key}=${quote}[redacted]${quote}`, secrets: /LEAK_ME|HIDE|prefix/ },
+    ];
+  })),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
