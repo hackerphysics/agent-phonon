@@ -438,6 +438,38 @@ const credentialCases = [
         expected: "token=[redacted]", secrets: /OUTER|HIDE|ME|PRIVATE_SUFFIX/ },
     ];
   }),
+  ...[
+    ...["token", "password", "secret", "api_key", "api-key"].map(key => ({
+      prefix: `${key}=OUTER`, redacted: `${key}=[redacted]`,
+    })),
+    { prefix: 'token="OUTER"TOPSECRET', redacted: 'token="[redacted]"' },
+    { prefix: "token='OUTER'TOPSECRET", redacted: "token='[redacted]'" },
+    { prefix: "password=''OUTER", redacted: "password=[redacted]" },
+    { prefix: 'password=""OUTER', redacted: "password=[redacted]" },
+    ...["token=", "token=''", 'token=""'].map(prefix => ({ prefix, redacted: "token=[redacted]" })),
+  ].flatMap(({ prefix, redacted }) => ["token", "password", "secret", "api_key", "api-key"].flatMap(key =>
+    ['"', "'"].flatMap(quote => ["PRIVATE_PREFIX", "KEEP_ME something", "api_key=KEEP_ME something"].map(interior => {
+      const opposite = quote === '"' ? "'" : '"';
+      return {
+        label: `HOLD19 multiword prefix ${prefix}-password=${quote}X ${interior} before ${key}`,
+        input: `${prefix}-password=${quote}X ${interior} ${key}= ${opposite}HIDE ${quote}TAIL${opposite}PRIVATE_SUFFIX`,
+        expected: `${redacted} ${key}= ${opposite}[redacted]${opposite}`,
+        secrets: /PRIVATE_PREFIX|KEEP_ME|something|OUTER|TOPSECRET|HIDE|TAIL|LEAK_ME|PRIVATE_SUFFIX|ME/,
+      };
+    })))),
+  ...['"', "'"].flatMap(quote => {
+    const opposite = quote === '"' ? "'" : '"';
+    return [
+      { label: `HOLD19 multiword prefix with spaced glued opener and escaped quote ${quote}`,
+        input: `token=OUTER-password= ${quote}X \\${quote} PRIVATE_PREFIX KEEP_ME secret= ${opposite}HIDE ${quote} LEAK_ME${opposite}PRIVATE_SUFFIX`,
+        expected: `token=[redacted] secret= ${opposite}[redacted]${opposite}`,
+        secrets: /PRIVATE_PREFIX|KEEP_ME|OUTER|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/ },
+      { label: `HOLD19 multiword prefix before quoted key, colon and tabs ${quote}`,
+        input: `token=OUTER-password=${quote}X PRIVATE_PREFIX KEEP_ME API-Key${opposite} :\t ${opposite}HIDE ${quote}TAIL${opposite}PRIVATE_SUFFIX`,
+        expected: `token=[redacted] API-Key${opposite} :\t ${opposite}[redacted]${opposite}`,
+        secrets: /PRIVATE_PREFIX|KEEP_ME|OUTER|HIDE|TAIL|PRIVATE_SUFFIX|ME/ },
+    ];
+  }),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
