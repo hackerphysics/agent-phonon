@@ -504,6 +504,42 @@ const credentialCases = [
         secrets: /PRIVATE_PREFIX|KEEP_ME|OUTER|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/ },
     ];
   }),
+  ...[
+    ...["token", "password", "secret", "api_key", "api-key"].map(key => ({
+      prefix: `${key}=OUTER`, redacted: `${key}=[redacted]`,
+    })),
+    { prefix: 'token="OUTER"TOPSECRET', redacted: 'token="[redacted]"' },
+    { prefix: "token='OUTER'TOPSECRET", redacted: "token='[redacted]'" },
+    { prefix: "password=''OUTER", redacted: "password=[redacted]" },
+    { prefix: 'password=""OUTER', redacted: "password=[redacted]" },
+    ...["token=", "token=''", 'token=""'].map(prefix => ({ prefix, redacted: "token=[redacted]" })),
+  ].flatMap(({ prefix, redacted }) => ["token", "password", "secret", "api_key"].flatMap(key =>
+    ['"', "'"].flatMap(quote => ["PRIVATE_PREFIX KEEP_ME", "KEEP_ME something", "api_key=KEEP_ME something"].flatMap(mid => {
+      const opposite = quote === '"' ? "'" : '"';
+      const contained = `${prefix}-password=${quote}X ${key}=${opposite}secret=${opposite} ${mid}`;
+      const secrets = /PRIVATE_PREFIX|KEEP_ME|something|OUTER|TOPSECRET|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/;
+      return [
+        { label: `HOLD21 mid-body ${prefix} ${quote} ${key} ${mid}`,
+          input: `${contained} ${key}=${opposite}HIDE ${quote} LEAK_ME${opposite}PRIVATE_SUFFIX`,
+          expected: `${redacted} ${key}=${opposite}[redacted]${opposite}`, secrets },
+        { label: `HOLD21 contained-trailing ${prefix} ${quote} ${key} ${mid}`,
+          input: `${contained}${quote}`, expected: redacted, secrets },
+      ];
+    })))),
+  ...['"', "'"].flatMap(quote => {
+    const opposite = quote === '"' ? "'" : '"';
+    return ["token", "password", "secret", "api_key", "api-key"].flatMap(valueKey => ["", " "].flatMap(space => {
+      const contained = `token=OUTER-password=${space}${quote}X token=${space}${opposite}${valueKey}=${opposite} PRIVATE_PREFIX KEEP_ME`;
+      const secrets = /PRIVATE_PREFIX|KEEP_ME|OUTER|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/;
+      return [
+        { label: `HOLD21 opaque ${valueKey}= mid-body ${quote} ${JSON.stringify(space)}`,
+          input: `${contained} password=${space}${opposite}HIDE ${quote} LEAK_ME${opposite}PRIVATE_SUFFIX`,
+          expected: `token=[redacted] password=${space}${opposite}[redacted]${opposite}`, secrets },
+        { label: `HOLD21 opaque ${valueKey}= contained-trailing ${quote} ${JSON.stringify(space)}`,
+          input: `${contained}${quote}`, expected: "token=[redacted]", secrets },
+      ];
+    }));
+  }),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
