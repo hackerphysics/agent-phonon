@@ -137,6 +137,8 @@ export class PhononConnection {
     /** 设备本地预注册的确定性维护目标。 */
     maintenance?: MaintenanceManagerConfig;
     delivery?: Partial<import("./delivery-capacity.js").DeliveryConfig>;
+    /** @internal Tenant-scoped live clock obligations transferred by PhononClient. */
+    liveDispatchScheduleIds?: ReadonlySet<string>;
   }) {
     this.managedMcp = opts.managedMcp;
     this.tenantId = opts.tenantId;
@@ -287,9 +289,8 @@ export class PhononConnection {
       acknowledgeInteraction:(id,response)=>this.interactionReceipts.applied(id,interactionHash(response)),
     });
 
-    // L4 调度器（device-authoritative）。当前由 PhononConnection 持有：重连会
-    // dispose 旧实例、由新实例从 store 重建 cron；在途 run 会明确落为 failed，
-    // 避免旧 connection 的 timers/runtime 与新实例并存。
+    // The client may retain the dispatch-only clock across a socket outage;
+    // replacement transfers live obligations and disposes it before restoring state.
     this.scheduler = new SchedulerEngine({
       tenantId: this.tenantId,
       engine: this.engine,
@@ -299,7 +300,7 @@ export class PhononConnection {
       emit: (method, params) => this.peer.notifyRaw(method, params),
       assertRunAllowed: (schedule) => this.policy.assertMethodAllowed(schedule.target.runKind === "dispatch" ? "schedule.trigger" : schedule.target.runKind === "workflow" ? "workflow.run" : "session.create"),
     });
-    this.scheduler.start();
+    this.scheduler.start(opts.liveDispatchScheduleIds);
     this.scheduler.replayUnacked();
     this.replayWorkflowEvents();
     // Workflow ownership is tenant-scoped and persisted. Recovery runs only
@@ -323,6 +324,15 @@ export class PhononConnection {
   /** 连接断开时永久释放 connection-scoped runtime。 */
   onClose(reason = "connection closed"): Promise<void> {
     return this.dispose(reason);
+  }
+
+  /** @internal Transfer only occurrence recording to the device client's lifetime. */
+  detachDispatchClock(reason: string): SchedulerEngine | undefined {
+    if (this.disposed) return undefined;
+    const clock = this.scheduler;
+    clock?.detachDispatchClock(reason);
+    this.scheduler = undefined;
+    return clock;
   }
 
   /**
