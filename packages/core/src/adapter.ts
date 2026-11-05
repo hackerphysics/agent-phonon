@@ -216,6 +216,8 @@ export function formatInitialContextLines(initialContext?: ContextItem[]): strin
  *   discover 要枚举出多个 AgentDescriptor，agentId 形如 `openclaw:main` / `openclaw:phonon`。
  */
 export interface AgentAdapter {
+  /** OpenClaw vendor-native read-only inventory, separate from the L4 clock. */
+  openclawScheduleList?(): Promise<import("@agent-phonon/protocol").OpenClawSchedule[]>;
   /** runtime 内部名，如 "openclaw"。 */
   readonly name: string;
 

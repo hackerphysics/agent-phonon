@@ -1,5 +1,6 @@
 import { spawnSupervisedAgent, type ProcessSupervisor } from "../process-supervisor.js";
 import { discoveryProbe } from "../discovery-probe.js";
+import { readOpenClawSchedules } from "./openclaw-schedule.js";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -166,6 +167,13 @@ class OpenClawSession implements AdapterSession {
 }
 
 export class OpenClawAdapter implements AgentAdapter {
+  openclawScheduleList() {
+    return readOpenClawSchedules(async () => {
+      const output = await discoveryProbe(this.bin, ["cron", "list", "--all", "--json"]);
+      if (output === null) throw new Error("OpenClaw CLI unavailable");
+      return JSON.parse(output);
+    });
+  }
   readonly name = "openclaw";
   readonly capabilities = {...OPENCLAW_CAPABILITIES,reasoningControl:false};
   /** 默认驱动哪个 OpenClaw agent（可被 session agentConfig.openclawAgent 覆盖）。 */

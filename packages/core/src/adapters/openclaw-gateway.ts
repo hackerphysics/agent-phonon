@@ -26,6 +26,7 @@ import { z } from "zod";
 import { OpenClawPeerCapabilities, OpenClawInputCapabilities, projectOpenClawToolResult } from "./openclaw-peer-context.js";
 import { CurrentTurnInput } from "../current-turn-input.js";
 import { nativeVersionAtLeast } from "@agent-phonon/protocol";
+import { readOpenClawSchedules } from "./openclaw-schedule.js";
 
 const PHONON_PLUGIN = "agent-phonon-hitl";
 const PHONON_OPTIONAL_TOOLS = ["phonon_request_interaction", "phonon_acknowledge_interaction", "phonon_conversation_board", "phonon_workflow", "phonon_conversation_message", "phonon_publish_document", "phonon_project_coordination"];
@@ -443,6 +444,12 @@ class GatewaySession implements AdapterSession {
 }
 
 export class OpenClawGatewayAdapter implements AgentAdapter {
+  openclawScheduleList() {
+    return readOpenClawSchedules(async () => {
+      await this.gw.connect();
+      return this.gw.rpc("cron.list", { includeDisabled: true }, 8000);
+    });
+  }
   readonly name = "openclaw";
   readonly capabilities = {...CAPABILITIES};
   private gw: GatewayClient;

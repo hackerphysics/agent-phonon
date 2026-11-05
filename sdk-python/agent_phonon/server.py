@@ -629,6 +629,13 @@ class PhononDevice:
         if client_request_id is not None: params["clientRequestId"] = client_request_id
         return await self._peer.request("schedule.delete", params)
 
+    async def openclaw_schedule_list(self) -> dict:
+        """Inspect device-owned OpenClaw jobs without using the Phonon L4 clock."""
+        return await self._peer.request("openclaw.schedule.list", {})
+
+    async def openclaw_schedule_get(self, job_id: str) -> dict:
+        return await self._peer.request("openclaw.schedule.get", {"id": job_id})
+
     async def schedule_list(self, **filt: Any) -> dict:
         return await self._peer.request("schedule.list", filt)
 

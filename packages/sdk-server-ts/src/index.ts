@@ -40,6 +40,9 @@ export type {
   WorkflowReplyDirective,
   WorkflowDoneDirective,
   ScheduleDispatch,
+  OpenClawSchedule,
+  OpenClawScheduleListResult,
+  OpenClawScheduleGetResult,
   RunResolveResult,
   SkillInstallStatusResult,
 } from "@agent-phonon/protocol";
