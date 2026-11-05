@@ -34,6 +34,13 @@ export interface StoredSkillInstall {
  * connection_tenants, idempotency, pending_interactions。tenant/inbox_queue 后续按需。
  */
 export class PhononStore {
+  /** Read-only executor probes survive a transport controller, never its write authority. */
+  readonly pendingNativeStops = new Map<string, {
+    stopJSON: string;
+    recoveryJSON: string | null;
+    observe: () => Promise<{confirmation:"process_tree_exit"|"native_terminal";checkpoint?:string} | undefined>;
+    pending?: Promise<{confirmation:"process_tree_exit"|"native_terminal";checkpoint?:string} | undefined>;
+  }>();
   readonly activeCompressions = new Set<string>();
   readonly activeSessionControls = new Set<string>();
   readonly activeSkillInstalls = new Set<string>();
@@ -826,6 +833,7 @@ export class PhononStore {
   }
   /** 删一条 session 元数据（不动快照文件，由调用方决定）。 */
   deleteSession(sessionId: string): void {
+    for (const key of this.pendingNativeStops.keys()) if (key.endsWith("\0" + sessionId)) this.pendingNativeStops.delete(key);
     this.db.prepare("DELETE FROM sessions WHERE session_id=?").run(sessionId);
     this.db.prepare("DELETE FROM session_native_owners WHERE session_id=?").run(sessionId);
   }
@@ -1013,6 +1021,7 @@ export class PhononStore {
       .run(state,response??null,hash??null,new Date().toISOString(),tenant,request);
   }
   close(): void {
+    this.pendingNativeStops.clear();
     this.peers?.close();
     this.archives?.close();
     this.db.close();

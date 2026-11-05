@@ -371,7 +371,17 @@ class HermesSession implements AdapterSession {
   async interrupt(): Promise<void> {
     if (this.current) { const current = this.current; this.current = undefined; await current.terminate(); }
   }
-  async observeNativeStop(turnId:string){return this.lastNative?.turnId===turnId&&this.lastNative.supervisor.hasStopped()?"process_tree_exit" as const:undefined;}
+  async observeNativeStop(turnId:string){
+    const native=this.lastNative;
+    if(native?.turnId!==turnId||!native.supervisor.hasStopped())return;
+    // Interruption clears the old checkpoint. Re-read the same native history
+    // after real tree exit instead of leaving recovery permanently unavailable.
+    if(!this.nativeObservation&&this.hermesSessionId&&this.profileHome){
+      const observed=await observeHermesSession(this.env.binPath??"hermes",this.profile,this.hermesSessionId,this.cwd,this.env.profileFileBrokerRoot).catch(()=>undefined);
+      if(this.lastNative===native&&observed?.nativeHome===this.profileHome)this.nativeObservation=observed;
+    }
+    return "process_tree_exit" as const;
+  }
   async switchModel(model: string): Promise<{ warnings?: string[] }> { this.model = model; return {}; }
   async inject(context: ContextItem[]): Promise<void> {
     for (const c of context) this.pendingInject.push(`[${c.role}] ${c.content}`);

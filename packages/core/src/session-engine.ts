@@ -555,6 +555,7 @@ export class SessionEngine {
     const rec = this.assertTenant(sessionId, tenantId);
     if (rec.project !== expected.project || rec.agent !== expected.agent || rec.model !== expected.model) throw new PhononError("errInvalidParams", "Session recovery identity changed");
     if (rec.status === "terminated") throw new PhononError("errSessionTerminated");
+    await this.refreshDetachedStop(rec);
     const authority=this.captureProjectAuthority(rec);
     this.runtimeContext?.assertAgentAllowed?.(rec.agent);
     this.assertCompressionIdle(rec);
@@ -604,6 +605,7 @@ export class SessionEngine {
     const rec = this.assertTenant(sessionId, tenantId);
     if (rec.status === "terminated")
       throw new PhononError("errSessionTerminated", "session terminated");
+    await this.refreshDetachedStop(rec);
     const authority=this.captureProjectAuthority(rec);
     if(opts.whenBusy==="inject"&&(rec.detached||rec.status!=="running"||!rec.currentTurnId))throw new PhononError("errSessionBusy","insertion requires an existing active turn");
     if(opts.expectedActiveTurnId!==undefined){
@@ -1145,8 +1147,56 @@ export class SessionEngine {
     }finally{this.control(rec,false);}
   }
 
+  private async refreshDetachedStop(rec:SessionRecord):Promise<void>{
+    if(!rec.detached||this.disposed||!this.store)return;
+    const store=this.store,key=rec.tenantId+"\0"+rec.sessionId;
+    const row=store.nativeSessionSnapshot(rec.tenantId,rec.sessionId);
+    if(!row||row.status==="terminated"||row.project_id!==rec.project||row.agent_id!==rec.agent||row.model!==rec.model||(row.worktree_id??undefined)!==rec.worktreeId
+      ||(row.employee_id??undefined)!==rec.employeeId||(row.employee_revision??undefined)!==rec.employeeRevision)return;
+    let proof:NativeStopTarget;
+    try{proof=NativeStopTarget.parse(JSON.parse(String(row.native_stop_json)));}catch{return;}
+    if(proof.sessionId!==rec.sessionId)return;
+    if(proof.state==="confirmed"){
+      rec.nativeStop=proof;rec.recoveryCheckpoint=readSessionCheckpoint(row.recovery_json);
+      rec.recoverySource=row.recovery_json===null?null:String(row.recovery_json);
+      if(rec.recoveryCheckpoint?.settled)return;
+    }
+    const observation=store.pendingNativeStops.get(key);
+    if(!observation)return;
+    if(observation.stopJSON!==row.native_stop_json||observation.recoveryJSON!==row.recovery_json){store.pendingNativeStops.delete(key);return;}
+    if(store.nativeSessionOwnedElsewhere(rec.tenantId,rec.sessionId,this.nativeOwner)
+      ||store.activeSessionControls.has(key)||store.compressionBlocked(rec.tenantId,rec.sessionId))return;
+    const authority=this.captureProjectAuthority(rec);
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    const pending=observation.pending??=observation.observe().catch(()=>undefined);
+    const settled=await Promise.race([pending.then(value=>({value})),new Promise<undefined>(resolve=>{
+      timer=setTimeout(()=>resolve(undefined),DISPOSE_SETTLE_TIMEOUT_MS);
+    })]).finally(()=>{if(timer)clearTimeout(timer);});
+    if(!settled)return;
+    if(observation.pending===pending)observation.pending=undefined;
+    const result=settled.value;
+    if(!result||this.disposed||!rec.detached||rec.ownsNative)return;
+    this.assertProjectAuthority(rec,authority);
+    if(store.activeSessionControls.has(key)||store.compressionBlocked(rec.tenantId,rec.sessionId))return;
+    if(!store.claimNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner,{checkpoint:observation.recoveryJSON,
+      nativeStopJSON:observation.stopJSON,project:rec.project,agent:rec.agent,model:rec.model,
+      employeeId:rec.employeeId,employeeRevision:rec.employeeRevision}))return;
+    rec.ownsNative=true;
+    try{
+      rec.nativeStop={...proof,state:"confirmed",confirmation:result.confirmation,reasonCode:undefined,observedAt:new Date().toISOString()};
+      rec.recoveryCheckpoint=readSessionCheckpoint(result.checkpoint??row.recovery_json);
+      this.persist(rec);
+      if(store.pendingNativeStops.get(key)===observation){
+        if(rec.recoveryCheckpoint?.settled||!this.registry.resolve(rec.agent)?.recoverSession)store.pendingNativeStops.delete(key);
+        else{observation.stopJSON=JSON.stringify(rec.nativeStop);observation.recoveryJSON=rec.recoveryCheckpoint?JSON.stringify(rec.recoveryCheckpoint):null;}
+      }
+    }finally{store.releaseNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner);rec.ownsNative=false;}
+  }
+
   async nativeStopStatus(tenant:string,session:string,turnId?:string):Promise<NativeStopTarget>{
-    const rec=this.assertTenant(session,tenant),proof=rec.nativeStop;
+    const rec=this.assertTenant(session,tenant);
+    await this.refreshDetachedStop(rec);
+    const proof=rec.nativeStop;
     if(!proof||proof.turnId!==turnId)return {version:1,sessionId:session as never,...(turnId?{turnId}:{}),state:"unknown",observedAt:new Date().toISOString(),reasonCode:"stop_target_unavailable"};
     if(proof.state!=="confirmed"&&!rec.detached&&!this.disposed&&rec.nativeStopSettled&&rec.nativeStopNotDispatched){this.confirmNativeStop(rec,"not_started");return rec.nativeStop!;}
     if(proof.state!=="confirmed"&&!rec.detached&&!this.disposed&&rec.nativeStopSettled&&proof.turnId){
@@ -1363,6 +1413,7 @@ export class SessionEngine {
 
   async status(tenantId: string, sessionId: string) {
     const rec = this.assertTenant(sessionId, tenantId);
+    await this.refreshDetachedStop(rec);
     const meta = this.toMeta(rec);
     // 补充上下文信息（adapter 能提供时，D33）；detached/游离 session 无 live adapterSession，跳过
     if (!rec.detached && rec.adapterSession?.describe) {
@@ -1441,7 +1492,30 @@ export class SessionEngine {
       if(!rec.controlOperation&&!this.store?.compressionBlocked(rec.tenantId,rec.sessionId))this.captureCheckpoint(rec,true);
       this.persist(rec);
     }
-    for(const rec of this.sessions.values())if(rec.ownsNative){this.store?.releaseNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner);rec.ownsNative=false;}
+    for(const rec of this.sessions.values())if(rec.ownsNative){
+      const store=this.store,stop=rec.nativeStop,adapterSession=rec.adapterSession;
+      if(store&&rec.detached&&stop?.turnId&&(stop.state!=="confirmed"||!rec.recoveryCheckpoint?.settled)&&adapterSession?.observeNativeStop){
+        const row=store.nativeSessionSnapshot(rec.tenantId,rec.sessionId),turnId=stop.turnId;
+        const identity={version:1,adapter:this.registry.resolve(rec.agent)?.name,agent:rec.agent,model:rec.model,project:rec.project,cwd:rec.cwd,settled:true};
+        let settled=!rec.turnSettlement;
+        void rec.turnSettlement?.promise.then(()=>{settled=true;},()=>{});
+        if(row)store.pendingNativeStops.set(rec.tenantId+"\0"+rec.sessionId,{
+          stopJSON:String(row.native_stop_json),recoveryJSON:row.recovery_json===null?null:String(row.recovery_json),
+          observe:async()=>{
+            if(!settled)return;
+            const confirmation=await adapterSession.observeNativeStop!(turnId);
+            if(confirmation!=="process_tree_exit"&&confirmation!=="native_terminal")return;
+            let checkpoint:string|undefined;
+            try{
+              const state=adapterSession.recoveryCheckpoint?.();
+              if(state){const value=JSON.stringify(SessionCheckpoint.parse({...identity,state}));if(Buffer.byteLength(value)<=65536)checkpoint=value;}
+            }catch{}
+            return {confirmation,checkpoint};
+          },
+        });
+      }
+      store?.releaseNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner);rec.ownsNative=false;
+    }
     this.sessions.clear();
     this.nativeStopListeners.clear();
   }

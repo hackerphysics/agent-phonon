@@ -123,6 +123,20 @@ class AIAgent:
     async close(){await conn.conn.dispose();store.close();if(previous===undefined)delete process.env.HERMES_HOME;else process.env.HERMES_HOME=previous;rmSync(root,{recursive:true,force:true});}};
 }
 
+test("Hermes re-observes the same readonly native history after a confirmed stop cleared its checkpoint",{skip:!existsSync("/usr/bin/python3")},async()=>{
+  const f=await fixture();
+  try{
+    await f.turn(f.privateId,"retained original");
+    const engine=(f.conn.conn as any).engine,session=engine.sessions.get(f.privateId).adapterSession;
+    const saved=session.recoveryCheckpoint(),before=f.calls().length;
+    assert.ok(saved);assert.equal(session.lastNative.supervisor.hasStopped(),true);
+    session.nativeObservation=undefined;
+    assert.equal(session.recoveryCheckpoint(),undefined);
+    assert.equal(await session.observeNativeStop(session.lastNative.turnId),"process_tree_exit");
+    assert.deepEqual(session.recoveryCheckpoint(),saved);assert.equal(f.calls().length,before);
+  }finally{await f.close();}
+});
+
 for(const version of ["0.16","0.21"] as const){
 test(`Hermes ${version} DE recovery preserves distinct private/group native histories, memory and pending context without inference`,{skip:!existsSync("/usr/bin/python3")},async()=>{
   const f=await fixture(version);

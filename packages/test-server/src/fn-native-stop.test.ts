@@ -125,6 +125,41 @@ test("stop evidence arriving after the disposal window cannot mutate the release
   }finally{confirm();release();await f.close();}
 });
 
+test("the next connection rechecks a late native stop and delivers only the new message",async()=>{
+  let active=false,stopped=false,checkpointReady=false,release:()=>void=()=>{},turn:string|undefined;
+  const inputs:string[]=[],registry=new AdapterRegistry();
+  const create:AgentAdapter["createSession"]=async params=>({
+    sessionId:params.sessionId,model:params.model,interrupt:async()=>{},terminate:async()=>{},
+    observeNativeStop:async id=>id===turn&&stopped?"process_tree_exit":undefined,
+    recoveryCheckpoint:()=>stopped&&checkpointReady?{nativeID:"same-session"}:undefined,
+    send:async(input,options)=>{
+      inputs.push(input);turn=options.turnId;
+      if(inputs.length===1){active=true;await new Promise<void>(resolve=>{release=resolve;});active=false;}
+      else options.emit({type:"result",sessionId:params.sessionId,turnId:options.turnId,seq:0,at:new Date().toISOString(),status:"completed",text:"next reply",final:true} as never);
+    },
+  });
+  registry.register({name:"stop",capabilities:{nativeSession:true,interrupt:true} as never,discoverAgents:async()=>[],createSession:create,
+    recoverSession:async(params,checkpoint)=>{assert.deepEqual(checkpoint,{nativeID:"same-session"});return create(params);}});
+  const f=await setup(registry);
+  try{
+    const ack=await f.tc.call("workflow.run",request(f.project)) as any;await until(()=>active);
+    await f.restart();
+    const row=f.store.loadSessions("owner")[0]!,sessionId=String(row.session_id);
+    assert.equal((await f.tc.call("session.status",{sessionId}) as any).nativeStop.state,"unknown");
+    stopped=true;release();await until(()=>!active);
+    const stoppedOnly=await f.tc.call("session.status",{sessionId}) as any;
+    assert.equal(stoppedOnly.nativeStop.state,"confirmed");assert.equal(stoppedOnly.recovery.canAttempt,false);
+    assert.equal(f.store.pendingNativeStops.size,1);
+    checkpointReady=true;
+    const fresh=await f.tc.call("session.status",{sessionId}) as any;
+    assert.equal(fresh.nativeStop.state,"confirmed");assert.equal(fresh.recovery.canAttempt,true);
+    assert.equal(f.store.pendingNativeStops.size,0);
+    await f.tc.call("workflow.cancel",{workflowId:ack.workflowId});
+    await f.tc.call("session.send",{sessionId,input:"new original message"});
+    await until(()=>inputs.length===2);assert.deepEqual(inputs,["work","new original message"]);
+  }finally{stopped=true;release();await f.close();}
+});
+
 test("Gateway stop needs the matching native terminal, not a chat.abort acknowledgement or another run",async()=>{
   const adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:"ws://127.0.0.1:1",token:"fixture"}});let runId:string|undefined;
   (adapter as any).gw={connect:async()=>{},close:()=>{},isConnected:()=>true,connectionEpoch:()=>1,rpc:async(method:string,params:any)=>{if(method==="chat.send")runId=params.idempotencyKey;return {};}};
