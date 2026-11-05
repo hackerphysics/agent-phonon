@@ -116,6 +116,10 @@ test("OpenClaw normalizes interval/at, unknown trigger kinds and nullable option
 });
 
 const credentialCases = [
+  { label: "fully double-quoted value", input: 'password="alpha"',
+    expected: 'password="[redacted]"', secrets: /alpha/ },
+  { label: "fully single-quoted value", input: "password='alpha'",
+    expected: "password='[redacted]'", secrets: /alpha/ },
   { label: "HOLD leading quoted whitespace", input: 'reminder password=" alpha"',
     expected: 'reminder password="[redacted]"', secrets: /alpha/ },
   { label: "HOLD internal quoted whitespace", input: 'failed password="alpha beta gamma"',
@@ -156,6 +160,14 @@ const credentialCases = [
     expected: "https://example.test?password=[redacted]&token=[redacted]&keep=public", secrets: /FULL_PRIVATE|prefix|PRIVATE_SUFFIX/ },
   { label: "HOLD5 whitespace-separated assignments", input: "password=prefix}PRIVATE_SUFFIX token=}FULL_PRIVATE keep=public",
     expected: "password=[redacted] token=[redacted] keep=public", secrets: /prefix|PRIVATE_SUFFIX|FULL_PRIVATE/ },
+  { label: "HOLD6 mid-value single quote", input: "password=prefix'SECRET_SUFFIX",
+    expected: "password=[redacted]", secrets: /prefix|SECRET_SUFFIX/ },
+  { label: "HOLD6 mid-value double quote", input: 'password=prefix"SECRET_SUFFIX',
+    expected: "password=[redacted]", secrets: /prefix|SECRET_SUFFIX/ },
+  { label: "HOLD6 query parameter boundaries", input: `https://example.test?password=prefix'SECRET_SUFFIX&token=prefix"SECRET_SUFFIX&keep=public`,
+    expected: "https://example.test?password=[redacted]&token=[redacted]&keep=public", secrets: /prefix|SECRET_SUFFIX/ },
+  { label: "HOLD6 whitespace-separated assignments", input: `password=prefix'SECRET_SUFFIX token=prefix"SECRET_SUFFIX keep=public`,
+    expected: "password=[redacted] token=[redacted] keep=public", secrets: /prefix|SECRET_SUFFIX/ },
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
