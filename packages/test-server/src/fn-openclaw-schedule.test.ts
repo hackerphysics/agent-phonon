@@ -170,6 +170,31 @@ for (const { label, input, expected, secrets } of credentialCases) {
   });
 }
 
+for (const scheme of ["https", "http"]) {
+  for (const method of ["list", "get"] as const) {
+    for (const field of ["name", "lastError", "delivery.to"]) {
+      test(`OpenClaw ${method} redacts HOLD empty-user ${scheme} URL password in ${field}`, async () => {
+        const f = fixture();
+        try {
+          const conn = f.actor();
+          const input = `${scheme}://:local_secret@example.test/request`;
+          const expected = `${scheme}://[redacted]@example.test/request`;
+          f.respond({ jobs: [{ ...nativeJob,
+            ...(field === "name" ? { name: input }
+              : field === "lastError" ? { state: { lastError: input } }
+                : { delivery: { ...nativeJob.delivery, to: input } }),
+          }] });
+          const result = await conn.call(`openclaw.schedule.${method}`, method === "get" ? { id: nativeJob.id } : {});
+          const job = method === "list" ? OpenClawScheduleListResult.parse(result).schedules[0]!
+            : OpenClawScheduleGetResult.parse(result).schedule;
+          assert.equal(field === "name" ? job.name : field === "lastError" ? job.state.lastError : job.delivery.to, expected);
+          assert.doesNotMatch(JSON.stringify(result), /local_secret/);
+        } finally { await f.close(); }
+      });
+    }
+  }
+}
+
 test("OpenClaw accepts only complete initial-page envelopes and legacy arrays", async () => {
   const f = fixture();
   try {
