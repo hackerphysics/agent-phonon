@@ -5,6 +5,8 @@ import { PROTOCOL_VERSION } from "@agent-phonon/protocol";
 import { PhononError } from "./rpc.js";
 import { PhononStore } from "./store.js";
 import type { RpcTransport } from "./rpc.js";
+import { SchedulerEngine } from "./scheduler-engine.js";
+import { PolicyEnforcer } from "./policy.js";
 
 const CONNECTION_TIMING = {
   connectTimeoutMs: 15_000,
@@ -51,6 +53,7 @@ export class PhononClient {
   private readonly managedMcp?: import("./index.js").ManagedMcpHandlers;
   private ws?: WebSocket;
   private conn?: PhononConnection;
+  private dispatchClock?: SchedulerEngine;
   private dialing = new Map<WebSocket, (reason: string) => void>();
   private stopActive?: (reason: string) => void;
   /** Every replacement waits for all retired runtimes, including unpublished candidates. */
@@ -144,6 +147,7 @@ export class PhononClient {
   /** 连接并完成握手，resolve 后即可接收 server 的 session.* 下发。 */
   connect(): Promise<{ tenantId: string }> {
     if (this.closed) return Promise.reject(new Error("client closed"));
+    this.startDispatchClock();
     const generation = ++this.generation;
     this.clearReconnect();
     for (const cancel of this.dialing.values()) cancel("connection attempt superseded");
@@ -278,6 +282,8 @@ export class PhononClient {
           this.stopActive?.("connection replaced");
           await this.teardown;
           assertCurrent();
+          this.dispatchClock?.dispose("connection restored");
+          this.dispatchClock = undefined;
           this.lastTenantId = welcome.tenantId;
           this.store.rememberConnectionTenant(this.serverUrl, welcome.tenantId, new Date().toISOString());
           const localDirectorySource={url:this.serverUrl,deviceKey:this.deviceKey,expectedTenantId:this.expectedTenantId};
@@ -394,8 +400,27 @@ export class PhononClient {
   }
 
   private retire(conn: PhononConnection, reason: string): void {
+    if (!this.closed && !conn.isDisposed) {
+      const clock = conn.detachDispatchClock(reason);
+      if (clock) {
+        this.dispatchClock?.dispose("dispatch clock replaced");
+        this.dispatchClock = clock;
+      }
+    }
     this.teardown = Promise.all([this.teardown, conn.dispose(reason)]).then(() => undefined);
     void this.teardown.catch(() => undefined);
+  }
+
+  private startDispatchClock(): void {
+    if (this.conn || this.dispatchClock) return;
+    // Only a previously authenticated server binding may select the local tenant.
+    const tenantId = this.lastTenantId ?? this.store.connectionTenant(this.serverUrl);
+    if (!tenantId || this.expectedTenantId !== undefined && tenantId !== this.expectedTenantId) return;
+    const policy = new PolicyEnforcer({ policy: this.policy, trustLocal: this.trustLocal, workspaceRoot: this.workspaceRoot });
+    const clock = new SchedulerEngine({ tenantId, store: this.store, dispatchOnly: true, emit: () => {},
+      assertRunAllowed: () => policy.assertMethodAllowed("schedule.trigger") });
+    this.dispatchClock = clock;
+    clock.start();
   }
 
   close(): Promise<void> {
@@ -406,6 +431,8 @@ export class PhononClient {
     this.clearReconnect();
     for (const cancel of this.dialing.values()) cancel("client closed");
     this.stopActive?.("client closed");
+    this.dispatchClock?.dispose("client closed");
+    this.dispatchClock = undefined;
     this.closing = this.teardown.then(() => {
       if (this.ownsStore && !this.storeClosed) {
         this.storeClosed = true;

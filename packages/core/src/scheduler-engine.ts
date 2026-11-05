@@ -56,11 +56,9 @@ interface RunRuntime {
   dispatch?: ScheduleDispatch;
 }
 
-export interface SchedulerEngineOptions {
+interface SchedulerClockOptions {
   tenantId: string;
-  engine: SessionEngine;
   store: PhononStore;
-  resolveCwd: (projectId: string) => string;
   /** The current tenant-scoped workflow engine. */
   workflows?: () => WorkflowEngine | undefined;
   emit: (method: "run.started" | "run.event" | "run.finished" | "schedule.changed", params: unknown) => void;
@@ -69,6 +67,11 @@ export interface SchedulerEngineOptions {
   defaultTz?: string;
   now?: () => number;
 }
+
+export type SchedulerEngineOptions = SchedulerClockOptions & (
+  | { dispatchOnly: true; engine?: never; resolveCwd?: never }
+  | { dispatchOnly?: false; engine: SessionEngine; resolveCwd: (projectId: string) => string }
+);
 
 const MASK = "***";
 const TERMINAL = new Set<RunStatus>(["success", "failed", "timeout", "cancelled", "skipped"]);
@@ -83,6 +86,7 @@ export class SchedulerEngine {
   private queues = new Map<string, string[]>();
   private started = false;
   private disposed = false;
+  private dispatchOnly = false;
   private readonly ownerId = `scheduler-owner-${process.pid}-${randomUUID()}`;
   private readonly leaseMs = 5_000;
   private leaseTimer?: ReturnType<typeof setInterval>;
@@ -90,6 +94,7 @@ export class SchedulerEngine {
 
   constructor(opts: SchedulerEngineOptions) {
     this.opts = opts;
+    this.dispatchOnly = opts.dispatchOnly ?? false;
   }
 
   private now(): number {
@@ -115,7 +120,7 @@ export class SchedulerEngine {
     this.leaseTimer.unref?.();
     for (const row of this.opts.store.listSchedules(this.opts.tenantId)) {
       const schedule = this.rowToSchedule(row);
-      if (schedule.enabled && schedule.trigger.kind === "cron") this.restoreCron(schedule);
+      if (schedule.enabled && schedule.trigger.kind === "cron" && (!this.dispatchOnly || schedule.target.runKind === "dispatch")) this.restoreCron(schedule);
     }
   }
 
@@ -128,6 +133,36 @@ export class SchedulerEngine {
     for (const rt of this.runtimes.values()) this.clearRunTimer(rt);
   }
 
+  /** Keep only the device's occurrence clock alive while its controller is offline. */
+  detachDispatchClock(reason: string): void {
+    if (this.disposed || this.dispatchOnly) return;
+    this.dispatchOnly = true;
+    for (const id of this.timers.keys()) {
+      const row = this.opts.store.getSchedule(id, this.opts.tenantId);
+      if (!row || this.rowToSchedule(row).target.runKind !== "dispatch") this.disarm(id);
+    }
+    for (const rt of [...this.runtimes.values()]) {
+      if (!rt.dispatch) this.retireRuntime(rt, reason);
+    }
+  }
+
+  private retireRuntime(rt: RunRuntime, reason: string): void {
+    const queued = rt.phase === "queued";
+    // Durable workflows, retries and dispatches reattach under the next owner.
+    if ((rt.dispatch || rt.workflowId || rt.phase === "retry_wait") && !TERMINAL.has(rt.status)) {
+      this.clearRunTimer(rt);
+      this.opts.store.releaseRun(rt.runId, this.opts.tenantId, this.ownerId, rt.ownerEpoch);
+    } else {
+      this.finishRun(rt, queued ? "cancelled" : "failed", queued ? `queued run cancelled: ${reason}` : reason, undefined, {
+        drain: false, emit: false,
+      });
+      if (!queued) void this.cancelExecution(rt, reason);
+    }
+    this.detachMappings(rt);
+    this.removeFromQueue(rt);
+    this.runtimes.delete(rt.runId);
+  }
+
   /**
    * Permanent teardown. Running work is failed and queued work is cancelled so
    * no persisted run remains pending. The disposed fence prevents late async
@@ -137,22 +172,7 @@ export class SchedulerEngine {
     if (this.disposed) return;
     this.disposed = true;
     this.stop();
-    for (const rt of [...this.runtimes.values()]) {
-      const queued = rt.phase === "queued";
-      // A workflow and its schedule run are device-authoritative, not bound to
-      // one websocket. Leave the run active so the replacement scheduler can
-      // reattach before WorkflowEngine emits recovery events.
-      if ((rt.dispatch || rt.workflowId || rt.phase === "retry_wait") && !TERMINAL.has(rt.status)) {
-        this.clearRunTimer(rt);
-        this.opts.store.releaseRun(rt.runId, this.opts.tenantId, this.ownerId, rt.ownerEpoch);
-        continue;
-      }
-      this.finishRun(rt, queued ? "cancelled" : "failed", queued ? `queued run cancelled: ${reason}` : reason, undefined, {
-        drain: false,
-        emit: false,
-      });
-      if (!queued) void this.cancelExecution(rt, reason);
-    }
+    for (const rt of [...this.runtimes.values()]) this.retireRuntime(rt, reason);
     this.queues.clear();
     this.runtimes.clear();
     this.sessionToRun.clear();
@@ -461,6 +481,7 @@ export class SchedulerEngine {
 
   private async launchRun(schedule: Schedule, source: RunTriggerSource, input?: TriggerInput, cronNextRunAt?: string): Promise<string> {
     if (this.disposed) throw new Error("scheduler disposed");
+    if (this.dispatchOnly && schedule.target.runKind !== "dispatch") throw new PhononError("errPolicyDenied", "controller disconnected");
     if (schedule.target.dispatch?.expiresAt && Date.parse(schedule.target.dispatch.expiresAt) <= this.now()) {
       this.setEnabled(schedule.id, false);
       throw new PhononError("errPolicyDenied", "dispatch authorization expired");
@@ -582,6 +603,7 @@ export class SchedulerEngine {
         rt.workflowId = launched.workflowId;
         this.workflowToRun.set(launched.workflowId, rt.runId);
       } else {
+        if (!this.opts.engine || !this.opts.resolveCwd) throw new PhononError("errPolicyDenied", "dispatch clock cannot execute a session");
         const cwd = this.opts.resolveCwd(schedule.target.project);
         const created = await this.opts.engine.create({
           tenantId: this.opts.tenantId,
@@ -607,7 +629,7 @@ export class SchedulerEngine {
       this.armRunTimeout(rt, schedule.policy?.timeoutMs);
 
       if (rt.sessionId) {
-        await this.opts.engine.send(
+        await this.opts.engine!.send(
           this.opts.tenantId,
           rt.sessionId,
           this.mapInput(schedule.target.prompt ?? "", rt.input) ?? "",
@@ -630,7 +652,7 @@ export class SchedulerEngine {
     rt.retryHistory.push({ attempt: rt.attempt, at: new Date(this.now()).toISOString(), phase, error });
     // Every failed attempt relinquishes its execution resource, including the
     // final attempt. Mapping is already detached, so late events are fenced.
-    if (sessionId) void this.opts.engine.terminate(this.opts.tenantId, sessionId).catch(() => {});
+    if (sessionId) void this.opts.engine?.terminate(this.opts.tenantId, sessionId).catch(() => {});
     if (workflowId) void this.opts.workflows?.()?.cancel(workflowId, "scheduled attempt failed").catch(() => {});
 
     if (rt.attempt < rt.maxAttempts) {
@@ -792,7 +814,7 @@ export class SchedulerEngine {
 
   private async cancelExecution(rt: RunRuntime, reason: string): Promise<void> {
     const tasks: Promise<unknown>[] = [];
-    if (rt.sessionId) tasks.push(this.opts.engine.interrupt(this.opts.tenantId, rt.sessionId, reason).catch(() => {}));
+    if (rt.sessionId && this.opts.engine) tasks.push(this.opts.engine.interrupt(this.opts.tenantId, rt.sessionId, reason).catch(() => {}));
     if (rt.workflowId) tasks.push(this.opts.workflows?.()?.cancel(rt.workflowId, reason).catch(() => {}) ?? Promise.resolve());
     await Promise.allSettled(tasks);
   }
@@ -866,6 +888,7 @@ export class SchedulerEngine {
 
   private armCron(schedule: Schedule): void {
     if (!this.started || this.disposed || schedule.trigger.kind !== "cron") return;
+    if (this.dispatchOnly && schedule.target.runKind !== "dispatch") return;
     this.disarm(schedule.id);
     const nextIso = schedule.nextRunAt ?? this.computeNextRun(schedule.trigger);
     if (!nextIso) return;
@@ -884,6 +907,7 @@ export class SchedulerEngine {
     if (!row) return;
     const schedule = this.rowToSchedule(row);
     if (!schedule.enabled || schedule.trigger.kind !== "cron") return;
+    if (this.dispatchOnly && schedule.target.runKind !== "dispatch") return;
     if (schedule.nextRunAt && Date.parse(schedule.nextRunAt) - this.now() > 1000) {
       this.armCron(schedule);
       return;
@@ -897,7 +921,11 @@ export class SchedulerEngine {
       // Capacity pressure never rejects/defers. A true persistence/read failure
       // is not accepted and must not advance the due cursor or fake a result.
       if (!(error instanceof PhononError) || error.appCode !== "errPolicyDenied") throw error;
-      this.persist({ ...schedule, nextRunAt });
+      const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
+      if (current) {
+        const updated = this.rowToSchedule(current);
+        if (updated.enabled) this.persist({ ...updated, nextRunAt });
+      }
     }
     if (!this.started || this.disposed) return;
     const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
@@ -1072,6 +1100,7 @@ export class SchedulerEngine {
     const nowIso = new Date(this.now()).toISOString();
     try {
       for (const row of this.opts.store.listActiveRuns(this.opts.tenantId)) {
+        if (this.dispatchOnly && !row.dispatch_json) continue;
         const runId = row.id as string;
         if (this.runtimes.has(runId)) continue;
         const ownerEpoch = this.opts.store.claimRun(runId, this.opts.tenantId, this.ownerId, this.leaseMs);
@@ -1339,6 +1368,7 @@ export class SchedulerEngine {
   }
 
   private safeEmit(method: "run.started" | "run.event" | "run.finished" | "schedule.changed", params: unknown): void {
+    if (this.dispatchOnly) return;
     try {
       this.opts.emit(method, params);
     } catch {

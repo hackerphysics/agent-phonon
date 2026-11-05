@@ -21,6 +21,19 @@ trigger input, and emits `run.started` **without creating a Session or model**.
 `run.get` / `schedule.runs.list` expose the frozen `dispatch` and `input`.
 Disconnect/restart preserves handed-off and queued dispatches for reconciliation.
 
+While the device process remains up, `PhononClient` retains a dispatch-only
+clock across websocket disconnection. Every due tick still commits an occurrence
+and the next cursor locally; no Session, Workflow or model is launched offline.
+Reconnect retires that clock before restoring the connection scheduler and the
+controller drains `schedule.runs.list({unackedOnly:true})`. Closing the client
+stops the clock. On process restart, `catchUp:false` advances past process-down
+ticks without creating a catch-up burst, but never deletes existing receipts.
+With a previously authenticated server-to-tenant binding in the store, the
+restarted client also records future dispatch ticks before its first successful
+reconnect. A configured tenant ID alone is not a substitute for that binding.
+The application server may poll/reconcile; it must not run a second cron clock
+that manufactures occurrences for these schedules.
+
 A controller must validate its own current user authorization, target identity,
 workspace, enabled revision, budget and event provenance, then execute through
 its normal authorized Session / Workflow path. A durable occurrence is not an

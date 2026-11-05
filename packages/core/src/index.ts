@@ -287,9 +287,8 @@ export class PhononConnection {
       acknowledgeInteraction:(id,response)=>this.interactionReceipts.applied(id,interactionHash(response)),
     });
 
-    // L4 调度器（device-authoritative）。当前由 PhononConnection 持有：重连会
-    // dispose 旧实例、由新实例从 store 重建 cron；在途 run 会明确落为 failed，
-    // 避免旧 connection 的 timers/runtime 与新实例并存。
+    // The client may retain the dispatch-only clock across a socket outage;
+    // replacement disposes it before this connection restores durable state.
     this.scheduler = new SchedulerEngine({
       tenantId: this.tenantId,
       engine: this.engine,
@@ -323,6 +322,15 @@ export class PhononConnection {
   /** 连接断开时永久释放 connection-scoped runtime。 */
   onClose(reason = "connection closed"): Promise<void> {
     return this.dispose(reason);
+  }
+
+  /** @internal Transfer only occurrence recording to the device client's lifetime. */
+  detachDispatchClock(reason: string): SchedulerEngine | undefined {
+    if (this.disposed) return undefined;
+    const clock = this.scheduler;
+    clock?.detachDispatchClock(reason);
+    this.scheduler = undefined;
+    return clock;
   }
 
   /**
