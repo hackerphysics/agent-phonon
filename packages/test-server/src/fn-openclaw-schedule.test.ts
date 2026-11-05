@@ -553,6 +553,33 @@ const credentialCases = [
         expected: `${key}=${quote}[redacted]${quote}`, secrets: /LEAK_ME|HIDE|prefix/ },
     ];
   })),
+  ...["token", "password", "secret", "api_key", "api-key"].flatMap(outer =>
+    ["token", "password", "secret", "api_key", "api-key"].flatMap(next => ['"', "'"].flatMap(quote => {
+      const opposite = quote === '"' ? "'" : '"';
+      const crossing = `${outer}=${quote}prefix password=${opposite}HIDE ${quote} LEAK_ME${opposite}`;
+      const redacted = `${outer}=${quote}[redacted]${quote}`;
+      const secrets = /prefix|HIDE|LEAK_ME|PRIVATE_SUFFIX|FIRST_PRIVATE|SECOND_PRIVATE|ONLYONE/;
+      return [
+        ...[" ", ",", ";", "&"].flatMap(separator =>
+          ["", "PRIVATE_SUFFIX", " PRIVATE_SUFFIX", "PRIVATE_SUFFIX PRIVATE_SUFFIX"].map(suffix => ({
+            label: `HOLD23 top-level ${outer} crossing ${quote} before ${next} with separator ${JSON.stringify(separator)} and suffix ${JSON.stringify(suffix)}`,
+            input: `${crossing}${suffix}${separator}${next}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+            expected: `${redacted}${separator}${next}=${quote}[redacted]${quote}`, secrets,
+          }))),
+        { label: `HOLD23 top-level ${outer} crossing ${quote} before single-word ${next}`,
+          input: `${crossing} ${next}=${quote}ONLYONE${quote}`,
+          expected: `${redacted} ${next}=${quote}[redacted]${quote}`, secrets },
+        { label: `HOLD23 top-level ${outer} crossing ${quote} with outer closer before ${next}`,
+          input: `${crossing}${quote} ${next}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+          expected: `${redacted} ${next}=${quote}[redacted]${quote}`, secrets },
+        { label: `HOLD23 top-level ${outer} crossing ${quote} before opposite-quoted ${next}`,
+          input: `${crossing}PRIVATE_SUFFIX ${next}=${opposite}FIRST_PRIVATE SECOND_PRIVATE${opposite}`,
+          expected: `${redacted} ${next}=${opposite}[redacted]${opposite}`, secrets },
+        { label: `HOLD23 top-level ${outer} crossing ${quote} before unquoted ${next}`,
+          input: `${crossing}PRIVATE_SUFFIX ${next}=ONLYONE`,
+          expected: `${redacted} ${next}=[redacted]`, secrets },
+      ];
+    }))),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
