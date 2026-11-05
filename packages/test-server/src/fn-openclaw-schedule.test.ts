@@ -580,6 +580,39 @@ const credentialCases = [
           expected: `${redacted} ${next}=[redacted]`, secrets },
       ];
     }))),
+  ...["token", "password", "secret", "api_key", "api-key"].flatMap(outer =>
+    ["x-password", "x-token", "x-secret", "x-api_key", "x-api-key"].flatMap(next => ['"', "'"].flatMap(quote => {
+      const opposite = quote === '"' ? "'" : '"';
+      const crossing = `${outer}=${quote}prefix password=${opposite}HIDE ${quote} LEAK_ME${opposite}`;
+      const redacted = `${outer}=${quote}[redacted]${quote}`;
+      const secrets = /prefix|alpha|HIDE|LEAK_ME|PRIVATE_SUFFIX|FIRST_PRIVATE|SECOND_PRIVATE|ONLYONE/;
+      return [
+        ...[", ", "; ", ",\t", ";\t"].flatMap(separator =>
+          ["", "PRIVATE_SUFFIX", " PRIVATE_SUFFIX", "PRIVATE_SUFFIX PRIVATE_SUFFIX"].map(suffix => ({
+            label: `HOLD24 top-level ${outer} crossing ${quote} before ${next} with separator ${JSON.stringify(separator)} and suffix ${JSON.stringify(suffix)}`,
+            input: `${crossing}${suffix}${separator}${next}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+            expected: `${redacted}${separator}${next}=${quote}[redacted]${quote}`, secrets,
+          }))),
+        ...(outer === "token" && next === "x-password" ? [", ", "; ", ",\t", ";\t"].flatMap(separator => [
+          ...['"', "'"].map(keyQuote => ({
+            label: `HOLD24 top-level ${outer} crossing ${quote} before ${keyQuote}${next}${keyQuote} with separator ${JSON.stringify(separator)}`,
+            input: `${crossing}PRIVATE_SUFFIX${separator}${keyQuote}${next}${keyQuote}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+            expected: `${redacted}${separator}${keyQuote}${next}${keyQuote}=${quote}[redacted]${quote}`, secrets,
+          })),
+          { label: `HOLD24 non-crossing ${outer} ${quote} before ${next} with separator ${JSON.stringify(separator)}`,
+            input: `${outer}=${quote}alpha${quote}${separator}${next}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+            expected: `${redacted}${separator}${next}=${quote}[redacted]${quote}`, secrets },
+          { label: `HOLD24 top-level ${outer} crossing ${quote} before single-word ${next} with separator ${JSON.stringify(separator)}`,
+            input: `${crossing}${separator}${next}=${quote}ONLYONE${quote}`,
+            expected: `${redacted}${separator}${next}=${quote}[redacted]${quote}`, secrets },
+        ]) : []),
+        ...[",", ";"].map(separator => ({
+          label: `HOLD24 no-space ${outer} crossing ${quote} before ${next} with separator ${JSON.stringify(separator)}`,
+          input: `${crossing}${separator}${next}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+          expected: `${redacted}${separator}${next}=${quote}[redacted]${quote}`, secrets,
+        })),
+      ];
+    }))),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
