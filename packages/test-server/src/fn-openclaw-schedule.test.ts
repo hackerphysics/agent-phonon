@@ -355,6 +355,26 @@ const credentialCases = [
     expected: 'password=[redacted],x-password= "[redacted]"', secrets: /TOPSECRET|HIDE|ME|alpha|beta/ },
   { label: "HOLD15 glued case-insensitive key with colon and tabs", input: "token=TOPSECRET-X-API-Key:\t 'HIDE ME' keep=public",
     expected: "token=[redacted] keep=public", secrets: /TOPSECRET|HIDE|ME/ },
+  ...[
+    ...["token", "password", "api_key", "api-key", "secret"].map(key => ({
+      prefix: `${key}=OUTER`, redacted: `${key}=[redacted]`,
+    })),
+    { prefix: 'token="OUTER"TOPSECRET', redacted: 'token="[redacted]"' },
+    { prefix: "token='OUTER'TOPSECRET", redacted: "token='[redacted]'" },
+    { prefix: "password=''OUTER", redacted: "password=[redacted]" },
+    { prefix: 'password=""OUTER', redacted: "password=[redacted]" },
+  ].flatMap(({ prefix, redacted }) => ["token", "password", "api_key", "api-key", "secret"].flatMap(key =>
+    ['"', "'"].flatMap(quote => ["HIDE ME", "part TOPSECRET"].map(body => ({
+      label: `HOLD16 overlapping glued ${prefix} with embedded ${key} and ${quote}${body}${quote}`,
+      input: `${prefix}-password=${quote}X ${key}= ${quote}${body}${quote}`,
+      expected: `${redacted} ${key}= ${quote}[redacted]${quote}`, secrets: /OUTER|TOPSECRET|HIDE|ME/,
+    }))))),
+  { label: "HOLD16 overlapping glued case-insensitive quoted key with colon and tabs",
+    input: 'token=OUTER-password="X API-Key" :\t "part TOPSECRET"',
+    expected: 'token=[redacted] API-Key" :\t "[redacted]"', secrets: /OUTER|TOPSECRET/ },
+  { label: "HOLD16 overlapping glued escaped body prefix and sticky secret suffix",
+    input: String.raw`token=OUTER-password="X \"Y token= "HIDE ME"PRIVATE_SUFFIX`,
+    expected: String.raw`token=[redacted] \"Y token= "[redacted]"`, secrets: /OUTER|HIDE|ME|PRIVATE_SUFFIX/ },
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
