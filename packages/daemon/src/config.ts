@@ -6,6 +6,7 @@ import { deliveryOptions, type DeliveryConfig, discoveryOptions, type DiscoveryO
 import { homedir, hostname } from "node:os";
 import { join, dirname,isAbsolute } from "node:path";
 import {readPrivateFile,replacePrivateFile,withConfigLock} from "./managed-mcp-config.js";
+import { discoverOpenClawGateway, isLoopbackGateway, type GatewayConfig } from "@agent-phonon/core";
 
 /**
  * daemon 配置（bug-bash B4）。
@@ -39,6 +40,8 @@ export interface AdapterConfig {
   gatewayUrl?: string;
   /** Gateway token（openclaw-gateway 用；缺省从 ~/.openclaw/openclaw.json 读）。 */
   gatewayToken?: string;
+  /** Local owner opt-out of exact new-device loopback pairing approval. */
+  gatewayAutoPair?: boolean;
   /** 默认 OpenClaw sub-agent。 */
   defaultAgent?: string;
   /** claude-code：网关 baseUrl/token/默认模型。 */
@@ -162,7 +165,7 @@ export function defaultConfig(): DaemonConfig {
     obs: { enabled: true, port: 4319 },
     maintenance: defaultMaintenance(),
     rescueAgent: { enabled: true },
-    adapters: [{ type: "openclaw-gateway", gatewayUrl: "ws://127.0.0.1:18789", defaultAgent: "main" }],
+    adapters: [{ type: "openclaw-gateway", defaultAgent: "main" }],
     servers: [],
   };
 }
@@ -186,6 +189,7 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): DaemonConfig {
   if(raw.employeeProfileFileBrokerRoot!==undefined&&(typeof raw.employeeProfileFileBrokerRoot!=="string"||!isAbsolute(raw.employeeProfileFileBrokerRoot)||raw.employeeProfileFileBrokerRoot.includes("\0")||raw.employeeProfileFileBrokerRoot.length>4096))throw new Error("employeeProfileFileBrokerRoot must be an absolute local runtime path");
   for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.hermesManagedProfileNativeTools!==undefined&&typeof adapter.hermesManagedProfileNativeTools!=="boolean")throw new Error(`adapters[${index}].hermesManagedProfileNativeTools must be a boolean`);
   for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.copilotPeerContext!==undefined&&typeof adapter.copilotPeerContext!=="boolean")throw new Error(`adapters[${index}].copilotPeerContext must be a boolean`);
+  for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.gatewayAutoPair!==undefined&&typeof adapter.gatewayAutoPair!=="boolean")throw new Error(`adapters[${index}].gatewayAutoPair must be a boolean`);
   for(const [index,adapter] of (raw.adapters??[]).entries())if(adapter.claudeSdkPath!==undefined&&(typeof adapter.claudeSdkPath!=="string"||!isAbsolute(adapter.claudeSdkPath)||/[\x00-\x1f\x7f]/.test(adapter.claudeSdkPath)||adapter.claudeSdkPath.length>4096))throw new Error(`adapters[${index}].claudeSdkPath must be an absolute local runtime path`);
   const d = defaultConfig();
   return {
@@ -295,11 +299,13 @@ export function redactConfig(cfg: DaemonConfig): DaemonConfig {
 
 /** 从 ~/.openclaw/openclaw.json 读 Gateway token（adapter 缺省）。 */
 export function readOpenClawGatewayToken(): string | undefined {
-  try {
-    const p = join(homedir(), ".openclaw", "openclaw.json");
-    const cfg = JSON.parse(readFileSync(p, "utf8"));
-    return cfg?.gateway?.auth?.token;
-  } catch {
-    return undefined;
-  }
+  try { return discoverOpenClawGateway().token || undefined; } catch { return undefined; }
+}
+
+/** Local credentials must never be implicitly forwarded to an explicit remote URL. */
+export function resolveOpenClawGateway(adapter: AdapterConfig): GatewayConfig {
+  if (adapter.gatewayUrl && !isLoopbackGateway(adapter.gatewayUrl) && !adapter.gatewayToken) throw new Error("Remote OpenClaw Gateway requires an explicit gatewayToken; local bootstrap credentials are not forwarded. Pair manually on the Gateway host");
+  if (adapter.gatewayUrl && adapter.gatewayToken) return { baseUrl: adapter.gatewayUrl, token: adapter.gatewayToken, autoPair: adapter.gatewayAutoPair };
+  const discovered = discoverOpenClawGateway();
+  return { baseUrl: adapter.gatewayUrl ?? discovered.baseUrl, token: adapter.gatewayToken ?? discovered.token, authMode: adapter.gatewayToken ? "token" : discovered.authMode, autoPair: adapter.gatewayAutoPair };
 }

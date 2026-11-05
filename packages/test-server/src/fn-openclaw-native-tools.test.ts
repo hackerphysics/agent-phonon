@@ -300,7 +300,7 @@ test("native controller, Gateway transport and plugin tools preserve human respo
   await new Promise<void>((resolve,reject) => {wss.once("listening", resolve);wss.once("error",reject);}).catch(error=>{
     host.close();wss.close();store.close();rmSync(root,{recursive:true,force:true});throw error;
   });
-  const adapter = new OpenClawGatewayAdapter({ gateway: { baseUrl: `ws://127.0.0.1:${wss.address() && (wss.address() as any).port}`, token: "test" } });
+  const adapter = new OpenClawGatewayAdapter({ gateway: { baseUrl: `ws://127.0.0.1:${wss.address() && (wss.address() as any).port}`, token: "test", deviceStateDir: join(root, "gateway-devices") } });
   const registry = new AdapterRegistry(); registry.register(adapter);
   const tc = new TestConn({ registry, store, tenantId: "owner", workspaceRoot: root });
   const task = deferred<void>(), failure = deferred<Error>();
@@ -314,7 +314,7 @@ test("native controller, Gateway transport and plugin tools preserve human respo
     return { requestId: captured.requestId, action: "submit", values: { approved: false } };
   });
   wss.on("connection", ws => {
-    ws.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: {} }));
+    ws.send(JSON.stringify({ type: "event", event: "connect.challenge", payload: { nonce: "native-tools-fixture", ts: Date.now() } }));
     ws.on("close", () => host.connection.abort());
     ws.on("message", raw => {
       void (async () => {
@@ -322,7 +322,7 @@ test("native controller, Gateway transport and plugin tools preserve human respo
         sentBodies.push({ method: frame.method, params });
         const send = (payload: unknown) => ws.send(JSON.stringify({ type: "res", id: frame.id, ok: true, payload }));
         if (frame.method === "connect") {
-          assert.equal(params.client.id, "gateway-client"); assert.equal(params.client.mode, "backend");
+          assert.equal(params.client.id, "gateway-client"); assert.equal(params.client.mode, "cli");
           assert.deepEqual(params.caps, ["tool-events"]);
           assert.equal(params.toolBindings, undefined); send({ type: "hello-ok",features:{capabilities:["session-settings-cas-v1"]} }); return;
         }
