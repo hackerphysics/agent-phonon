@@ -115,6 +115,85 @@ test("OpenClaw normalizes interval/at, unknown trigger kinds and nullable option
   } finally { await f.close(); }
 });
 
+const credentialCases = [
+  { label: "HOLD leading quoted whitespace", input: 'reminder password=" alpha"',
+    expected: 'reminder password="[redacted]"', secrets: /alpha/ },
+  { label: "HOLD internal quoted whitespace", input: 'failed password="alpha beta gamma"',
+    expected: 'failed password="[redacted]"', secrets: /alpha|beta|gamma/ },
+  { label: "HOLD escaped double quote", input: String.raw`password="SUPER\"SECRET"`,
+    expected: 'password="[redacted]"', secrets: /SUPER|SECRET/ },
+  { label: "HOLD Basic authorization", input: "Authorization: Basic dXNlcjpwYXNz",
+    expected: "Authorization: Basic [redacted]", secrets: /dXNlcjpwYXNz/ },
+  { label: "single quotes and whitespace", input: String.raw`secret=' alpha \'SECRET\' beta '`,
+    expected: "secret='[redacted]'", secrets: /alpha|SECRET|beta/ },
+  { label: "escaped backslash and common escapes", input: String.raw`api_key="ALPHA\\\t\n\r\"SECRET"`,
+    expected: 'api_key="[redacted]"', secrets: /ALPHA|SECRET/ },
+  { label: "multiple quoted assignments", input: String.raw`{"token":"ALPHA\"SECRET"} password='BETA VALUE'`,
+    expected: '{"token":"[redacted]"} password=\'[redacted]\'', secrets: /ALPHA|SECRET|BETA|VALUE/ },
+  { label: "unterminated quoted scalar", input: String.raw`password="ALPHA \"SECRET` + "\\",
+    expected: 'password="[redacted]"', secrets: /ALPHA|SECRET/ },
+  { label: "case-insensitive Basic with flexible whitespace", input: "authorization:\t bAsIc \t basic_credential",
+    expected: "authorization:\t bAsIc \t [redacted]", secrets: /basic_credential/ },
+  { label: "unquoted credential keys", input: "password=p_credential token=t_credential secret=s_credential api_key=ak_credential api-key=ah_credential",
+    expected: "password=[redacted] token=[redacted] secret=[redacted] api_key=[redacted] api-key=[redacted]", secrets: /[a-z]+_credential/ },
+  { label: "Bearer", input: "Bearer bearer_credential",
+    expected: "Bearer [redacted]", secrets: /bearer_credential/ },
+  { label: "URL userinfo", input: "https://user:pass@example.test/hook",
+    expected: "https://[redacted]@example.test/hook", secrets: /user:pass/ },
+];
+
+for (const { label, input, expected, secrets } of credentialCases) {
+  test(`OpenClaw list/get redact ${label} in name, lastError and delivery.to`, async () => {
+    const f = fixture();
+    try {
+      const conn = f.actor();
+      const id = "token=opaque-id", declarationKey = "token=opaque-declaration";
+      f.respond({ jobs: [
+        { ...nativeJob, id, declarationKey, name: input, state: { lastError: input },
+          delivery: { ...nativeJob.delivery, to: input } },
+        { ...nativeJob, id: "feishu-target" },
+      ] });
+      const listed = OpenClawScheduleListResult.parse(await conn.call("openclaw.schedule.list", {}));
+      const detail = OpenClawScheduleGetResult.parse(await conn.call("openclaw.schedule.get", { id }));
+      for (const result of [listed, detail]) assert.doesNotMatch(JSON.stringify(result), secrets);
+      for (const job of [listed.schedules[0]!, detail.schedule]) {
+        assert.equal(job.name, expected);
+        assert.equal(job.state.lastError, expected);
+        assert.equal(job.delivery.to, expected);
+        assert.equal(job.id, id);
+        assert.equal(job.declarationKey, declarationKey);
+      }
+      assert.equal(listed.schedules[1]!.delivery.to, "ou_opaque_target");
+      const target = OpenClawScheduleGetResult.parse(await conn.call("openclaw.schedule.get", { id: "feishu-target" }));
+      assert.equal(target.schedule.delivery.to, "ou_opaque_target");
+    } finally { await f.close(); }
+  });
+}
+
+test("OpenClaw accepts only complete initial-page envelopes and legacy arrays", async () => {
+  const f = fixture();
+  try {
+    const conn = f.actor();
+    for (const response of [[nativeJob], { jobs: [nativeJob] }, { jobs: [nativeJob], hasMore: false },
+      { jobs: [nativeJob], total: 1 }, { jobs: [nativeJob], offset: 0, limit: 1, hasMore: false },
+      { jobs: [nativeJob], offset: 0, limit: 1, total: 1 },
+      { jobs: [], offset: 0, limit: 0, total: 0, hasMore: false }]) {
+      f.respond(response);
+      const listed = OpenClawScheduleListResult.parse(await conn.call("openclaw.schedule.list", {}));
+      assert.equal(listed.schedules.length, Array.isArray(response) ? response.length : response.jobs.length);
+    }
+    for (const pagination of [{ offset: 1, limit: 1, hasMore: false, total: 1 },
+      { offset: 1 }, { offset: -1 }, { offset: 0 }, { limit: 1 }, { offset: 0, limit: 2 },
+      { offset: 0, limit: 1, hasMore: true }, { offset: 0, limit: 1, total: 2 },
+      { offset: 0, limit: 0, hasMore: false }, { offset: null }, { limit: null }]) {
+      f.respond({ jobs: [nativeJob], ...pagination });
+      await assert.rejects(() => conn.call("openclaw.schedule.list", {}), rpcError("errCapabilityUnsupported"));
+      await assert.rejects(() => conn.call("openclaw.schedule.get", { id: nativeJob.id }), rpcError("errCapabilityUnsupported"));
+      assert.ok(!(await conn.call("device.info", {}) as { capabilities: string[] }).capabilities.includes("openclaw_schedule_discover_v1"));
+    }
+  } finally { await f.close(); }
+});
+
 for (const reason of ["unknown method", "unauthorized token=TRANSPORT_SECRET", "Gateway disconnected"]) {
   test(`OpenClaw RPC failure is closed: ${reason.split(" ")[0]}`, async () => {
     const f = fixture();

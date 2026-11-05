@@ -19,8 +19,11 @@ payloadKind), delivery (`mode`, channel, to, lastDeliveryStatus, lastDelivered,
 lastFailureNotificationDeliveryStatus), and state (`nextRunAtMs`, lastRunAtMs,
 lastRunStatus/lastStatus, consecutiveErrors, lastError). Unknown vendor fields
 and raw payloads/prompts/configuration are omitted. Missing optional fields
-stay absent. Clear credential assignments, bearer credentials and URL
-passwords are redacted; opaque targets such as Feishu open_ids are preserved.
+stay absent. Clear credential assignments, Basic/Bearer credentials and URL
+passwords are redacted from name, lastError and delivery.to. Quoted assignment
+values are consumed in full, including whitespace and escaped quotes;
+unterminated quoted values are redacted through the end of the text. Opaque
+ids, declarationKeys and targets such as Feishu open_ids are preserved.
 
 `device.info.capabilities` includes `openclaw_schedule_discover_v1` only after
 a successful, validated native inventory read and when both methods are
@@ -28,6 +31,9 @@ permitted. Missing adapter/binary, unreachable Gateway, auth/method errors,
 malformed responses and duplicate ids never yield a successful empty inventory.
 Partial/paginated inventories (`hasMore`, `nextOffset` or a mismatched total)
 are rejected as unsupported rather than returning an incomplete list/detail.
+Offset/limit envelopes must start at offset zero (or omit offset), fit within
+their limit and prove completeness with `hasMore: false` or a matching total.
+Legacy bare arrays and envelopes without pagination metadata remain supported.
 Transport failures use `errAgentUnavailable`, unsupported configuration/shape
 uses `errCapabilityUnsupported`, and an absent or inaccessible detail id uses
 `errInvalidParams`. Method allowlists apply; agent allowlists filter by the

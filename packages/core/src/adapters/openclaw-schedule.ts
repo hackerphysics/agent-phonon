@@ -20,13 +20,22 @@ const vendorList = z.union([z.array(vendorJob), z.object({
   jobs: z.array(vendorJob), error: z.null().optional(), ok: z.literal(true).optional(),
   hasMore: z.literal(false).optional(), nextOffset: z.null().optional(),
   total: z.number().int().nonnegative().optional(),
-}).refine(value => value.total === undefined || value.total === value.jobs.length)]);
+  offset: z.literal(0).optional(), limit: z.number().int().nonnegative().optional(),
+}).refine(value => value.total === undefined || value.total === value.jobs.length)
+  .refine(value => value.limit === undefined || value.jobs.length <= value.limit)
+  .refine(value => (value.offset === undefined && value.limit === undefined)
+    || value.hasMore === false || value.total === value.jobs.length)]);
 
 // Only clear credential forms are redacted; opaque native delivery IDs stay intact.
 function publicText(value: string): string {
   return value
-    .replace(/\b(Bearer\s+)[^\s,;]+/gi, "$1[redacted]")
-    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*["']?)[^\s&;,"'}]+/gi, "$1[redacted]")
+    // Escapes are indivisible; an unterminated quoted value is redacted through EOF.
+    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|[^\s&;,"'}]+)/gi,
+      (_match, prefix: string, scalar: string) => {
+        const quote = scalar[0] === '"' || scalar[0] === "'" ? scalar[0] : "";
+        return `${prefix}${quote}[redacted]${quote}`;
+      })
+    .replace(/\b((?:Bearer|Basic)\s+)[^\s,;]+/gi, "$1[redacted]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@");
 }
 
