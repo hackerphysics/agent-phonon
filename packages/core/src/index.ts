@@ -1027,6 +1027,8 @@ export * from "./adapter.js";
 export { OpenClawAdapter } from "./adapters/openclaw.js";
 export { OpenClawGatewayAdapter } from "./adapters/openclaw-gateway.js";
 export { GatewayClient } from "./gateway-client.js";
+export { discoverOpenClawGateway, isLoopbackGateway } from "./openclaw-gateway-discover.js";
+export { GatewayConnectionError } from "./openclaw-pairing.js";
 export type { GatewayConfig } from "./gateway-client.js";
 export { PhononClient } from "./client.js";
 export { assertSecureServerUrl } from "./client.js";

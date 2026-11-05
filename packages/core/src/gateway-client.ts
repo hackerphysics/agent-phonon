@@ -2,6 +2,9 @@ import { WebSocket } from "ws";
 import { randomUUID, createHash } from "node:crypto";
 import { z } from "zod";
 import { nativeVersionAtLeast } from "@agent-phonon/protocol";
+import { OpenClawDeviceStore, signOpenClawDevice } from "./openclaw-device-identity.js";
+import { isLoopbackGateway } from "./openclaw-gateway-discover.js";
+import { approveLocalGatewayPairing, GatewayConnectionError, gatewayHandshakeError } from "./openclaw-pairing.js";
 
 /**
  * OpenClaw Gateway WebSocket 客户端（传输层）。
@@ -19,8 +22,13 @@ export interface GatewayConfig {
   /** ws 或 http URL（http 会自动转 ws）。 */
   baseUrl: string;
   token: string;
+  authMode?: "token" | "password" | "none";
   /** Optional narrower connection scopes; model switching must not persist agent defaults. */
   scopes?: string[];
+  /** Local owner opt-out; remote requests and upgrades are always manual. */
+  autoPair?: boolean;
+  /** Private Phonon-owned state root; defaults to ~/.agent-phonon/openclaw-gateway. */
+  deviceStateDir?: string;
 }
 
 interface Pending {
@@ -43,6 +51,7 @@ export class GatewayClient {
   private pending = new Map<string, Pending>();
   private eventHandlers = new Set<GatewayEventHandler>();
   private connectPromise: Promise<void> | null = null;
+  private connectGeneration = 0;
 
   constructor(config: GatewayConfig) {
     this.config = config;
@@ -132,18 +141,84 @@ export class GatewayClient {
   }
 
   connect(): Promise<void> {
+    if (this.connected) return Promise.resolve();
     if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this.doConnect();
-    return this.connectPromise;
+    const connecting = this.connectWithPairing(++this.connectGeneration).catch(error => {
+      if (this.connectPromise === connecting) this.connectPromise = null;
+      throw error;
+    });
+    this.connectPromise = connecting;
+    return connecting;
   }
 
-  private doConnect(): Promise<void> {
+  private emit(event: string, payload: Record<string, unknown>): void {
+    for (const handler of this.eventHandlers) { try { handler(event, payload); } catch { /* observer only */ } }
+  }
+
+  private async connectWithPairing(generation: number): Promise<void> {
+    const assertCurrent = () => {
+      if (generation !== this.connectGeneration) throw new GatewayConnectionError("Gateway connection cancelled; no pairing/reconnect attempted", "CONNECTION_CANCELLED");
+    };
+    let store: OpenClawDeviceStore;
+    let identity: ReturnType<OpenClawDeviceStore["identity"]>;
+    try { store = new OpenClawDeviceStore(this.config.baseUrl, this.config.deviceStateDir); identity = store.identity(); store.token(identity.deviceId); }
+    catch { throw new GatewayConnectionError("OpenClaw device identity unavailable; check the Phonon-owned state directory (0700), files (0600) and key integrity; do not reset keys to bypass pairing", "DEVICE_AUTH_LOCAL_IDENTITY"); }
+    try { await this.doConnect(store, identity, assertCurrent); }
+    catch (error) {
+      assertCurrent();
+      if (!(error instanceof GatewayConnectionError) || error.code !== "PAIRING_REQUIRED") throw error;
+      const audit = { actor: "agent-phonon", uid: process.getuid?.(), pid: process.pid, requestId: error.requestId,
+        deviceId: identity.deviceId, recommendedNextStep: error.recommendedNextStep };
+      this.emit("phonon.pairing.required", { ...audit, at: new Date().toISOString(), code: error.code });
+      if (!isLoopbackGateway(this.config.baseUrl) || this.config.autoPair === false || !error.requestId
+        || error.reason && error.reason !== "not-paired") throw error;
+      const record = (decision: string) => {
+        const entry = { ...audit, at: new Date().toISOString(), decision };
+        console.info(`[openclaw-pairing] ${JSON.stringify(entry)}`);
+        this.emit("phonon.pairing.audit", entry);
+      };
+      assertCurrent(); record("requested");
+      try {
+        await approveLocalGatewayPairing({ baseUrl: this.config.baseUrl, token: this.config.token, requestId: error.requestId,
+          deviceId: identity.deviceId, publicKey: identity.publicKey, scopes: this.scopes(), assertCurrent });
+      } catch {
+        record("failed");
+        assertCurrent();
+        throw new GatewayConnectionError(`OpenClaw local approval failed for ${error.requestId}; no scopes were widened. On the Gateway host run openclaw devices list, then openclaw devices approve ${error.requestId}`, "PAIRING_APPROVAL_FAILED", error.requestId, error.recommendedNextStep);
+      }
+      record("approved"); assertCurrent();
+      // One retry only. Never replay a chat/RPC, or retry a stale/superseded approval.
+      await this.doConnect(store, identity, assertCurrent);
+    }
+  }
+
+  private scopes(approved?: string[]): string[] {
+    const defaults = ["operator.read", "operator.write", "operator.admin"];
+    return this.config.scopes ?? (approved ? approved.filter(scope => defaults.includes(scope)) : defaults);
+  }
+
+  private doConnect(store: OpenClawDeviceStore, identity: ReturnType<OpenClawDeviceStore["identity"]>, assertCurrent: () => void): Promise<void> {
     return new Promise((resolve, reject) => {
+      assertCurrent();
+      if (this.config.authMode === "none" && !isLoopbackGateway(this.config.baseUrl)) throw new GatewayConnectionError("OpenClaw auth mode none is supported only for a local loopback Gateway", "AUTH_CONFIGURATION_INVALID");
+      const cached = store.token(identity.deviceId);
+      const scopes = this.scopes(cached?.scopes);
+      if (!cached && !this.config.token.trim() && this.config.authMode !== "none") {
+        reject(new GatewayConnectionError("OpenClaw shared Gateway token missing; run openclaw configure --section gateway", "AUTH_TOKEN_MISSING")); return;
+      }
       const wsUrl = this.config.baseUrl.replace(/^http/, "ws");
       const ws = new WebSocket(wsUrl);
       this.ws = ws;
       let handshakeDone = false;
-      const handshakeTimer=setTimeout(()=>{if(!handshakeDone){reject(new Error("Gateway handshake timed out"));ws.close();}},10000);
+      let challenged = false;
+      let failed = false;
+      const fail = (error: Error) => {
+        if (failed || handshakeDone) return;
+        failed = true; clearTimeout(handshakeTimer);
+        if (this.ws === ws) this.ws = null;
+        ws.terminate(); reject(error);
+      };
+      const handshakeTimer=setTimeout(()=>fail(new GatewayConnectionError("OpenClaw Gateway handshake timed out; check openclaw gateway status and the configured local port", "GATEWAY_TIMEOUT")),10000);
       handshakeTimer.unref();
 
       ws.on("message", (raw: Buffer) => {
@@ -151,12 +226,20 @@ export class GatewayClient {
         let frame: Record<string, unknown>;
         try {
           frame = JSON.parse(raw.toString());
+          if (!frame || typeof frame !== "object" || Array.isArray(frame)) return;
         } catch {
           return;
         }
 
         if (!handshakeDone) {
-          if (frame.type === "event" && frame.event === "connect.challenge") {
+          if (frame.type === "event" && frame.event === "connect.challenge" && !challenged) {
+            let device: ReturnType<typeof signOpenClawDevice>;
+            const auth = cached ? { deviceToken: cached.token } : { token: this.config.token };
+            try {
+              assertCurrent();
+              device = signOpenClawDevice(identity, frame.payload, scopes, cached?.token ?? this.config.token);
+            } catch { fail(new GatewayConnectionError("OpenClaw DEVICE_AUTH_CHALLENGE_INVALID: require a fresh nonce and non-negative integer challenge ts; check Gateway version/clock", "DEVICE_AUTH_CHALLENGE_INVALID")); return; }
+            challenged = true;
             ws.send(
               JSON.stringify({
                 type: "req",
@@ -165,16 +248,23 @@ export class GatewayClient {
                 params: {
                   minProtocol: GATEWAY_PROTOCOL_MIN,
                   maxProtocol: GATEWAY_PROTOCOL_MAX,
-                  client: { id: "gateway-client", version: "0.0.1", platform: "linux", mode: "backend" },
+                  // backend is a reserved local helper bypass and cannot mint an initial device token.
+                  client: { id: "gateway-client", version: "0.0.1", platform: process.platform, mode: "cli" },
                   role: "operator",
-                  scopes: this.config.scopes ?? ["operator.read", "operator.write", "operator.admin"],
+                  scopes,
                   caps: ["tool-events"],
-                  auth: { token: this.config.token },
+                  auth,
+                  device,
                   userAgent: "agent-phonon/0.0.1",
                 },
               }),
             );
-          } else if (frame.type === "res" && frame.ok && (frame.payload as { type?: string })?.type === "hello-ok") {
+          } else if (frame.type === "res" && frame.id === "connect-1" && challenged && frame.ok && (frame.payload as { type?: string })?.type === "hello-ok") {
+            try {
+              assertCurrent();
+              const auth = (frame.payload as { auth?: { deviceToken?: unknown } }).auth;
+              if (auth?.deviceToken !== undefined) store.saveToken(identity, auth);
+            } catch { fail(new GatewayConnectionError("OpenClaw device token could not be persisted; check private state permissions and the hello-ok auth receipt", "DEVICE_AUTH_PERSIST_FAILED")); return; }
             handshakeDone = true;
             clearTimeout(handshakeTimer);
             this.connected = true;
@@ -182,9 +272,8 @@ export class GatewayClient {
             this.capabilities=new Set(Array.isArray(advertised)?advertised.filter((value):value is string=>typeof value==="string"):[]);
             this.epoch++;
             resolve();
-          } else if (frame.type === "res" && !frame.ok) {
-            clearTimeout(handshakeTimer);
-            reject(new Error(`handshake failed: ${JSON.stringify(frame.error)}`));
+          } else if (frame.type === "res" && frame.id === "connect-1" && !frame.ok) {
+            fail(gatewayHandshakeError(frame.error));
           }
           return;
         }
@@ -214,11 +303,11 @@ export class GatewayClient {
       });
 
       ws.on("error", (err) => {
-        if (!handshakeDone) {clearTimeout(handshakeTimer);reject(err);}
+        if (!handshakeDone) fail(new GatewayConnectionError(`OpenClaw Gateway not reachable (${(err as NodeJS.ErrnoException).code ?? "transport error"}); check openclaw gateway status, gateway.port and loopback listener`, "GATEWAY_UNREACHABLE"));
       });
       ws.on("close", () => {
         clearTimeout(handshakeTimer);
-        if(!handshakeDone)reject(new Error("Gateway closed before authentication"));
+        if(!handshakeDone) fail(new GatewayConnectionError("OpenClaw Gateway closed before authentication; check credentials and pairing on the Gateway host", "GATEWAY_CLOSED"));
         if(this.ws!==ws)return;
         this.connected = false;
         this.capabilities.clear();
@@ -254,6 +343,7 @@ export class GatewayClient {
   }
 
   close(): void {
+    this.connectGeneration++;
     const socket=this.ws;
     this.ws = null;
     this.connected = false;

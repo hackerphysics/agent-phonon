@@ -5,7 +5,7 @@ import { homedir, platform } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AdapterRegistry, OpenClawGatewayAdapter, ClaudeCodeAdapter, CodexAdapter, HermesAdapter, OpenCodeAdapter, CopilotAdapter, PiAdapter, RescueAdapter, spawnSyncAgent, PhononStore } from "@agent-phonon/core";
-import { ADAPTER_TYPES, loadConfig, writeConfig, readOpenClawGatewayToken, DEFAULT_CONFIG_PATH, type AdapterConfig, type DaemonConfig } from "./config.js";
+import { ADAPTER_TYPES, loadConfig, writeConfig, resolveOpenClawGateway, DEFAULT_CONFIG_PATH, type AdapterConfig, type DaemonConfig } from "./config.js";
 import { LaunchdService } from "./launchd.js";
 
 /**
@@ -148,10 +148,11 @@ export function autoDetectAdapters(adapters: AdapterConfig[]): AdapterConfig[] {
 export async function cmdDoctor(): Promise<void> {
   console.log("agent-phonon doctor\n");
   // OpenClaw Gateway
-  const gwToken = readOpenClawGatewayToken();
-  const gwUrl = "ws://127.0.0.1:18789";
-  const gwOk = await gatewayReachable(gwUrl);
-  console.log(`OpenClaw Gateway (${gwUrl}): ${gwOk ? "✓ reachable" : "✗ unreachable"}${gwToken ? " (token found)" : " (no token in ~/.openclaw/openclaw.json)"}`);
+  try {
+    const gateway = resolveOpenClawGateway({ type: "openclaw-gateway" });
+    const gwOk = await gatewayReachable(gateway.baseUrl);
+    console.log(`OpenClaw Gateway (${gateway.baseUrl}): ${gwOk ? "✓ reachable" : "✗ not listening; run openclaw gateway status"} (${gateway.authMode === "none" ? "auth mode none" : "credential found"})`);
+  } catch (error) { console.log(`OpenClaw Gateway: ${(error as Error).message}`); }
   // OpenClaw plugin
   const pluginDir = join(homedir(), ".openclaw", "extensions", "agent-phonon-hitl");
   console.log(`OpenClaw HITL plugin: ${existsSync(pluginDir) ? "✓ installed" : "✗ not installed (run: agent-phonon plugin install openclaw)"}`);
@@ -207,8 +208,8 @@ export function buildRegistry(adapters: AdapterConfig[], rescue?: DaemonConfig["
   }
   for (const a of autoDetectAdapters(adapters)) {
     if (a.type === "openclaw-gateway") {
-      const token = a.gatewayToken ?? readOpenClawGatewayToken();
-      if (token) reg.register(new OpenClawGatewayAdapter({ gateway: { baseUrl: a.gatewayUrl ?? "ws://127.0.0.1:18789", token }, defaultAgent: a.defaultAgent ?? "main" }));
+      try { reg.register(new OpenClawGatewayAdapter({ gateway: resolveOpenClawGateway(a), defaultAgent: a.defaultAgent ?? "main" })); }
+      catch (error) { console.warn(`[discover] openclaw-gateway adapter skipped: ${(error as Error).message}`); }
     } else if (a.type === "claude-code") {
       reg.register(new ClaudeCodeAdapter({ env: { binPath: a.claudeBinPath, sdkPath: a.claudeSdkPath, settingsPath: a.claudeSettingsPath, baseUrl: a.claudeBaseUrl, authToken: a.claudeAuthToken, defaultModel: a.claudeDefaultModel ?? "default", models: a.claudeModels } }));
     } else if (a.type === "codex") {
@@ -233,7 +234,7 @@ export function cmdAdapterAdd(type: string, opts: Record<string, string | undefi
   switch (type) {
     case "openclaw":
     case "openclaw-gateway":
-      a = { type: "openclaw-gateway", gatewayUrl: opts.gatewayUrl ?? "ws://127.0.0.1:18789", gatewayToken: opts.token, defaultAgent: opts.defaultAgent ?? "main" };
+      a = { type: "openclaw-gateway", gatewayUrl: opts.gatewayUrl, gatewayToken: opts.token, defaultAgent: opts.defaultAgent ?? "main" };
       break;
     case "claude-code":
       a = { type: "claude-code", claudeBinPath: opts.bin, claudeSdkPath: opts.sdkPath, claudeBaseUrl: opts.baseUrl, claudeAuthToken: opts.token, claudeDefaultModel: opts.model ?? "default" };

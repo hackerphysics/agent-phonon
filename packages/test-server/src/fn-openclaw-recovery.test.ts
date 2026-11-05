@@ -24,7 +24,7 @@ async function fixture(){
     pendingInputs:{items:row.pending?[{}]:[],total:row.pending},sessionInfo:{key:row.key,sessionId:row.id,createdAt:row.createdAt,model:row.model.slice(6),modelProvider:"local",spawnedCwd:row.cwd,
       hasActiveRun:row.active,activeRunIds:row.active?[randomUUID()]:[],activeLeafEntryId:row.leaf,archived:row.archived,status:row.status,endedAt:row.endedAt}});
   server.on("connection",socket=>{
-    socket.send(JSON.stringify({type:"event",event:"connect.challenge",payload:{nonce:"isolated"}}));
+    socket.send(JSON.stringify({type:"event",event:"connect.challenge",payload:{nonce:"isolated",ts:Date.now()}}));
     socket.on("message",async raw=>{
       const request=JSON.parse(String(raw)),p=request.params??{},method=String(request.method);
       const respond=(payload:unknown)=>socket.send(JSON.stringify({type:"res",id:request.id,ok:true,payload}));
@@ -77,7 +77,7 @@ async function fixture(){
       }catch(error){socket.send(JSON.stringify({type:"res",id:request.id,ok:false,error:{code:"INVALID_REQUEST",message:String(error)}}));}
     });
   });
-  const address=server.address() as {port:number},adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:`ws://127.0.0.1:${address.port}`,token:"synthetic"}}),registry=new AdapterRegistry();registry.register(adapter);
+  const address=server.address() as {port:number},adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:`ws://127.0.0.1:${address.port}`,token:"synthetic",deviceStateDir:join(root,"gateway-devices")}}),registry=new AdapterRegistry();registry.register(adapter);
   let store=new PhononStore(join(root,"state.db")),conn=new TestConn({registry,store,workspaceRoot:root,tenantId:"owner",policy:{allowEmployeeProfiles:true}});
   const project=(await conn.call("project.create",{name:"Group",git:false}) as any).project.projectId as string;
   const create=async(projectId=project,employee?:{id:string;revision:number})=>(await conn.call("session.create",{project:projectId,agent:"openclaw:base",model,...(employee?{agentConfig:{employee}}:{})}) as any).sessionId as string;

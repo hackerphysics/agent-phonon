@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ADAPTER_TYPES, writeConfig, redactConfig, defaultConfig, configureRescueAgent, loadConfig, type AdapterConfig } from "./config.js";
+import { ADAPTER_TYPES, writeConfig, redactConfig, defaultConfig, configureRescueAgent, loadConfig, resolveOpenClawGateway, readOpenClawGatewayToken, type AdapterConfig } from "./config.js";
 import { autoDetectAdapters, buildRegistry } from "./commands.js";
 import * as core from "@agent-phonon/core";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,28 @@ import { PhononDaemon } from "./daemon.js";
 import { AdapterRegistry, CopilotAdapter, HermesAdapter } from "@agent-phonon/core";
 import { withPeerFixture } from "../../core/dist/testing/peer-fixture.js";
 import { hermesProfileFixture } from "./hermes-profile.test-fixture.js";
+
+test("config: Gateway discovery shares environment/port wiring and never sends local credentials to remote hosts", t => {
+  const root = mkdtempSync(join(tmpdir(), "phonon-gateway-config-")), path = join(root, "openclaw.json");
+  const previous = process.env.OPENCLAW_CONFIG_PATH;
+  process.env.OPENCLAW_CONFIG_PATH = path;
+  t.after(() => { if (previous === undefined) delete process.env.OPENCLAW_CONFIG_PATH; else process.env.OPENCLAW_CONFIG_PATH = previous; rmSync(root, { recursive: true, force: true }); });
+  writeFileSync(path, JSON.stringify({ gateway: { port: 23456, auth: { token: "local-test-secret" } } }));
+  assert.equal(defaultConfig().adapters[0]?.gatewayUrl, undefined, "new configs discover instead of pinning the default port");
+  assert.equal(readOpenClawGatewayToken(), "local-test-secret");
+  assert.deepEqual(resolveOpenClawGateway({ type: "openclaw-gateway", gatewayAutoPair: false }), {
+    baseUrl: "ws://127.0.0.1:23456", token: "local-test-secret", authMode: "token", autoPair: false,
+  });
+  assert.throws(() => resolveOpenClawGateway({ type: "openclaw-gateway", gatewayUrl: "wss://remote.invalid" }), /explicit gatewayToken/);
+  rmSync(path);
+  assert.equal(readOpenClawGatewayToken(), undefined);
+  assert.deepEqual(resolveOpenClawGateway({ type: "openclaw-gateway", gatewayUrl: "wss://remote.invalid", gatewayToken: "explicit-test-secret" }), {
+    baseUrl: "wss://remote.invalid", token: "explicit-test-secret", autoPair: undefined,
+  });
+  const cfg = defaultConfig(); cfg.adapters[0]!.gatewayAutoPair = "true" as unknown as boolean;
+  const configPath = join(root, "phonon.json"); writeFileSync(configPath, JSON.stringify(cfg));
+  assert.throws(() => loadConfig(configPath), /gatewayAutoPair must be a boolean/);
+});
 
 function configuredHermes(f: ReturnType<typeof hermesProfileFixture>, flag?: boolean) {
   const cfg = defaultConfig(), missing = join(f.root, "not-installed"), path = join(f.root, "daemon.json");

@@ -19,7 +19,7 @@ import {
   type PhononConnection,
   type AgentAdapter,
 } from "@agent-phonon/core";
-import { type DaemonConfig, readOpenClawGatewayToken, validateServerConfigs } from "./config.js";
+import { type DaemonConfig, resolveOpenClawGateway, validateServerConfigs } from "./config.js";
 import { autoDetectAdapters } from "./commands.js";
 import { ObsServer, unavailableDeliveryMeasurement } from "./obs-server.js";
 import { ManagedMcpManager, managedMcpStateDir,managedMcpSourceFingerprint } from "./managed-mcp.js";
@@ -97,13 +97,14 @@ export class PhononDaemon {
   private registerAdapters(): void {
     for (const a of autoDetectAdapters(this.cfg.adapters)) {
       if (a.type === "openclaw-gateway") {
-        const token = a.gatewayToken ?? readOpenClawGatewayToken();
-        if (!token) {
-          console.warn("[daemon] openclaw-gateway adapter skipped: no Gateway token");
+        let gateway: ReturnType<typeof resolveOpenClawGateway>;
+        try { gateway = resolveOpenClawGateway(a); }
+        catch (error) {
+          console.warn(`[daemon] openclaw-gateway adapter skipped: ${(error as Error).message}`);
           continue;
         }
         const ad = new OpenClawGatewayAdapter({
-          gateway: { baseUrl: a.gatewayUrl ?? "ws://127.0.0.1:18789", token },
+          gateway,
           defaultAgent: a.defaultAgent ?? "main",
         });
         this.gatewayAdapters.push(ad);
