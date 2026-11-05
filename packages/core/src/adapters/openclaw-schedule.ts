@@ -31,12 +31,13 @@ function publicText(value: string): string {
   return value
     // Escapes are indivisible; an unterminated quoted value is redacted through EOF.
     // Like empty pairs, quoted-closer sticky and unquoted scanning stop before the next credential assignment (including quoted keys).
-    // All next-key lookaheads reject word/hyphen prefixes so embedded identifiers do not false-stop scanning.
+    // Next-key lookaheads reject embedded identifiers, except hyphen-prefixed assignments with quoted values.
+    // Stop before those assignments too, so their optional whitespace cannot strand a quoted secret.
     // Glued non-key suffixes are still consumed with the value; a boundary } stays structural.
     // Leading empty quote pairs scan same-value suffixes, but not a following credential assignment.
     // Commas, semicolons, closing braces and quotes can be part of an unquoted value.
     // Otherwise only whitespace, &, a structural } or EOF ends an unquoted credential value.
-    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])+(?:"|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?(?<![\w-])(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|'(?:\\[\s\S]|[^'\\])+(?:'|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?(?<![\w-])(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|(?:''|"")(?:(?![,;]?(?<![\w-])(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|(?:(?!}(?:\s|&|$))(?![,;]?["']?(?<![\w-])(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])+)/gi,
+    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])+(?:"|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?(?<![\w-])(?:[\w-]+-(?=(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*["']))?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|'(?:\\[\s\S]|[^'\\])+(?:'|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?(?<![\w-])(?:[\w-]+-(?=(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*["']))?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|(?:''|"")(?:(?![,;]?(?<![\w-])(?:[\w-]+-(?=(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*["']))?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|(?:(?!}(?:\s|&|$))(?![,;]?["']?(?<![\w-])(?:[\w-]+-(?=(?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*["']))?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])+)/gi,
       (_match, prefix: string, scalar: string) => {
         const quote = scalar[0] !== scalar[1] && (scalar[0] === '"' || scalar[0] === "'") ? scalar[0] : "";
         return `${prefix}${quote}[redacted]${quote}`;
