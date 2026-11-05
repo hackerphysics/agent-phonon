@@ -147,10 +147,11 @@ export class PhononClient {
   /** 连接并完成握手，resolve 后即可接收 server 的 session.* 下发。 */
   connect(): Promise<{ tenantId: string }> {
     if (this.closed) return Promise.reject(new Error("client closed"));
-    this.startDispatchClock();
     const generation = ++this.generation;
     this.clearReconnect();
     for (const cancel of this.dialing.values()) cancel("connection attempt superseded");
+    // Retirement returns an unpublished candidate's live clock before any cold-start fallback.
+    this.startDispatchClock();
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.serverUrl, { handshakeTimeout: this.timing.handshakeTimeoutMs });
       let settled = false;

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { AdapterRegistry, PhononClient, PhononStore } from "@agent-phonon/core";
+import { AdapterRegistry, PhononClient, PhononConnection, PhononStore, SchedulerEngine } from "@agent-phonon/core";
 import { PhononDevice, PhononServer } from "@agent-phonon/server-sdk";
 import { MockAdapter } from "./harness.js";
 
@@ -45,7 +45,7 @@ async function fixture(t: TestContext, catchUp = false) {
   const { schedule } = await device.schedule.create({ name: "offline dispatch", trigger: { kind: "cron", expr: "* * * * *", tz: "UTC" },
     target: { runKind: "dispatch", project: String(project.projectId), dispatch },
     policy: { overlap: "allow", catchUp, maxRetries: 0 }, consent: { push: "full" } });
-  return { store, device, dispatch, schedule, project, connect, get models() { return models; },
+  return { store, server, device, dispatch, schedule, project, connect, get client() { return client!; }, get models() { return models; },
     set serverAvailable(available: boolean) { serverAvailable = available; },
     async disconnect() {
       currentDevice.disconnect();
@@ -130,6 +130,58 @@ test("warm reconnect transfers all overdue dispatch occurrences without arming t
   assert.equal(f.runs().length, 3, "neither a retired timer nor an in-flight drain may record a disabled schedule");
   assert.equal(f.models, 0);
 });
+
+for (const catchUp of [false, true]) {
+  test(`unpublished supersession preserves owed dispatch ticks (catchUp:${catchUp})`, async t => {
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    t.after(() => release());
+    const f = await fixture(t, catchUp);
+    await f.disconnect();
+    let candidate: PhononConnection | undefined;
+    const originalHandle = PhononConnection.prototype.handle;
+    t.mock.method(PhononConnection.prototype, "handle", function(this: PhononConnection, data: string) {
+      const frame = JSON.parse(data);
+      if (frame.method === "schedule.ack" && frame.params.runId === "hold-unpublished-dispatch") {
+        candidate = this;
+        return hold;
+      }
+      return originalHandle.call(this, data);
+    });
+    // A buffered notification holds inboundChain after welcome/clock handoff but before publication.
+    f.server.once("device", (device: PhononDevice) => device.schedule.ack("hold-unpublished-dispatch"));
+    const starts = t.mock.method(SchedulerEngine.prototype, "start");
+    const superseded = assert.rejects(f.connect(), /connection attempt superseded/);
+    for (let i = 0; i < 2000 && !candidate; i++) await drain();
+    assert.ok(candidate, "the candidate must reach the unpublished welcome window");
+    assert.equal(f.client.connection, undefined);
+    assert.equal((f.client as unknown as { dispatchClock?: SchedulerEngine }).dispatchClock, undefined);
+    assert.equal(starts.mock.callCount(), 1, "the candidate owns the handed-off clock");
+    t.mock.timers.setTime(Date.now() + 3 * 60000);
+    assert.equal(f.runs().length, 0);
+    assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:01:00.000Z");
+
+    const accepted = t.mock.method(f.store, "acceptCronRun");
+    const replacement = f.connect();
+    assert.equal(candidate.isDisposed, true, "supersession must retire the unpublished candidate synchronously");
+    release();
+    const device = await replacement;
+    await superseded;
+    assert.notEqual(f.client.connection, candidate, "the retired candidate must never publish");
+    const pending = await device.schedule.runs.list({ scheduleId: f.schedule.id, unackedOnly: true });
+    assert.equal(pending.runs.length, 3, "live obligations must neither skip nor fold into a cold-start receipt");
+    assert.deepEqual(accepted.mock.calls.map(call => call.arguments[1]), [
+      "2026-11-05T00:02:00.000Z", "2026-11-05T00:03:00.000Z", "2026-11-05T00:04:00.000Z",
+    ], "each owed occurrence must advance the durable cursor by exactly one minute");
+    assert.equal(starts.mock.callCount(), 2, "only the candidate and replacement may start clocks; no competing cold clock");
+    assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:04:00.000Z");
+    await f.tick();
+    assert.equal(f.runs().length, 4, "only the replacement may record the next tick");
+    assert.equal(new Set(f.runs().map(run => run.id)).size, 4);
+    assert.ok(f.runs().every(run => run.status === "running" && !run.session_id && !run.workflow_id));
+    assert.equal(f.models, 0);
+  });
+}
 
 test("warm reconnect revalidates expiry before accepting overdue dispatch occurrences", async t => {
   const f = await fixture(t);
