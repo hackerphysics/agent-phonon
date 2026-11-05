@@ -39,6 +39,17 @@ export class AgentInteractionBridge {
     if(JSON.stringify(next.capabilities())!==JSON.stringify(this.capabilities()))throw new Error("session tool capabilities changed");
     this.binding=next;this.suspended=false;this.mcp?.resetRequestBudget();
   }
+  /** Generation of the currently admitted binding; capture at bind time for ownership fences. */
+  ownedGeneration():number{return this.generation;}
+  /**
+   * Suspend only if `expected` still owns the live binding.
+   * A late old-turn finally/abort must not suspend a newer rebind.
+   */
+  suspendIfOwned(expected:number):boolean{
+    if(this.closed||this.suspended||this.generation!==expected)return false;
+    this.suspend();
+    return true;
+  }
   suspend():void{
     this.generation++;
     this.suspended=true;
@@ -52,12 +63,17 @@ export class AgentInteractionBridge {
     if(!!request!==!!applied)throw new Error("Native human interaction requires its matching acknowledgement handler");
   }
 
+  private listenWait?:{resolve:()=>void;reject:(error:Error)=>void};
   async listen():Promise<Record<string,string>>{
     if(this.closed)throw new Error("bridge closed");
     if(this.environment)return {...this.environment};
     this.token=randomBytes(32).toString("base64url");
     this.server=createServer((req,res)=>{void this.handle(req,res);});
-    await new Promise<void>((resolve,reject)=>{this.server!.once("error",reject);this.server!.listen(0,"127.0.0.1",()=>resolve());});
+    await new Promise<void>((resolve,reject)=>{
+      this.listenWait={resolve,reject};
+      this.server!.once("error",error=>{this.listenWait=undefined;reject(error);});
+      this.server!.listen(0,"127.0.0.1",()=>{this.listenWait=undefined;resolve();});
+    });
     const address=this.server.address();if(!address||typeof address==="string")throw new Error("interaction bridge unavailable");
     const tools:NativeMcpTool[]=[
       ...(this.request?[
@@ -85,6 +101,8 @@ export class AgentInteractionBridge {
   close():Promise<void>{
     if(this.closing)return this.closing;
     this.closed=true;const server=this.server;this.server=undefined;
+    const pendingListen=this.listenWait;this.listenWait=undefined;
+    pendingListen?.reject(new Error("bridge closed"));
     this.suspend();this.environment=undefined;
     this.delivered.clear();this.token="";
     this.closing=(async()=>{await this.mcp?.close();if(server){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}})();

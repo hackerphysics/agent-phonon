@@ -78,3 +78,40 @@ test('separate session tokens remain isolated and tool capability changes cannot
     assert.equal((await client(ea)('tools/call',call)).result.isError,true);
   }finally{await a.close();await b.close();}
 });
+
+
+test('late previous-turn suspendIfOwned cannot suspend a newer rebound binding',async()=>{
+  let first=0,second=0;
+  const bridge=new AgentInteractionBridge(...handlers(async i=>{first++;return reply(i);}));
+  try{
+    const env=await bridge.listen(),rpc=client(env);
+    const oldGeneration=bridge.ownedGeneration();
+    assert.equal((await rpc('tools/call',call)).result.isError,undefined);assert.equal(first,1);
+    // Interrupt-equivalent: old turn suspends, replacement rebinds.
+    bridge.suspend();
+    bridge.rebind(...handlers(async i=>{second++;return reply(i);}));
+    const newGeneration=bridge.ownedGeneration();
+    assert.notEqual(newGeneration,oldGeneration);
+    assert.deepEqual(await bridge.listen(),env);
+    // Late old finally / abort listener must be a no-op against the new binding.
+    assert.equal(bridge.suspendIfOwned(oldGeneration),false);
+    assert.equal((await rpc('tools/call',call)).result.isError,undefined);assert.equal(second,1);
+    assert.equal(bridge.suspendIfOwned(newGeneration),true);
+    assert.equal((await rpc('tools/call',call)).result.isError,true);
+  }finally{await bridge.close();}
+});
+
+test('close during listen settles the wait and revokes the token instead of hanging',async()=>{
+  const bridge=new AgentInteractionBridge(...handlers(reply));
+  // Inject a never-completing listen wait to prove close rejects it (P2 mid-bind close).
+  let rejectListen!:(error:Error)=>void;
+  const stuck=new Promise<void>((_resolve,reject)=>{rejectListen=reject;});
+  (bridge as any).listenWait={resolve:()=>{},reject:rejectListen};
+  const closed=bridge.close();
+  await assert.rejects(stuck,/bridge closed/);
+  await closed;
+  assert.equal((bridge as any).listenWait,undefined);
+  assert.equal((bridge as any).token,"");
+  assert.equal((bridge as any).environment,undefined);
+  assert.equal((bridge as any).server,undefined);
+});
