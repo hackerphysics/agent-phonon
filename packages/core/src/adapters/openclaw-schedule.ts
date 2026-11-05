@@ -31,11 +31,12 @@ function publicText(value: string): string {
   return value
     // Escapes are indivisible; an unterminated quoted value is redacted through EOF.
     // Like empty pairs, quoted-closer sticky scanning stops before the next credential assignment (including quoted keys).
+    // Both sticky and empty-pair lookaheads require a word boundary before key names so embedded identifiers do not false-stop scanning.
     // Glued non-key suffixes are still consumed with the value; a boundary } stays structural.
     // Leading empty quote pairs scan same-value suffixes, but not a following credential assignment.
     // Commas, semicolons, closing braces and quotes can be part of an unquoted value.
     // Otherwise only whitespace, & or EOF ends an unquoted credential value.
-    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])+(?:"|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|'(?:\\[\s\S]|[^'\\])+(?:'|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|(?:''|"")(?:(?![,;]?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|[^\s&]+)/gi,
+    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])+(?:"|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?\b(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|'(?:\\[\s\S]|[^'\\])+(?:'|\\?$)(?:(?!}(?:\s|&|$))(?![,;]?["']?\b(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|(?:''|"")(?:(?![,;]?\b(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|[^\s&]+)/gi,
       (_match, prefix: string, scalar: string) => {
         const quote = scalar[0] !== scalar[1] && (scalar[0] === '"' || scalar[0] === "'") ? scalar[0] : "";
         return `${prefix}${quote}[redacted]${quote}`;
