@@ -30,10 +30,10 @@ const vendorList = z.union([z.array(vendorJob), z.object({
 function publicText(value: string): string {
   return value
     // Escapes are indivisible; an unterminated quoted value is redacted through EOF.
-    // Empty quote pairs are not terminators; scan through them as unquoted content.
+    // Leading empty quote pairs scan same-value suffixes, but not a following credential assignment.
     // Commas, semicolons, closing braces and quotes can be part of an unquoted value.
-    // Only whitespace, & or EOF ends an unquoted credential value.
-    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])+(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])+(?:'|\\?$)|[^\s&]+)/gi,
+    // Otherwise only whitespace, & or EOF ends an unquoted credential value.
+    .replace(/((?:token|password|secret|api[_-]?key)["']?\s*[=:]\s*)("(?:\\[\s\S]|[^"\\])+(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])+(?:'|\\?$)|(?:''|"")(?:(?![,;]?(?:token|password|secret|api[_-]?key)["']?\s*[=:])[^\s&])*|[^\s&]+)/gi,
       (_match, prefix: string, scalar: string) => {
         const quote = scalar[0] !== scalar[1] && (scalar[0] === '"' || scalar[0] === "'") ? scalar[0] : "";
         return `${prefix}${quote}[redacted]${quote}`;
