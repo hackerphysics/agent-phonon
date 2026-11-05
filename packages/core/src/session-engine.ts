@@ -85,6 +85,7 @@ export class AdapterRegistry {
 
 /** 引擎内 session 记录。 */
 interface SessionRecord {
+  interactionBridge?:AgentInteractionBridge;
   nativeStop?:NativeStopTarget;
   nativeStopOperation?:Promise<void>;
   nativeStopSettled?:boolean;
@@ -735,6 +736,7 @@ export class SessionEngine {
     const insertion = new AbortController();
     rec.insertionWindow = { turnId, controller: insertion };
     let interactionBridge:AgentInteractionBridge|undefined;
+    let bridgeGeneration:number|undefined;
     let peerBridge:PeerContextBridge|undefined;
     let peerContext:PeerContextReceiver|undefined;
     const initialPeerMessageIds=new Set<string>();
@@ -899,10 +901,47 @@ export class SessionEngine {
       } : undefined;
       const projectCoordination=requestCoordination ? (raw:AgentCoordinationInput)=>requestCoordination(raw,false) : undefined;
       if(requestInteraction||conversationBoard||conversationWorkflow||conversationMessage||publishDocument||projectCoordination){
-        interactionBridge=new AgentInteractionBridge(requestInteraction,requestInteraction?acknowledgeInteraction:undefined,conversationBoard,conversationWorkflow,conversationMessage,publishDocument,projectCoordination);
-        runtimeEnvironment={...environment,...await interactionBridge.listen()};
-        if(abort.signal.aborted)void interactionBridge.close();
-        else abort.signal.addEventListener("abort",()=>{void interactionBridge?.close();},{once:true});
+        const handlers:ConstructorParameters<typeof AgentInteractionBridge>=[requestInteraction,requestInteraction?acknowledgeInteraction:undefined,conversationBoard,conversationWorkflow,conversationMessage,publishDocument,projectCoordination];
+        const bridgeAlive=()=>!this.disposed&&!abort.signal.aborted&&rec.currentTurnId===turnId&&!rec.terminalTurns.has(turnId)&&rec.status!=="terminated";
+        // Pre-bridge awaits (reasoning inventory / employee resolve) can yield while
+        // terminate/dispose/interrupt already ran with interactionBridge still unset.
+        if(!bridgeAlive()){
+          /* Skip create/rebind for a dead turn/session. */
+        }else if(rec.interactionBridge){
+          rec.interactionBridge.rebind(...handlers);
+          interactionBridge=rec.interactionBridge;
+          runtimeEnvironment={...environment,...await interactionBridge.listen()};
+          if(!bridgeAlive()){
+            // Rebound after death: suspend this ownership only; keep session listener.
+            const generation=interactionBridge.ownedGeneration();
+            interactionBridge.suspendIfOwned(generation);
+            interactionBridge=undefined;
+          }else{
+            bridgeGeneration=interactionBridge.ownedGeneration();
+            abort.signal.addEventListener("abort",()=>{if(bridgeGeneration!==undefined)interactionBridge?.suspendIfOwned(bridgeGeneration);},{once:true});
+          }
+        }else{
+          interactionBridge=new AgentInteractionBridge(...handlers);
+          rec.interactionBridge=interactionBridge;
+          try{
+            runtimeEnvironment={...environment,...await interactionBridge.listen()};
+          }catch(error){
+            if(rec.interactionBridge===interactionBridge)rec.interactionBridge=undefined;
+            await interactionBridge.close().catch(()=>{});
+            interactionBridge=undefined;
+            if(!bridgeAlive()){/* late create after terminate/dispose */}
+            else throw error;
+          }
+          if(interactionBridge&&!bridgeAlive()){
+            // Created after terminate/dispose: close listener+token, do not leave suspend-only residue.
+            if(rec.interactionBridge===interactionBridge)rec.interactionBridge=undefined;
+            await interactionBridge.close();
+            interactionBridge=undefined;
+          }else if(interactionBridge){
+            bridgeGeneration=interactionBridge.ownedGeneration();
+            abort.signal.addEventListener("abort",()=>{if(bridgeGeneration!==undefined)interactionBridge?.suspendIfOwned(bridgeGeneration);},{once:true});
+          }
+        }
       }
       if (projectCoordination) {
         if(abort.signal.aborted||rec.currentTurnId!==turnId||rec.terminalTurns.has(turnId))return;
@@ -1016,7 +1055,10 @@ export class SessionEngine {
       if(coordinationHeartbeat)clearInterval(coordinationHeartbeat);
       await peerBridge?.close();
       if(interactionBridge)abort.abort();
-      await interactionBridge?.close();
+      // Fence suspend to this turn's binding generation so a late finally cannot
+      // suspend a replacement turn that already rebound the shared bridge.
+      if(interactionBridge&&bridgeGeneration!==undefined)interactionBridge.suspendIfOwned(bridgeGeneration);
+      else if(interactionBridge&&bridgeGeneration===undefined)interactionBridge.suspend();
       releaseEmployee?.();
       insertion.abort();
       if (rec.insertionWindow?.controller === insertion) rec.insertionWindow = undefined;
@@ -1310,6 +1352,7 @@ export class SessionEngine {
     rec.queue.length = 0;
     rec.status = "terminated";
     rec.currentTurnId = undefined;
+    await rec.interactionBridge?.close();rec.interactionBridge=undefined;
     this.persist(rec);
     if (!rec.detached && rec.adapterSession?.terminate) {
       await settleWithin([Promise.resolve().then(() => rec.adapterSession.terminate()).catch(() => {})]);
@@ -1358,6 +1401,7 @@ export class SessionEngine {
       rec.queue.length = 0;
       rec.abort?.abort();
       rec.abort = undefined;
+      if(rec.interactionBridge){closing.push(rec.interactionBridge.close());rec.interactionBridge=undefined;}
       if (!rec.detached && rec.adapterSession) {
         rec.adapterSession.setUnsolicitedSink?.(() => {});
         const wasRunning = rec.status === "running";
