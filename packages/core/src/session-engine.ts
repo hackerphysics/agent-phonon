@@ -1164,6 +1164,7 @@ export class SessionEngine {
     const observation=store.pendingNativeStops.get(key);
     if(!observation)return;
     if(observation.stopJSON!==row.native_stop_json||observation.recoveryJSON!==row.recovery_json){store.pendingNativeStops.delete(key);return;}
+    const stopJSON=observation.stopJSON,recoveryJSON=observation.recoveryJSON;
     if(store.nativeSessionOwnedElsewhere(rec.tenantId,rec.sessionId,this.nativeOwner)
       ||store.activeSessionControls.has(key)||store.compressionBlocked(rec.tenantId,rec.sessionId))return;
     const authority=this.captureProjectAuthority(rec);
@@ -1176,10 +1177,11 @@ export class SessionEngine {
     if(observation.pending===pending)observation.pending=undefined;
     const result=settled.value;
     if(!result||this.disposed||!rec.detached||rec.ownsNative)return;
+    if(store.pendingNativeStops.get(key)!==observation||observation.stopJSON!==stopJSON||observation.recoveryJSON!==recoveryJSON)return;
     this.assertProjectAuthority(rec,authority);
     if(store.activeSessionControls.has(key)||store.compressionBlocked(rec.tenantId,rec.sessionId))return;
-    if(!store.claimNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner,{checkpoint:observation.recoveryJSON,
-      nativeStopJSON:observation.stopJSON,project:rec.project,agent:rec.agent,model:rec.model,
+    if(!store.claimNativeSession(rec.tenantId,rec.sessionId,this.nativeOwner,{checkpoint:recoveryJSON,
+      nativeStopJSON:stopJSON,project:rec.project,agent:rec.agent,model:rec.model,
       employeeId:rec.employeeId,employeeRevision:rec.employeeRevision}))return;
     rec.ownsNative=true;
     try{

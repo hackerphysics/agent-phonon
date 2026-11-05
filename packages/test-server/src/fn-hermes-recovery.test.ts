@@ -133,8 +133,29 @@ test("Hermes re-observes the same readonly native history after a confirmed stop
     session.nativeObservation=undefined;
     assert.equal(session.recoveryCheckpoint(),undefined);
     assert.equal(await session.observeNativeStop(session.lastNative.turnId),"process_tree_exit");
+    await until(()=>!!session.recoveryCheckpoint());
     assert.deepEqual(session.recoveryCheckpoint(),saved);assert.equal(f.calls().length,before);
   }finally{await f.close();}
+});
+
+test("Hermes stop confirmation does not wait for a slow checkpoint probe and coalesces its reads",{skip:!existsSync("/usr/bin/python3")},async()=>{
+  const f=await fixture();let session:any;
+  try{
+    await f.turn(f.privateId,"retained original");
+    session=(f.conn.conn as any).engine.sessions.get(f.privateId).adapterSession;
+    const saved=session.recoveryCheckpoint(),before=f.calls().length;
+    const probe=join(f.root,"hermes_state.py"),count=join(f.root,"stop-probes");
+    writeFileSync(probe,`import time\nwith open(${JSON.stringify(count)},'a') as f: f.write('probe\\n')\ntime.sleep(2.5)\n`+readFileSync(probe,"utf8"));
+    session.nativeObservation=undefined;
+    const started=Date.now();
+    assert.equal(await session.observeNativeStop(session.lastNative.turnId),"process_tree_exit");
+    assert.ok(Date.now()-started<1000,"known process-tree exit must not depend on history read latency");
+    assert.equal(await session.observeNativeStop("another-turn"),undefined);
+    assert.equal(await session.observeNativeStop(session.lastNative.turnId),"process_tree_exit");
+    await until(()=>!!session.recoveryCheckpoint());
+    assert.deepEqual(session.recoveryCheckpoint(),saved);assert.equal(f.calls().length,before);
+    assert.equal(readFileSync(count,"utf8"),"probe\n");
+  }finally{await session?.stopCheckpointObservation;await f.close();}
 });
 
 for(const version of ["0.16","0.21"] as const){

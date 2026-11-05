@@ -160,6 +160,32 @@ test("the next connection rechecks a late native stop and delivers only the new 
   }finally{stopped=true;release();await f.close();}
 });
 
+test("a slow detached stop probe cannot borrow a newer observation's snapshot for its ownership claim",async()=>{
+  let active=false,release:()=>void=()=>{},resolveProbe!:(value:any)=>void;
+  const registry=new AdapterRegistry();
+  registry.register({name:"stop",capabilities:{nativeSession:true,interrupt:true} as never,discoverAgents:async()=>[],createSession:async params=>({
+    sessionId:params.sessionId,model:params.model,interrupt:async()=>{},terminate:async()=>{},observeNativeStop:async()=>undefined,
+    send:async()=>{active=true;await new Promise<void>(resolve=>{release=resolve;});},
+  }),recoverSession:async()=>{throw new Error("must not resume work");}});
+  const f=await setup(registry);let reading:Promise<unknown>|undefined;
+  try{
+    await f.tc.call("workflow.run",request(f.project));await until(()=>active);await f.restart();release();
+    const row=f.store.loadSessions("owner")[0]!,sessionId=String(row.session_id),key="owner\0"+sessionId;
+    const observation=f.store.pendingNativeStops.get(key)!;assert.ok(observation);
+    observation.observe=()=>new Promise(resolve=>{resolveProbe=resolve;});
+    reading=f.tc.call("session.status",{sessionId});await until(()=>!!resolveProbe);
+    const old=JSON.parse(String(row.native_stop_json));
+    const checkpoint={version:1,adapter:"stop",agent:"stop:worker",model:"m1",project:f.project,cwd:row.project_cwd,settled:true,state:{nativeID:"newer-source"}};
+    const stopJSON=JSON.stringify({...old,state:"confirmed",confirmation:"native_terminal",reasonCode:undefined,observedAt:new Date().toISOString()}),recoveryJSON=JSON.stringify(checkpoint);
+    (f.store as any).db.prepare("UPDATE sessions SET native_stop_json=?,recovery_json=? WHERE tenant_id=? AND session_id=?").run(stopJSON,recoveryJSON,"owner",sessionId);
+    observation.stopJSON=stopJSON;observation.recoveryJSON=recoveryJSON;
+    resolveProbe({confirmation:"process_tree_exit",checkpoint:JSON.stringify({...checkpoint,state:{nativeID:"obsolete-source"}})});
+    await reading;
+    const current=f.store.nativeSessionSnapshot("owner",sessionId)!;
+    assert.equal(current.native_stop_json,stopJSON);assert.equal(current.recovery_json,recoveryJSON);
+  }finally{resolveProbe?.(undefined);release();await reading?.catch(()=>{});await f.close();}
+});
+
 test("Gateway stop needs the matching native terminal, not a chat.abort acknowledgement or another run",async()=>{
   const adapter=new OpenClawGatewayAdapter({gateway:{baseUrl:"ws://127.0.0.1:1",token:"fixture"}});let runId:string|undefined;
   (adapter as any).gw={connect:async()=>{},close:()=>{},isConnected:()=>true,connectionEpoch:()=>1,rpc:async(method:string,params:any)=>{if(method==="chat.send")runId=params.idempotencyKey;return {};}};
