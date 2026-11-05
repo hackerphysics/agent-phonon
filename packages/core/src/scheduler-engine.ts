@@ -105,7 +105,7 @@ export class SchedulerEngine {
   // lifecycle
   // -------------------------------------------------------------------------
 
-  start(): void {
+  start(liveDispatchScheduleIds?: ReadonlySet<string>): void {
     if (this.started || this.disposed) return;
     this.started = true;
     this.reconcileOrphanedRuns();
@@ -120,7 +120,9 @@ export class SchedulerEngine {
     this.leaseTimer.unref?.();
     for (const row of this.opts.store.listSchedules(this.opts.tenantId)) {
       const schedule = this.rowToSchedule(row);
-      if (schedule.enabled && schedule.trigger.kind === "cron" && (!this.dispatchOnly || schedule.target.runKind === "dispatch")) this.restoreCron(schedule);
+      if (schedule.enabled && schedule.trigger.kind === "cron" && (!this.dispatchOnly || schedule.target.runKind === "dispatch")) {
+        this.restoreCron(schedule, schedule.target.runKind === "dispatch" && liveDispatchScheduleIds?.has(schedule.id) === true);
+      }
     }
   }
 
@@ -144,6 +146,19 @@ export class SchedulerEngine {
     for (const rt of [...this.runtimes.values()]) {
       if (!rt.dispatch) this.retireRuntime(rt, reason);
     }
+  }
+
+  /** Transfer live obligations, including callbacks not yet entered, before a replacement starts. */
+  handoffDispatchClock(tenantId: string): ReadonlySet<string> {
+    const live = new Set<string>();
+    if (this.started && !this.disposed && this.dispatchOnly && tenantId === this.opts.tenantId) {
+      for (const row of this.opts.store.listSchedules(tenantId)) {
+        const schedule = this.rowToSchedule(row);
+        if (schedule.enabled && schedule.trigger.kind === "cron" && schedule.target.runKind === "dispatch") live.add(schedule.id);
+      }
+    }
+    this.dispose("connection restored");
+    return live;
   }
 
   private retireRuntime(rt: RunRuntime, reason: string): void {
@@ -861,16 +876,16 @@ export class SchedulerEngine {
   // cron
   // -------------------------------------------------------------------------
 
-  private restoreCron(schedule: Schedule): void {
+  private restoreCron(schedule: Schedule, liveDispatch = false): void {
     if (schedule.trigger.kind !== "cron") return;
     const missed = schedule.nextRunAt !== undefined && Date.parse(schedule.nextRunAt) <= this.now();
     if (missed) {
-      if (schedule.policy?.catchUp) {
-        void this.onCronFire(schedule.id).catch(() => this.reportBackgroundFailure());
+      if (liveDispatch || schedule.policy?.catchUp) {
+        // A warm handoff owes every process-up tick; a process restart catches up at most once.
+        void this.onCronFire(schedule.id, !liveDispatch).catch(() => this.reportBackgroundFailure());
         return;
       }
-      // Advance durably before any catch-up launch. One startup produces at most
-      // one catch-up run regardless of how many occurrences were missed.
+      // Only process-down ticks may be skipped by catchUp:false.
       const updated = { ...schedule, nextRunAt: this.computeNextRun(schedule.trigger) };
       this.persist(updated);
       this.safeEmit("schedule.changed", { schedule: this.maskSchedule(updated) });
@@ -901,38 +916,47 @@ export class SchedulerEngine {
     this.timers.set(schedule.id, timer);
   }
 
-  private async onCronFire(scheduleId: string): Promise<void> {
-    if (!this.started || this.disposed) return;
-    const row = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
-    if (!row) return;
-    const schedule = this.rowToSchedule(row);
-    if (!schedule.enabled || schedule.trigger.kind !== "cron") return;
-    if (this.dispatchOnly && schedule.target.runKind !== "dispatch") return;
-    if (schedule.nextRunAt && Date.parse(schedule.nextRunAt) - this.now() > 1000) {
-      this.armCron(schedule);
-      return;
-    }
-    const nextRunAt = this.computeNextRun(schedule.trigger);
-    if (!nextRunAt) return;
-    try {
-      // Run receipt + next occurrence are committed together before execution.
-      await this.launchRun(schedule, "cron", undefined, nextRunAt);
-    } catch (error) {
-      // Capacity pressure never rejects/defers. A true persistence/read failure
-      // is not accepted and must not advance the due cursor or fake a result.
-      if (!(error instanceof PhononError) || error.appCode !== "errPolicyDenied") throw error;
-      const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
-      if (current) {
-        const updated = this.rowToSchedule(current);
-        if (updated.enabled) this.persist({ ...updated, nextRunAt });
+  private async onCronFire(scheduleId: string, processDownCatchUp = false): Promise<void> {
+    while (this.started && !this.disposed) {
+      const row = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
+      if (!row) return;
+      const schedule = this.rowToSchedule(row);
+      if (!schedule.enabled || schedule.trigger.kind !== "cron") return;
+      if (this.dispatchOnly && schedule.target.runKind !== "dispatch") return;
+      if (schedule.nextRunAt && Date.parse(schedule.nextRunAt) - this.now() > 1000) {
+        this.armCron(schedule);
+        return;
       }
+      const liveDispatch = schedule.target.runKind === "dispatch" && !processDownCatchUp;
+      const nextRunAt = this.computeNextRun(schedule.trigger,
+        liveDispatch && schedule.nextRunAt ? Date.parse(schedule.nextRunAt) : this.now());
+      if (!nextRunAt) return;
+      try {
+        // Run receipt + next occurrence are committed together before execution.
+        await this.launchRun(schedule, "cron", undefined, nextRunAt);
+      } catch (error) {
+        if (!this.started || this.disposed) return;
+        // Capacity pressure never rejects/defers. A true persistence/read failure
+        // is not accepted and must not advance the due cursor or fake a result.
+        if (!(error instanceof PhononError) || error.appCode !== "errPolicyDenied") throw error;
+        const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
+        if (current) {
+          const updated = this.rowToSchedule(current);
+          if (updated.enabled) this.persist({ ...updated, nextRunAt });
+        }
+      }
+      if (!this.started || this.disposed) return;
+      const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
+      if (!current) return;
+      const updated = this.rowToSchedule(current);
+      this.safeEmit("schedule.changed", { schedule: this.maskSchedule(updated) });
+      if (!updated.enabled) return;
+      if (!liveDispatch || !updated.nextRunAt || Date.parse(updated.nextRunAt) > this.now()) {
+        this.armCron(updated);
+        return;
+      }
+      // Re-read policy, expiry and the durable cursor for each owed process-up occurrence.
     }
-    if (!this.started || this.disposed) return;
-    const current = this.opts.store.getSchedule(scheduleId, this.opts.tenantId);
-    if (!current) return;
-    const updated = this.rowToSchedule(current);
-    this.safeEmit("schedule.changed", { schedule: this.maskSchedule(updated) });
-    this.armCron(updated);
   }
 
   private disarm(scheduleId: string): void {
@@ -954,9 +978,9 @@ export class SchedulerEngine {
     return trigger;
   }
 
-  private computeNextRun(trigger: ScheduleTrigger): string | undefined {
+  private computeNextRun(trigger: ScheduleTrigger, after = this.now()): string | undefined {
     if (trigger.kind !== "cron") return undefined;
-    return nextCronAfter(trigger.expr, new Date(this.now()), trigger.tz ?? this.opts.defaultTz)?.toISOString();
+    return nextCronAfter(trigger.expr, new Date(after), trigger.tz ?? this.opts.defaultTz)?.toISOString();
   }
 
   // -------------------------------------------------------------------------

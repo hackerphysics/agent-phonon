@@ -24,8 +24,12 @@ Disconnect/restart preserves handed-off and queued dispatches for reconciliation
 While the device process remains up, `PhononClient` retains a dispatch-only
 clock across websocket disconnection. Every due tick still commits an occurrence
 and the next cursor locally; no Session, Workflow or model is launched offline.
-Reconnect retires that clock before restoring the connection scheduler and the
-controller drains `schedule.runs.list({unackedOnly:true})`. Closing the client
+Reconnect transfers the live schedule obligations and retires that clock before
+restoring the connection scheduler, including ticks whose timers have not fired
+yet. Delayed dispatch callbacks advance from the durable due cursor one occurrence
+at a time, never folding multiple process-up ticks into one receipt. Receipt
+timestamps reflect actual recording time. The controller drains
+`schedule.runs.list({unackedOnly:true})`. Closing the client
 stops the clock. On process restart, `catchUp:false` advances past process-down
 ticks without creating a catch-up burst, but never deletes existing receipts.
 With a previously authenticated server-to-tenant binding in the store, the

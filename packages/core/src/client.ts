@@ -282,7 +282,7 @@ export class PhononClient {
           this.stopActive?.("connection replaced");
           await this.teardown;
           assertCurrent();
-          this.dispatchClock?.dispose("connection restored");
+          const liveDispatchScheduleIds = this.dispatchClock?.handoffDispatchClock(welcome.tenantId);
           this.dispatchClock = undefined;
           this.lastTenantId = welcome.tenantId;
           this.store.rememberConnectionTenant(this.serverUrl, welcome.tenantId, new Date().toISOString());
@@ -291,6 +291,7 @@ export class PhononClient {
           try{this.store.localDirectoryAdmissions().observe(localDirectorySource,welcome.tenantId);}catch{}
 
           const conn = new PhononConnection({
+            liveDispatchScheduleIds,
             managedMcp: this.managedMcp,
             tenantId: welcome.tenantId,
             localDirectorySource,

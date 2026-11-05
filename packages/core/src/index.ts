@@ -137,6 +137,8 @@ export class PhononConnection {
     /** 设备本地预注册的确定性维护目标。 */
     maintenance?: MaintenanceManagerConfig;
     delivery?: Partial<import("./delivery-capacity.js").DeliveryConfig>;
+    /** @internal Tenant-scoped live clock obligations transferred by PhononClient. */
+    liveDispatchScheduleIds?: ReadonlySet<string>;
   }) {
     this.managedMcp = opts.managedMcp;
     this.tenantId = opts.tenantId;
@@ -288,7 +290,7 @@ export class PhononConnection {
     });
 
     // The client may retain the dispatch-only clock across a socket outage;
-    // replacement disposes it before this connection restores durable state.
+    // replacement transfers live obligations and disposes it before restoring state.
     this.scheduler = new SchedulerEngine({
       tenantId: this.tenantId,
       engine: this.engine,
@@ -298,7 +300,7 @@ export class PhononConnection {
       emit: (method, params) => this.peer.notifyRaw(method, params),
       assertRunAllowed: (schedule) => this.policy.assertMethodAllowed(schedule.target.runKind === "dispatch" ? "schedule.trigger" : schedule.target.runKind === "workflow" ? "workflow.run" : "session.create"),
     });
-    this.scheduler.start();
+    this.scheduler.start(opts.liveDispatchScheduleIds);
     this.scheduler.replayUnacked();
     this.replayWorkflowEvents();
     // Workflow ownership is tenant-scoped and persisted. Recovery runs only

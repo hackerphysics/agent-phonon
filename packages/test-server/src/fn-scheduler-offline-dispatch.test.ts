@@ -11,7 +11,7 @@ async function drain() {
   for (let i = 0; i < 10; i++) await new Promise<void>(resolve => setImmediate(resolve));
 }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, catchUp = false) {
   const root = mkdtempSync(join(tmpdir(), "phonon-offline-dispatch-"));
   const store = new PhononStore(join(root, "state.sqlite"));
   let serverAvailable = true;
@@ -44,7 +44,7 @@ async function fixture(t: TestContext) {
   const dispatch = { key: "offline-automation", revision: 1, contentHash: "a".repeat(64), expiresAt: new Date(Date.now() + 86400000).toISOString() };
   const { schedule } = await device.schedule.create({ name: "offline dispatch", trigger: { kind: "cron", expr: "* * * * *", tz: "UTC" },
     target: { runKind: "dispatch", project: String(project.projectId), dispatch },
-    policy: { overlap: "allow", catchUp: false, maxRetries: 0 }, consent: { push: "full" } });
+    policy: { overlap: "allow", catchUp, maxRetries: 0 }, consent: { push: "full" } });
   return { store, device, dispatch, schedule, project, connect, get models() { return models; },
     set serverAvailable(available: boolean) { serverAvailable = available; },
     async disconnect() {
@@ -86,6 +86,75 @@ test("dispatch clock records every offline tick and reconnect drains the durable
   assert.equal(f.runs().length, 0, "the retired offline clock must not survive reconnect");
 });
 
+for (const offline of [true, false]) {
+  test(`warm ${offline ? "reconnect" : "connection replacement"} records a due dispatch before its timer fires`, async t => {
+    const f = await fixture(t);
+    if (offline) await f.disconnect();
+    // Move wall time across the deadline without executing the pending callback.
+    t.mock.timers.setTime(Date.now() + 60000);
+    assert.equal(f.runs().length, 0);
+    assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:01:00.000Z");
+    const device = await f.connect();
+    const pending = await device.schedule.runs.list({ scheduleId: f.schedule.id, unackedOnly: true });
+    assert.equal(pending.runs.length, 1, "continuous uptime must not use process-down skipping");
+    assert.equal(pending.runs[0]?.startedAt, "2026-11-05T00:01:00.000Z");
+    assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:02:00.000Z");
+    await f.tick();
+    assert.equal(f.runs().length, 2, "only the replacement clock may record the next tick");
+    assert.equal(f.models, 0);
+  });
+
+  test(`a delayed ${offline ? "offline" : "connected"} dispatch callback records every owed minute`, async t => {
+    const f = await fixture(t);
+    if (offline) await f.disconnect();
+    await f.tick(3 * 60000);
+    assert.equal(f.runs().length, 3, "a delayed callback must not fold three occurrences into one");
+    assert.ok(f.runs().every(run => run.status === "running" && !run.session_id && !run.workflow_id));
+    assert.equal(new Set(f.runs().map(run => run.id)).size, 3);
+    assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:04:00.000Z");
+    await f.tick();
+    assert.equal(f.runs().length, 4);
+    assert.equal(f.models, 0);
+  });
+}
+
+test("warm reconnect transfers all overdue dispatch occurrences without arming two clocks", async t => {
+  const f = await fixture(t);
+  await f.disconnect();
+  t.mock.timers.setTime(Date.now() + 3 * 60000);
+  const device = await f.connect();
+  assert.equal((await device.schedule.runs.list({ scheduleId: f.schedule.id, unackedOnly: true })).runs.length, 3);
+  assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:04:00.000Z");
+  await device.schedule.disable(f.schedule.id);
+  await f.tick(3 * 60000);
+  assert.equal(f.runs().length, 3, "neither a retired timer nor an in-flight drain may record a disabled schedule");
+  assert.equal(f.models, 0);
+});
+
+test("warm reconnect revalidates expiry before accepting overdue dispatch occurrences", async t => {
+  const f = await fixture(t);
+  await f.device.schedule.update({ scheduleId: f.schedule.id, target: { runKind: "dispatch", project: String(f.project.projectId),
+    dispatch: { ...f.dispatch, expiresAt: new Date(Date.now() + 30000).toISOString() } } });
+  await f.disconnect();
+  t.mock.timers.setTime(Date.now() + 3 * 60000);
+  const device = await f.connect();
+  assert.equal((await device.schedule.runs.list({ scheduleId: f.schedule.id, unackedOnly: true })).runs.length, 0);
+  assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.enabled, 0);
+  assert.equal(f.models, 0);
+});
+
+test("catchUp:true still folds process-down dispatch ticks into one startup receipt", async t => {
+  const f = await fixture(t, true);
+  await f.restart();
+  await f.tick(3 * 60000);
+  const device = await f.connect();
+  assert.equal((await device.schedule.runs.list({ scheduleId: f.schedule.id, unackedOnly: true })).runs.length, 1);
+  assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:04:00.000Z");
+  await f.tick();
+  assert.equal(f.runs().length, 2);
+  assert.equal(f.models, 0);
+});
+
 test("catchUp:false skips process-down ticks but preserves earlier unacked dispatch receipts", async t => {
   const f = await fixture(t);
   await f.disconnect(); await f.tick();
@@ -104,7 +173,7 @@ test("catchUp:false skips process-down ticks but preserves earlier unacked dispa
 test("offline dispatch retains every receipt beyond active capacity and still enforces expiry", async t => {
   const f = await fixture(t);
   await f.disconnect();
-  for (let minute = 0; minute < 75; minute++) await f.tick();
+  await f.tick(75 * 60000);
   const runs = f.runs();
   assert.equal(runs.length, 75);
   assert.equal(runs.filter(run => run.status === "running").length, 32);
