@@ -36,7 +36,8 @@ function publicText(value: string): string {
         return `${prefix}${quote}[redacted]${quote}`;
       })
     .replace(/\b((?:Bearer|Basic)\s+)[^\s,;]+/gi, "$1[redacted]")
-    .replace(/(https?:\/\/)[^\s/@]*:[^\s/@]+@/gi, "$1[redacted]@");
+    // Greedy userinfo reaches the last authority @, never the path, query or fragment.
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]*:[^\s/?#]*@/gi, "$1[redacted]@");
 }
 
 /** The supplied transport performs exactly one read. Errors never become []. */

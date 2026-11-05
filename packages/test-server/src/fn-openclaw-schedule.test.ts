@@ -140,6 +140,28 @@ const credentialCases = [
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
     expected: "https://[redacted]@example.test/hook", secrets: /user:pass/ },
+  { label: "HOLD postgres URL userinfo", input: "postgres://user:db_secret@example.test/database",
+    expected: "postgres://[redacted]@example.test/database", secrets: /db_secret/ },
+  { label: "HOLD mysql URL userinfo", input: "mysql://user:mysql_secret@example.test/database",
+    expected: "mysql://[redacted]@example.test/database", secrets: /mysql_secret/ },
+  { label: "HOLD empty-user redis URL userinfo", input: "redis://:redis_secret@example.test:6379/0",
+    expected: "redis://[redacted]@example.test:6379/0", secrets: /redis_secret/ },
+  { label: "HOLD mongodb URL userinfo", input: "mongodb://user:mongo_secret@example.test/database",
+    expected: "mongodb://[redacted]@example.test/database", secrets: /mongo_secret/ },
+  { label: "HOLD ftp URL userinfo", input: "ftp://user:ftp_secret@example.test/file",
+    expected: "ftp://[redacted]@example.test/file", secrets: /ftp_secret/ },
+  { label: "file URL userinfo", input: "file://user:file_secret@example.test/share/file",
+    expected: "file://[redacted]@example.test/share/file", secrets: /file_secret/ },
+  { label: "generic scheme URL userinfo", input: "Custom+db.v1-test://:custom_secret@example.test/database",
+    expected: "Custom+db.v1-test://[redacted]@example.test/database", secrets: /custom_secret/ },
+  { label: "HOLD multi-@ https URL userinfo", input: "https://user:alpha@beta@example.test/path",
+    expected: "https://[redacted]@example.test/path", secrets: /user:|alpha|beta/ },
+  { label: "multi-@ postgres URL userinfo", input: "postgres://user:alpha@beta@example.test:5432/database",
+    expected: "postgres://[redacted]@example.test:5432/database", secrets: /user:|alpha|beta/ },
+  { label: "multi-@ username URL userinfo", input: "https://user@tenant:alpha@beta@example.test/path",
+    expected: "https://[redacted]@example.test/path", secrets: /user|tenant|alpha|beta/ },
+  { label: "credential URL authority boundaries", input: "https://user:uri_credential@example.test:443/path@segment?recipient=other@example.test#fragment@tail",
+    expected: "https://[redacted]@example.test:443/path@segment?recipient=other@example.test#fragment@tail", secrets: /user:uri_credential/ },
 ];
 
 for (const { label, input, expected, secrets } of credentialCases) {
@@ -166,6 +188,26 @@ for (const { label, input, expected, secrets } of credentialCases) {
       assert.equal(listed.schedules[1]!.delivery.to, "ou_opaque_target");
       const target = OpenClawScheduleGetResult.parse(await conn.call("openclaw.schedule.get", { id: "feishu-target" }));
       assert.equal(target.schedule.delivery.to, "ou_opaque_target");
+    } finally { await f.close(); }
+  });
+}
+
+for (const input of ["person@example.test", "ou_opaque_target", "https://user@example.test:443/path",
+  "https://example.test/user:pass@segment", "https://example.test?recipient=user:pass@example.test",
+  "https://example.test#user:pass@example.test"]) {
+  test(`OpenClaw list/get preserve non-credential text ${input}`, async () => {
+    const f = fixture();
+    try {
+      const conn = f.actor();
+      f.respond({ jobs: [{ ...nativeJob, name: input, state: { lastError: input },
+        delivery: { ...nativeJob.delivery, to: input } }] });
+      const listed = OpenClawScheduleListResult.parse(await conn.call("openclaw.schedule.list", {}));
+      const detail = OpenClawScheduleGetResult.parse(await conn.call("openclaw.schedule.get", { id: nativeJob.id }));
+      for (const job of [listed.schedules[0]!, detail.schedule]) {
+        assert.equal(job.name, input);
+        assert.equal(job.state.lastError, input);
+        assert.equal(job.delivery.to, input);
+      }
     } finally { await f.close(); }
   });
 }
