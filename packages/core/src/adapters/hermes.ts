@@ -1,6 +1,7 @@
 import { parse as parseYaml } from "yaml";
 import { HERMES_BRIDGE } from "./hermes-bridge.js";
 import { HERMES_PROFILE_BRIDGE } from "./hermes-profile-bridge.js";
+import { HermesScheduleDiscoverer, type HermesScheduleScope } from "./hermes-schedule-discover.js";
 import { hermesNativeToolEnvironment } from "./hermes-native-tools.js";
 import { hermesCommandApprovalEnvironment } from "./hermes-command-approval.js";
 import { hermesPeerContextEnvironment, hermesPeerContextSupported } from "./hermes-peer-context.js";
@@ -151,6 +152,8 @@ function fetchHermesCatalogModels(url: string, provider?: string, signal?: Abort
 export interface HermesEnv {
   /** Hermes executable path. Prefer an absolute path when running under systemd/launchd. */
   binPath?: string;
+  /** Local home override for read-only native cron discovery only. */
+  nativeScheduleHome?: string;
   /** 默认模型（如 anthropic/claude-opus-4.6 或 provider 自带格式）。 */
   defaultModel?: string;
   /** provider 覆盖（如 anthropic / openrouter；不传用 Hermes config 默认）。 */
@@ -468,6 +471,21 @@ export class HermesAdapter implements AgentAdapter {
     this.capabilities={...CAPABILITIES,employeeProfiles:process.platform!=="win32"};
     if(this.env.managedProfileNativeTools!==undefined&&typeof this.env.managedProfileNativeTools!=="boolean")throw new PhononError("errInvalidParams","managedProfileNativeTools must be a boolean");
     this.defaultProfile = opts.defaultProfile ?? "default";
+  }
+
+  /** Native Hermes inventory only; never Phonon L4 schedules or a clock control. */
+  discoverNativeSchedules(scope: HermesScheduleScope = {}) {
+    return this.nativeScheduleDiscoverer().discoverNativeSchedules(scope);
+  }
+
+  getNativeSchedule(id: string, scope: HermesScheduleScope = {}) {
+    return this.nativeScheduleDiscoverer().getNativeSchedule(id, scope);
+  }
+
+  private nativeScheduleDiscoverer() {
+    return new HermesScheduleDiscoverer({
+      binPath: this.env.binPath, home: this.env.nativeScheduleHome, defaultProfile: this.defaultProfile,
+    });
   }
 
   async discoverAgents(signal?: AbortSignal): Promise<AgentDescriptor[]> {

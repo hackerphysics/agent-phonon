@@ -1067,6 +1067,11 @@ export { codexAuthorityArgs } from "./adapters/codex.js";
 export { HermesAdapter } from "./adapters/hermes.js";
 export { HERMES_BRIDGE } from "./adapters/hermes-bridge.js";
 export type { HermesEnv } from "./adapters/hermes.js";
+export { HermesScheduleDiscoverer, HermesScheduleDiscoveryError } from "./adapters/hermes-schedule-discover.js";
+export type {
+  HermesScheduleScope, HermesScheduleDiscoveryOptions, HermesScheduleDiscoveryErrorCode,
+  HermesNativeScheduleSummary, HermesNativeScheduleDetail, HermesNativeScheduleInventory,
+} from "./adapters/hermes-schedule-discover.js";
 export { OpenCodeAdapter } from "./adapters/opencode.js";
 export type { OpenCodeEnv } from "./adapters/opencode.js";
 export { CopilotAdapter, parseCopilotEvent, parseCopilotModelsHelp } from "./adapters/copilot.js";
