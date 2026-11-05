@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { AdapterRegistry, OpenClawAdapter, OpenClawGatewayAdapter, PhononStore, GatewayClient } from "@agent-phonon/core";
 import { METHODS, OpenClawScheduleListResult, OpenClawScheduleGetResult } from "@agent-phonon/protocol";
 import { PhononDevice } from "@agent-phonon/server-sdk";
+import { readOpenClawSchedules } from "../../core/dist/adapters/openclaw-schedule.js";
 import { TestConn } from "./harness.js";
 
 const nativeJob = {
@@ -20,6 +21,34 @@ const nativeJob = {
     lastError: "timeout token=NATIVE_SECRET", ignored: "STATE_SECRET" },
   gateway: { token: "GATEWAY_SECRET" },
 };
+
+const crossingWhitespaceCases = ['"', "'"].flatMap(quote => [256, 512].map(length => {
+  const opposite = quote === '"' ? "'" : '"';
+  return {
+    label: `HOLD25 crossing ${quote} with ${length} trailing spaces`,
+    input: `token=${quote}prefix password=${opposite}HIDE ${quote} LEAK_ME${opposite}` + " ".repeat(length) + "public",
+    expected: `token=${quote}[redacted]${quote}`, secrets: /HIDE|LEAK_ME|prefix/,
+  };
+}));
+
+for (const { label, input, expected, secrets } of crossingWhitespaceCases) {
+  test(`OpenClaw redacts ${label} without blocking the event loop`, async () => {
+    for (let iteration = 0; iteration < 6; iteration++) {
+      const start = performance.now();
+      const [job] = await readOpenClawSchedules(async () => [{
+        ...nativeJob, name: input, state: { lastError: input }, delivery: { ...nativeJob.delivery, to: input },
+      }]);
+      const elapsed = performance.now() - start;
+      // Include parsing and all three display fields; the old pattern took seconds even when warm.
+      const budget = iteration === 0 ? 100 : 50;
+      assert.ok(elapsed < budget, `${label} iteration ${iteration} took ${elapsed.toFixed(1)}ms (budget ${budget}ms)`);
+      for (const value of [job!.name, job!.state.lastError, job!.delivery.to]) {
+        assert.equal(value, expected);
+        assert.doesNotMatch(value!, secrets);
+      }
+    }
+  });
+}
 
 function rpcError(code: string, message?: RegExp) {
   return (error: unknown) => {
@@ -116,6 +145,7 @@ test("OpenClaw normalizes interval/at, unknown trigger kinds and nullable option
 });
 
 const credentialCases = [
+  ...crossingWhitespaceCases,
   { label: "fully double-quoted value", input: 'password="alpha"',
     expected: 'password="[redacted]"', secrets: /alpha/ },
   { label: "fully single-quoted value", input: "password='alpha'",
