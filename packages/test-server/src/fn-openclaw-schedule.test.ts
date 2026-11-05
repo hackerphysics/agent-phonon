@@ -308,6 +308,19 @@ const credentialCases = [
     expected: 'token="[redacted]",pre-token= "[redacted]"', secrets: /alpha|HIDE|ME|HIDE ME/ },
   { label: "HOLD13 hyphenated spaced quoted chain", input: 'token="alpha",x-password= "HIDE ME",my-api-key= \'ALPHA BETA\'',
     expected: 'token="[redacted]",x-password= "[redacted]",my-api-key= \'[redacted]\'', secrets: /alpha|HIDE|ME|HIDE ME|ALPHA|BETA|ALPHA BETA/ },
+  ...[
+    { prefix: "token=TOPSECRET", expected: "token=[redacted]" },
+    { prefix: "api_key=TOPSECRET", expected: "api_key=[redacted]" },
+    { prefix: "password=TOPSECRET", expected: "password=[redacted]" },
+    { prefix: 'token="OUTER"TOPSECRET', expected: 'token="[redacted]"' },
+    { prefix: "token='OUTER'TOPSECRET", expected: "token='[redacted]'" },
+    { prefix: "password=''TOPSECRET", expected: "password=[redacted]" },
+    { prefix: 'password=""TOPSECRET', expected: "password=[redacted]" },
+  ].flatMap(({ prefix, expected }) => ["password", "x-password", "api-key", "api_key", "secret"].flatMap(key =>
+    ['"', "'"].map(quote => ({
+      label: `HOLD14 glued ${prefix}-${key} with ${quote} quotes`,
+      input: `${prefix}-${key}=${quote}alpha${quote}`, expected, secrets: /TOPSECRET|OUTER|alpha/,
+    })))),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
