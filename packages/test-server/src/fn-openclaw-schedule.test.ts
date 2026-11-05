@@ -403,6 +403,41 @@ const credentialCases = [
     expected: "token=[redacted]", secrets: /OUTER|HIDE|ME/ },
   { label: "HOLD17 escaped interior opener is not an overlap", input: String.raw`token=OUTER-password="Xtoken= \"HIDE ME\""PRIVATE_SUFFIX`,
     expected: "token=[redacted]", secrets: /OUTER|HIDE|ME|PRIVATE_SUFFIX/ },
+  ...[
+    ...["token", "password", "secret", "api_key", "api-key"].map(key => ({
+      prefix: `${key}=OUTER`, redacted: `${key}=[redacted]`,
+    })),
+    { prefix: 'token="OUTER"TOPSECRET', redacted: 'token="[redacted]"' },
+    { prefix: "token='OUTER'TOPSECRET", redacted: "token='[redacted]'" },
+    { prefix: "password=''OUTER", redacted: "password=[redacted]" },
+    { prefix: 'password=""OUTER', redacted: "password=[redacted]" },
+    ...["token=", "token=''", 'token=""'].map(prefix => ({ prefix, redacted: "token=[redacted]" })),
+  ].flatMap(({ prefix, redacted }) => ["token", "password", "secret", "api_key", "api-key"].flatMap(key =>
+    ['"', "'"].flatMap(quote => ["", " "].map(space => {
+      const opposite = quote === '"' ? "'" : '"';
+      return {
+        label: `HOLD18 mixed-quote crossing ${prefix}-password=${space}${quote} with ${key}`,
+        input: `${prefix}-password=${space}${quote}X ${key}= ${opposite}HIDE ${quote} LEAK_ME${opposite}PRIVATE_SUFFIX`,
+        expected: `${redacted} ${key}= ${opposite}[redacted]${opposite}`,
+        secrets: /OUTER|TOPSECRET|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/,
+      };
+    })))),
+  ...['"', "'"].flatMap(quote => {
+    const opposite = quote === '"' ? "'" : '"';
+    return [
+      { label: `HOLD18 adjacent mixed-quote crossing ${quote}`,
+        input: `token=OUTER-password=${quote}Xtoken= ${opposite}HIDE ${quote} LEAK_ME${opposite}PRIVATE_SUFFIX`,
+        expected: `token=[redacted]token= ${opposite}[redacted]${opposite}`,
+        secrets: /OUTER|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/ },
+      { label: `HOLD18 mixed-quote crossing with escaped interior quote ${quote}`,
+        input: `token=OUTER-password=${quote}X secret= ${opposite}HIDE \\${quote} ME ${quote} LEAK_ME${opposite}PRIVATE_SUFFIX`,
+        expected: `token=[redacted] secret= ${opposite}[redacted]${opposite}`,
+        secrets: /OUTER|HIDE|LEAK_ME|PRIVATE_SUFFIX|ME/ },
+      { label: `HOLD18 contained opposite quotes with escaped glued quote ${quote}`,
+        input: `token=OUTER-password=${quote}Xtoken= ${opposite}HIDE \\${quote} ME${opposite}${quote}PRIVATE_SUFFIX`,
+        expected: "token=[redacted]", secrets: /OUTER|HIDE|ME|PRIVATE_SUFFIX/ },
+    ];
+  }),
   { label: "Bearer", input: "Bearer bearer_credential",
     expected: "Bearer [redacted]", secrets: /bearer_credential/ },
   { label: "URL userinfo", input: "https://user:pass@example.test/hook",
