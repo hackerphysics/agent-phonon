@@ -341,3 +341,11 @@ available. Both SDKs preserve the new contract; raw controllers must prepare
 capabilities before their own durable claims. Unknown filesystem outcomes never
 auto-replay. See `PROJECT_PROVISIONING.md` for lifecycle, metadata-only status
 repair, default-off policy, Windows refusal and incomplete release/device gates.
+
+## OpenClaw Native Schedule Discovery
+
+`openclaw.schedule.list` and `openclaw.schedule.get` inspect existing vendor
+jobs, independently of Phonon L4 `schedule.*`. Availability is advertised as
+`openclaw_schedule_discover_v1` in `device.info` only after a validated native
+read. See [the read-only contract](decisions/2026-11-05-openclaw-schedule-discovery.md)
+for fields, SDK equivalents, error handling and policy boundaries.

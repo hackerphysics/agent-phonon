@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { OpenClawScheduleListParams, OpenClawScheduleListResult, OpenClawScheduleGetParams, OpenClawScheduleGetResult } from "./openclaw-schedule.js";
 import { RunResolveParams, RunResolveResult } from "./schedule.js";
 import { ManagedMcpConfigureParams, ManagedMcpStatusParams, ManagedMcpStatusResult } from "./managed-mcp.js";
 import {
@@ -201,6 +202,14 @@ import {
 const z_void = z.undefined();
 
 export const METHODS = {
+  "openclaw.schedule.list": {
+    direction: "s2p", kind: "request",
+    params: OpenClawScheduleListParams, result: OpenClawScheduleListResult,
+  },
+  "openclaw.schedule.get": {
+    direction: "s2p", kind: "request",
+    params: OpenClawScheduleGetParams, result: OpenClawScheduleGetResult,
+  },
   "mcp.configure": { direction: "s2p", kind: "request", params: ManagedMcpConfigureParams, result: ManagedMcpStatusResult },
   "mcp.status": { direction: "s2p", kind: "request", params: ManagedMcpStatusParams, result: ManagedMcpStatusResult },
   // --- 握手（phonon 拨出后先发）---

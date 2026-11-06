@@ -24,6 +24,7 @@ import type {
   SchedulePushConsent,
   ScheduleListParams,
   ScheduleListResult,
+  OpenClawScheduleListResult, OpenClawScheduleGetResult,
   ScheduleCreateResult,
   Run,
   RunStatus,
@@ -526,6 +527,14 @@ export class PhononDevice extends EventEmitter {
     /** 手动 ack 终态 run（平时不需调用，SDK 在 run.finished 入口自动 ack）。 */
     ack: (runId: string, opts?: { lastSeq?: number; finished?: boolean }) =>
       this.peer.notify("schedule.ack", { runId, ...opts }),
+  };
+
+  /** Device Gateway's vendor-native jobs, not Phonon L4 schedules. */
+  openclaw = {
+    schedule: {
+      list: () => this.peer.request("openclaw.schedule.list", {}) as Promise<OpenClawScheduleListResult>,
+      get: (id: string) => this.peer.request("openclaw.schedule.get", { id }) as Promise<OpenClawScheduleGetResult>,
+    },
   };
 
   /** L4 run 观测。 */

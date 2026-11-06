@@ -496,6 +496,18 @@ export class PhononConnection {
     }
   }
 
+  private async openclawSchedules() {
+    const adapter = this.registry.get("openclaw");
+    if (!adapter?.openclawScheduleList) throw new PhononError("errCapabilityUnsupported", "OpenClaw schedule discovery is not configured");
+    const schedules = await adapter.openclawScheduleList();
+    return schedules.filter(schedule => {
+      const agent = schedule.effectiveAgentId ?? schedule.agentId;
+      if (!agent) return this.policy.policy.allowedAgents.length === 0;
+      try { this.policy.assertAgentAllowed(`openclaw:${agent}`); return true; }
+      catch { return false; }
+    });
+  }
+
   /** server → phonon 方法分发（L2 dispatch）。 */
   private async dispatch(method: string, params: unknown): Promise<unknown> {
     let p = (params ?? {}) as Record<string, unknown>;
@@ -632,6 +644,13 @@ export class PhononConnection {
       }
       case "device.info": {
         const info:DeviceInfoResult = await collectDeviceInfo();
+        try {
+          this.policy.assertMethodAllowed("openclaw.schedule.list");
+          this.policy.assertMethodAllowed("openclaw.schedule.get");
+          if (this.policy.policy.allowedAgents.length && !this.policy.policy.allowedAgents.some(agent => agent.startsWith("openclaw:"))) throw new PhononError("errPolicyDenied");
+          await this.openclawSchedules();
+          info.capabilities.push("openclaw_schedule_discover_v1");
+        } catch { /* Optional vendor capability is never advertised without a successful read. */ }
         const provisionReceiver=await this.projectProvision.capability();
         if(provisionReceiver){info.projectProvisionReceiverID=provisionReceiver;info.capabilities.push("project_provision_v1");}
         const worktreeReceiver=this.worktreeProvision.capability();
@@ -690,6 +709,13 @@ export class PhononConnection {
         return this.maintenance.serviceStatus(p.targetId as string, p.serviceId as string);
       case "maintenance.service.restart":
         return this.maintenance.serviceRestart(p.targetId as string, p.serviceId as string);
+      case "openclaw.schedule.list":
+        return { schedules: await this.openclawSchedules() };
+      case "openclaw.schedule.get": {
+        const schedule = (await this.openclawSchedules()).find(job => job.id === p.id);
+        if (!schedule) throw new PhononError("errInvalidParams", "OpenClaw schedule id not found or not permitted");
+        return { schedule };
+      }
       case "discovery.list": {
         const agents = await this.registry.inventory.list();
         return { agents: agents.filter((agent) => {
