@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { OpenClawScheduleListParams, OpenClawScheduleListResult, OpenClawScheduleGetParams, OpenClawScheduleGetResult } from "./openclaw-schedule.js";
+import { HermesScheduleListParams, HermesScheduleListResult, HermesScheduleGetParams, HermesScheduleGetResult } from "./hermes-schedule.js";
 import { RunResolveParams, RunResolveResult } from "./schedule.js";
 import { ManagedMcpConfigureParams, ManagedMcpStatusParams, ManagedMcpStatusResult } from "./managed-mcp.js";
 import {
@@ -202,6 +203,14 @@ import {
 const z_void = z.undefined();
 
 export const METHODS = {
+  "hermes.schedule.list": {
+    direction: "s2p", kind: "request",
+    params: HermesScheduleListParams, result: HermesScheduleListResult,
+  },
+  "hermes.schedule.get": {
+    direction: "s2p", kind: "request",
+    params: HermesScheduleGetParams, result: HermesScheduleGetResult,
+  },
   "openclaw.schedule.list": {
     direction: "s2p", kind: "request",
     params: OpenClawScheduleListParams, result: OpenClawScheduleListResult,

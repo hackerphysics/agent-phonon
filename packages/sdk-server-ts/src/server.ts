@@ -25,6 +25,7 @@ import type {
   ScheduleListParams,
   ScheduleListResult,
   OpenClawScheduleListResult, OpenClawScheduleGetResult,
+  HermesScheduleListResult, HermesScheduleGetResult,
   ScheduleCreateResult,
   Run,
   RunStatus,
@@ -527,6 +528,14 @@ export class PhononDevice extends EventEmitter {
     /** 手动 ack 终态 run（平时不需调用，SDK 在 run.finished 入口自动 ack）。 */
     ack: (runId: string, opts?: { lastSeq?: number; finished?: boolean }) =>
       this.peer.notify("schedule.ack", { runId, ...opts }),
+  };
+
+  /** Device Gateway's vendor-native jobs, not Phonon L4 schedules. */
+  hermes = {
+    schedule: {
+      list: (scope: { profile?: string } = {}) => this.peer.request("hermes.schedule.list", scope) as Promise<HermesScheduleListResult>,
+      get: (id: string, scope: { profile?: string } = {}) => this.peer.request("hermes.schedule.get", { ...scope, id }) as Promise<HermesScheduleGetResult>,
+    },
   };
 
   /** Device Gateway's vendor-native jobs, not Phonon L4 schedules. */

@@ -27,7 +27,7 @@ const vendorList = z.union([z.array(vendorJob), z.object({
     || value.hasMore === false || value.total === value.jobs.length)]);
 
 // Only clear credential forms are redacted; opaque native delivery IDs stay intact.
-function publicText(value: string): string {
+export function publicText(value: string): string {
   return value
     // Escapes are indivisible; an unterminated quoted value is redacted through EOF.
     // Top-level quoted crossings consume spaced/sticky suffixes, but stop before the next credential so its whole value rematches.
