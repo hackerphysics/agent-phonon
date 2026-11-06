@@ -97,11 +97,47 @@ try:
         from hermes_state import SessionDB
         db=SessionDB(db_path=path,read_only=True)
         try:
-            sid=request['sessionId']
+            sid=request.get('sessionId')
+            if request.get('legacy'):
+                # Old controllers did not persist native IDs. Require multiple
+                # exact tool IDs from the original device-owned turn, in one
+                # unique native history. Never select by time/cwd/title alone.
+                import time
+                evidence=request['legacy']; ids=evidence['toolCallIds']
+                conn=getattr(db,'_conn',None)
+                if not isinstance(conn,sqlite3.Connection): raise RuntimeError('native read connection unavailable')
+                candidates=None
+                for call_id in ids:
+                    rows=conn.execute('SELECT DISTINCT session_id FROM messages WHERE tool_call_id=? AND active=1',(call_id,)).fetchall()
+                    found={r[0] for r in rows}
+                    candidates=found if candidates is None else candidates & found
+                if not candidates or len(candidates)!=1: raise RuntimeError('original turn identity ambiguous')
+                sid=next(iter(candidates))
+                # A native close marker plus an exclusive native process check
+                # is required. A missing historical PID alone is not proof.
+                if os.name!='posix' or not sys.platform.startswith('darwin'): raise RuntimeError('legacy native process observation unsupported')
+                import subprocess, re
+                lines=subprocess.run(['/bin/ps','-axo','pid=,command='],capture_output=True,text=True,timeout=2,check=True).stdout.splitlines()
+                processes=[]; owner=None; parts=[]
+                for line in lines:
+                    match=re.match(r'^\s*(\d+)\s+(.*)$',line)
+                    if match:
+                        if owner is not None and owner!=os.getpid(): processes.append(' '.join(parts))
+                        owner=int(match.group(1));parts=[match.group(2)]
+                    elif owner is not None: parts.append(line)
+                if owner is not None and owner!=os.getpid(): processes.append(' '.join(parts))
+                for command in processes:
+                    if '--profile '+request['profile'] in command and re.search(r'(^|\s)chat(\s|$)',command): raise RuntimeError('native profile still active')
+                if any(command.startswith(str(home)) or ('--resume '+sid) in command for command in processes): raise RuntimeError('native session still active')
             row=db.get_session(sid)
             if not row or row.get('id')!=sid or row.get('source')!='cli' or row.get('archived')!=0: raise RuntimeError('session missing')
             if db.resolve_resume_session_id(sid)!=sid: raise RuntimeError('native identity changed')
             if row.get('ended_at') is None or not math.isfinite(float(row['ended_at'])): raise RuntimeError('native session not settled')
+            if request.get('legacy'):
+                from datetime import datetime
+                last=datetime.fromisoformat(request['legacy']['observedAt'].replace('Z','+00:00')).timestamp()
+                if float(row['ended_at'])<last or row.get('end_reason') not in ('cli_close','agent_close'): raise RuntimeError('native close does not cover original turn')
+                if row.get('model')!=request['model']: raise RuntimeError('native model changed')
             cwd=str(Path(row['cwd']).resolve(strict=True))
             if cwd!=str(Path(request['cwd']).resolve(strict=True)): raise RuntimeError('workspace changed')
             count=safe_count(db,path,sid,row)
@@ -124,7 +160,7 @@ except Exception:
 wire.flush()
 `.replace("# PHONON_HERMES_PROFILE_FILES",HERMES_PROFILE_FILES);
 
-export async function observeHermesSession(bin:string,profile:string,sessionId:string,cwd:string,profileFileBrokerRoot?:string):Promise<HermesNativeObservation>{
+export async function observeHermesSession(bin:string,profile:string,sessionId:string,cwd:string,profileFileBrokerRoot?:string,legacy?:{toolCallIds:string[];observedAt:string;model:string}):Promise<HermesNativeObservation>{
   const command=hermesCommand(bin);
   let broker:string|undefined;
   if(process.platform==="win32"){
@@ -133,7 +169,7 @@ export async function observeHermesSession(bin:string,profile:string,sessionId:s
   }
   return new Promise((resolve,reject)=>{
     const failure=()=>new PhononError("errSessionBusy","Hermes native Session identity could not be verified");
-    const invocation=hermesBridgeInvocation(HERMES_RECOVERY_PROBE,[command.entry,...(broker?[broker]:[])],JSON.stringify({profile,sessionId,cwd}));
+    const invocation=hermesBridgeInvocation(HERMES_RECOVERY_PROBE,[command.entry,...(broker?[broker]:[])],JSON.stringify({profile,sessionId,cwd,...(legacy?{legacy,model:legacy.model}:{})}));
     const child=execFile(command.python,invocation.args,{cwd:dirname(command.entry),timeout:8000,maxBuffer:65536,env:{...process.env,PYTHONDONTWRITEBYTECODE:"1"}},(error,stdout)=>{
       if(error){reject(failure());return;}
       try{const result=JSON.parse(stdout);if(result.ok!==true)throw failure();resolve(HermesNativeObservation.parse(result.native));}catch{reject(failure());}

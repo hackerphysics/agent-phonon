@@ -615,6 +615,16 @@ export class HermesAdapter implements AgentAdapter {
     if(native.nativeHome!==hint.home||params.employee&&realpathSync(params.employee.home)!==native.nativeHome)return;
     return {phononSessionId:params.sessionId,model:params.model,native,pendingInject:hint.pendingInject,...(params.employee?{employeeId:params.employee.employeeId}:{})};
   }
+  async observeLegacySessionRecovery(params:CreateSessionParams,evidence:{turnId:string;toolCallIds:string[];observedAt:string}):Promise<Record<string,unknown>|undefined>{
+    // Only the DE's dedicated profile has an unambiguous owner for historical
+    // lookup. Shared/default profiles cannot be inferred by proximity.
+    if(process.platform!=="darwin"||!params.employee||evidence.toolCallIds.length<2||evidence.toolCallIds.length>256)return;
+    const profile=params.employee.runtimeProfile;
+    const native=await observeHermesSession(this.env.binPath??"hermes",profile,"",params.cwd,this.env.profileFileBrokerRoot,
+      {toolCallIds:evidence.toolCallIds,observedAt:evidence.observedAt,model:params.model});
+    if(realpathSync(params.employee.home)!==native.nativeHome)return;
+    return {phononSessionId:params.sessionId,model:params.model,native,pendingInject:[],employeeId:params.employee.employeeId};
+  }
   provisionEmployee(target:EmployeeProfileTarget){return this.employeeOperation("apply",target);}
   inspectEmployee(target:EmployeeProfileTarget){return this.employeeOperation("inspect",target);}
   private async windowsProfileRuntime():Promise<string>{

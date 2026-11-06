@@ -1169,20 +1169,28 @@ export class SessionEngine {
     let observation=store.pendingNativeStops.get(key);
     if(!observation){
       const adapter=this.registry.resolve(rec.agent);
-      if(!adapter?.observeSessionRecovery||!row.recovery_hint_json||!rec.cwd||store.nativeSessionOwnedElsewhere(rec.tenantId,rec.sessionId,this.nativeOwner)
+      if(!adapter||!rec.cwd||!proof.turnId||store.nativeSessionOwnedElsewhere(rec.tenantId,rec.sessionId,this.nativeOwner)
         ||store.activeSessionControls.has(key)||store.compressionBlocked(rec.tenantId,rec.sessionId))return;
       const authority=this.captureProjectAuthority(rec);
-      let hint:Record<string,unknown>;try{hint=JSON.parse(String(row.recovery_hint_json));}catch{return;}
-      if(!proof.turnId||hint.turnId!==proof.turnId||hint.sessionId!==rec.sessionId)return;
       const employee=rec.employeeId?await this.runtimeContext?.resolveEmployee?.(rec.tenantId,rec.employeeId,undefined,rec.agent):undefined;
-      const state=await adapter.observeSessionRecovery({sessionId:rec.sessionId,agentId:rec.agent,model:rec.model,cwd:rec.cwd,
-        reattach:true,runtimeContext:this.runtimeContext,employee},hint).catch(()=>undefined);
+      this.assertProjectAuthority(rec,authority);
+      const params={sessionId:rec.sessionId,agentId:rec.agent,model:rec.model,cwd:rec.cwd,
+        reattach:true,runtimeContext:this.runtimeContext,employee};
+      let state:Record<string,unknown>|undefined,confirmation:"process_tree_exit"|"native_terminal"="process_tree_exit";
+      if(row.recovery_hint_json){
+        let hint:Record<string,unknown>;try{hint=JSON.parse(String(row.recovery_hint_json));}catch{return;}
+        if(hint.turnId!==proof.turnId||hint.sessionId!==rec.sessionId)return;
+        state=await adapter.observeSessionRecovery?.(params,hint).catch(()=>undefined);
+      }else if(adapter.observeLegacySessionRecovery){
+        const evidence=this.transcripts?.recoveryEvidence(rec.sessionId,proof.turnId);
+        if(evidence){state=await adapter.observeLegacySessionRecovery(params,evidence).catch(()=>undefined);confirmation="native_terminal";}
+      }
       this.assertProjectAuthority(rec,authority);
       if(!state||this.disposed||!rec.detached)return;
       const checkpoint=JSON.stringify(SessionCheckpoint.parse({version:1,adapter:adapter.name,agent:rec.agent,model:rec.model,
         project:rec.project,cwd:rec.cwd,settled:true,state}));
       observation={stopJSON:String(row.native_stop_json),recoveryJSON:row.recovery_json===null?null:String(row.recovery_json),
-        observe:async()=>({confirmation:"process_tree_exit",checkpoint})};
+        observe:async()=>({confirmation,checkpoint})};
       store.pendingNativeStops.set(key,observation);
     }
     if(observation.stopJSON!==row.native_stop_json||observation.recoveryJSON!==row.recovery_json){store.pendingNativeStops.delete(key);return;}

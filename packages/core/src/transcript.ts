@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, existsSync, chmodSync, lstatSync } from "node:fs";
+import { appendFileSync, mkdirSync, existsSync, chmodSync, lstatSync,openSync,readSync,closeSync,constants,fstatSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -25,6 +25,28 @@ export class TranscriptWriter {
   /** 某 session 的快照文件路径。 */
   pathFor(sessionId: string): string {
     return join(this.dir, `${sanitize(sessionId)}.jsonl`);
+  }
+
+  /** Bounded device-owned original-turn evidence, never user-provided paths. */
+  recoveryEvidence(sessionId:string,turnId:string):{turnId:string;toolCallIds:string[];observedAt:string}|undefined{
+    let fd:number|undefined;
+    try{
+      fd=openSync(this.pathFor(sessionId),constants.O_RDONLY|constants.O_NOFOLLOW);
+      const st=fstatSync(fd);if(!st.isFile()||st.nlink!==1||typeof process.getuid==="function"&&st.uid!==process.getuid()||(st.mode&0o022)!==0)return;
+      const length=Math.min(st.size,2*1024*1024),buffer=Buffer.alloc(length);
+      readSync(fd,buffer,0,length,st.size-length);
+      const lines=buffer.toString("utf8").split("\n");if(st.size>length)lines.shift();
+      const ids=new Set<string>();let observedAt:string|undefined;
+      for(const line of lines){
+        let row:any;try{row=JSON.parse(line);}catch{continue;}
+        if(row.kind!=="event"||row.turnId!==turnId||row.event?.sessionId!==sessionId||row.event?.turnId!==turnId)continue;
+        if(row.event.type!=="tool_call"||typeof row.event.toolCallId!=="string"||!/^[a-zA-Z0-9_-]{8,256}$/.test(row.event.toolCallId))continue;
+        ids.add(row.event.toolCallId);if(Number.isFinite(Date.parse(row.ts)))observedAt=row.ts;
+      }
+      if(ids.size>=2&&ids.size<=256&&observedAt)return {turnId,toolCallIds:[...ids],observedAt};
+    }catch{/* Missing historical evidence remains unconfirmed. */}
+    finally{if(fd!==undefined)closeSync(fd);}
+    return;
   }
 
   /** 确保目录存在（首次写时建，0700）。返回该 session 的文件路径。 */

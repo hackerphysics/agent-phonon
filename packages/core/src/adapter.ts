@@ -248,6 +248,9 @@ export interface AgentAdapter {
   observeSessionCheckpoint?(params: CreateSessionParams): Promise<Record<string, unknown> | undefined>;
   /** Fresh read-only native/process evidence after the original controller is gone. */
   observeSessionRecovery?(params: CreateSessionParams, hint: Record<string, unknown>): Promise<Record<string, unknown> | undefined>;
+  /** Upgrade-only read of exact original tool identities in native history.
+   * Never infer identity from timestamps, cwd or a missing PID alone. */
+  observeLegacySessionRecovery?(params: CreateSessionParams, evidence: {turnId:string;toolCallIds:string[];observedAt:string}): Promise<Record<string, unknown> | undefined>;
   provisionEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
   inspectEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
 

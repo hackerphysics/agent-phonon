@@ -30,7 +30,7 @@ class SessionDB:
   self._conn=sqlite3.connect(db_path.as_uri()+'?mode=ro',uri=True,isolation_level=None)
   self._conn.row_factory=sqlite3.Row
   def authorize(action,table,column,*unused):
-   if action==sqlite3.SQLITE_READ and table=='messages' and column not in ('','id','session_id','active','role'): return sqlite3.SQLITE_DENY
+   if action==sqlite3.SQLITE_READ and table=='messages' and column not in ('','id','session_id','active','role','tool_call_id'): return sqlite3.SQLITE_DENY
    return sqlite3.SQLITE_OK
   self._conn.set_authorizer(authorize)
  def get_session(self,sid):
@@ -156,6 +156,56 @@ test("Hermes durable identity hint recovers after the store and original control
     assert.equal(f.inferences().length,2);assert.equal(f.calls()[1].sid,f.calls()[0].sid);
     assert.deepEqual(f.inferences().map(row=>row.text.includes("only the new input")),[false,true]);
   }finally{await f.close();}
+});
+
+test("Hermes legacy DE stop recovers only exact original native tool identities without replay",{skip:process.platform!=="darwin"||!existsSync("/usr/bin/python3")},async()=>{
+  const f=await fixture("0.16");
+  try{
+    await f.turn(f.privateId,"legacy original");
+    const row=f.store.nativeSessionSnapshot("owner",f.privateId)!,hint=JSON.parse(String(row.recovery_hint_json));
+    const at=new Date(Date.now()-1000).toISOString(),ids=["call_original_legacy_one","call_original_legacy_two"];
+    const db=new DatabaseSync(join(f.nativeHome,"state.db"));
+    for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES(?,'tool','retained',?)").run(f.calls()[0].sid,id);
+    db.prepare("UPDATE sessions SET ended_at=? WHERE id=?").run(Date.now()/1000,f.calls()[0].sid);db.close();
+    for(const id of ids)writeFileSync(String(row.transcript_path),JSON.stringify({ts:at,kind:"event",turnId:hint.turnId,event:{type:"tool_call",sessionId:f.privateId,turnId:hint.turnId,toolCallId:id}})+"\n",{flag:"a"});
+    await f.conn.conn.dispose();
+    (f.store as any).db.prepare("UPDATE sessions SET status='paused',recovery_json=NULL,recovery_hint_json=NULL,native_stop_json=? WHERE session_id=?")
+      .run(JSON.stringify({version:1,sessionId:f.privateId,turnId:hint.turnId,state:"unknown",reasonCode:"controller_disposed",observedAt:new Date().toISOString()}),f.privateId);
+    await f.restart();
+    const status=await f.conn.call("session.status",{sessionId:f.privateId}) as any;
+    assert.equal(status.nativeStop.state,"confirmed");assert.equal(status.nativeStop.confirmation,"native_terminal");assert.equal(status.recovery.canAttempt,true);
+    assert.equal(f.calls().length,1);assert.equal(f.inferences().length,1);
+    await f.conn.call("session.recover",f.expected(f.privateId));await f.turn(f.privateId,"only new legacy input");
+    assert.equal(f.calls()[1].sid,f.calls()[0].sid);assert.equal(f.inferences().length,2);
+  }finally{await f.close();}
+});
+
+test("legacy native recovery rejects mismatched, absent and ambiguous original tools",{skip:process.platform!=="darwin"||!existsSync("/usr/bin/python3")},async()=>{
+  for(const variant of ["missing","ambiguous","foreign-turn","unsettled","model","active-process"]){
+    const f=await fixture("0.16");
+    try{
+      await f.turn(f.privateId,"legacy original");
+      const row=f.store.nativeSessionSnapshot("owner",f.privateId)!,hint=JSON.parse(String(row.recovery_hint_json)),sid=f.calls()[0].sid;
+      const ids=["call_original_legacy_one","call_original_legacy_two"],at=new Date(Date.now()-1000).toISOString();
+      const db=new DatabaseSync(join(f.nativeHome,"state.db"));
+      if(variant!=="missing")for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES(?,'tool','retained',?)").run(sid,id);
+      if(variant==="ambiguous")for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES('foreign','tool','foreign',?)").run(id);
+      if(variant==="unsettled")db.prepare("UPDATE sessions SET ended_at=NULL WHERE id=?").run(sid);
+      if(variant==="model")db.prepare("UPDATE sessions SET model='foreign' WHERE id=?").run(sid);
+      db.close();
+      for(const id of ids)writeFileSync(String(row.transcript_path),JSON.stringify({ts:at,kind:"event",turnId:variant==="foreign-turn"?"foreign":hint.turnId,event:{type:"tool_call",sessionId:f.privateId,turnId:hint.turnId,toolCallId:id}})+"\n",{flag:"a"});
+      await f.conn.conn.dispose();
+      (f.store as any).db.prepare("UPDATE sessions SET status='paused',recovery_json=NULL,recovery_hint_json=NULL,native_stop_json=? WHERE session_id=?")
+        .run(JSON.stringify({version:1,sessionId:f.privateId,turnId:hint.turnId,state:"unknown",reasonCode:"controller_disposed",observedAt:new Date().toISOString()}),f.privateId);
+      // A current native process check is mandatory, including after a store reopen.
+      let child:import("node:child_process").ChildProcess|undefined;
+      try{
+        if(variant==="active-process")child=(await import("node:child_process")).spawn(process.execPath,["-e","setInterval(()=>{},1000)","--","--profile",f.employee.runtimeProfile,"chat"],{stdio:"ignore"});
+        await f.restart();const status=await f.conn.call("session.status",{sessionId:f.privateId}) as any;
+        assert.equal(status.nativeStop.state,"unknown",variant);assert.equal(f.inferences().length,1);assert.equal(f.calls().length,1);
+      }finally{if(child){child.kill();await new Promise(resolve=>child!.once("exit",resolve));}}
+    }finally{await f.close();}
+  }
 });
 
 test("Hermes stop confirmation does not wait for a slow checkpoint probe and coalesces its reads",{skip:!existsSync("/usr/bin/python3")},async()=>{
