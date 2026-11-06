@@ -22,6 +22,7 @@ import { PhononStore } from "./store.js";
 import { FileManager } from "./file-manager.js";
 import { collectDeviceResources } from "./resources.js";
 import { collectDeviceInfo } from "./device-info.js";
+import { readHermesSchedules } from "./hermes-schedules.js";
 import { WorkflowEngine } from "./workflow-engine.js";
 import { SchedulerEngine } from "./scheduler-engine.js";
 import { EnvManager } from "./env-manager.js";
@@ -645,6 +646,12 @@ export class PhononConnection {
       case "device.info": {
         const info:DeviceInfoResult = await collectDeviceInfo();
         try {
+          this.policy.assertMethodAllowed("hermes.schedule.list");
+          this.policy.assertMethodAllowed("hermes.schedule.get");
+          await readHermesSchedules(this.registry.get("hermes"), this.policy);
+          info.capabilities.push("hermes_schedule_discover_v1");
+        } catch { /* Advertise only after an authorized, validated read. */ }
+        try {
           this.policy.assertMethodAllowed("openclaw.schedule.list");
           this.policy.assertMethodAllowed("openclaw.schedule.get");
           if (this.policy.policy.allowedAgents.length && !this.policy.policy.allowedAgents.some(agent => agent.startsWith("openclaw:"))) throw new PhononError("errPolicyDenied");
@@ -711,6 +718,9 @@ export class PhononConnection {
         return this.maintenance.serviceRestart(p.targetId as string, p.serviceId as string);
       case "openclaw.schedule.list":
         return { schedules: await this.openclawSchedules() };
+      case "hermes.schedule.list":
+      case "hermes.schedule.get":
+        return readHermesSchedules(this.registry.get("hermes"), this.policy, p.profile as string | undefined, p.id as string | undefined);
       case "openclaw.schedule.get": {
         const schedule = (await this.openclawSchedules()).find(job => job.id === p.id);
         if (!schedule) throw new PhononError("errInvalidParams", "OpenClaw schedule id not found or not permitted");

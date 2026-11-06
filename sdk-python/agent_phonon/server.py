@@ -629,6 +629,15 @@ class PhononDevice:
         if client_request_id is not None: params["clientRequestId"] = client_request_id
         return await self._peer.request("schedule.delete", params)
 
+    async def hermes_schedule_list(self, *, profile: str | None = None) -> dict:
+        return await self._peer.request("hermes.schedule.list", {} if profile is None else {"profile": profile})
+
+    async def hermes_schedule_get(self, job_id: str, *, profile: str | None = None) -> dict:
+        params = {"id": job_id}
+        if profile is not None:
+            params["profile"] = profile
+        return await self._peer.request("hermes.schedule.get", params)
+
     async def openclaw_schedule_list(self) -> dict:
         """Inspect device-owned OpenClaw jobs without using the Phonon L4 clock."""
         return await self._peer.request("openclaw.schedule.list", {})

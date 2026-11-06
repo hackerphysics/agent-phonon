@@ -31,6 +31,7 @@ export * from "./schemas/env.js";
 export * from "./schemas/workflow.js";
 export * from "./schemas/schedule.js";
 export * from "./schemas/openclaw-schedule.js";
+export * from "./schemas/hermes-schedule.js";
 export * from "./schemas/maintenance.js";
 export * from "./schemas/jsonrpc.js";
 export * from "./schemas/methods.js";
