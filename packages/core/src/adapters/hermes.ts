@@ -310,7 +310,13 @@ class HermesSession implements AdapterSession {
         let ev: Record<string, any>;
         try { ev = JSON.parse(line); } catch { return; }
         const base = { sessionId: this.sessionId, turnId, seq: 0, at: new Date().toISOString() };
-        if(ev.type==="hermes_runtime"){
+        if(ev.type==="hermes_session"){
+          if(typeof ev.session_id==="string"&&ev.session_id.length>0&&ev.session_id.length<=512
+            &&(!this.hermesSessionId||this.hermesSessionId===ev.session_id)&&ev.profile_home===this.profileHome){
+            this.hermesSessionId=ev.session_id;
+            opts.recordRecoveryHint?.();
+          }
+        }else if(ev.type==="hermes_runtime"){
           try{
             const home=typeof ev.profile_home==="string"&&isAbsolute(ev.profile_home)?realpathSync(ev.profile_home):undefined;
             this.profileHome=home&&(!this.expectedProfileHome||realpathSync(this.expectedProfileHome)===home)?home:undefined;
@@ -447,6 +453,11 @@ class HermesSession implements AdapterSession {
   recoveryCheckpoint():HermesCheckpoint|undefined{
     if(!this.nativeObservation||this.lastNative&&!this.lastNative.supervisor.hasStopped())return;
     return {phononSessionId:this.sessionId,model:this.model,native:this.nativeObservation,pendingInject:[...this.pendingInject],...(this.employeeId?{employeeId:this.employeeId}:{})};
+  }
+  recoveryHint():Record<string,unknown>|undefined{
+    if(!this.hermesSessionId||!this.profileHome||!this.lastNative?.supervisor.child.pid)return;
+    return {version:1,sessionId:this.sessionId,nativeSessionId:this.hermesSessionId,profile:this.profile,
+      home:this.profileHome,cwd:this.cwd,turnId:this.lastNative.turnId,pid:this.lastNative.supervisor.child.pid,pendingInject:[...this.pendingInject]};
   }
   async terminate(): Promise<void> { await this.interrupt(); }
 }
@@ -590,6 +601,19 @@ export class HermesAdapter implements AgentAdapter {
     await session.qualifyPeerContext();
     this.capabilities.injectMidTurn = !!session.peerContextCapability();
     return session;
+  }
+  async observeSessionRecovery(params:CreateSessionParams,hint:Record<string,unknown>):Promise<Record<string,unknown>|undefined>{
+    if(process.platform==="win32")return; // A vanished leader PID is not Windows Job-tree exit evidence.
+    const profile=params.employee?.runtimeProfile??(params.agentId.includes(":")?params.agentId.split(":")[1]!:this.defaultProfile);
+    if(hint.version!==1||hint.sessionId!==params.sessionId||hint.profile!==profile||hint.cwd!==params.cwd
+      ||typeof hint.nativeSessionId!=="string"||typeof hint.home!=="string"||!Number.isSafeInteger(hint.pid)||Number(hint.pid)<=0
+      ||!Array.isArray(hint.pendingInject)||hint.pendingInject.length>256||!hint.pendingInject.every(value=>typeof value==="string"))return;
+    // Unknown process probes remain unknown. A dead PID/group alone is not a native checkpoint.
+    try{process.kill(-Number(hint.pid),0);return;}
+    catch(error){if((error as NodeJS.ErrnoException).code!=="ESRCH")return;}
+    const native=await observeHermesSession(this.env.binPath??"hermes",profile,hint.nativeSessionId,params.cwd,this.env.profileFileBrokerRoot);
+    if(native.nativeHome!==hint.home||params.employee&&realpathSync(params.employee.home)!==native.nativeHome)return;
+    return {phononSessionId:params.sessionId,model:params.model,native,pendingInject:hint.pendingInject,...(params.employee?{employeeId:params.employee.employeeId}:{})};
   }
   provisionEmployee(target:EmployeeProfileTarget){return this.employeeOperation("apply",target);}
   inspectEmployee(target:EmployeeProfileTarget){return this.employeeOperation("inspect",target);}

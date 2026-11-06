@@ -9,6 +9,7 @@ export * from "./schemas/common.js";
 export * from "./schemas/capabilities.js";
 export * from "./schemas/discovery.js";
 export * from "./schemas/session.js";
+export * from "./schemas/message-delivery.js";
 export * from "./schemas/native-stop.js";
 export * from "./schemas/stream.js";
 export * from "./schemas/hook.js";

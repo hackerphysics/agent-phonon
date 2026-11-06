@@ -587,6 +587,24 @@ export class WorkflowEngine {
     throw new PhononError("errInvalidParams", `workflow ${workflowId} not found`);
   }
 
+  async observedStatus(workflowId:string):Promise<WorkflowStatusResult>{
+    const status=this.status(workflowId);
+    const row=this.opts.store?.getWorkflow(workflowId,this.opts.tenantId);
+    const metadata=row?.metadata_json?JSON.parse(String(row.metadata_json)):undefined;
+    if(status.status!=="paused"||status.error!=="transport interrupted; explicit native reconciliation required"
+      ||metadata?.native_chat!==true||!metadata.native_run_id||!status.nodes.length)return status;
+    const targets:NativeStopTarget[]=[];
+    for(const node of status.nodes){
+      if(!node.sessionId||!node.turnId)return status;
+      const proof=await this.opts.engine.nativeStopStatus(this.opts.tenantId,node.sessionId,node.turnId);
+      if(proof.state!=="confirmed")return status;
+      targets.push({...proof,nodeId:node.nodeId});
+    }
+    // Read projection of actual stopped executors; never restart the old workflow.
+    return {...status,status:"cancelled",error:"transport_interrupted",resumable:false,
+      nativeStop:{version:1,state:"confirmed",targets,observedAt:new Date().toISOString()}};
+  }
+
   private inputReceipt(row:Record<string,unknown>):WorkflowInputReceipt {
     const receipt=WorkflowInputReceiptSchema.parse({workflowId:row.workflow_id,nodeId:row.node_id,sessionId:row.session_id,turnId:row.turn_id,inputId:row.input_id,
       contentHash:row.request_hash,state:row.state,createdAt:row.created_at,updatedAt:row.updated_at,...(row.error_code?{errorCode:row.error_code}:{})});

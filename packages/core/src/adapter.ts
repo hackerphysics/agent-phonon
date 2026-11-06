@@ -103,9 +103,12 @@ export interface AdapterSession {
   /** Passive native evidence for the exact turn; abort acknowledgement alone
    * is not proof that the supervised tree/native run ended. */
   observeNativeStop?(turnId:string):Promise<"process_tree_exit"|"native_terminal"|undefined>;
+  /** Device-owned native identity and supervised process, never model input. */
+  recoveryHint?(): Record<string, unknown> | undefined;
 }
 
 export interface SendOptions {
+  recordRecoveryHint?: () => void;
   /** Repeatable controller guard immediately before native effects after async work. */
   beforeNativeEffect?: () => void;
   /** Controller-owned current-turn checkpoints; never a new prompt or an approval answer. */
@@ -243,6 +246,8 @@ export interface AgentAdapter {
   /** Read the original device-owned native history when an older controller did
    * not persist a checkpoint. Must not launch, create, repair or replay work. */
   observeSessionCheckpoint?(params: CreateSessionParams): Promise<Record<string, unknown> | undefined>;
+  /** Fresh read-only native/process evidence after the original controller is gone. */
+  observeSessionRecovery?(params: CreateSessionParams, hint: Record<string, unknown>): Promise<Record<string, unknown> | undefined>;
   provisionEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
   inspectEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
 

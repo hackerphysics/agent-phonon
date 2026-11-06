@@ -37,6 +37,7 @@ async function inferCapabilities(): Promise<string[]> {
   caps.add("native_proactive_output_v1");
   caps.add("session_recovery_v1");
   caps.add("native_stop_settlement_v1");
+  caps.add("message_inbox_v1");
   caps.add("native_conversation_message_files_v1");
   caps.add("project_coordination_v1");
   caps.add("dev_native_interactions_v1");

@@ -36,10 +36,12 @@ async function fixture(t: TestContext, options: { remote?: boolean; mutatePendin
   let onHelperClosed!: () => void, onSocketClosed!: () => void;
   const helperClosed = new Promise<void>(resolve => { onHelperClosed = resolve; });
   const socketClosed = new Promise<void>(resolve => { onSocketClosed = resolve; });
-  const host = options.remote ? "127.0.0.2" : "127.0.0.1";
+  const host = "127.0.0.1";
   const server = new WebSocketServer({ host, port: 0 });
   await new Promise<void>((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
-  const baseUrl = `ws://${host}:${(server.address() as { port: number }).port}`;
+  // An IPv4-mapped address is outside the helper's exact local allowlist,
+  // without requiring a 127.0.0.2 alias (not present by default on macOS).
+  const baseUrl = `ws://${options.remote?"[::ffff:127.0.0.1]":host}:${(server.address() as { port: number }).port}`;
   const config = { baseUrl, token: shared, deviceStateDir: join(root, "devices") };
   const clients: GatewayClient[] = [];
   t.after(async () => {

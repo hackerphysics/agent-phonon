@@ -174,6 +174,11 @@ export class PhononSession extends EventEmitter {
     return this.device.call("session.send",payload) as Promise<SendResult>;
   }
 
+  /** Persist an original message on the device without starting model work. */
+  receiveMessage(input: Omit<import("@agent-phonon/protocol").MessageReceiveParams,"sessionId">): Promise<import("@agent-phonon/protocol").MessageReceiveResult> {
+    return this.device.call("message.receive", {...input,sessionId:this.sessionId}) as Promise<import("@agent-phonon/protocol").MessageReceiveResult>;
+  }
+
   /** Verify/reopen the same native Session without sending model input. */
   recover(expected: {project:string;agent:string;model:string}): Promise<SessionMeta> {
     return this.device.call("session.recover", {...expected, sessionId:this.sessionId}) as Promise<SessionMeta>;

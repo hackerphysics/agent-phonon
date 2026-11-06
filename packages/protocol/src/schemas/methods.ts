@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MessageReceiveParams, MessageReceiveResult } from "./message-delivery.js";
 import { OpenClawScheduleListParams, OpenClawScheduleListResult, OpenClawScheduleGetParams, OpenClawScheduleGetResult } from "./openclaw-schedule.js";
 import { HermesScheduleListParams, HermesScheduleListResult, HermesScheduleGetParams, HermesScheduleGetResult } from "./hermes-schedule.js";
 import { RunResolveParams, RunResolveResult } from "./schedule.js";
@@ -337,6 +338,9 @@ export const METHODS = {
   },
   "conversation.archive.blob.read": {
     direction: "s2p", kind: "request", params: ConversationArchiveBlobReadParams, result: ConversationArchiveBlobReadResult,
+  },
+  "message.receive": {
+    direction: "s2p", kind: "request", params: MessageReceiveParams, result: MessageReceiveResult,
   },
   "session.create": {
     direction: "s2p",

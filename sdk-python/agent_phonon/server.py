@@ -106,6 +106,10 @@ class PhononSession:
             await _require_skill_capabilities(self.device, payload["skills"], False)
         return await self.device.call("session.send", payload)
 
+    async def receive_message(self, **payload: Any) -> dict:
+        """Durably receive a message without starting or recovering execution."""
+        return await self.device.call("message.receive", {**payload, "sessionId": self.session_id})
+
     async def recover(self, *, project: str, agent: str, model: str) -> dict:
         """Verify/reopen the same settled native Session; never sends input."""
         return await self.device.call("session.recover", {"sessionId": self.session_id, "project": project, "agent": agent, "model": model})

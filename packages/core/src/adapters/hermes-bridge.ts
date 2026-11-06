@@ -79,6 +79,7 @@ def observe(self, *args, **kwargs):
         return native_run(self, *args, **kwargs)
     root_agent = self
     root_invocations = 1
+    emit({"type": "hermes_session", "session_id": getattr(self, "session_id", None), "profile_home": profile_home})
     if not _phonon_refresh_native_tools(self):
         return {"completed": False, "error": "Native Hermes current-turn MCP tools unavailable"}
     history = kwargs.get("conversation_history") if "conversation_history" in kwargs else (args[2] if len(args) > 2 else None)

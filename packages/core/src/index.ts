@@ -19,6 +19,7 @@ import {PeerContextReporter} from "./peer-context-reporter.js";
 import type {DeviceInfoResult,SkillInstallParams,SkillInstallStatusParams,SkillInstallFenceParams,SkillPublishParams,SkillUnpublishParams} from "@agent-phonon/protocol";
 import { Outbox } from "./outbox.js";
 import { PhononStore } from "./store.js";
+import { receiveMessage } from "./message-inbox.js";
 import { FileManager } from "./file-manager.js";
 import { collectDeviceResources } from "./resources.js";
 import { collectDeviceInfo } from "./device-info.js";
@@ -522,6 +523,15 @@ export class PhononConnection {
     }
     // 只读租户 / 方法白名单（policy）
     this.policy.assertMethodAllowed(method);
+    if(method==="message.receive"){
+      this.policy.assertAgentAllowed(p.agent as string);
+      this.projects.get(p.project as string,{readonly:true});
+      if(typeof p.sessionId==="string"){
+        const row=this.store.nativeSessionSnapshot(this.tenantId,p.sessionId);
+        if(!row||row.project_id!==p.project||row.agent_id!==p.agent||row.model!==p.model)
+          throw new PhononError("errPolicyDenied","message receiver identity changed");
+      }
+    }
     let authority:ReturnType<PolicyEnforcer["captureProjectAuthority"]>|undefined;
     // Revalidate current authority before returning an idempotent success.
     if(method==="project.create"&&typeof p.path==="string"){
@@ -636,6 +646,10 @@ export class PhononConnection {
       });
     }
     switch (method) {
+      case "message.receive":
+        // No session status, checkpoint, discovery or execution-capacity gate.
+        assertCurrent?.();
+        return receiveMessage(this.store,this.tenantId,p as import("@agent-phonon/protocol").MessageReceiveParams);
       case "mcp.configure":
       case "mcp.status": {
         if (!this.managedMcp) throw new PhononError("errCapabilityUnsupported", "managed MCP is unavailable");
@@ -919,7 +933,7 @@ export class PhononConnection {
           metadata: p.metadata as Record<string, unknown> | undefined,
         });
       case "workflow.status":
-        return this.workflows!.status(p.workflowId as string);
+        return this.workflows!.observedStatus(p.workflowId as string);
       case "workflow.result":
         return this.workflows!.resultPage(p as never);
       case "workflow.input":

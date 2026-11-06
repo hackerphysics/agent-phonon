@@ -70,6 +70,28 @@ Research is not a compatibility commitment. See
 
 ## Message Delivery
 
+End-to-end delivery is the first product priority. Execution state, recovery
+markers, optional settings, `transport_unknown`, `paused`, `busy` and
+unconfirmed-stop records must never block or strand authorized messages.
+Durably retain each original message and attempt the current authorized
+channel regardless of cached execution observations. Keep transport receipt
+independent from execution admission, preserve ordering and stable idempotency
+identities, and never replay model/tool work to obtain delivery proof.
+
+Automatic recovery and retries use bounded attempt timeouts, capped backoff
+and an explicit, sufficiently generous budget. Only real delivery attempts
+consume that budget, not status checks, an absent controller, an initial
+timeout or the end of the fast-retry window. Reconnect wakes pending delivery.
+Declare delivery failed only when actual end-to-end attempts establish failure
+with evidence from both sender and receiver and all applicable recovery/retry
+budgets are exhausted. Missing ACKs remain unconfirmed, never fabricated
+failure or success. Retain the input and provide a working retry path.
+
+Identity, permissions, required human approvals and explicit pause/cancel/stop
+intent still constrain effects; never bypass them or turn execution constraints
+into transport gates. Test stale states, controller replacement, reconnect,
+late/lost ACKs, ordering/deduplication, exhausted budgets and cancellation.
+
 Reasoning settings are best-effort preferences. Missing/unsupported setting
 metadata or missing confirmation must not reject the original input or replace
 an actual native completion with failure. Do not replay a task to obtain setting

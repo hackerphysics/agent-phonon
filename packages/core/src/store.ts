@@ -11,6 +11,7 @@ import {canonicalWorkspacePath,workspacePathKey,assertNamespacePathAvailable,ass
 import {requestFingerprint} from "./idempotency.js";
 import {SkillInstallFenceResult,type SkillInstallFenceParams,type SkillInstallRecoveryContext} from "@agent-phonon/protocol";
 import {LocalDirectoryAdmissions} from "./local-directory-admission.js";
+import type { MessageReceiveParams, MessageReceiveResult } from "@agent-phonon/protocol";
 
 export interface StoredSkillRecord {
   agent:string;name:string;scope:"project"|"global";projectId?:string;version?:string;hash?:string;installedPath:string;installedAt:string;revision?:string;
@@ -92,6 +93,11 @@ export class PhononStore {
 
   private migrate(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS message_inbox (
+        tenant_id TEXT NOT NULL, message_id TEXT NOT NULL, recipient_id TEXT NOT NULL,
+        request_hash TEXT NOT NULL, payload TEXT NOT NULL, received_at TEXT NOT NULL,
+        PRIMARY KEY(tenant_id,message_id,recipient_id)
+      );
       CREATE TABLE IF NOT EXISTS projects (
         project_id TEXT PRIMARY KEY,
         name       TEXT NOT NULL,
@@ -370,6 +376,7 @@ export class PhononStore {
     this.ensureColumn("sessions", "employee_revision", "INTEGER");
     this.ensureColumn("sessions", "recovery_json", "TEXT");
     this.ensureColumn("sessions", "native_stop_json", "TEXT");
+    this.ensureColumn("sessions", "recovery_hint_json", "TEXT");
     this.ensureColumn("sessions", "project_cwd", "TEXT");
     this.ensureColumn("sessions", "project_cwd_identity", "TEXT");
     this.db.exec(`CREATE TABLE IF NOT EXISTS session_native_owners(
@@ -804,6 +811,24 @@ export class PhononStore {
   ownsNativeSession(tenant:string,session:string,owner:string):boolean {
     return !!this.db.prepare("SELECT 1 FROM session_native_owners WHERE tenant_id=? AND session_id=? AND owner_instance=?").get(tenant,session,owner);
   }
+  receiveMessage(tenant:string,input:MessageReceiveParams,hash:string,payload:string):MessageReceiveResult {
+    const now=new Date().toISOString();
+    this.db.prepare(`INSERT OR IGNORE INTO message_inbox VALUES(?,?,?,?,?,?)`)
+      .run(tenant,input.messageId,input.recipientId,hash,payload,now);
+    const row=this.db.prepare(`SELECT request_hash,received_at FROM message_inbox
+      WHERE tenant_id=? AND message_id=? AND recipient_id=?`).get(tenant,input.messageId,input.recipientId)!;
+    if(row.request_hash!==hash)throw new PhononError("errInvalidParams","message identity payload mismatch");
+    return {messageId:input.messageId,recipientId:input.recipientId,conversationId:input.conversationId,
+      requestHash:hash,receivedAt:String(row.received_at),state:"received"};
+  }
+
+  saveRecoveryHint(tenant:string,session:string,owner:string,hint:string):void {
+    if(Buffer.byteLength(hint)>65536)throw new PhononError("errInvalidParams","recovery hint exceeds limit");
+    this.db.prepare(`UPDATE sessions SET recovery_hint_json=? WHERE tenant_id=? AND session_id=?
+      AND EXISTS(SELECT 1 FROM session_native_owners WHERE tenant_id=? AND session_id=? AND owner_instance=?)`)
+      .run(hint,tenant,session,tenant,session,owner);
+  }
+
   nativeSessionSnapshot(tenant:string,session:string):Record<string,unknown>|undefined {
     return this.db.prepare("SELECT * FROM sessions WHERE tenant_id=? AND session_id=?").get(tenant,session) as Record<string,unknown>|undefined;
   }

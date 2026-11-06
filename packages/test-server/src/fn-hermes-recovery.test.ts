@@ -138,6 +138,26 @@ test("Hermes re-observes the same readonly native history after a confirmed stop
   }finally{await f.close();}
 });
 
+test("Hermes durable identity hint recovers after the store and original controller are replaced without replaying work",{skip:process.platform==="win32"||!existsSync("/usr/bin/python3")},async()=>{
+  const f=await fixture();
+  try{
+    await f.turn(f.privateId,"first original input");
+    const row=f.store.nativeSessionSnapshot("owner",f.privateId)!,hint=JSON.parse(String(row.recovery_hint_json));
+    assert.equal(hint.sessionId,f.privateId);assert.ok(hint.turnId);assert.equal(hint.nativeSessionId,f.calls()[0].sid);
+    await f.conn.conn.dispose();
+    (f.store as any).db.prepare("UPDATE sessions SET status='paused',recovery_json=NULL,native_stop_json=? WHERE session_id=?")
+      .run(JSON.stringify({version:1,sessionId:f.privateId,turnId:hint.turnId,state:"unknown",reasonCode:"controller_disposed",observedAt:new Date().toISOString()}),f.privateId);
+    await f.restart();assert.equal(f.store.pendingNativeStops.size,0);
+    const status=await f.conn.call("session.status",{sessionId:f.privateId}) as any;
+    assert.equal(status.nativeStop.state,"confirmed");assert.equal(status.recovery.canAttempt,true);
+    assert.equal(f.calls().length,1);assert.equal(f.inferences().length,1);
+    await f.conn.call("session.recover",f.expected(f.privateId));
+    await f.turn(f.privateId,"only the new input");
+    assert.equal(f.inferences().length,2);assert.equal(f.calls()[1].sid,f.calls()[0].sid);
+    assert.deepEqual(f.inferences().map(row=>row.text.includes("only the new input")),[false,true]);
+  }finally{await f.close();}
+});
+
 test("Hermes stop confirmation does not wait for a slow checkpoint probe and coalesces its reads",{skip:!existsSync("/usr/bin/python3")},async()=>{
   const f=await fixture();let session:any;
   try{
