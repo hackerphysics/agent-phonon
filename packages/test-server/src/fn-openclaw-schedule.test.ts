@@ -54,7 +54,23 @@ const followingHyphenWhitespaceCases = ['"', "'"].flatMap(quote => {
   }));
 });
 
-for (const { label, input, expected, secrets } of [...trailingWhitespaceCases, ...crossingWhitespaceCases, ...followingHyphenWhitespaceCases]) {
+const bareHyphenWhitespaceCases = ['"', "'"].flatMap(quote => {
+  const opposite = quote === '"' ? "'" : '"';
+  const prefix = `token=${quote}prefix password=${opposite}HIDE ${quote} LEAK_ME${opposite}`;
+  return [",", ";"].flatMap(separator => ["-password", "-token", "-secret", "-api-key", "-api_key",
+    "x-password", "a-password", "--password"].flatMap(key =>
+    (key.startsWith("--") || !key.startsWith("-") ? [""] : ["", '"', "'"]).flatMap(keyQuote =>
+      [64, 65, 4000].map(length => ({
+        label: `HOLD29 crossing ${quote} before ${keyQuote}${key}${keyQuote} after ${separator} and ${length} spaces`,
+        input: prefix + separator + " ".repeat(length) + `${keyQuote}${key}${keyQuote}=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`,
+        // Preserve the established long-gap separator consumption, but never a partial multiword value.
+        expected: `token=${quote}[redacted]${quote}${length <= 64 ? separator : ""}${" ".repeat(64)}${keyQuote}${key}${keyQuote}=${quote}[redacted]${quote}`,
+        secrets: /HIDE|LEAK_ME|FIRST_PRIVATE|SECOND_PRIVATE/,
+      })))));
+});
+
+for (const { label, input, expected, secrets } of [...trailingWhitespaceCases, ...crossingWhitespaceCases,
+  ...followingHyphenWhitespaceCases, ...bareHyphenWhitespaceCases]) {
   test(`OpenClaw redacts ${label} without blocking the event loop`, async () => {
     assert.ok(input.length < 4096);
     for (let iteration = 0; iteration < 6; iteration++) {
@@ -191,6 +207,7 @@ const credentialCases = [
   ...crossingWhitespaceCases,
   ...trailingWhitespaceCases,
   ...followingHyphenWhitespaceCases,
+  ...bareHyphenWhitespaceCases,
   { label: "fully double-quoted value", input: 'password="alpha"',
     expected: 'password="[redacted]"', secrets: /alpha/ },
   { label: "fully single-quoted value", input: "password='alpha'",
