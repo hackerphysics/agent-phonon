@@ -41,7 +41,20 @@ const trailingWhitespaceCases = ['"', "'"].flatMap(quote => {
   }));
 });
 
-for (const { label, input, expected, secrets } of [...trailingWhitespaceCases, ...crossingWhitespaceCases]) {
+const followingHyphenWhitespaceCases = ['"', "'"].flatMap(quote => {
+  const opposite = quote === '"' ? "'" : '"';
+  const prefix = `token=${quote}prefix password=${opposite}HIDE ${quote} LEAK_ME${opposite}`;
+  const following = `x-password=${quote}FIRST_PRIVATE SECOND_PRIVATE${quote}`;
+  return [64, 65, 66, 128, 256, 512, 4000, 4095 - prefix.length - 1 - following.length].map(length => ({
+    label: `HOLD28 crossing ${quote} before following-hyphen multiword secret after ${length} spaces`,
+    input: prefix + "," + " ".repeat(length) + following,
+    // Beyond the forward scan bound, consuming the separator is acceptable; neither value may leak.
+    expected: `token=${quote}[redacted]${quote}${length <= 64 ? "," : ""}${" ".repeat(64)}x-password=${quote}[redacted]${quote}`,
+    secrets: /HIDE|LEAK_ME|FIRST_PRIVATE|SECOND_PRIVATE/,
+  }));
+});
+
+for (const { label, input, expected, secrets } of [...trailingWhitespaceCases, ...crossingWhitespaceCases, ...followingHyphenWhitespaceCases]) {
   test(`OpenClaw redacts ${label} without blocking the event loop`, async () => {
     assert.ok(input.length < 4096);
     for (let iteration = 0; iteration < 6; iteration++) {
@@ -177,6 +190,7 @@ test("OpenClaw normalizes interval/at, unknown trigger kinds and nullable option
 const credentialCases = [
   ...crossingWhitespaceCases,
   ...trailingWhitespaceCases,
+  ...followingHyphenWhitespaceCases,
   { label: "fully double-quoted value", input: 'password="alpha"',
     expected: 'password="[redacted]"', secrets: /alpha/ },
   { label: "fully single-quoted value", input: "password='alpha'",
