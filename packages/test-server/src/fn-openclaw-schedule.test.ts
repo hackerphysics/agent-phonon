@@ -31,15 +31,26 @@ const crossingWhitespaceCases = ['"', "'"].flatMap(quote => [256, 512].map(lengt
   };
 }));
 
-for (const { label, input, expected, secrets } of crossingWhitespaceCases) {
+const trailingWhitespaceCases = ['"', "'"].flatMap(quote => {
+  const opposite = quote === '"' ? "'" : '"';
+  const prefix = `token=${quote}prefix password=${opposite}HIDE ${quote} LEAK_ME${opposite}`;
+  return [4000, 4095 - prefix.length - "public".length].map(length => ({
+    label: `HOLD27 crossing ${quote} with ${length} trailing spaces`,
+    input: prefix + " ".repeat(length) + "public",
+    expected: `token=${quote}[redacted]${quote}`, secrets: /HIDE|LEAK_ME|prefix/,
+  }));
+});
+
+for (const { label, input, expected, secrets } of [...trailingWhitespaceCases, ...crossingWhitespaceCases]) {
   test(`OpenClaw redacts ${label} without blocking the event loop`, async () => {
+    assert.ok(input.length < 4096);
     for (let iteration = 0; iteration < 6; iteration++) {
       const start = performance.now();
       const [job] = await readOpenClawSchedules(async () => [{
         ...nativeJob, name: input, state: { lastError: input }, delivery: { ...nativeJob.delivery, to: input },
       }]);
       const elapsed = performance.now() - start;
-      // Cold and warm budgets absorb CI variance; both remain far below the pre-HOLD25 multi-second path.
+      // Cold and warm budgets absorb CI variance; both remain far below the quadratic crossing path.
       const budget = 250;
       assert.ok(elapsed < budget, `${label} iteration ${iteration} took ${elapsed.toFixed(1)}ms (budget ${budget}ms)`);
       for (const value of [job!.name, job!.state.lastError, job!.delivery.to]) {
@@ -49,6 +60,25 @@ for (const { label, input, expected, secrets } of crossingWhitespaceCases) {
     }
   });
 }
+
+test("OpenClaw redacts a six-job HOLD27 inventory without blocking the event loop", async () => {
+  const { input, expected, secrets } = trailingWhitespaceCases[0]!;
+  const start = performance.now();
+  const jobs = await readOpenClawSchedules(async () => Array.from({ length: 6 }, (_, index) => ({
+    ...nativeJob, id: `opaque-${index}`, name: input, state: { lastError: input },
+    delivery: { ...nativeJob.delivery, to: input },
+  })));
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 250, `HOLD27 six-job inventory took ${elapsed.toFixed(1)}ms (budget 250ms)`);
+  assert.equal(jobs.length, 6);
+  for (const [index, job] of jobs.entries()) {
+    assert.equal(job.id, `opaque-${index}`);
+    for (const value of [job.name, job.state.lastError, job.delivery.to]) {
+      assert.equal(value, expected);
+      assert.doesNotMatch(value!, secrets);
+    }
+  }
+});
 
 function rpcError(code: string, message?: RegExp) {
   return (error: unknown) => {
@@ -146,6 +176,7 @@ test("OpenClaw normalizes interval/at, unknown trigger kinds and nullable option
 
 const credentialCases = [
   ...crossingWhitespaceCases,
+  ...trailingWhitespaceCases,
   { label: "fully double-quoted value", input: 'password="alpha"',
     expected: 'password="[redacted]"', secrets: /alpha/ },
   { label: "fully single-quoted value", input: "password='alpha'",
