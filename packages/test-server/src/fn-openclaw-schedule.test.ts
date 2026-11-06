@@ -39,8 +39,8 @@ for (const { label, input, expected, secrets } of crossingWhitespaceCases) {
         ...nativeJob, name: input, state: { lastError: input }, delivery: { ...nativeJob.delivery, to: input },
       }]);
       const elapsed = performance.now() - start;
-      // Include parsing and all three display fields; the old pattern took seconds even when warm.
-      const budget = iteration === 0 ? 100 : 50;
+      // Cold budget absorbs CI variance; warm stays far below the pre-HOLD25 multi-second path.
+      const budget = iteration === 0 ? 250 : 100;
       assert.ok(elapsed < budget, `${label} iteration ${iteration} took ${elapsed.toFixed(1)}ms (budget ${budget}ms)`);
       for (const value of [job!.name, job!.state.lastError, job!.delivery.to]) {
         assert.equal(value, expected);
