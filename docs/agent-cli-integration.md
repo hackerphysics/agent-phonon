@@ -156,17 +156,18 @@ the command sandbox, global approval policy or actual human decisions. Do not
 enable general command networking merely to publish a file or request input.
 
 ### Invocation
-1. **CLI**: `codex exec - --json -c sandbox_mode="workspace-write" -c model_provider=<id>
+1. **CLI**: `codex exec - --json -c sandbox_mode="danger-full-access" -c approval_policy="never" -c model_provider=<id>
    -c model_providers.<id>.base_url=... -c model_providers.<id>.wire_api=responses
    -c model_providers.<id>.env_key=OPENAI_API_KEY --model <m>`
    - Prompt on **stdin** (argv uses `-` as placeholder).
    - Resume: `codex exec resume <thread_id> - --json ...`
-   - Pass `-c sandbox_mode="workspace-write"` on every turn, including resume
-     and recovery. Otherwise noninteractive execution can default to read-only
-     even when the project directory is authorized. Use `-c` because native
-     `exec resume` does not accept `--sandbox`.
-   - Keep native approval policy, command-network restrictions and writable-root
-     settings unchanged. Do not add bypass/full-auto flags or rewrite user config.
+   - Pass `-c sandbox_mode="danger-full-access" -c approval_policy="never"` on every
+     turn, including resume, recovery and app-server. Headless Phonon has no Codex
+     Desktop reviewer, so `workspace-write` + `on-request` leaves `.git` read-only,
+     disables network, and turns escalations into `approval request failed`.
+   - Confined coding profiles may opt into `sandbox_mode="workspace-write"` via
+     adapter env. Do not add `--dangerously-*` / `--full-auto` CLI flags or rewrite
+     the user's `~/.codex/config.toml`.
 2. **Provider override via `-c`** so you don't touch `~/.codex/config.toml`.
    - If your endpoint's model only speaks the Responses protocol
      (`/v1/responses`, not chat/completions), set `wire_api=responses`.

@@ -11,6 +11,7 @@ import {
   type DaemonConfig,
 } from "./config.js";
 import { existsSync } from "node:fs";
+import {runLocalDirectoryCommand} from "./local-directory-cli.js";
 import { configureManagedMcpConsent, runManagedMcpProxy,managedMcpSourceFingerprint } from "./managed-mcp.js";
 import { cmdDoctor, cmdDiscover, cmdAdapterAdd, cmdAdapterList, cmdPluginInstall, cmdService, cmdSessions } from "./commands.js";
 
@@ -34,6 +35,9 @@ function opt(name: string): string | undefined {
 
 async function main(): Promise<void> {
   switch (cmd) {
+    case "directory":
+      console.log(JSON.stringify(runLocalDirectoryCommand(args),null,2));
+      break;
     case "mcp": {
       if (args[0] === "proxy") {
         const server = opt("server"), binding = opt("binding");

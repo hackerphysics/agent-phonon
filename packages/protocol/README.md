@@ -74,6 +74,8 @@ pnpm json-schema   # 导出 dist/json-schema/*.json（供非 TS 服务端）
 
 `conversation.message` adds strict `AgentMessageInput`, controller-stamped
 `ConversationMessageParams` and bounded `ConversationMessageResult` schemas.
+Read-only `history` and `read` operations preserve the originating active group
+scope; `native_group_history_v1` advertises their support. They never dispatch peers.
 It never accepts model-owned sender/chat/owner routing. See
 [Native Group Messages](../../docs/NATIVE_GROUP_MESSAGES.md) for explicit DE
 mentions, server-enforced causal budgets, receipts and SDK handlers.

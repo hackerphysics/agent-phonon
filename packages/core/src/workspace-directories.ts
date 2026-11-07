@@ -20,6 +20,9 @@ export function directoryInputParts(input:string,root:string,home:string,style:"
 
 export async function workspaceDirectorySuggestions(input:string,limit:number,policy:PolicyEnforcer,projects:ProjectManager,current:()=>void){
   const style=process.platform==="win32"?"windows":"posix",parts=directoryInputParts(input,policy.workspaceRoot,homedir(),style);
+  // An exact locally selected directory is its own navigation boundary. Do not
+  // enumerate its unadmitted parent just to complete the final path component.
+  if(policy.localDirectoryAdmission?.(parts.current)){parts.parent=parts.current;parts.prefix="";}
   const access=(path:string)=>{current();policy.assertProjectDirectoryNavigation(path);return projects.directoryAccess(path);};
   const parent=await realpath(parts.parent);access(parent);const parentIdentity=directoryIdentity(parent);
   const observation=async(path:string)=>{

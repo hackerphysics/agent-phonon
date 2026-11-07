@@ -167,6 +167,14 @@ class SessionOptions(unittest.IsolatedAsyncioTestCase):
             return {"status": "recorded", "messageID": "message"}
         device.set_conversation_message_handler(message_with_files)
         self.assertEqual(await device._handle_inbound("conversation.message", payload), {"status": "recorded", "messageID": "message"})
+        for payload in [{"operation": "history", "throughOrder": "90", "beforeOrder": "70", "limit": 10},
+                        {"operation": "read", "messageID": "public-message", "offset": 6000}]:
+            expected = {"status": "history" if payload["operation"] == "history" else "message"}
+            async def read_history(params):
+                self.assertEqual(params, payload)
+                return expected
+            device.set_conversation_message_handler(read_history)
+            self.assertIs(await device._handle_inbound("conversation.message", payload), expected)
 
     async def test_conversation_workflow_handler_is_explicit_and_awaited(self):
         device = PhononDevice("device", "tenant", object())
@@ -178,6 +186,13 @@ class SessionOptions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await device._handle_inbound("conversation.workflow", {"operation": "catalog"}), {"status": "catalog", "data": {"operation": "catalog"}})
         payload = {"operation": "execute", "requestId": "retained-request", "delivery": "detached", "plan": {"review": "request", "nodes": [{"id": "review", "attachmentIDs": ["native-file:retained"], "artifactSources": ["producer"]}]}}
         self.assertEqual(await device._handle_inbound("conversation.workflow", payload), {"status": "catalog", "data": payload})
+        for mode, fields in [("graph", {"executorID": "coordinator", "communicationGraph": {"edges": [{"from": "coordinator", "to": "worker"}], "maxIterations": 3}}), ("discussion", {"chairmanID": "chair", "termination": {"maxRounds": 2, "chairmanSignal": "[DISCUSS_END]"}})]:
+            request = {**payload, "plan": {**payload["plan"], "mode": mode, **fields}}
+            self.assertEqual(await device._handle_inbound("conversation.workflow", request), {"status": "catalog", "data": request})
+        status = {"operation": "status", "requestId": "retained-request", "nodeID": "worker", "attempt": 3, "offset": 4096}
+        self.assertEqual(await device._handle_inbound("conversation.workflow", status), {"status": "catalog", "data": status})
+        answer = {"operation": "respond", "requestId": "workflow-request", "requestID": "node-question", "requestVersion": 1, "action": "submit", "values": {"region": "east"}}
+        self.assertEqual(await device._handle_inbound("conversation.workflow", answer), {"status": "catalog", "data": answer})
 
     async def test_reasoning_is_per_turn_and_default_is_explicit(self):
         class Device:
@@ -195,7 +210,6 @@ class SessionOptions(unittest.IsolatedAsyncioTestCase):
             ("session.send", {"sessionId": "session", "input": "default", "reasoning": {"level": None}}),
             ("session.send", {"sessionId": "session", "input": "maximum", "reasoning": {"level": "max"}}),
         ])
-
         levels = ["off", "none", "minimal", "ultra", "auto", "adaptive", "native-next"]
         for level in levels:
             await session.send(level, reasoning={"level": level})

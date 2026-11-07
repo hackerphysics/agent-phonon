@@ -59,6 +59,33 @@ class Host {
   close() { this.connection.abort(); this.cleanup?.({}); }
 }
 
+test("OpenClaw group history is read-only, scoped and checks the requested message/window identity",async()=>{
+  const host=new Host(),conversationID=randomUUID(),projectID=randomUUID(),messageID=randomUUID();let wrong=false;
+  const message={id:messageID,historyOrder:"5",author:"assistant",senderID:randomUUID(),senderName:"DE",createdAt:new Date().toISOString(),text:"Shared background",textLength:17,isExcerpt:false,mentionIDs:[],attachmentIDs:[]};
+  const server=createServer(async(req,res)=>{
+    let body="";for await(const chunk of req)body+=chunk;
+    const raw=JSON.parse(body);assert.equal(req.headers.authorization,"Bearer "+input.token);assert.equal(req.url,"/message");
+    res.setHeader("content-type","application/json");res.end(JSON.stringify(raw.operation==="history"
+      ?{status:"history",conversationID,projectID,throughOrder:wrong?"8":raw.throughOrder??"9",messages:[message]}
+      :{status:"message",conversationID,projectID,message:{...message,id:wrong?randomUUID():messageID},offset:raw.offset??0}));
+  });
+  let input:any;
+  try{
+    await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));const port=(server.address() as {port:number}).port;
+    input=host.input({interactionUrl:`http://127.0.0.1:${port}/interaction`,receiptUrl:`http://127.0.0.1:${port}/applied`,messageUrl:`http://127.0.0.1:${port}/message`});
+    assert.equal(host.rpc(BIND_METHOD,input).ok,true);
+    const tool=host.factory(host.context(input))!.find(tool=>tool.name===MESSAGE_TOOL)!;
+    assert.match(tool.description,/Read-only operation=history/);
+    assert.equal(((await host.invoke(input,MESSAGE_TOOL,{operation:"history",throughOrder:"9",beforeOrder:"8",limit:2})).details as any).status,"history");
+    assert.equal(((await host.invoke(input,MESSAGE_TOOL,{operation:"read",messageID,offset:0})).details as any).status,"message");
+    wrong=true;await assert.rejects(host.invoke(input,MESSAGE_TOOL,{operation:"read",messageID}),/No message was sent/);
+    await assert.rejects(host.invoke(input,MESSAGE_TOOL,{operation:"history",throughOrder:"9"}),/No message was sent/);
+    await assert.rejects(host.invoke(input,MESSAGE_TOOL,{operation:"history",conversationID:randomUUID()}));
+    host.rpc(RELEASE_METHOD,{sessionKey:input.sessionKey,runId:input.runId});
+    await assert.rejects(host.invoke(input,MESSAGE_TOOL,{operation:"history"}));
+  }finally{host.close();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}
+});
+
 test("native plugin binding is admin-only, bounded, local, idempotent and never returns capabilities", () => {
   const host = new Host(), input = host.input();
   try {

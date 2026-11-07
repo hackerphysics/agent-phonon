@@ -25,9 +25,23 @@ export const ConversationWorkflowPlan=z.object({
   projectID:z.string().uuid(),title:z.string().min(1).max(240),goal:z.string().min(1).max(4000),
   review:z.enum(["request","not_requested"]),maxParallel:z.number().int().min(1).max(4).default(2),
   nodes:z.array(ConversationWorkflowNode).min(1).max(16),
+  mode:z.enum(["dag","graph","discussion"]).optional().describe("Omission preserves DAG. Graph routes bounded iterations through an executor; discussion runs bounded participant/chairman rounds. Same-device and cross-device bindings are supported."),
+  executorID:z.string().max(64).optional(),
+  communicationGraph:z.object({edges:z.array(z.object({from:z.string().max(64),to:z.string().max(64)}).strict()).min(1).max(128),maxIterations:z.number().int().min(1).max(12).default(12)}).strict().optional(),
+  chairmanID:z.string().max(64).optional(),
+  termination:z.object({maxRounds:z.number().int().min(1).max(10).default(10),chairmanSignal:z.string().min(1).max(100).default("[DISCUSS_END]"),consensusSignal:z.string().min(1).max(100).optional()}).strict().optional(),
 }).strict().superRefine((plan,ctx)=>{
   const nodes=new Map(plan.nodes.map(node=>[node.id,node]));
   if(nodes.size!==plan.nodes.length){ctx.addIssue({code:"custom",message:"Duplicate node"});return;}
+  const mode=plan.mode??"dag";
+  if(mode==="dag"&&(plan.executorID||plan.communicationGraph||plan.chairmanID||plan.termination)
+    ||mode==="graph"&&(!plan.executorID||!nodes.has(plan.executorID)||!plan.communicationGraph||plan.chairmanID||plan.termination||plan.nodes.length<2
+      ||plan.communicationGraph.edges.some(edge=>edge.from!==plan.executorID||edge.to===plan.executorID||!nodes.has(edge.to))
+      ||new Set(plan.communicationGraph.edges.map(edge=>edge.from+":"+edge.to)).size!==plan.communicationGraph.edges.length)
+    ||mode==="discussion"&&(!plan.chairmanID||!nodes.has(plan.chairmanID)||!plan.termination||plan.executorID||plan.communicationGraph||plan.nodes.length<2)
+    ||mode!=="dag"&&plan.nodes.some(node=>node.dependsOn.length)){
+    ctx.addIssue({code:"custom",message:"Invalid workflow orchestration"});return;
+  }
   const visited=new Set<string>(),active=new Set<string>();
   const visit=(id:string):boolean=>{
     if(active.has(id)||!nodes.has(id))return false;
@@ -35,7 +49,7 @@ export const ConversationWorkflowPlan=z.object({
     active.add(id);
     const node=nodes.get(id)!;
     if(node.canvasSkill&&(node.skills?.length===16||node.skills?.some(skill=>skill.name==="product-intent-canvas")))return false;
-    if(new Set(node.attachmentIDs).size!==(node.attachmentIDs?.length??0)||new Set(node.artifactSources).size!==(node.artifactSources?.length??0)||node.artifactSources?.some(source=>!node.dependsOn.includes(source)))return false;
+    if(new Set(node.attachmentIDs).size!==(node.attachmentIDs?.length??0)||new Set(node.artifactSources).size!==(node.artifactSources?.length??0)||node.artifactSources?.some(source=>mode==="dag"?!node.dependsOn.includes(source):source===node.id||!nodes.has(source)))return false;
     if(new Set(node.dependsOn).size!==node.dependsOn.length||node.dependsOn.some(dependency=>!visit(dependency)))return false;
     active.delete(id);visited.add(id);return true;
   };
@@ -45,12 +59,14 @@ export type ConversationWorkflowPlan=z.infer<typeof ConversationWorkflowPlan>;
 export const AgentWorkflowInput=z.discriminatedUnion("operation",[
   z.object({operation:z.literal("catalog"),projectID:z.string().uuid().optional(),offset:z.number().int().nonnegative().safe().optional(),skillTarget:skillTarget.optional()}).strict(),
   z.object({operation:z.literal("execute"),requestId:z.string().uuid(),replacesRequestId:z.string().uuid().optional(),delivery:z.enum(["wait","detached"]).optional(),plan:ConversationWorkflowPlan}).strict(),
-  z.object({operation:z.literal("status"),requestId:z.string().uuid(),nodeID:z.string().max(64).optional(),offset:z.number().int().nonnegative().safe().optional()}).strict(),
+  z.object({operation:z.literal("status"),requestId:z.string().uuid(),nodeID:z.string().max(64).optional(),attempt:z.number().int().min(1).max(256).optional().describe("Exact immutable attempt number returned by status for iterative workflows; omit for latest node result."),offset:z.number().int().nonnegative().safe().optional()}).strict(),
+  z.object({operation:z.literal("respond"),requestId:z.string().uuid(),requestID:z.string().uuid(),requestVersion:z.number().int().positive(),action:z.enum(["submit","cancel"]),
+    values:z.record(z.union([z.string().max(4000),z.number().finite(),z.boolean(),z.array(z.string().max(240)).max(32)])).optional()}).strict(),
 ]);
 export type AgentWorkflowInput=z.infer<typeof AgentWorkflowInput>;
 const source={nativeRunId:z.string().uuid(),workflowId:z.string().min(1).max(255),sessionId:SessionId,turnId:z.string().min(1).max(255)};
 export const ConversationWorkflowParams=z.discriminatedUnion("operation",[
-  AgentWorkflowInput.options[0].extend(source),AgentWorkflowInput.options[1].extend(source),AgentWorkflowInput.options[2].extend(source),
+  AgentWorkflowInput.options[0].extend(source),AgentWorkflowInput.options[1].extend(source),AgentWorkflowInput.options[2].extend(source),AgentWorkflowInput.options[3].extend(source),
 ]);
 export type ConversationWorkflowParams=AgentWorkflowInput & {nativeRunId:string;workflowId:string;sessionId:string;turnId:string};
 export const ConversationWorkflowResult=z.object({

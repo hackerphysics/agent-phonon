@@ -590,8 +590,9 @@ export class ProjectManager {
     });
   }
 
-  async exec(params: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number }): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; truncated: boolean }> {
+  async exec(params: { projectId: string; worktreeId?: string; command: string; args?: string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number; maxOutputBytes?: number },assertCurrent?:()=>void): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; truncated: boolean }> {
     const root = this.cwdFor(params.projectId, params.worktreeId);
+    const identity=directoryIdentity(root);
     let rootReal: string;
     let cwd: string;
     try {
@@ -608,6 +609,9 @@ export class ProjectManager {
     const started = Date.now();
     const max = params.maxOutputBytes ?? 1024 * 1024;
     const timeoutMs = params.timeoutMs ?? 120_000;
+    if(this.cwdFor(params.projectId,params.worktreeId)!==root)throw new PhononError("errPolicyDenied","project.exec workspace changed");
+    assertDirectoryIdentity(root,identity);this.assertProjectPath?.(cwd);this.assertOwnership(cwd);
+    assertCurrent?.();
     return new Promise((resolveP, reject) => {
       const supervisor = spawnSupervised(params.command, params.args ?? [], { cwd, shell: false, env: buildChildProcessEnvironment(params.env) });
       const child = supervisor.child;
