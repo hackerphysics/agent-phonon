@@ -30,7 +30,7 @@ class SessionDB:
   self._conn=sqlite3.connect(db_path.as_uri()+'?mode=ro',uri=True,isolation_level=None)
   self._conn.row_factory=sqlite3.Row
   def authorize(action,table,column,*unused):
-   if action==sqlite3.SQLITE_READ and table=='messages' and column not in ('','id','session_id','active','role','tool_call_id'): return sqlite3.SQLITE_DENY
+   if action==sqlite3.SQLITE_READ and table=='messages' and column not in ('','id','session_id','active','role','tool_call_id','tool_calls'): return sqlite3.SQLITE_DENY
    return sqlite3.SQLITE_OK
   self._conn.set_authorizer(authorize)
  def get_session(self,sid):
@@ -165,7 +165,11 @@ test("Hermes legacy DE stop recovers only exact original native tool identities 
     const row=f.store.nativeSessionSnapshot("owner",f.privateId)!,hint=JSON.parse(String(row.recovery_hint_json));
     const at=new Date(Date.now()-1000).toISOString(),ids=["call_original_legacy_one","call_original_legacy_two"];
     const db=new DatabaseSync(join(f.nativeHome,"state.db"));
-    for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES(?,'tool','retained',?)").run(f.calls()[0].sid,id);
+    db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES(?,'tool','retained',?)").run(f.calls()[0].sid,ids[0]!);
+    // The final interrupted call has no result. Its exact original native
+    // assistant tool identity must still permit read-only reconciliation.
+    db.prepare("INSERT INTO messages(session_id,role,content,tool_calls) VALUES(?,'assistant','',?)")
+      .run(f.calls()[0].sid,JSON.stringify([{id:ids[1],type:'function',function:{name:'wait',arguments:'{}'}}]));
     db.prepare("UPDATE sessions SET ended_at=? WHERE id=?").run(Date.now()/1000,f.calls()[0].sid);db.close();
     for(const id of ids)writeFileSync(String(row.transcript_path),JSON.stringify({ts:at,kind:"event",turnId:hint.turnId,event:{type:"tool_call",sessionId:f.privateId,turnId:hint.turnId,toolCallId:id}})+"\n",{flag:"a"});
     await f.conn.conn.dispose();
@@ -181,14 +185,17 @@ test("Hermes legacy DE stop recovers only exact original native tool identities 
 });
 
 test("legacy native recovery rejects mismatched, absent and ambiguous original tools",{skip:process.platform!=="darwin"||!existsSync("/usr/bin/python3")},async()=>{
-  for(const variant of ["missing","ambiguous","foreign-turn","unsettled","model","active-process"]){
+  for(const variant of ["missing","ambiguous","foreign-turn","unsettled","model","active-process","substring","malformed-calls"]){
     const f=await fixture("0.16");
     try{
       await f.turn(f.privateId,"legacy original");
       const row=f.store.nativeSessionSnapshot("owner",f.privateId)!,hint=JSON.parse(String(row.recovery_hint_json)),sid=f.calls()[0].sid;
       const ids=["call_original_legacy_one","call_original_legacy_two"],at=new Date(Date.now()-1000).toISOString();
       const db=new DatabaseSync(join(f.nativeHome,"state.db"));
-      if(variant!=="missing")for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES(?,'tool','retained',?)").run(sid,id);
+      if(!['missing','substring','malformed-calls'].includes(variant))for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES(?,'tool','retained',?)").run(sid,id);
+      if(variant==='substring')db.prepare("INSERT INTO messages(session_id,role,tool_calls) VALUES(?,'assistant',?)")
+        .run(sid,JSON.stringify(ids.map(id=>({id:id+'-not-the-original'}))));
+      if(variant==='malformed-calls')db.prepare("INSERT INTO messages(session_id,role,tool_calls) VALUES(?,'assistant',?)").run(sid,'{broken');
       if(variant==="ambiguous")for(const id of ids)db.prepare("INSERT INTO messages(session_id,role,content,tool_call_id) VALUES('foreign','tool','foreign',?)").run(id);
       if(variant==="unsettled")db.prepare("UPDATE sessions SET ended_at=NULL WHERE id=?").run(sid);
       if(variant==="model")db.prepare("UPDATE sessions SET model='foreign' WHERE id=?").run(sid);

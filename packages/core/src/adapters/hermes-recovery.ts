@@ -108,7 +108,14 @@ try:
                 if not isinstance(conn,sqlite3.Connection): raise RuntimeError('native read connection unavailable')
                 candidates=None
                 for call_id in ids:
-                    rows=conn.execute('SELECT DISTINCT session_id FROM messages WHERE tool_call_id=? AND active=1',(call_id,)).fetchall()
+                    # A cancelled tool may have its native call persisted but
+                    # no result. Both are exact native identities; never use
+                    # LIKE/substring matching or require the tool to complete.
+                    rows=conn.execute('''SELECT DISTINCT session_id FROM messages WHERE active=1 AND
+                      (tool_call_id=? OR EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(tool_calls)
+                        AND json_type(tool_calls)='array' THEN tool_calls ELSE '[]' END) call
+                        WHERE call.type='object' AND (json_extract(call.value,'$.id')=?
+                          OR json_extract(call.value,'$.call_id')=?)))''',(call_id,call_id,call_id)).fetchall()
                     found={r[0] for r in rows}
                     candidates=found if candidates is None else candidates & found
                 if not candidates or len(candidates)!=1: raise RuntimeError('original turn identity ambiguous')
