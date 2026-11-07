@@ -115,7 +115,7 @@ test("client ping watchdog terminates a dead peer even if it sends data or unrel
   s.sockets[0]!.pong("unsolicited-not-the-ping");
   s.sockets[0]!.send(JSON.stringify({ jsonrpc: "2.0", method: "discovery.list", params: {} }));
   await drain(); time.tick(timing.pongTimeoutMs - 1); assert.equal(c.connection, conn);
-  time.tick(1); await until(() => c.connection === undefined && conn.isDisposed);
+  time.tick(1); await until(() => c.connection === undefined);assert.equal(conn.isDisposed,false);
   assert.notEqual(socket.readyState, WebSocket.OPEN); assert.equal(socket.listenerCount("pong"), 0);
   await c.close(); await time.clean();
 });
@@ -138,10 +138,10 @@ test("flapping connections retain bounded exponential backoff until a stable hea
   for (const delay of [40, 80, 160, 320, 320]) {
     const count = s.sockets.length, previous = c.connection!;
     s.sockets.at(-1)!.terminate(); await until(() => !!state(c).reconnectTimer);
-    assert.equal(previous.isDisposed, true);
+    assert.equal(previous.isDisposed, false);
     assert.equal(time.active.get(state(c).reconnectTimer!), delay);
     time.tick(delay - 1); await drain(); assert.equal(s.sockets.length, count);
-    time.tick(1); await until(() => !!c.connection && c.connection !== previous);
+    time.tick(1); await until(() => !!c.connection && s.sockets.length>count);assert.equal(c.connection,previous);
     assert.equal(state(c).backoffMs, Math.min(delay * 2, timing.reconnectMaxMs), "welcome must not reset flapping backoff");
   }
   for (let i = 0; i < 16; i++) {
@@ -162,7 +162,7 @@ test("reconnect jitter is bounded and repeated start does not overlap dials", as
     await c.start(); const active = c.connection!, before = s.sockets.length;
     await c.start(); assert.equal(s.sockets.length, before);
     s.sockets.at(-1)!.terminate(); await until(() => !!state(c).reconnectTimer);
-    assert.equal(active.isDisposed, true); assert.equal(time.active.get(state(c).reconnectTimer!), expected);
+    assert.equal(active.isDisposed, false); assert.equal(time.active.get(state(c).reconnectTimer!), expected);
     await c.close(); await time.clean();
   }
 });
@@ -200,7 +200,7 @@ test("a timed-out candidate preserves incumbent liveness and later incumbent fai
   assert.equal(state(c).reconnectTimer, undefined);
   s.sockets[0]!.terminate(); await until(() => !!state(c).reconnectTimer);
   time.tick(timing.reconnectBaseMs); await until(() => s.sockets.length === 3 && !!c.connection);
-  assert.notEqual(c.connection, incumbent); assert.equal(incumbent.isDisposed, true);
+  assert.equal(c.connection, incumbent); assert.equal(incumbent.isDisposed, false);
   await c.close(); await time.clean();
 });
 
@@ -242,43 +242,30 @@ test("manual close cancels hello and all timers and cannot be undone by a late w
   assert.equal(c.connection, undefined); assert.equal(state(c).dialing.size, 0); assert.equal(s.sockets.length, 1);
 });
 
-test("socket errors clean watchdogs and dispose ownership once without harming a manual replacement", async t => {
+test("socket errors detach transport without disposing execution or harming a manual replacement", async t => {
   const s = await server(t), time = clock(t), c = client(t, s.url);
   await c.connect(); const old = state(c).ws!, previous = c.connection!;
   const dispose = t.mock.method(previous, "dispose");
-  old.emit("error", new Error("synthetic transport failure")); await until(() => previous.isDisposed);
-  assert.equal(c.connection, undefined); assert.equal(dispose.mock.callCount(), 1);
-  await time.clean(); await c.connect(); const next = c.connection!;
+  old.emit("error", new Error("synthetic transport failure")); await until(() => c.connection===undefined);
+  assert.equal(previous.isDisposed,false);assert.equal(dispose.mock.callCount(),0);
+  await c.connect(); const next = c.connection!;assert.equal(next,previous);
   old.emit("error", new Error("stale duplicate failure")); old.emit("close", 1006, Buffer.alloc(0));
-  assert.equal(c.connection, next); assert.equal(dispose.mock.callCount(), 1);
+  assert.equal(c.connection, next); assert.equal(dispose.mock.callCount(), 0);
   await c.close(); await time.clean();
 });
 
-test("replacement and newer supersession wait for incumbent runtime teardown before publishing", async t => {
-  const gate = deferred(); t.after(gate.resolve);
-  const s = await server(t), time = clock(t), c = client(t, s.url);
-  await c.connect(); const incumbent = c.connection!, original = incumbent.dispose.bind(incumbent);
-  t.mock.method(incumbent, "dispose", async (reason: string) => { await original(reason); await gate.promise; });
-  const first = assert.rejects(c.connect(), /superseded/);
-  await until(() => s.hellos.length === 2 && incumbent.isDisposed);
-  assert.equal(c.connection, undefined);
-  const newest = c.connect(); await first;
-  await until(() => s.hellos.length === 3); await drain(); assert.equal(c.connection, undefined);
-  gate.resolve(); await newest; assert.ok(c.connection); assert.notEqual(c.connection, incumbent);
-  await c.close(); await time.clean();
+test("healthy socket replacement retains exactly one execution runtime and explicit close disposes it",async t=>{
+  const s=await server(t),time=clock(t),c=client(t,s.url);await c.connect();const runtime=c.connection!;
+  const dispose=t.mock.method(runtime,'dispose');
+  await c.connect();await c.connect();assert.equal(c.connection,runtime);assert.equal(dispose.mock.callCount(),0);
+  await c.close();assert.equal(runtime.isDisposed,true);assert.ok(dispose.mock.callCount()>=1);await time.clean();
 });
 
-test("a deadline during runtime replacement cannot publish late or create overlapping runtimes", async t => {
-  const gate = deferred(); t.after(gate.resolve);
-  const s = await server(t), time = clock(t), c = client(t, s.url);
-  await c.connect(); const incumbent = c.connection!, original = incumbent.dispose.bind(incumbent);
-  t.mock.method(incumbent, "dispose", async (reason: string) => { await original(reason); await gate.promise; });
-  const attempt = assert.rejects(c.connect(), /deadline/);
-  await until(() => s.hellos.length === 2 && incumbent.isDisposed);
-  time.tick(timing.connectTimeoutMs); await attempt;
-  assert.equal(c.connection, undefined); assert.equal(state(c).dialing.size, 0);
-  gate.resolve(); await drain(); assert.equal(c.connection, undefined);
-  await c.close(); await time.clean();
+test("a replacement hello deadline cannot dispose an incumbent execution runtime",async t=>{
+  const s=await server(t,{hello(socket,id,index){if(index===0)welcome(socket,id);}}),time=clock(t),c=client(t,s.url);
+  await c.connect();const runtime=c.connection!,attempt=assert.rejects(c.connect(),/timeout|deadline/);
+  await until(()=>s.hellos.length===2);time.tick(timing.helloTimeoutMs);await attempt;
+  assert.equal(c.connection,runtime);assert.equal(runtime.isDisposed,false);await c.close();await time.clean();
 });
 
 test("an unpublished candidate runtime is retired before its successor can start", async t => {

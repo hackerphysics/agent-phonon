@@ -107,10 +107,11 @@ test('TypeScript SDK preserves Dev attribution and exact decisions on both callb
 });
 
 test("a late approval cannot cross an interrupted turn boundary",async()=>{
-  const state=await setup();
+  const state=await setup();let interrupt:Promise<unknown>|undefined;
   state.tc.setRequestResponder("interaction.request",async params=>{
     const request=params as any;
-    await state.tc.call("session.interrupt",{sessionId:request.sessionId,reason:"Stop before decision delivery"});
+    interrupt=state.tc.call("session.interrupt",{sessionId:request.sessionId,reason:"Stop before decision delivery"});
+    await interrupt;
     return {requestId:request.requestId,action:"submit",values:{approved:true}};
   });
   try{
@@ -118,7 +119,8 @@ test("a late approval cannot cross an interrupted turn boundary",async()=>{
     const receipt=await state.tc.call("interaction.status",{requestId:"late"}) as any;
     assert.equal(receipt.state,"cancelled");
     assert.equal(JSON.parse(String(state.store.interactionReceipt("owner","late")!.response_json)).action,"cancel");
-  }finally{await state.close();}
+    await interrupt; // the control response must settle before fixture disposal
+  }finally{await interrupt?.catch(()=>{});await state.close();}
 });
 
 test("native workflow human review acknowledges only after the controller consumes the explicit decision",async()=>{

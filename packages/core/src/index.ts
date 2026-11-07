@@ -94,6 +94,8 @@ export class PhononConnection {
   readonly tenantId: string;
   private engine: SessionEngine;
   private peer: RpcPeer;
+  private transport:RpcTransport;
+  private transportAttached=true;
   private peerReporter?:PeerContextReporter;
   private registry: AdapterRegistry;
   private projects: ProjectManager;
@@ -143,6 +145,7 @@ export class PhononConnection {
     liveDispatchScheduleIds?: ReadonlySet<string>;
   }) {
     this.managedMcp = opts.managedMcp;
+    this.transport=opts.transport;
     this.tenantId = opts.tenantId;
     this.registry = opts.registry;
     this.policy = new PolicyEnforcer({ policy: opts.policy, trustLocal: opts.trustLocal, workspaceRoot: opts.workspaceRoot });
@@ -285,7 +288,8 @@ export class PhononConnection {
       replay: (payload) => {
         if (this.disposed) return;
         // Preserve the persisted event bytes, not a regenerated status/envelope payload.
-        opts.transport.send(`{"jsonrpc":"2.0","method":"workflow.event","params":${payload}}`);
+        if(!this.transportAttached)throw new Error("message channel disconnected");
+        this.transport.send(`{"jsonrpc":"2.0","method":"workflow.event","params":${payload}}`);
       },
       requestInteraction: (params: unknown) => this.requestInteraction(params),
       acknowledgeInteraction:(id,response)=>this.interactionReceipts.applied(id,interactionHash(response)),
@@ -300,7 +304,10 @@ export class PhononConnection {
       resolveCwd: (projectId) => this.projects.resolveCwd(projectId),
       workflows: () => this.workflows,
       emit: (method, params) => this.peer.notifyRaw(method, params),
-      assertRunAllowed: (schedule) => this.policy.assertMethodAllowed(schedule.target.runKind === "dispatch" ? "schedule.trigger" : schedule.target.runKind === "workflow" ? "workflow.run" : "session.create"),
+      assertRunAllowed: (schedule) => {
+        if(!this.transportAttached&&schedule.target.runKind!=="dispatch")throw new PhononError("errPolicyDenied","new scheduled execution requires an authorized channel");
+        this.policy.assertMethodAllowed(schedule.target.runKind === "dispatch" ? "schedule.trigger" : schedule.target.runKind === "workflow" ? "workflow.run" : "session.create");
+      },
     });
     this.scheduler.start(opts.liveDispatchScheduleIds);
     this.scheduler.replayUnacked();
@@ -323,7 +330,21 @@ export class PhononConnection {
     return this.peer.handle(data);
   }
 
-  /** 连接断开时永久释放 connection-scoped runtime。 */
+  /** A socket is replaceable; the tenant runtime and its active turns are not. */
+  detachTransport(reason="connection lost"):void{
+    if(this.disposed||!this.transportAttached)return;
+    this.transportAttached=false;
+    clearTimeout(this.workflowRetryTimer);this.workflowRetryTimer=undefined;
+    this.peer.detachTransport(reason);
+  }
+  async attachTransport(tenant:string,transport:RpcTransport):Promise<void>{
+    if(this.disposed||tenant!==this.tenantId)throw new PhononError("errUnauthorized","runtime tenant changed");
+    this.transport=transport;this.transportAttached=true;this.peer.attachTransport(transport);
+    this.replayWorkflowEvents();
+    await this.scheduler?.transportReconnected();
+  }
+
+  /** Explicit shutdown permanently releases the runtime. */
   onClose(reason = "connection closed"): Promise<void> {
     return this.dispose(reason);
   }
@@ -338,9 +359,9 @@ export class PhononConnection {
   }
 
   /**
-   * Idempotent permanent teardown. Because SessionEngine is currently owned by
-   * a connection, active turns/runs are interrupted and persisted as
-   * paused/failed before a reconnect builds the replacement runtime.
+   * Idempotent device/client shutdown. Temporary socket outages only detach
+   * transport; explicit shutdown still fences active execution and persists
+   * its real settlement before releasing device-owned resources.
    */
   dispose(reason = "connection disposed"): Promise<void> {
     this.peerReporter?.close();
@@ -456,7 +477,7 @@ export class PhononConnection {
 
   /** 主动通知 server：agent 可用性变化（discovery.changed，D14）。 */
   notifyDiscoveryChanged(params: unknown): void {
-    if (this.disposed) return;
+    if (this.disposed||!this.transportAttached) return;
     const event = METHODS["discovery.changed"].params.parse(params);
     try { this.policy.assertAgentAllowed(event.agentId); } catch { return; }
     this.peer.notifyRaw("discovery.changed", event);

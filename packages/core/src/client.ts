@@ -53,6 +53,8 @@ export class PhononClient {
   private readonly managedMcp?: import("./index.js").ManagedMcpHandlers;
   private ws?: WebSocket;
   private conn?: PhononConnection;
+  /** Device/client-owned tenant execution, retained across replaceable sockets. */
+  private runtime?:PhononConnection;
   private dispatchClock?: SchedulerEngine;
   private dialing = new Map<WebSocket, (reason: string) => void>();
   private stopActive?: (reason: string) => void;
@@ -291,7 +293,11 @@ export class PhononClient {
           // Observation is not consent. Legacy non-private storage cannot grant.
           try{this.store.localDirectoryAdmissions().observe(localDirectorySource,welcome.tenantId);}catch{}
 
-          const conn = new PhononConnection({
+          if(this.runtime&&this.runtime.tenantId!==welcome.tenantId){
+            // Authentication to another tenant never adopts old execution.
+            await this.runtime.dispose("authenticated tenant changed");this.runtime=undefined;
+          }
+          const conn = this.runtime??new PhononConnection({
             liveDispatchScheduleIds,
             managedMcp: this.managedMcp,
             tenantId: welcome.tenantId,
@@ -308,6 +314,8 @@ export class PhononClient {
             maintenance: this.maintenance,
           });
           ownedConn = conn;
+          if(this.runtime)await conn.attachTransport(welcome.tenantId,transport);
+          assertCurrent();
           // welcome ACK is authoritative for already-received events. Persist it
           // before any replay so a crash during replay cannot resurrect them.
           for (const ack of welcome.ackedSeqs ?? []) conn.acknowledgeStream(ack.sessionId, ack.lastSeq);
@@ -342,6 +350,7 @@ export class PhononClient {
           assertCurrent();
           this.ws = ws;
           this.conn = conn;
+          this.runtime=conn;
           this.dialing.delete(ws);
           this.stopActive = reason => stop(new Error(reason));
           clearTimeout(deadline);
@@ -402,19 +411,15 @@ export class PhononClient {
   }
 
   private retire(conn: PhononConnection, reason: string): void {
-    if (!this.closed && !conn.isDisposed) {
-      const clock = conn.detachDispatchClock(reason);
-      if (clock) {
-        this.dispatchClock?.dispose("dispatch clock replaced");
-        this.dispatchClock = clock;
-      }
+    if(!this.closed&&!conn.isDisposed&&conn===this.runtime){
+      conn.detachTransport(reason);this.runtime=conn;return;
     }
     this.teardown = Promise.all([this.teardown, conn.dispose(reason)]).then(() => undefined);
     void this.teardown.catch(() => undefined);
   }
 
   private startDispatchClock(): void {
-    if (this.conn || this.dispatchClock) return;
+    if (this.runtime || this.conn || this.dispatchClock) return;
     // Only a previously authenticated server binding may select the local tenant.
     const tenantId = this.lastTenantId ?? this.store.connectionTenant(this.serverUrl);
     if (!tenantId || this.expectedTenantId !== undefined && tenantId !== this.expectedTenantId) return;
@@ -435,6 +440,7 @@ export class PhononClient {
     this.stopActive?.("client closed");
     this.dispatchClock?.dispose("client closed");
     this.dispatchClock = undefined;
+    if(this.runtime){this.teardown=Promise.all([this.teardown,this.runtime.dispose("client closed")]).then(()=>undefined);this.runtime=undefined;}
     this.closing = this.teardown.then(() => {
       if (this.ownsStore && !this.storeClosed) {
         this.storeClosed = true;

@@ -139,7 +139,7 @@ test("dispose during scheduled session creation cannot resurrect a running run o
   store.close();
 });
 
-test("PhononClient auto-reconnect disposes the replaced connection and close disposes the current one", async () => {
+test("PhononClient auto-reconnect retains the execution runtime and explicit close disposes it", async () => {
   const wss = new WebSocketServer({ port: 0 });
   await new Promise<void>((resolve) => wss.once("listening", resolve));
   const address = wss.address();
@@ -164,8 +164,8 @@ test("PhononClient auto-reconnect disposes the replaced connection and close dis
   const first = client.connection;
   assert.ok(first);
   sockets[0]!.close();
-  await waitFor(() => sockets.length >= 2 && !!client.connection && client.connection !== first);
-  assert.equal(first.isDisposed, true, "socket close tears down the old runtime before reconnect");
+  await waitFor(() => sockets.length >= 2 && !!client.connection);
+  assert.equal(client.connection,first);assert.equal(first.isDisposed, false, "socket close must not tear down execution");
 
   const current = client.connection!;
   await client.close();
@@ -210,8 +210,8 @@ test("failed candidate dial preserves incumbent and incumbent close still reconn
 
   (client as unknown as { backoffMs: number }).backoffMs = 5;
   sockets[0]!.close();
-  await waitFor(() => sockets.length >= 3 && !!client.connection && client.connection !== incumbent);
-  assert.equal(incumbent.isDisposed, true);
+  await waitFor(() => sockets.length >= 3 && !!client.connection);
+  assert.equal(client.connection,incumbent);assert.equal(incumbent.isDisposed, false);
 
   await client.close();
   await new Promise<void>((resolve) => wss.close(() => resolve()));

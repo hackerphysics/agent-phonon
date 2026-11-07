@@ -126,6 +126,20 @@ export class SchedulerEngine {
     }
   }
 
+  /** Reconcile due local occurrences on a new socket without restarting or
+   * retiring the device-owned execution clock. Cursor commits remain atomic. */
+  async transportReconnected():Promise<void>{
+    if(this.disposed||!this.started)return;
+    for(const row of this.opts.store.listSchedules(this.opts.tenantId)){
+      const schedule=this.rowToSchedule(row);
+      if(schedule.enabled&&schedule.trigger.kind==="cron"&&schedule.target.runKind==="dispatch"
+        &&schedule.nextRunAt&&Date.parse(schedule.nextRunAt)<=this.now()){
+        this.disarm(schedule.id);await this.onCronFire(schedule.id);
+      }
+    }
+    this.replayUnacked();
+  }
+
   stop(): void {
     this.started = false;
     if (this.leaseTimer) clearInterval(this.leaseTimer);

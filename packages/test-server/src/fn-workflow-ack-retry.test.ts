@@ -194,7 +194,7 @@ test("rejected reliable handler never ACKs; disposal stops retries and leaves du
   await f.client.close(); time.tick(60_000); await drain(); assert.equal(time.active.size, 0);
 }));
 
-test("transport replacement retires old retry ownership and only the successor can drain", async t => withPeerFixture("workflow-ack-replacement", async scope => {
+test("transport replacement retains execution and only the winning socket can drain", async t => withPeerFixture("workflow-ack-replacement", async scope => {
   const time = clock(t);
   const f = await fixture(scope, { dropAck: (_ack, socket) => socket === 0 });
   seed(f.store, "replacement");
@@ -203,7 +203,7 @@ test("transport replacement retires old retry ownership and only the successor c
   time.tick(1_000);
   await f.client.connect();
   await until(() => f.store.delivery.snapshot().channels.workflow.count === 0, "successor ACK");
-  assert.equal(previous.isDisposed, true); assert.notEqual(f.client.connection, previous);
+  assert.equal(previous.isDisposed, false); assert.equal(f.client.connection, previous);
   assert.equal(f.sockets.length, 2);
   const oldCount = f.events.filter(value => value.socket === 0).length;
   seed(f.store, "successor-only");

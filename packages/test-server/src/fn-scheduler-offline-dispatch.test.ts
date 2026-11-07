@@ -156,24 +156,24 @@ for (const catchUp of [false, true]) {
     assert.ok(candidate, "the candidate must reach the unpublished welcome window");
     assert.equal(f.client.connection, undefined);
     assert.equal((f.client as unknown as { dispatchClock?: SchedulerEngine }).dispatchClock, undefined);
-    assert.equal(starts.mock.callCount(), 1, "the candidate owns the handed-off clock");
+    assert.equal(starts.mock.callCount(), 0, "socket replacement reuses the device clock");
     t.mock.timers.setTime(Date.now() + 3 * 60000);
     assert.equal(f.runs().length, 0);
     assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:01:00.000Z");
 
     const accepted = t.mock.method(f.store, "acceptCronRun");
     const replacement = f.connect();
-    assert.equal(candidate.isDisposed, true, "supersession must retire the unpublished candidate synchronously");
+    assert.equal(candidate.isDisposed, false, "supersession detaches only the candidate socket, not the retained runtime");
     release();
     const device = await replacement;
     await superseded;
-    assert.notEqual(f.client.connection, candidate, "the retired candidate must never publish");
+    assert.equal(f.client.connection, candidate, "the same retained runtime attaches only to the winning socket");
     const pending = await device.schedule.runs.list({ scheduleId: f.schedule.id, unackedOnly: true });
     assert.equal(pending.runs.length, 3, "live obligations must neither skip nor fold into a cold-start receipt");
     assert.deepEqual(accepted.mock.calls.map(call => call.arguments[1]), [
       "2026-11-05T00:02:00.000Z", "2026-11-05T00:03:00.000Z", "2026-11-05T00:04:00.000Z",
     ], "each owed occurrence must advance the durable cursor by exactly one minute");
-    assert.equal(starts.mock.callCount(), 2, "only the candidate and replacement may start clocks; no competing cold clock");
+    assert.equal(starts.mock.callCount(), 0, "no reconnect may start a competing execution clock");
     assert.equal(f.store.getSchedule(f.schedule.id, "offline-owner")?.next_run_at, "2026-11-05T00:04:00.000Z");
     await f.tick();
     assert.equal(f.runs().length, 4, "only the replacement may record the next tick");

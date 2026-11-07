@@ -30,6 +30,7 @@ interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
+  wire?: string;
 }
 
 export class RpcPeer extends EventEmitter {
@@ -38,6 +39,8 @@ export class RpcPeer extends EventEmitter {
   private pending = new Map<string | number, Pending>();
   private nextId = 1;
   private disposed = false;
+  private attached = true;
+  private transportEpoch = 0;
 
   constructor(transport: RpcTransport, handler: RpcHandler) {
     super();
@@ -65,8 +68,12 @@ export class RpcPeer extends EventEmitter {
             }, timeoutMs)
           : undefined;
       const requestId = (params as { requestId?: string } | undefined)?.requestId;
-      this.pending.set(id, { resolve, reject, timer, method, requestId });
-      try { this.transport.send(JSON.stringify(msg)); }
+      const wire=JSON.stringify(msg);
+      this.pending.set(id, { resolve, reject, timer, method, requestId, wire });
+      // Human decisions have stable application identity and must wait across
+      // outages. Other uncertain effects require caller reconciliation, not replay.
+      if(!this.attached&&method==="interaction.request")return;
+      try { if(!this.attached)throw new Error("message channel disconnected; reconcile the original request identity");this.transport.send(wire); }
       catch (err) { if (timer) clearTimeout(timer); this.pending.delete(id); reject(err); }
     });
   }
@@ -90,12 +97,31 @@ export class RpcPeer extends EventEmitter {
 
   notifyRaw(method: string, params: unknown): void {
     if (this.disposed) return;
+    if(!this.attached)throw new Error("message channel disconnected");
     this.transport.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+  }
+
+  /** Transport loss is not execution disposal. Preserve only safely correlated
+   * human decisions; arbitrary effectful requests are never automatically replayed. */
+  detachTransport(reason:string):void{
+    if(this.disposed||!this.attached)return;
+    this.attached=false;this.transportEpoch++;
+    for(const [id,pending] of this.pending){
+      if(pending.method==="interaction.request")continue;
+      this.pending.delete(id);if(pending.timer)clearTimeout(pending.timer);
+      pending.reject(new Error(reason+"; receipt unconfirmed, reconcile original request"));
+    }
+  }
+  attachTransport(transport:RpcTransport):void{
+    if(this.disposed)throw new Error("RPC peer disposed");
+    this.transport=transport;this.attached=true;this.transportEpoch++;
+    for(const pending of this.pending.values())if(pending.method==="interaction.request"&&pending.wire)transport.send(pending.wire);
   }
 
   /** 喂入一条收到的文本。 */
   async handle(data: string): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed||!this.attached) return;
+    const epoch=this.transportEpoch,transport=this.transport;
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(data);
@@ -123,13 +149,13 @@ export class RpcPeer extends EventEmitter {
       const isNotification = !("id" in msg) || msg.id === undefined || msg.id === null;
       try {
         const result = await this.handler(msg.method, msg.params);
-        if (!isNotification) {
-          this.transport.send(
+        if (!isNotification&&this.attached&&this.transportEpoch===epoch) {
+          transport.send(
             JSON.stringify({ jsonrpc: "2.0", id: msg.id as JsonRpcId, result: result ?? null }),
           );
         }
       } catch (err) {
-        if (!isNotification) {
+        if (!isNotification&&this.attached&&this.transportEpoch===epoch) {
           const appCode = (err as { appCode?: string })?.appCode;
           const message = (err as Error)?.message ?? "internal error";
           this.transport.send(
