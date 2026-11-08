@@ -33,12 +33,16 @@ export async function collectDeviceInfo() {
 async function inferCapabilities(): Promise<string[]> {
   const caps = new Set<string>(["project_namespace_v1","durable_workflow_dispatch_v1","manual_dev_recovery_v1","dev_dispatch_identity_v1","current_turn_input_v1","native_chat_workflow_v1","native_interaction_receipts_v1","employee_profiles_v1","native_conversation_board_v1","session_compression_receipts_v1","turn_reasoning_v1","best_effort_reasoning_v1","native_workflow_delegation_v1","native_conversation_messages_v1"]);
   caps.add("native_detached_workflow_v1");
+  caps.add("native_reasoning_levels_v1");
+  caps.add("native_workflow_modes_v1");
+  caps.add("native_workflow_creator_questions_v1");
   caps.add("workspace_directory_picker_v1");
   caps.add("native_proactive_output_v1");
   caps.add("session_recovery_v1");
   caps.add("native_stop_settlement_v1");
   caps.add("message_inbox_v1");
   caps.add("native_conversation_message_files_v1");
+  caps.add("native_group_history_v1");
   caps.add("project_coordination_v1");
   caps.add("dev_native_interactions_v1");
   caps.add("native_group_history_v1");

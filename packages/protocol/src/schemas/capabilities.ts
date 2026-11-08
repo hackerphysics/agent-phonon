@@ -24,6 +24,7 @@ export type HookType = z.infer<typeof HookType>;
  */
 export const AgentCapabilities = z.object({
   employeeProfiles:z.boolean().optional(),
+  employeeProfileBindings:z.boolean().optional(),
   reasoningControl: z.boolean().optional(),
   /** 原生 session / resume（无则由 core 用注册表模拟）。 */
   nativeSession: z.boolean(),

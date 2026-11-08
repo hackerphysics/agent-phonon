@@ -305,6 +305,14 @@ export async function* query({prompt,options}) {
 export function createSdkMcpServer(){throw new Error('Mock receive fixture must not register native tools');}
 `;
 
+test("Claude peer runner preserves native effort through the SDK extraArgs boundary",()=>fixture(async f=>{
+  const asset=prepareClaudePeerRunner(f.options,{entry:"/owned/cli.js",sdk:"/owned/sdk.mjs"},{sessionId:f.state.native,prompt:"Original",model:"default",resume:false,effort:"ultracode"});
+  try{
+    assert.equal(JSON.parse(asset.stdin).effort,"ultracode");
+    assert.ok(readFileSync(asset.args[0]!,"utf8").includes('...(frame.effort?{effort:frame.effort}:{})'));
+  }finally{asset.cleanup();}
+}));
+
 for(const failure of[false,true])test(`Claude owned SDK transport keeps native identity, filters child tools and ${failure?"rejects native error results":"uses only native final text"}`,()=>fixture(async f=>{
   const cli=join(f.root,"cli.js"),sdk=join(f.root,"sdk.mjs");
   writeFileSync(cli,`#!${process.execPath}\nconsole.log('2.0.1 (Claude Code)');\n`,{mode:0o700});writeFileSync(sdk,MOCK_SDK);

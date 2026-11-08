@@ -72,7 +72,7 @@ test("OpenCode maps only unambiguous, enabled native effort variants and strips 
 });
 
 test("OpenClaw retains native id-based thinking levels without guessing model support",()=>{
-  assert.deepEqual(parseOpenClawNativeModels({models:[{id:"model",provider:"native",available:true,thinkingLevels:[{id:"off"},{id:"medium"},{id:"xhigh"},{id:"max"}]}]})[0]?.reasoningLevels,["standard","xhigh","max"]);
+  assert.deepEqual(parseOpenClawNativeModels({models:[{id:"model",provider:"native",available:true,thinkingLevels:[{id:"off"},{id:"medium"},{id:"xhigh"},{id:"max"}]}]})[0]?.reasoningLevels,["off","standard","xhigh","max"]);
   assert.equal(parseOpenClawNativeModels({models:[{key:"native/plain",available:true}]})[0]?.reasoningLevels,undefined);
   assert.throws(()=>parseOpenClawNativeModels({models:[{key:"duplicate"},{key:"duplicate"}]}));
 });
@@ -128,16 +128,55 @@ test("OpenCode discovers pure native metadata and applies the mapped variant onc
   assert.equal(sends[1].args[sends[1].args.indexOf("--variant")+1],"peak");
 }));
 
-test("OpenClaw one-shot CLI uses agent-scoped native levels and sends thinking without inventing confirmation",{skip:process.platform==="win32"},()=>withPeerFixture("openclaw-cli-effort",async scope=>{
+test("OpenClaw one-shot metadata cannot bypass the qualified Gateway execution requirement",{skip:process.platform==="win32"},()=>withPeerFixture("openclaw-cli-effort",async scope=>{
   const f=fixture(scope.root,{kind:"openclaw"}),adapter=new OpenClawAdapter({binPath:f.bin,defaultAgent:"owned"});
   const descriptor=(await adapter.discoverAgents())[0]!;
   assert.equal(descriptor.capabilities.reasoningControl,true);assert.deepEqual(descriptor.models[0]?.reasoningLevels,["low","standard","max"]);
   const session=await adapter.createSession({sessionId:"fixture",agentId:"openclaw:owned",model:"fixture/model",cwd:scope.root});scope.defer(()=>session.terminate());
   const events:any[]=[],proof:unknown[]=[];
-  await session.send("original input",{turnId:"turn",verbosity:"trace",emit:event=>events.push(event),reasoning:{level:"standard"},acknowledgeReasoning:value=>proof.push(value)});
-  assert.equal(events.at(-1)?.status,"completed");assert.deepEqual(proof,[]);
-  const calls=f.calls(),sent=calls.filter(call=>call.args.includes("--message"));assert.equal(sent.length,1);
-  assert.equal(sent[0].args[sent[0].args.indexOf("--thinking")+1],"medium");
+  await assert.rejects(session.send("original input",{turnId:"turn",verbosity:"trace",emit:event=>events.push(event),reasoning:{level:"standard"},acknowledgeReasoning:value=>proof.push(value)}),{appCode:"errCapabilityUnsupported"});
+  assert.deepEqual(events,[]);assert.deepEqual(proof,[]);
+  const calls=f.calls(),sent=calls.filter(call=>call.args.includes("--message"));assert.equal(sent.length,0);
   assert.equal(calls.find(call=>call.args[0]==="models").args[3],"owned");
   assert.equal(JSON.parse(calls.find(call=>call.args[0]==="gateway").args[4]).agentId,"owned");
+}));
+
+test("native catalogs retain off, none, minimal, ultra and future effort identifiers",()=>{
+  const levels=["off","none","minimal","low","medium","high","xhigh","max","ultra","auto","adaptive","native-next"];
+  const canonical=levels.map(level=>level==="medium"?"standard":level);
+  assert.deepEqual(parseCopilotNativeModels({models:[{...models[0],supportedReasoningEfforts:levels}]})[0]?.reasoningLevels,canonical);
+  assert.deepEqual(parseOpenClawNativeModels({models:[{key:"native/model",thinkingLevels:levels.map(id=>({id}))} ]})[0]?.reasoningLevels,canonical);
+  const variants=Object.fromEntries(levels.map((level,index)=>["variant-"+index,{reasoningEffort:level}]));
+  const parsed=parseOpenCodeNativeModels("fixture/model\n"+JSON.stringify({...opencode,variants},null,2));
+  assert.deepEqual(parsed.models[0]?.reasoningLevels,canonical);
+  canonical.forEach((level,index)=>assert.equal(parsed.variants.get("fixture/model")?.get(level),"variant-"+index));
+});
+
+test("Copilot sends every advertised native effort unchanged on the original turn",{skip:process.platform==="win32"},()=>withPeerFixture("copilot-all-native-efforts",async scope=>{
+  const levels=["off","none","minimal","ultra","auto","adaptive","native-next"];
+  const f=fixture(scope.root,{kind:"copilot",models:[{...models[0],supportedReasoningEfforts:levels}]}),adapter=new CopilotAdapter({env:{binPath:f.bin,defaultModel:"model"}});
+  assert.deepEqual((await adapter.discoverAgents())[0]?.models.find(model=>model.id==="model")?.reasoningLevels,levels);
+  const session=await adapter.createSession({sessionId:"fixture",agentId:"copilot",model:"model",cwd:scope.root});scope.defer(()=>session.terminate());
+  for(const level of levels){
+    const proof:unknown[]=[],events:any[]=[];
+    await session.send("original "+level,{turnId:level,verbosity:"final",reasoning:{level},acknowledgeReasoning:value=>proof.push(value),emit:event=>events.push(event)});
+    assert.deepEqual(proof,[level]);assert.equal(events.at(-1)?.status,"completed");
+  }
+  const sends=f.calls().filter(call=>call.prompt);
+  assert.equal(sends.length,levels.length);
+  assert.deepEqual(sends.map(call=>call.args[call.args.indexOf("--reasoning-effort")+1]),levels);
+}));
+
+test("OpenCode passes every discovered effort's actual variant instead of a guessed level name",()=>withPeerFixture("opencode-all-native-efforts",async scope=>{
+  const levels=["off","none","minimal","ultra","auto","adaptive","native-next"];
+  const variants=Object.fromEntries(levels.map((level,i)=>["native-variant-"+i,{reasoningEffort:level}]));
+  const f=fixture(scope.root,{kind:"opencode",opencode:{...opencode,variants}}),adapter=new OpenCodeAdapter({env:{binPath:f.bin}});
+  assert.deepEqual((await adapter.discoverAgents())[0]?.models.find(model=>model.id==="fixture/model")?.reasoningLevels,levels);
+  const session=await adapter.createSession({sessionId:"fixture",agentId:"opencode",model:"fixture/model",cwd:scope.root});scope.defer(()=>session.terminate());
+  for(const level of levels){const events:any[]=[],proof:unknown[]=[];
+    await session.send("original "+level,{turnId:level,verbosity:"final",reasoning:{level},emit:event=>events.push(event),acknowledgeReasoning:value=>proof.push(value)});
+    assert.equal(events.at(-1)?.status,"completed");assert.deepEqual(proof,[]);
+  }
+  const sends=f.calls().filter(call=>call.args[0]==="run");
+  assert.deepEqual(sends.map(call=>call.args[call.args.indexOf("--variant")+1]),levels.map((_,i)=>"native-variant-"+i));
 }));

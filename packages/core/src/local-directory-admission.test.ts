@@ -72,8 +72,8 @@ for(const phase of ["create","create-late","recover","recover-observe","recover-
   test(`admission generation real connection preparation ${phase}`,()=>withPeerFixture("admission-generation-prep",async scope=>{
     const f=await fixture(scope);f.admit();const call=f.connect(),engine=(call.connection as any).engine as SessionEngine;
     const project=(await call("project.create",f.params)).result.project;
-    const gate=deferred(),entered=deferred(),sent=deferred(),effects:string[]=[];
-    scope.defer(()=>{gate.release();entered.release();sent.release();});
+    const gate=deferred(),entered=deferred(),sent=deferred(),activeTurn=deferred(),effects:string[]=[];
+    scope.defer(()=>{gate.release();entered.release();sent.release();activeTurn.release();});
     let delay=false;
     const block=async()=>{entered.release();await gate.promise;};
     const employee={id:"11111111-1111-4111-8111-111111111111",revision:1};
@@ -81,7 +81,7 @@ for(const phase of ["create","create-late","recover","recover-observe","recover-
       prepareSkills:()=>({}),loadSkills:async()=>{await block();return {context:"",names:[],bindings:[]};},
       resolveEmployee:async()=>{if(delay&&["create","recover","recover-prep","refresh"].includes(phase))await block();return {...employee,revision:delay?2:1,context:[]};},useEmployee:()=>()=>{},
     });
-    const native={model:"fake",send:async(input:string)=>{effects.push(input);sent.release();if(phase==="insertion")await gate.promise;},
+    const native={model:"fake",send:async(input:string)=>{effects.push(input);sent.release();if(phase==="insertion")await activeTurn.promise;},
       interrupt:async()=>{},terminate:async()=>{effects.push("terminate");},inject:async()=>{effects.push("inject");},insertAtToolGap:async()=>{effects.push("insert");},
       describe:async()=>{if(delay&&phase==="compress")await block();return {usedTokens:1};},compressNative:async()=>{effects.push("compress");return {applied:true};},
     };
@@ -132,7 +132,7 @@ for(const phase of ["create","create-late","recover","recover-observe","recover-
       if(phase==="compress")assert.equal((result.value as any).errorCode,"compression_not_dispatched");
       else if(phase==="send-admission")assert.equal((result.value as any).error?.data?.appCode,"errPolicyDenied");
       else if(phase!=="skills")assert.equal(result.error?.appCode,"errPolicyDenied");
-    }finally{gate.release();entered.release();sent.release();}
+    }finally{gate.release();entered.release();sent.release();activeTurn.release();}
   }));
 }
 

@@ -99,7 +99,7 @@ def observe(self, *args, **kwargs):
     if reasoning_request is not None:
         config = getattr(self, "reasoning_config", None)
         observed = "off" if isinstance(config, dict) and config.get("enabled") is False else (config.get("effort") if isinstance(config, dict) else None)
-        if observed in ("off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto", "adaptive"):
+        if isinstance(observed, str) and 1 <= len(observed) <= 64 and 'a' <= observed[0] <= 'z' and all('a' <= c <= 'z' or '0' <= c <= '9' or c in '_-' for c in observed):
             emit({"type": "hermes_reasoning", "native_value": observed})
     close_peer_context = _phonon_install_peer_context(self)
     old_ids = {c.get("id") for m in history if isinstance(m, dict) for c in (m.get("tool_calls") or [])}

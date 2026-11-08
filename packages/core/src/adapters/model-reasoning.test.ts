@@ -12,6 +12,38 @@ import { PiAdapter } from "./pi.js";
 import { parseHermesReasoningLevels } from "./hermes.js";
 import { discoverCodexNativeModels, parseCodexNativeModels } from "./codex-models.js";
 import { discoverPiNativeModels, parsePiNativeModels, piModelReasoningLevels } from "./pi-models.js";
+import { ClaudeCodeAdapter,parseClaudeReasoningLevels } from "./claude-code.js";
+
+test("Claude advertises only an installed effort flag and retains native named levels",()=>{
+  assert.equal(parseClaudeReasoningLevels("--model <id>"),undefined);
+  assert.deepEqual(parseClaudeReasoningLevels("  --effort <level>  Effort level (choices: low, medium, high, max, ultracode)\n  --model <id>"),["low","standard","high","max","ultracode"]);
+});
+
+test("Claude sends native efforts on the original CLI invocation without inventing confirmation",()=>withPeerFixture("claude-native-efforts",async scope=>{
+  const bin=join(scope.root,"claude.mjs"),calls=join(scope.root,"calls.jsonl");
+  writeFileSync(bin,"#!"+process.execPath+"\n"+String.raw`
+import fs from 'node:fs';const args=process.argv.slice(2);
+if(args.includes('--version')){console.log('2.1.203');process.exit(0);}
+if(args.includes('--help')){console.log('  --effort <level>  Effort (choices: low, medium, high, max, ultracode)');process.exit(0);}
+let input='';for await(const chunk of process.stdin)input+=chunk;
+fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({args,input})+'\n');
+const id=args[args.indexOf(args.includes('--resume')?'--resume':'--session-id')+1];
+console.log(JSON.stringify({type:'result',session_id:id,subtype:'success',is_error:false,result:'actual result',num_turns:1}));
+`,{mode:0o700});
+  const adapter=new ClaudeCodeAdapter({env:{binPath:bin,defaultModel:"native"}});
+  const descriptor=(await adapter.discoverAgents())[0]!;
+  assert.equal(descriptor.capabilities.reasoningControl,true);
+  assert.deepEqual(descriptor.models[0]?.reasoningLevels,["low","standard","high","max","ultracode"]);
+  const session=await adapter.createSession({sessionId:"fixture",agentId:"claude-code",model:"native",cwd:scope.root});scope.defer(()=>session.terminate());
+  for(const level of ["standard","max","ultracode"]){
+    const events:any[]=[],proof:unknown[]=[];
+    await session.send("original "+level,{turnId:level,verbosity:"final",reasoning:{level},emit:event=>events.push(event),acknowledgeReasoning:value=>proof.push(value)});
+    assert.equal(events.at(-1)?.status,"completed");assert.deepEqual(proof,[]);
+  }
+  const sent=readFileSync(calls,"utf8").trim().split("\n").map(line=>JSON.parse(line));
+  assert.deepEqual(sent.map(row=>row.args[row.args.indexOf("--effort")+1]),["medium","max","ultracode"]);
+  assert(sent.every(row=>!row.args.includes("--dangerously-skip-permissions")));
+}));
 
 const cli = String.raw`
 import fs from 'node:fs';import path from 'node:path';import {fileURLToPath} from 'node:url';
@@ -53,26 +85,37 @@ test("reasoning protocol and canonical mapping preserve max as a distinct native
   assert.deepEqual(TurnReasoning.parse({ level: "max" }), { level: "max" });
   assert.equal(SessionSendParams.parse({ sessionId: "session", input: "task", reasoning: { level: "max" } }).reasoning?.level, "max");
   assert.equal(nativeReasoning("max"), "max");
-  assert.deepEqual(reportedReasoningLevels(["medium", "xhigh", "max", "max", "ultra"]), ["standard", "xhigh", "max"]);
+  assert.deepEqual(reportedReasoningLevels(["medium", "xhigh", "max", "max", "ultra"]), ["standard", "xhigh", "max", "ultra"]);
   assert.deepEqual(reportedReasoningLevels(["medium", "standard", "high"]), ["standard", "high"]);
   assert.equal(ReasoningConfirmation.parse({ requestedLevel: "max", nativeValue: "max", effectiveLevel: "max" }).effectiveLevel, "max");
   assert.equal(ModelInfo.parse({ id: "model", reasoningLevels: ["low", "standard", "high", "xhigh", "max"] }).reasoningLevels?.length, 5);
-  assert.equal(ModelInfo.safeParse({ id: "model", reasoningLevels: ["ultra"] }).success, false);
+  const native = ["off", "none", "minimal", "low", "standard", "high", "xhigh", "max", "ultra", "auto", "adaptive", "ultracode", "native-next"];
+  assert.deepEqual(ModelInfo.parse({ id: "model", reasoningLevels: native }).reasoningLevels, native);
+  for (const level of native) {
+    assert.equal(TurnReasoning.parse({ level }).level, level);
+    assert.equal(nativeReasoning(level), level === "standard" ? "medium" : level);
+    assert.equal(ReasoningConfirmation.parse({ requestedLevel: level, nativeValue: nativeReasoning(level), effectiveLevel: level }).effectiveLevel, level);
+  }
+  for (const invalid of ["", " high", "HIGH", "high\n", "--help", "high;cmd", "x".repeat(65)]) {
+    assert.equal(TurnReasoning.safeParse({ level: invalid }).success, false);
+  }
+  assert.equal(ModelInfo.safeParse({ id: "model", reasoningLevels: ["low", "low"] }).success, false);
 });
 
 test("Pi native maps advertise advanced effort only for the exact supporting model", () => {
-  assert.deepEqual(models.map(model => piModelReasoningLevels(model)), [["low", "standard", "high"], ["low", "standard", "high", "xhigh", "max"], ["high"], []]);
+  assert.deepEqual(models.map(model => piModelReasoningLevels(model)), [["off", "minimal", "low", "standard", "high"], ["off", "minimal", "low", "standard", "high", "xhigh", "max"], ["off", "minimal", "high"], ["off"]]);
   assert.equal(piModelReasoningLevels({ reasoning: true, thinkingLevelMap: { max: 123 } }), undefined);
   assert.equal(piModelReasoningLevels({}), undefined);
-  assert.deepEqual(piModelReasoningLevels({ reasoning: true, thinkingLevelMap: { xhigh: "", max: "" } }), ["low", "standard", "high", "xhigh", "max"]);
+  assert.deepEqual(piModelReasoningLevels({ reasoning: true, thinkingLevelMap: { xhigh: "", max: "" } }), ["off", "minimal", "low", "standard", "high", "xhigh", "max"]);
+  assert.deepEqual(piModelReasoningLevels({ reasoning: true, thinkingLevelMap: { off: null, minimal: null } }), ["low", "standard", "high"]);
   const parsed = parsePiNativeModels({ models: [{ ...models[1], headers: { Authorization: "synthetic-not-a-secret" } }] });
-  assert.deepEqual(parsed[0]?.reasoningLevels, ["low", "standard", "high", "xhigh", "max"]);
+  assert.deepEqual(parsed[0]?.reasoningLevels, ["off", "minimal", "low", "standard", "high", "xhigh", "max"]);
   assert.equal("headers" in parsed[0]!, false);
 });
 
 test("Hermes derives CLI-accepted levels from its native help without adding unrelated options", () => {
   const help = "  --reasoning LEVEL     Reasoning effort for this session: none, minimal, low,\n                        medium, high, xhigh, max, or ultra. Overrides\n                        agent.reasoning_effort for this run only.\n  --max-turns N         Maximum turns\n";
-  assert.deepEqual(parseHermesReasoningLevels(help), ["low", "standard", "high", "xhigh", "max"]);
+  assert.deepEqual(parseHermesReasoningLevels(help), ["none", "minimal", "low", "standard", "high", "xhigh", "max", "ultra"]);
   assert.deepEqual(parseHermesReasoningLevels("  --reasoning LEVEL     Choose low, medium, high\n  --max-turns N\n"), ["low", "standard", "high"]);
   assert.equal(parseHermesReasoningLevels("--reasoning LEVEL\n--max-turns N"), undefined);
 });
@@ -113,7 +156,7 @@ test("Pi metadata discovery has no prompt or persistent session and keeps model 
   const f = setup(scope.root);
   const result = await discoverPiNativeModels({ bin: f.bin, env: process.env, onRuntime: runtime => scope.watch(runtime.child, true) });
   assert.equal(result.selectedID, "fixture/ordinary");
-  assert.deepEqual(result.models[1]?.reasoningLevels, ["low", "standard", "high", "xhigh", "max"]);
+  assert.deepEqual(result.models[1]?.reasoningLevels, ["off", "minimal", "low", "standard", "high", "xhigh", "max"]);
   assert.deepEqual(f.queries().map(row => row.query.type), ["get_available_models", "get_state"]);
   assert(f.queries().every(row => row.args.includes("--no-session") && row.args.includes("--no-context-files") && row.args.includes("--no-extensions")));
 }));
@@ -141,7 +184,7 @@ test("Pi catalog enriches its native selected alias without mutating owner model
   const f = setup(scope.root), explicit = [{ id: "ordinary", available: true }];
   const adapter = new PiAdapter({ env: { binPath: f.bin, defaultModel: "ordinary", models: explicit } });
   const result = (await adapter.discoverAgents())[0]!;
-  assert.deepEqual(result.models[0]?.reasoningLevels, ["low", "standard", "high"]);
+  assert.deepEqual(result.models[0]?.reasoningLevels, ["off", "minimal", "low", "standard", "high"]);
   assert.deepEqual(explicit, [{ id: "ordinary", available: true }]);
 }));
 

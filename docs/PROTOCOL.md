@@ -51,7 +51,7 @@ phonon 拿 device key 主动拨出连服务端；单条 WebSocket 上双向跑 J
 | `interaction.cancel` | server→phonon | request | 主动取消 pending 交互（P1-5） |
 | `interaction.status` | server→phonon | request | 查询 tenant 隔离的持久交互回执、请求/回应哈希和可信运行归属；区分已送达与执行方已确认消费 |
 | `conversation.board` | phonon→server | request | 当前原生轮次读写自己的会话状态板；控制器标记来源，服务端校验权限、版本及幂等回执。 |
-| `conversation.workflow` | phonon→server | request | DE 读取显式 Agent / Role / 工作副本目录、提交跨设备 DAG 并按来源选择请求审批；返回真实子任务结果，不把工作 Agent 加入群。 |
+| `conversation.workflow` | phonon→server | request | DE 读取显式 Agent / Role / 工作副本目录，提交同设备或跨设备 DAG、循环 Graph、多轮 Discussion 并按来源选择请求审批；worker 只读父计划状态，不创建或发起计划。 |
 | `conversation.message` | phonon→server | request | 当前项目群 DE 的成员查询、显式定向消息及只读回执；身份由控制器标记，权限、预算及真实投递状态由服务端维护。 |
 | `project.coordination` | phonon→server | request | 独立项目协作目录、活动声明、跨设备信箱与回执；不写人类聊天、不自动启动任务。详见 `PROJECT_COORDINATION.md`。 |
 | `conversation.archive.append/read/status` | server→phonon | request | 独立持久化 Phonon 规范会话记录、固定水位分页和查询归档检查点；默认关闭，不启动 Agent、不替代附件归档或安全回收。见 [CONVERSATION_ARCHIVE.md](CONVERSATION_ARCHIVE.md)。 |

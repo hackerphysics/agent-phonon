@@ -1043,6 +1043,10 @@ export class SessionEngine {
           const hint=rec.adapterSession.recoveryHint?.();
           if(hint)this.store?.saveRecoveryHint(rec.tenantId,rec.sessionId,this.nativeOwner,JSON.stringify(hint));
         },
+        beforeNativeEffect:()=>{
+          if(this.disposed||abort.signal.aborted||rec.currentTurnId!==turnId||rec.terminalTurns.has(turnId))throw new PhononError("errSessionBusy","original native turn ended");
+          this.assertProjectAuthority(rec,authority);
+        },
         ...(peerContext?{peerContext}:{}),
         ...(nativeReasoningRequest?{reasoning:nativeReasoningRequest,acknowledgeReasoning}:{}),
         ...(requestInteraction?{requestInteraction,acknowledgeInteraction}:{}),...(conversationBoard?{conversationBoard}:{}),...(conversationWorkflow?{conversationWorkflow}:{}),...(conversationMessage?{conversationMessage}:{}),...(publishDocument?{publishDocument}:{}),...(projectCoordination?{projectCoordination}:{}) });

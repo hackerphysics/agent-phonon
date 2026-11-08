@@ -42,7 +42,7 @@ test("one-level native suggestions filter by prefix before the limit and hide fo
   await assert.rejects(workspaceDirectorySuggestions(join(root,"foreign")+"/",100,policy,manager,()=>{}));
   await assert.rejects(workspaceDirectorySuggestions(scope.root+"/outside/",100,policy,manager,()=>{}));
 }));
-test("existing-directory registration preserves bytes, persists the identity and reuses one reference",()=>withPeerFixture("directory-registration",async scope=>{
+test("existing-directory registration preserves bytes and follows its bound path while new requests require current identity",()=>withPeerFixture("directory-registration",async scope=>{
   const root=join(scope.root,"work"),path=join(root,"Existing directory");mkdirSync(root);mkdirSync(path);writeFileSync(join(path,"source.txt"),"Original bytes\n");
   const policy=new PolicyEnforcer({workspaceRoot:root,trustLocal:true}),store=new PhononStore(join(scope.root,"state.db"));scope.defer(()=>store.close());
   const manager=new ProjectManager(()=>[],{namespace:"alice",workspaceRoot:root,store,assertProjectPath:path=>policy.assertProjectPath(path)});
@@ -53,6 +53,9 @@ test("existing-directory registration preserves bytes, persists the identity and
   const reopened=new ProjectManager(()=>[],{namespace:"alice",workspaceRoot:root,store,assertProjectPath:path=>policy.assertProjectPath(path)});
   assert.equal(reopened.get(first.projectId).directoryIdentity,identity);
   renameSync(path,path+"-old");mkdirSync(path);
-  assert.throws(()=>reopened.get(first.projectId));assert.equal(reopened.list().length,0);
+  assert.equal(reopened.get(first.projectId).path,path);assert.equal(reopened.list().length,1);
+  assert.equal(readFileSync(join(path+"-old","source.txt"),"utf8"),"Original bytes\n");
   await assert.rejects(reopened.create(params));
+  const replacement=await reopened.create({...params,existingDirectoryIdentity:directoryIdentity(path)});
+  assert.equal(replacement.projectId,first.projectId);assert.equal(reopened.list().length,1);
 }));

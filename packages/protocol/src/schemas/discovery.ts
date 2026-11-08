@@ -21,7 +21,7 @@ export const ModelInfo = z.object({
   contextWindow: z.number().int().positive().optional(),
   /** 该模型当前是否可用（如鉴权过期会变 false）。 */
   available: z.boolean().default(true),
-  reasoningLevels: z.array(ReasoningLevel).max(5).optional(),
+  reasoningLevels: z.array(ReasoningLevel).max(64).refine(levels => new Set(levels).size === levels.length).optional(),
 });
 export type ModelInfo = z.infer<typeof ModelInfo>;
 

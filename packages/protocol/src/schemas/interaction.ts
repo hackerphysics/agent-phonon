@@ -120,6 +120,8 @@ export const InteractionRequestResult = z.object({
   action: z.enum(["submit", "cancel", "timeout"]),
   /** 提交时各字段值（key → 值）。 */
   values: z.record(z.union([z.string(), z.array(z.string()), z.boolean(), z.number()])).optional(),
+  /** Source-confirmed responder attribution. DE replies never imply human approval. */
+  responder:z.object({kind:z.literal("de"),id:z.string().uuid(),runID:z.string().uuid()}).strict().optional(),
 });
 export type InteractionRequestResult = z.infer<typeof InteractionRequestResult>;
 

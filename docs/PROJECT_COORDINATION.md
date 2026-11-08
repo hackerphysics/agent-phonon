@@ -369,12 +369,21 @@ from ordinary Phonon streams while native records remain owner-inspectable.
 Coordinator secrets are captured by the module and removed from later shell
 environments when no independent controller callback needs the channel.
 
-This binding can observe only `context_hook` output, not the final provider
-payload. Core enforces that evidence ceiling and never labels it as a
-`provider_payload` or consumption ACK. A weaker observation cannot downgrade an
-existing stronger one. Installed acceptance separately inspects the actual next
-provider request and the native database; that test evidence is not silently
-promoted into a stronger production receipt.
+The qualified default native-fetch path now separates a pure controller
+authorization from observation. It confirms `provider_payload` only after
+invoking the selected native fetch with the assembled body, never merely after
+constructing a hook result. This is native submission evidence, not remote
+provider acceptance, model consumption or task completion. Provider failures
+remain native and the wrapper never retries them.
+
+A caller-configured fetch may rewrite the body; it retains the `context_hook`
+ceiling and cannot confirm ordinary insertion. Each private boundary declares
+its `inputEvidence` ceiling. Core preserves its peer receive path but rejects
+ordinary input rather than promoting a weak receipt or queuing another task.
+The private `/peer-context/authorize` operation validates exact offered IDs and
+current authority without changing journal state, recording delivery or
+answering approvals. Native API/SDK, endpoint, model, source and budget guards
+remain mandatory. Unknown transports remain unqualified.
 
 OpenCode pure mode and unqualified versions remain polling-only. In particular,
 the separately installed 1.15.10 did not complete its final reply in the tested

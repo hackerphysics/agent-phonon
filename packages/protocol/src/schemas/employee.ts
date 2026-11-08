@@ -5,6 +5,10 @@ export const EmployeeSelection=z.object({id:z.string().uuid(),revision:z.number(
 export const EmployeeProfileApplyParams=z.object({
   employeeId:z.string().uuid(),revision:z.number().int().positive(),agent:AgentId,model:z.string().min(1).max(240),
   profileId:z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  profileBinding:z.discriminatedUnion("kind",[
+    z.object({kind:z.literal("harness")}).strict(),
+    z.object({kind:z.literal("employee"),employeeId:z.string().uuid()}).strict(),
+  ]).optional(),
   name:z.string().min(1).max(120),responsibility:z.string().max(4000),
   documents:z.object({soul:z.string().max(100000),agents:z.string().max(100000),user:z.string().max(100000),tools:z.string().max(100000)}).strict(),
 }).strict();

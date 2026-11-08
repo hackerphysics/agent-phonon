@@ -5,12 +5,12 @@ import type { ProcessSupervisor } from "../process-supervisor.js";
 /** Pi >= 0.84.1's native getSupportedThinkingLevels contract, not a provider-name guess. */
 export function piModelReasoningLevels(model: Record<string, unknown>): ReasoningLevel[] | undefined {
   if (typeof model.reasoning !== "boolean") return undefined;
-  if (!model.reasoning) return [];
+  if (!model.reasoning) return ["off"];
   const raw = model.thinkingLevelMap;
   if (raw !== undefined && (!raw || typeof raw !== "object" || Array.isArray(raw))) return undefined;
   const map = (raw ?? {}) as Record<string, unknown>;
   if (Object.values(map).some(value => value !== null && typeof value !== "string")) return undefined;
-  const levels: Array<[ReasoningLevel, string]> = [["low", "low"], ["standard", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"]];
+  const levels: Array<[ReasoningLevel, string]> = [["off", "off"], ["minimal", "minimal"], ["low", "low"], ["standard", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"]];
   return levels.filter(([canonical, native]) => map[native] !== null
     && (!["xhigh", "max"].includes(canonical) || typeof map[native] === "string")).map(([canonical]) => canonical);
 }

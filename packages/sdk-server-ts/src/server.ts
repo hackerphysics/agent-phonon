@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { WebSocketServer, WebSocket } from "ws";
 import { RpcPeer, type Transport, newId } from "./rpc.js";
 import type {
+  TurnReasoning,
   AgentDescriptor,
   SessionMeta,
   StreamEvent,
@@ -165,7 +166,7 @@ export class PhononSession extends EventEmitter {
 
   /** Send input; inject resolves only after application to the current turn.
    * Unsupported modes reject unless an explicit supported fallback is given. */
-  async send(input: string, opts?: { verbosity?: "final" | "messages" | "tools" | "trace"; skills?: SkillSelectionInput[]; whenBusy?: "queue" | "interrupt" | "inject"; fallback?: "queue" | "interrupt" | "inject"; turnId?: string; clientRequestId?: string; reasoning?: {level:"low"|"standard"|"high"|"xhigh"|"max"|null} }): Promise<SendResult> {
+  async send(input: string, opts?: { verbosity?: "final" | "messages" | "tools" | "trace"; skills?: SkillSelectionInput[]; whenBusy?: "queue" | "interrupt" | "inject"; fallback?: "queue" | "interrupt" | "inject"; turnId?: string; clientRequestId?: string; reasoning?: TurnReasoning }): Promise<SendResult> {
     const payload={sessionId:this.sessionId,input,...opts};
     if(pinnedSkills(payload.skills??[])){
       const frozen=wireSnapshot(payload);await requireSkillCapabilities(this.device,frozen.skills??[],false);

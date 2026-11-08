@@ -253,6 +253,8 @@ export interface AgentAdapter {
   observeLegacySessionRecovery?(params: CreateSessionParams, evidence: {turnId:string;toolCallIds:string[];observedAt:string}): Promise<Record<string, unknown> | undefined>;
   provisionEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
   inspectEmployee?(target:EmployeeProfileTarget):Promise<EmployeeProfileObservation>;
+  /** Read an existing native profile without claiming ownership or changing its files. */
+  inspectHarnessProfile?(agent:string):Promise<EmployeeProfileObservation & {runtimeProfile:string}>;
 
   /**
    * global skill 安装目录（design D24 + 安全边界规则）。

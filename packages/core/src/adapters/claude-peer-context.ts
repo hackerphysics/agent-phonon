@@ -278,6 +278,7 @@ async function main() {
   if(typeof frame.prompt!=="string" || typeof frame.model!=="string" || typeof frame.resume!=="boolean"
     || frame.settingsPath!==undefined&&(typeof frame.settingsPath!=="string"||!isAbsolute(frame.settingsPath))
     || frame.cliNode!==undefined&&(typeof frame.cliNode!=="string"||!isAbsolute(frame.cliNode))
+    || frame.effort!==undefined&&(typeof frame.effort!=="string"||!/^[a-z][a-z0-9_-]{0,63}(?![\s\S])/.test(frame.effort))
     || !/^[a-f0-9-]{36}$/.test(sessionId||"")) throw new Error("Invalid native invocation");
   const local=(value,path)=>{const url=new URL(value||"");if(url.protocol!=="http:"||url.hostname!=="127.0.0.1"||!url.port||url.pathname!==path||url.username||url.password||url.search||url.hash)throw new Error("Invalid native channel");return url;};
   const endpoint=frame.peerEnabled?local(peerUrl,"/peer-context"):undefined;
@@ -343,7 +344,7 @@ async function main() {
     if(!startup.confirmed()) {startupRejected=true;active=false;return {continue:false,stopReason:"Native startup policy could not be verified"};}
     return callback(...args);
   });
-  const extraArgs={...(!frame.resume?{"session-id":sessionId}:{}),...(frame.settingsPath?{"setting-sources":"",settings:frame.settingsPath}:{})};
+  const extraArgs={...(!frame.resume?{"session-id":sessionId}:{}),...(frame.settingsPath?{"setting-sources":"",settings:frame.settingsPath}:{}),...(frame.effort?{effort:frame.effort}:{})};
   const options={cwd:process.cwd(),env:{...process.env},pathToClaudeCodeExecutable:entry,
     ...(frame.externalSdk?{spawnClaudeCodeProcess:startup.spawnClaudeCodeProcess,...(frame.cliNode?{executable:"node"}:{})}
       :{executable:"node",executableArgs:startup.executableArgs}),extraArgs,abortController:controller,hooks,
@@ -385,7 +386,7 @@ if(process.argv[1]===fileURLToPath(import.meta.url)) {
 `;
 
 export function prepareClaudePeerRunner(options: SendOptions, binding: ClaudeSdkBinding, input: {
-  sessionId: string; prompt: string; model: string; resume: boolean; settingsPath?: string;nativeInput?:boolean;
+  sessionId: string; prompt: string; model: string; resume: boolean; settingsPath?: string;nativeInput?:boolean;effort?:string;
 }): { args: string[]; stdin: string; cleanup: () => void } {
   if(options.peerContext){
     const endpoint = new URL(options.environment?.AGENT_PHONON_PEER_CONTEXT_URL ?? "");
@@ -400,7 +401,7 @@ export function prepareClaudePeerRunner(options: SendOptions, binding: ClaudeSdk
     const types=options.projectCoordination?pathToFileURL(createRequire(import.meta.url).resolve("@modelcontextprotocol/sdk/types.js")).href:"";
     return {args:[path,pathToFileURL(binding.sdk).href,binding.entry,input.sessionId,types],stdin:JSON.stringify({prompt:input.prompt,model:input.model,resume:input.resume,peerEnabled:!!options.peerContext,coordination:!!options.projectCoordination,
       otherControllerTools:!!(options.requestInteraction||options.conversationBoard||options.conversationWorkflow||options.conversationMessage||options.publishDocument),nativeInput:input.nativeInput===true,
-      ...(binding.kind==="external"?{externalSdk:true,...(binding.cliNode?{cliNode:binding.cliNode}:{})}:{}),...(input.settingsPath?{settingsPath:input.settingsPath}:{})}),
+      ...(binding.kind==="external"?{externalSdk:true,...(binding.cliNode?{cliNode:binding.cliNode}:{})}:{}),...(input.settingsPath?{settingsPath:input.settingsPath}:{}),...(input.effort?{effort:input.effort}:{})}),
       cleanup:()=>rmSync(directory,{recursive:true,force:true})};
   } catch(error) {rmSync(directory,{recursive:true,force:true});throw error;}
 }

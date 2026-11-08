@@ -78,10 +78,37 @@ frozen plan. The phone's authorized detail endpoint retains those full records.
 
 Use actual catalog IDs, not these examples. A node may select an independent
 canonical `roleID`. No raw path, model override, credential or `agentConfig` is
-accepted. Plans are bounded DAGs: 1-16 unique nodes, valid acyclic dependencies,
-1-4 parallel tasks, and a bounded document size. Other low-level workflow modes
-remain available through the existing protocol; this conversation surface is a
-cross-device DAG broker, not an arbitrary protocol proxy.
+accepted. Plans have 1-16 unique nodes, 1-4 parallel tasks and a bounded document
+size. Omitted `mode` preserves DAG with valid acyclic dependencies. A device with
+`native_workflow_modes_v1` also supports `mode: "graph"` and `"discussion"` through
+this same tool, for both same-device and cross-device bindings. This remains a
+typed canonical broker, never an arbitrary low-level protocol proxy.
+
+Graph requires `executorID` and `communicationGraph: {edges: [{from, to}],
+maxIterations}`. Every edge must originate at that declared executor and target a
+declared worker; the iteration bound is 1-12. Its frozen executor emits fenced
+`phonon.workflow.route`, `.feedback`, `.reply` or `.done` directives. Invalid or
+foreign targets are never partially dispatched. Human review uses the existing
+turn-scoped human interaction tools, not model-authored approval. A Graph
+executor is a subordinate Agent inside the DE's plan, not a second DE and cannot
+catalog or execute another workflow.
+
+Discussion requires `chairmanID` and `termination: {maxRounds, chairmanSignal,
+consensusSignal?}`. It has at least two participants, up to 10 rounds and a barrier
+before the chairman reviews contributions. Prior observations, including the
+chairman's feedback, are provided to the next round. Both iterative modes require
+empty `dependsOn`; routing and round barriers determine order.
+
+Each iterative invocation is a separate durable Run and burner Session, keeping
+the existing exact-turn authority and cleanup contract. It receives bounded prior
+observations, not a claim to retained native model history. Full workflow detail
+retains immutable attempt/run identities. Tool status returns the latest 16
+attempts plus `attemptCount`; `status` with `nodeID`, exact `attempt` and `offset`
+reads any earlier full result. At most 256 invocations may be admitted. Files use
+the same frozen inputs; an iterative `artifactSources` entry selects the most
+recent completed publication of another declared node, if one exists. No bytes
+are silently inferred from device paths. Review, detached delivery, source
+authority, cancellation and original-DE reporting remain shared with DAG.
 
 ## Review Is Source-Selected
 
@@ -102,6 +129,34 @@ human response, task dispatch acceptance, and verified results remain distinct.
 The execution API and model tools cannot submit a human approval.
 
 ## Execution And Isolation
+
+### Creator Communication
+
+New DE plans retain immutable creator identity separately from their backing
+human/MCP authorization. An ordinary worker `phonon_request_interaction` form
+(without approval presentation or native permission hook) is addressed to that
+original DE. The control plane sends one durable request in the originating DE
+conversation; it never creates another worker or promotes a worker to chat member.
+Human-created UI Dev workflows instead retain the existing authorized Loop source
+route. Required human approvals and native permission hooks stay human-only.
+
+The original DE can inspect `status.questions` and answer using
+`{operation:'respond', requestId:workflow_request_uuid, requestID:question_uuid,
+requestVersion, action:'submit', values:{...}}` or `action:'cancel'`. Only this DE's
+current authenticated conversation/turn may answer that exact live question;
+other DEs, workers and ordinary human response commands cannot impersonate it.
+The answer carries `responder:{kind:'de',id,runID}` in `InteractionRequestResult`.
+Consumption still requires the worker's existing `decisionHash` acknowledgement;
+submission alone is not delivery/application or task completion.
+
+For synchronous `execute`, a pending creator question yields
+`status:'status', data.awaitingCreator:true, data.questions` so the same DE turn
+can gather information and respond. It then reads status; it never re-executes to
+continue. Detached plans queue the original card as one durable DE input only
+after the source turn settles. Cancellation, expired questions, original source
+withdrawal and workspace changes fence new responses/admission. No DE reply
+grants native permissions or stands in for human approval. A DE device advertises
+`native_workflow_creator_questions_v1`; old runtime updates are explicit.
 
 Only an actual DE may catalog/execute. Groups cannot retarget another Project;
 private chats can explicitly select an accessible canonical Project without
